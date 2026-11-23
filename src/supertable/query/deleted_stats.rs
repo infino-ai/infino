@@ -390,6 +390,19 @@ impl<'a> LiveColumn<'a> {
         })
     }
 
+    /// The values the deleted rows held, each with how many held it.
+    pub(crate) fn deleted_counts(&self) -> Result<Vec<(ScalarValue, u64)>, Unknown> {
+        if self.deleted == 0 || self.no_values() {
+            return Ok(Vec::new());
+        }
+        let delta = self.delta()?;
+        if delta.all_null() {
+            return Ok(Vec::new());
+        }
+        let counts = delta.value_counts.as_ref().ok_or(Unknown::Scan)?;
+        Ok(counts.entries().to_vec())
+    }
+
     /// How the live rows change the stored value counts. A superfile that
     /// holds values it recorded no counts of is scanned.
     pub(crate) fn counts_change(&self) -> Result<CountsChange, Unknown> {
@@ -662,19 +675,24 @@ pub(crate) fn better_bound<'a>(
 mod tests {
     use std::{collections::HashSet, ops::Range, slice::from_ref, sync::Arc};
 
-    use arrow_array::{Int64Array, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{ArrayRef, Int64Array, LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use datafusion::prelude::{col, lit};
     use roaring::RoaringBitmap;
     use tempfile::TempDir;
 
     use super::*;
     use crate::{
+        Analyzer,
+        memory::ConnectionMemoryBudget,
+        runtime_metrics::op_stats::with_op_stats,
         storage::{LocalFsStorageProvider, StorageProvider},
+        superfile::builder::FtsConfig,
         supertable::{
-            Supertable, SupertableOptions, SupertableReader, query::sql::value_count_schema,
+            Supertable, SupertableOptions, SupertableReader,
+            query::{sql::value_count_schema, value_count_carry::MAX_TABLE_VALUE_COUNTS},
         },
-        test_helpers::default_disk_cache,
+        test_helpers::{default_disk_cache, xorshift},
     };
 
     /// Rows of the superfile whose deletes cover most of it.
@@ -695,6 +713,17 @@ mod tests {
     /// Rows of the superfile with deletes in the bounds test: more distinct
     /// values of `w` than a superfile counts exactly.
     const WIDE_ROWS: i64 = 300;
+
+    /// Files in the keyword value-count fixture, and rows in each.
+    const KEYWORD_FILES: usize = 5;
+    const KEYWORD_ROWS: usize = 2_000;
+    /// Distinct numbers the fixture's values are made from: well past the
+    /// table-wide limit, so the statistics decline.
+    const KEYWORD_POOL: u64 = 1_500;
+    /// `n` is drawn from `0..KEYWORD_N_RANGE`; rows below
+    /// `KEYWORD_DELETED_BELOW` are deleted, about one in ten.
+    const KEYWORD_N_RANGE: u64 = 1_000;
+    const KEYWORD_DELETED_BELOW: i64 = 100;
 
     struct Table {
         table: Supertable,
@@ -1021,5 +1050,251 @@ mod tests {
             sorted_rows(from_ref(&counted))
         );
         assert_eq!(reader.deleted_stats().len(), 1);
+    }
+
+    /// The keyword value-count fixture: `n`, a `keyword` column `tag` and
+    /// the same text in a `standard` column `plain`, over
+    /// [`KEYWORD_FILES`] files and one more whose rows are all deleted,
+    /// with about one row in ten deleted from the rest. The table is
+    /// returned with the directories that hold it.
+    fn keyword_value_table(term_index: bool) -> (TempDir, TempDir, Supertable, SchemaRef) {
+        let dir = TempDir::new().expect("tempdir");
+        let cache_dir = TempDir::new().expect("cache dir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("tag", DataType::LargeUtf8, true),
+            Field::new("plain", DataType::LargeUtf8, true),
+        ]));
+        let fts = vec![
+            FtsConfig::new("tag").analyzer(Analyzer::Keyword),
+            FtsConfig::new("plain"),
+        ];
+        let mut options = SupertableOptions::new(Arc::clone(&schema), fts, vec![])
+            .expect("options")
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(default_disk_cache(storage, cache_dir.path()))
+            .with_term_index(term_index);
+        // Bounded, so a test can fill it.
+        options.connection_memory_budget = ConnectionMemoryBudget::with_room();
+        let table = Supertable::create(options).expect("create");
+        let mut next = xorshift(0x5EED);
+        // The last file's rows are all deleted: it holds no live value,
+        // and its deleted rows are not read.
+        for file in 0..=KEYWORD_FILES {
+            let n: Vec<i64> = (0..KEYWORD_ROWS)
+                .map(|_| match file {
+                    KEYWORD_FILES => KEYWORD_N_RANGE as i64,
+                    _ => (next() % KEYWORD_N_RANGE) as i64,
+                })
+                .collect();
+            // Spellings `standard` would fold together, the empty
+            // string, non-ASCII, and a null in about one row in ten.
+            let tags: Vec<Option<String>> = (0..KEYWORD_ROWS)
+                .map(|_| {
+                    let r = next();
+                    let v = r % KEYWORD_POOL;
+                    match r % 10 {
+                        0 => None,
+                        1 => Some(String::new()),
+                        2 => Some(format!("Tag {v}")),
+                        3 => Some(format!("tag {v}.")),
+                        4 => Some(format!("ünï/{v}")),
+                        _ => Some(format!("tag {v}")),
+                    }
+                })
+                .collect();
+            let tags: ArrayRef = Arc::new(LargeStringArray::from(tags));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(n)), Arc::clone(&tags), tags],
+            )
+            .expect("batch");
+            let mut writer = table.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        table
+            .delete(
+                col("n")
+                    .lt(lit(KEYWORD_DELETED_BELOW))
+                    .or(col("n").eq(lit(KEYWORD_N_RANGE as i64))),
+            )
+            .expect("delete");
+        (dir, cache_dir, table, schema)
+    }
+
+    /// `value_counts` on a keyword column equals the grouped count, with
+    /// nulls, deletes, a file with every row deleted and many files, and
+    /// reads no row: from the term index, and from each file's dictionary on
+    /// a table that keeps no index. The same values in a `standard` column
+    /// go through the grouped count.
+    #[test]
+    fn keyword_value_counts_sum_the_terms_less_the_deleted_rows() {
+        assert!(MAX_TABLE_VALUE_COUNTS < KEYWORD_POOL as usize);
+        for term_index in [true, false] {
+            let (_dir, _cache_dir, table, schema) = keyword_value_table(term_index);
+            let reader = table.reader().expect("reader");
+            for (column, reads_rows) in [("tag", false), ("plain", true)] {
+                let label = format!("{column}, term index {term_index}");
+                let (counted, stats) =
+                    with_op_stats(|| reader.value_counts(column).expect("value counts"));
+                let grouped = rows(
+                    &reader,
+                    &format!("SELECT {column}, COUNT(*) FROM supertable GROUP BY {column}"),
+                );
+                assert_eq!(sorted_rows(from_ref(&counted)), grouped, "{label}");
+                assert_eq!(
+                    stats.rows_materialized > 0,
+                    reads_rows,
+                    "{label}: {stats:?}"
+                );
+                let field = schema.field_with_name(column).expect("field");
+                let value_schema = value_count_schema(field).expect("schema");
+                assert!(
+                    reader
+                        .value_counts_from_stats(column, &value_schema)
+                        .expect("from stats")
+                        .is_none(),
+                    "{label}: the statistics decline"
+                );
+            }
+        }
+    }
+
+    /// Files in [`long_keyword_table`], and rows in each.
+    const LONG_FILES: usize = 4;
+    const LONG_ROWS: usize = 2_000;
+    /// Bytes of each of its values, all distinct: its term counts take
+    /// several MiB.
+    const LONG_VALUE_LEN: usize = 600;
+    /// Budget bytes [`keyword_value_counts_short_of_the_budget_stop_partway`]
+    /// leaves free: about one and a half files' worth of term counts, so the
+    /// term-index walk fits some terms but not all, and one file's term list
+    /// fits but not the next.
+    const PARTIAL_ROOM: usize = LONG_ROWS * LONG_VALUE_LEN * 3 / 2;
+    /// A table of one `keyword` column `tag` whose values are all distinct
+    /// and [`LONG_VALUE_LEN`] bytes long, over [`LONG_FILES`] files, with
+    /// one row in ten null.
+    fn long_keyword_table(term_index: bool) -> (TempDir, TempDir, Supertable) {
+        let dir = TempDir::new().expect("tempdir");
+        let cache_dir = TempDir::new().expect("cache dir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "tag",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let fts = vec![FtsConfig::new("tag").analyzer(Analyzer::Keyword)];
+        let mut options = SupertableOptions::new(Arc::clone(&schema), fts, vec![])
+            .expect("options")
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(default_disk_cache(storage, cache_dir.path()))
+            .with_term_index(term_index);
+        options.connection_memory_budget = ConnectionMemoryBudget::with_room();
+        let table = Supertable::create(options).expect("create");
+        for file in 0..LONG_FILES {
+            let tags: Vec<Option<String>> = (0..LONG_ROWS)
+                .map(|row| {
+                    let n = file * LONG_ROWS + row;
+                    (!n.is_multiple_of(10)).then(|| format!("{n:0>LONG_VALUE_LEN$}"))
+                })
+                .collect();
+            let tags: ArrayRef = Arc::new(LargeStringArray::from(tags));
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![tags]).expect("batch");
+            let mut writer = table.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        (dir, cache_dir, table)
+    }
+
+    /// When a keyword column's term counts do not fit the connection memory
+    /// budget, the term path declines and keeps nothing charged, both from
+    /// the term index and from each file's dictionary. `value_counts` then
+    /// runs the grouped count, which hits the full budget. With room, the
+    /// terms answer, equal to `GROUP BY`, and no row is read.
+    #[test]
+    fn keyword_value_counts_over_the_budget_run_the_grouped_count() {
+        for term_index in [true, false] {
+            let label = format!("term index {term_index}");
+            let (_dir, _cache_dir, table) = long_keyword_table(term_index);
+            let reader = table.reader().expect("reader");
+            let grouped = rows(&reader, "SELECT tag, COUNT(*) FROM supertable GROUP BY tag");
+            let tag = Field::new("tag", DataType::LargeUtf8, true);
+            let value_schema = value_count_schema(&tag).expect("schema");
+            let budget = &reader.manifest().options.connection_memory_budget;
+
+            let held = budget.hold_all();
+            let used = budget.used();
+            let from_terms = reader
+                .value_counts_from_terms("tag", &value_schema)
+                .expect("from terms");
+            assert!(from_terms.is_none(), "{label}: the terms do not fit");
+            assert_eq!(
+                budget.used(),
+                used,
+                "{label}: the refused counts hold nothing"
+            );
+            let err = reader
+                .value_counts("tag")
+                .expect_err("the grouped count meets the full budget");
+            assert!(
+                err.to_string().contains("during SQL query"),
+                "{label}: refused by the grouped count, not the terms: {err}"
+            );
+            drop(held);
+
+            let (counted, stats) =
+                with_op_stats(|| reader.value_counts("tag").expect("value counts"));
+            assert_eq!(
+                sorted_rows(from_ref(&counted)),
+                grouped,
+                "{label}: with room"
+            );
+            assert_eq!(
+                stats.rows_materialized, 0,
+                "{label}: from the terms: {stats:?}"
+            );
+        }
+    }
+
+    /// When the budget fits some of a keyword column's term counts but not
+    /// all, the term path stops partway and releases what it charged: the
+    /// term-index walk is refused after some terms are added, and without
+    /// the index one file's list is charged before the next is refused.
+    /// With room again, `value_counts` equals `GROUP BY` and the budget holds
+    /// nothing afterwards.
+    #[test]
+    fn keyword_value_counts_short_of_the_budget_stop_partway() {
+        for term_index in [true, false] {
+            let label = format!("term index {term_index}");
+            let (_dir, _cache_dir, table) = long_keyword_table(term_index);
+            let reader = table.reader().expect("reader");
+            let grouped = rows(&reader, "SELECT tag, COUNT(*) FROM supertable GROUP BY tag");
+            let tag = Field::new("tag", DataType::LargeUtf8, true);
+            let value_schema = value_count_schema(&tag).expect("schema");
+            let budget = &reader.manifest().options.connection_memory_budget;
+
+            let before = budget.used();
+            let mut held = budget.hold_all();
+            held.shrink(PARTIAL_ROOM);
+            let used = budget.used();
+            let from_terms = reader
+                .value_counts_from_terms("tag", &value_schema)
+                .expect("from terms");
+            assert!(from_terms.is_none(), "{label}: not every term fits");
+            assert_eq!(
+                budget.used(),
+                used,
+                "{label}: what the refused counts charged is released"
+            );
+            drop(held);
+            let counted = reader.value_counts("tag").expect("value counts");
+            assert_eq!(sorted_rows(from_ref(&counted)), grouped, "{label}");
+            assert_eq!(budget.used(), before, "{label}: nothing held afterwards");
+        }
     }
 }

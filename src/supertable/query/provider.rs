@@ -4255,7 +4255,7 @@ pub(crate) mod tests {
         superfile::{
             builder::FtsConfig,
             fts::{
-                analysis::{Stemmer, Stopwords, chain_tokenizer},
+                analysis::{Analyzer, Stemmer, Stopwords, chain_tokenizer},
                 tokenize::StandardTokenizer,
             },
             vector::layout::VectorLayout,
@@ -4849,7 +4849,11 @@ pub(crate) mod tests {
             if c == "title" {
                 Some(Arc::new(StandardTokenizer))
             } else {
-                Some(chain_tokenizer(Stopwords::None, Stemmer::English))
+                Some(chain_tokenizer(
+                    Analyzer::Standard,
+                    Stopwords::None,
+                    Stemmer::English,
+                ))
             }
         };
         let terms_for = |column: &str| {

@@ -51,7 +51,16 @@ use crate::{
 /// Parts without an `fts_summary_agg` entry for this column
 /// (no info) survive — same "always-keep" treatment the
 /// list-level pruner gives to missing aggregates.
+///
+/// An empty `prefix` (every term matches) keeps every part, as
+/// the superfile-level `fts_prefix_skip` does. The term range
+/// cannot answer it: a part whose only term is the empty string
+/// (a keyword column whose values are all `''`) has an empty
+/// `(min, max)`, which the summary records as "no range".
 pub fn prune_parts_for_fts_prefix(list: &Manifest, column: FieldId, prefix: &[u8]) -> Vec<PartId> {
+    if prefix.is_empty() {
+        return list.parts.iter().map(|entry| entry.part_id).collect();
+    }
     let upper = prefix_upper_bound(prefix);
     list.parts
         .iter()
@@ -76,8 +85,9 @@ fn part_overlaps_prefix(
         return true;
     };
     let Some((min_term, max_term)) = agg.term_range.as_ref() else {
-        // Every superfile had an empty dictionary for this column;
-        // nothing to match. Skip.
+        // No superfile holds a non-empty term for this column. The
+        // empty term may still be there, but only an empty prefix
+        // matches it, and the caller keeps every part for that.
         return false;
     };
     // Overlap check: [prefix, upper) intersects [min_term, max_term]
@@ -525,6 +535,24 @@ mod tests {
         let survivors = prune_parts_for_fts_prefix(&list, fid("title"), b"echo");
         assert_eq!(survivors.len(), 1);
         assert_eq!(survivors[0], part1.part_id);
+    }
+
+    /// A part whose only term is the empty string (a keyword column
+    /// whose values are all `''`) has an empty `(min, max)`, which the
+    /// summary records as no range. An empty prefix matches that term,
+    /// so it keeps the part; any other prefix still prunes it.
+    #[test]
+    fn prune_parts_for_fts_prefix_empty_prefix_keeps_an_all_empty_part() {
+        let empty = entry_from_superfiles(&[seg(0, 10, &[""], None)], 0);
+        let words = entry_from_superfiles(&[seg(11, 20, &["alpha"], None)], 1);
+        let fts = &empty.fts_summary_agg[&fid("title")];
+        assert_eq!(fts.term_range, None, "the empty term reads as no range");
+        let list = list_with(vec![empty.clone(), words.clone()]);
+
+        let survivors = prune_parts_for_fts_prefix(&list, fid("title"), b"");
+        assert_eq!(survivors, vec![empty.part_id, words.part_id]);
+        let survivors = prune_parts_for_fts_prefix(&list, fid("title"), b"al");
+        assert_eq!(survivors, vec![words.part_id]);
     }
 
     #[test]

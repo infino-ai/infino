@@ -19,7 +19,7 @@ use arrow_schema::{Schema, SchemaRef};
 use serde_json::{Value, json};
 
 use crate::{
-    IndexSpec, InfinoError, Supertable,
+    Analyzer, ColumnIndex, IndexSpec, InfinoError, Supertable,
     supertable::schema::{TableSchema, change::SchemaPatch},
 };
 
@@ -166,6 +166,8 @@ impl RemoteCatalog {
         schema: SchemaRef,
         indexes: IndexSpec,
     ) -> Result<Supertable, InfinoError> {
+        indexes.check_analyzers()?;
+        only_standard_analyzers(indexes.fts_analyzers())?;
         let body = json!({
             "table_name": name,
             "schema_ipc": wire::schema_to_ipc_base64(&schema)?,
@@ -244,6 +246,10 @@ impl RemoteCatalog {
         patch: &SchemaPatch,
         expected: Option<u32>,
     ) -> Result<TableSchema, InfinoError> {
+        only_standard_analyzers(patch.fields.iter().filter_map(|f| match &f.index {
+            Some(ColumnIndex::Fts { analyzer, .. }) => Some(*analyzer),
+            _ => None,
+        }))?;
         let mut body = json!({ "table_name": name, "patch": patch.to_json() });
         if let Some(expected) = expected {
             body["expected_schema_id"] = json!(expected);
@@ -260,6 +266,21 @@ impl RemoteCatalog {
             Err(e) => return Err(e),
         };
         read_schema_document("apply_schema", response)
+    }
+}
+
+/// The hosted service builds only `standard` indexes. A service that does
+/// not know `keyword` could build the column as `standard`, and then every
+/// query would look up whole values among split words. So refuse here.
+fn only_standard_analyzers(
+    analyzers: impl IntoIterator<Item = Analyzer>,
+) -> Result<(), InfinoError> {
+    match analyzers.into_iter().find(|a| *a != Analyzer::Standard) {
+        Some(analyzer) => Err(InfinoError::Config(format!(
+            "the hosted service does not support the {:?} analyzer yet",
+            analyzer.as_str()
+        ))),
+        None => Ok(()),
     }
 }
 

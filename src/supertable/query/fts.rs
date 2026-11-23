@@ -117,7 +117,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError, config,
-    memory::ConnectionMemoryBudget,
+    memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::run_on_pool_unless_blocking,
     runtime_metrics::op_stats,
     superfile::{
@@ -132,7 +132,7 @@ use crate::{
                 GlobalTermIdf, LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet,
                 PreparedClauses, QueryDict, QueryIdf, ScoringView,
             },
-            tokenize::Phrase,
+            tokenize::{KEYWORD_TOKENIZER, Phrase},
         },
         id_space::{FtsDocId, RowId, row_bitmap},
     },
@@ -3065,17 +3065,22 @@ impl SupertableReader {
         // As in `bm25_search_async`: a prefix query over a column with no
         // full-text index would otherwise fail deep in the scan with an opaque
         // missing-metadata error. Reject up front, naming the searchable set.
-        if manifest.try_fts_tokenizer_for(column).is_none() {
+        let Some(tokenizer) = manifest.try_fts_tokenizer_for(column) else {
             return Err(QueryError::InvalidQuery(no_fts_index_message(
                 column,
                 &manifest.fts_configs(),
             )));
-        }
-        // Expansion matches the dictionary's lowercased bytes, and the
-        // term-range prune compares the same bytes, so both see one prefix.
+        };
+        // Expansion matches the dictionary's bytes, and the term-range
+        // prune compares the same bytes, so both see one prefix: lowercased,
+        // except on a keyword column, whose terms keep their case.
+        let prefix = match tokenizer.name() {
+            KEYWORD_TOKENIZER => prefix.as_bytes().to_vec(),
+            _ => prefix.to_ascii_lowercase().into_bytes(),
+        };
         let prune_leaf = PruneLeaf::Prefix {
             column: column.to_owned(),
-            prefix: prefix.to_ascii_lowercase().into_bytes(),
+            prefix,
         };
         let kept = self.select_scored(column, &prune_leaf, None).await?;
         let shoulds = self
@@ -3172,6 +3177,130 @@ impl SupertableReader {
             .into_iter()
             .filter_map(|t| String::from_utf8(t).ok())
             .collect())
+    }
+
+    /// Every term of `column` with its document count, summed over `files`,
+    /// deleted rows included. The term index answers for the superfiles it
+    /// covers; the dictionaries answer for the rest.
+    ///
+    /// The map holds every distinct value of the column, and each file
+    /// outside the index hands back its whole term list, so both are charged
+    /// to the connection memory budget as they are built. `None` when a
+    /// charge is refused: the caller then counts another way, budgeted and
+    /// able to spill. What was charged is released when the returned
+    /// [`TermCounts`] is dropped.
+    pub(crate) async fn term_doc_counts(
+        &self,
+        column: &str,
+        files: Vec<Arc<SuperfileEntry>>,
+    ) -> Result<Option<TermCounts>, QueryError> {
+        let field = self.manifest().field_id(column);
+        let budget = Arc::clone(&self.manifest().options.connection_memory_budget);
+        let Some(mut counts) = TermCounts::new(&budget) else {
+            return Ok(None);
+        };
+        let index = self
+            .manifest()
+            .term_index()
+            .await
+            .map_err(QueryError::from)?;
+        let rest: Vec<Arc<SuperfileEntry>> = match (&index, field) {
+            (Some(index), Some(field)) => {
+                let (covered, rest): (Vec<_>, Vec<_>) = files
+                    .into_iter()
+                    .partition(|entry| index.is_indexed(&entry.superfile_id));
+                let live: HashSet<Uuid> = covered.iter().map(|e| e.superfile_id).collect();
+                if !live.is_empty() {
+                    let head = field.term_key("").len();
+                    // Whether each superfile ordinal of the index is live, so a
+                    // posting is checked without a lookup by id.
+                    let live_ordinals: Vec<bool> = (0..index.root().superfiles.len() as u32)
+                        .map(|o| index.superfile_id(o).is_some_and(|id| live.contains(&id)))
+                        .collect();
+                    let mut fits = true;
+                    index
+                        .for_each_prefix(field, "", |key, run| {
+                            let held: u64 = run
+                                .iter()
+                                .filter(|p| live_ordinals.get(p.superfile as usize) == Some(&true))
+                                .map(|p| p.df)
+                                .sum();
+                            fits = held == 0 || counts.add(&key[head..], held);
+                            fits
+                        })
+                        .await
+                        .map_err(QueryError::from)?;
+                    if !fits {
+                        return Ok(None);
+                    }
+                }
+                rest
+            }
+            _ => files,
+        };
+        let column_arc: Arc<str> = Arc::from(column);
+        let pool = Arc::clone(&self.manifest().options.reader_pool);
+        let units = rest.into_iter().map(|entry| (entry, ())).collect();
+        // Set once any file's list is refused by the budget. The answer is
+        // then thrown away, so the other files check it and stop before
+        // reading or charging anything more.
+        let refused = Arc::new(AtomicBool::new(false));
+        let per_superfile: Vec<Option<(Vec<(Vec<u8>, u64)>, Reservation)>> = dispatch::fanout_with(
+            self,
+            units,
+            false,
+            self.open_intent(),
+            move |r, _entry, _sidecars, _now, ()| {
+                let column_arc = Arc::clone(&column_arc);
+                let pool = Arc::clone(&pool);
+                let budget = Arc::clone(&budget);
+                let refused = Arc::clone(&refused);
+                async move {
+                    if refused.load(AtomicOrdering::Relaxed) {
+                        return Ok(None);
+                    }
+                    let fts = r
+                        .fts()
+                        .ok_or_else(|| QueryError::Internal("superfile has no FTS index".into()))?;
+                    let column = r.column_alias(field, &column_arc);
+                    let terms = fts.terms_with_prefix(column, b"", Some(&pool)).await?;
+                    if refused.load(AtomicOrdering::Relaxed) {
+                        return Ok(None);
+                    }
+                    // Each file's list is held until the merge below takes
+                    // it.
+                    let bytes = terms.iter().map(|t| term_entry_bytes(t.len())).sum();
+                    let Ok(held) = budget.try_reserve(bytes) else {
+                        refused.store(true, AtomicOrdering::Relaxed);
+                        return Ok(None);
+                    };
+                    let texts = terms
+                        .iter()
+                        .map(|t| str::from_utf8(t))
+                        .collect::<Result<Vec<&str>, _>>()
+                        .map_err(|_| QueryError::Internal("a term is not UTF-8".into()))?;
+                    let (dfs, _) = fts.term_dfs(column, &texts).await?;
+                    Ok(Some((terms.into_iter().zip(dfs).collect(), held)))
+                }
+            },
+        )
+        .await?;
+        let mut lists = Vec::with_capacity(per_superfile.len());
+        for list in per_superfile {
+            let Some(list) = list else {
+                return Ok(None);
+            };
+            lists.push(list);
+        }
+        for (terms, held) in lists {
+            for (term, df) in terms {
+                if df > 0 && !counts.add(&term, df) {
+                    return Ok(None);
+                }
+            }
+            drop(held);
+        }
+        Ok(Some(counts))
     }
 
     /// Parse `query` into positive and negated tokens, then select the
@@ -4978,6 +5107,76 @@ impl Supertable {
     }
 }
 
+/// Bytes charged for one term held as a map key or a list entry: its own
+/// bytes, the `Vec` that owns them, its count, and the map slot around them.
+fn term_entry_bytes(term_len: usize) -> usize {
+    term_len + size_of::<Vec<u8>>() + size_of::<u64>() + TERM_SLOT_OVERHEAD
+}
+
+/// A hash map slot's share beyond its pair: the control byte and the empty
+/// slots its load factor keeps, rounded up.
+const TERM_SLOT_OVERHEAD: usize = 16;
+
+/// Bytes [`TermCounts`] charges the budget at once, so many small terms do
+/// not each make their own charge.
+const TERM_COUNTS_CHARGE: usize = 64 << 10;
+
+/// Each term of a column with its document count. Its bytes are charged to
+/// the connection memory budget as it grows, and released when it is
+/// dropped.
+#[derive(Debug)]
+pub(crate) struct TermCounts {
+    counts: HashMap<Vec<u8>, u64>,
+    /// Bytes the map holds by [`term_entry_bytes`]; the reservation stays at
+    /// or above it.
+    held: usize,
+    reservation: Reservation,
+}
+
+impl TermCounts {
+    /// An empty map, or `None` when the budget has no room left at all.
+    fn new(budget: &Arc<ConnectionMemoryBudget>) -> Option<Self> {
+        Some(Self {
+            counts: HashMap::new(),
+            held: 0,
+            reservation: budget.try_reserve(0).ok()?,
+        })
+    }
+
+    /// Add `n` documents to `term`. `false` when a new term does not fit the
+    /// budget; the map is then left without it.
+    fn add(&mut self, term: &[u8], n: u64) -> bool {
+        if let Some(count) = self.counts.get_mut(term) {
+            *count += n;
+            return true;
+        }
+        let bytes = term_entry_bytes(term.len());
+        let short = (self.held + bytes).saturating_sub(self.reservation.size());
+        let fits = short == 0
+            || self
+                .reservation
+                .try_grow(short.max(TERM_COUNTS_CHARGE))
+                .is_ok()
+            || self.reservation.try_grow(short).is_ok();
+        if !fits {
+            return false;
+        }
+        self.held += bytes;
+        self.counts.insert(term.to_vec(), n);
+        true
+    }
+
+    /// The count of `term`, to adjust in place.
+    pub(crate) fn get_mut(&mut self, term: &[u8]) -> Option<&mut u64> {
+        self.counts.get_mut(term)
+    }
+
+    /// The terms and their counts.
+    pub(crate) fn counts(&self) -> &HashMap<Vec<u8>, u64> {
+        &self.counts
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -5370,7 +5569,7 @@ mod tests {
         );
     }
 
-    use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
+    use arrow_array::{ArrayRef, Decimal128Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -5385,6 +5584,7 @@ mod tests {
         build_work_units, ceilings_at_table_avgdl, fanout_for, walk_dict,
     };
     use crate::{
+        Analyzer,
         config::{CompactionSettings, OptimizeOptions},
         memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
@@ -7324,6 +7524,59 @@ mod tests {
         let r = st.reader().expect("reader");
         let hits = r.bm25_search_prefix("title", "RUST", 5).expect("query");
         assert_eq!(hits.len(), 1);
+    }
+
+    /// An empty prefix finds the `''` values of a keyword column in a part
+    /// that holds no other value, with and without a term index. The empty
+    /// string is a real term there, but the part's term range reads as
+    /// empty, so the part-level prune must not drop the part for that.
+    #[test]
+    fn empty_prefix_keeps_a_part_whose_keyword_values_are_all_empty() {
+        for term_index in [true, false] {
+            let dir = TempDir::new().expect("tempdir");
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "tag",
+                DataType::LargeUtf8,
+                true,
+            )]));
+            // A one-byte part threshold puts each commit in a part of its
+            // own, and opening with no eager load leaves the parts unloaded,
+            // so a query chooses parts by their summaries.
+            let options = || {
+                SupertableOptions::new(
+                    Arc::clone(&schema),
+                    vec![FtsConfig::new("tag").analyzer(Analyzer::Keyword)],
+                    vec![],
+                )
+                .expect("options")
+                .with_storage(Arc::clone(&storage))
+                .with_part_size_threshold_bytes(1)
+                .with_eager_load_threshold(0)
+                .with_term_index(term_index)
+            };
+            let table = Supertable::create(options()).expect("create");
+            for values in [vec![Some("a"), None], vec![Some(""), Some(""), None]] {
+                let column: ArrayRef = Arc::new(LargeStringArray::from(values));
+                let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).expect("batch");
+                let mut w = table.writer().expect("writer");
+                w.append(&batch).expect("append");
+                w.commit().expect("commit");
+            }
+            drop(table);
+            let table = Supertable::open(options()).expect("open");
+            let hits = table
+                .reader()
+                .expect("reader")
+                .bm25_search_prefix("tag", "", 10)
+                .expect("prefix");
+            assert_eq!(
+                hits.len(),
+                3,
+                "`a` and both `''` rows, term index {term_index}"
+            );
+        }
     }
 
     #[test]

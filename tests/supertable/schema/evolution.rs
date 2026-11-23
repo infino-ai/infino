@@ -16,9 +16,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Bm25Params, BoolMode, ColumnIndex, CompactionSettings, Connection, FieldId, FieldPatch,
-    IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaError, SchemaPatch, Stemmer, Stopwords,
-    TableSchema, VectorFilter, connect, serde_json, test_helpers::distinct_unit_vectors,
+    Analyzer, BoolMode, ColumnIndex, CompactionSettings, Connection, FieldId, FieldPatch,
+    IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaError, SchemaPatch, TableSchema,
+    VectorFilter, connect, serde_json, test_helpers::distinct_unit_vectors,
 };
 use tempfile::TempDir;
 
@@ -1300,13 +1300,7 @@ fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
             &SchemaPatch::new(vec![
                 FieldPatch::named("body")
                     .with_type(DataType::LargeUtf8)
-                    .with_index(ColumnIndex::Fts {
-                        stopwords: Stopwords::None,
-                        stemmer: Stemmer::None,
-                        positions: false,
-                        stored: true,
-                        bm25: Bm25Params::default(),
-                    }),
+                    .with_index(ColumnIndex::fts(Analyzer::Standard)),
             ]),
             Some(grown.schema_id()),
         )
@@ -1330,13 +1324,7 @@ fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
             &SchemaPatch::new(vec![
                 FieldPatch::named("title")
                     .with_id(id_of(&with_body, "title"))
-                    .with_index(ColumnIndex::Fts {
-                        stopwords: Stopwords::None,
-                        stemmer: Stemmer::None,
-                        positions: false,
-                        stored: true,
-                        bm25: Bm25Params::default(),
-                    }),
+                    .with_index(ColumnIndex::fts(Analyzer::Standard)),
             ]),
             None,
         )
@@ -1633,18 +1621,16 @@ fn a_text_match_on_a_text_column_added_later_answers_as_token_match_does() {
         .expect("create");
     docs.append(&batch(vec![("title", titles(&["rust one", "go two"]))]))
         .expect("append before the column");
+    let mut positional = ColumnIndex::fts(Analyzer::Standard);
+    if let ColumnIndex::Fts { positions, .. } = &mut positional {
+        *positions = true;
+    }
     db.apply_schema(
         TABLE,
         &SchemaPatch::new(vec![
             FieldPatch::named("body")
                 .with_type(DataType::LargeUtf8)
-                .with_index(ColumnIndex::Fts {
-                    stopwords: Stopwords::None,
-                    stemmer: Stemmer::None,
-                    positions: true,
-                    stored: true,
-                    bm25: Bm25Params::default(),
-                }),
+                .with_index(positional),
         ]),
         None,
     )

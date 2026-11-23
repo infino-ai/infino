@@ -111,7 +111,7 @@ use crate::supertable::{
     error::QueryError,
     manifest::{
         ManifestSnapshot, SuperfileEntry, add_sum_arrays, list::ScalarValueCounts,
-        load_section_groups_blocking,
+        load_section_groups, load_section_groups_blocking,
     },
     query::{
         deleted_stats::{
@@ -1868,6 +1868,101 @@ pub(crate) fn value_counts_from_statistics(
     let counts = answered_counts(provider, column, &counts_split)?;
     let values = counts.iter().map(|(v, n)| (v.clone(), n)).collect();
     Some((values, counts_split.nulls))
+}
+
+/// What the statistics must give to sum a `keyword` column's term counts:
+/// the superfiles holding a live value, the values their deleted rows held
+/// (term counts include them, so they are subtracted), and the live nulls.
+pub(crate) struct TermCountInputs {
+    pub(crate) files: Vec<Arc<SuperfileEntry>>,
+    pub(crate) deleted: Vec<(ScalarValue, u64)>,
+    pub(crate) nulls: u64,
+}
+
+/// [`TermCountInputs`] for `column`, reading the deleted rows' statistics
+/// where needed, as [`non_null_count`] does. `None` when one is
+/// not known exactly (a manifest not fully loaded, a column mid-retype,
+/// deleted rows too many to read or holding too many values), or when a
+/// superfile's index of the column does not hold one term per value.
+pub(crate) async fn term_count_inputs(
+    provider: &SupertableProvider,
+    state: &SessionState,
+    column: &str,
+) -> Option<TermCountInputs> {
+    let manifest = provider.manifest();
+    let superfiles = manifest.complete_flat_superfiles()?;
+    if !counts_describe_column(manifest, column, superfiles) {
+        return None;
+    }
+    let stats_column = StatsColumn::new(manifest, column)?;
+    load_section_groups(superfiles, &[stats_column.id]).await;
+    let mut requests = Vec::new();
+    let mut inputs = term_count_pass(provider, superfiles, &stats_column, &mut requests)?;
+    if !requests.is_empty() {
+        read_requested(
+            provider,
+            state,
+            provider.deleted_stats(),
+            mem::take(&mut requests),
+        )
+        .await;
+        inputs = term_count_pass(provider, superfiles, &stats_column, &mut requests)?;
+    }
+    requests.is_empty().then_some(inputs)
+}
+
+/// One pass of [`term_count_inputs`]: a superfile whose deleted rows'
+/// statistics are not read yet is added to `requests` instead.
+fn term_count_pass(
+    provider: &SupertableProvider,
+    superfiles: &[Arc<SuperfileEntry>],
+    column: &StatsColumn,
+    requests: &mut Vec<DeletedRowStatsRequest>,
+) -> Option<TermCountInputs> {
+    let data_type = column.data_type.as_ref()?;
+    let mut inputs = TermCountInputs {
+        files: Vec::new(),
+        deleted: Vec::new(),
+        nulls: 0,
+    };
+    for entry in superfiles {
+        let deleted = provider
+            .deleted_rows(entry.superfile_id, Instant::now())
+            .ok()?;
+        // No live row: no value and no null, and no deleted rows to read.
+        if deleted.len() >= entry.n_docs {
+            continue;
+        }
+        let live = live_column(provider, entry, column.id, data_type, &deleted);
+        let answer = live
+            .live_nulls()
+            .and_then(|nulls| Ok((nulls, live.deleted_counts()?)));
+        let (nulls, deleted_counts) = match answer {
+            Ok(answer) => answer,
+            Err(Unknown::Unread) => {
+                requests.push(DeletedRowStatsRequest {
+                    entry: Arc::clone(entry),
+                    deleted,
+                    columns: [column.requests()].into_iter().collect(),
+                });
+                continue;
+            }
+            Err(Unknown::Scan) => return None,
+        };
+        inputs.nulls = inputs.nulls.checked_add(nulls)?;
+        if file_lacks_column(entry, column.id) {
+            continue;
+        }
+        // Every document with a token has exactly one: the file's index
+        // holds one term per value.
+        let lengths = entry.fts_summary.get(&column.id)?.length_stats?;
+        if lengths.total_tokens != lengths.n_scored_docs {
+            return None;
+        }
+        inputs.deleted.extend(deleted_counts);
+        inputs.files.push(Arc::clone(entry));
+    }
+    Some(inputs)
 }
 
 fn count_range_from_value_counts<'a>(

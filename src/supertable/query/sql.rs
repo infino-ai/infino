@@ -65,7 +65,9 @@ use arrow::{
     compute::{cast, concat_batches},
     record_batch::RecordBatch,
 };
-use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
+use arrow_array::{
+    Array, Decimal128Array, Int64Array, builder::LargeStringBuilder, new_empty_array,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
     catalog::{CatalogProviderList, MemoryCatalogProviderList},
@@ -99,6 +101,7 @@ use crate::{
     InfinoError,
     memory::{ConnectionMemoryBudget, Reclaim, Reservation, SqlSpill, budgeted_session_context},
     runtime_metrics::op_stats::{self, OpStatsCollector},
+    superfile::fts::tokenize::KEYWORD_TOKENIZER,
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
@@ -106,7 +109,7 @@ use crate::{
         query::{
             covered_agg::{
                 CoveredAggregateRewrite, lone_not_null_column, non_null_count,
-                prepare_aggregate_inputs, value_counts_from_statistics,
+                prepare_aggregate_inputs, term_count_inputs, value_counts_from_statistics,
             },
             exec::{
                 common::{collect_plan_metered, run_within_process_limit},
@@ -197,6 +200,90 @@ pub(crate) fn value_count_exprs(column: &str) -> (Vec<Expr>, Vec<Expr>) {
         vec![Expr::Column(Column::new_unqualified(column))],
         vec![count_all().alias(VALUE_COUNT_COLUMN)],
     )
+}
+
+/// Value-count rows of `schema`: each value with its count, then a null-keyed
+/// row counting `nulls` when there are any. `None` when a count is past what
+/// the count column holds.
+fn value_counts_batch(
+    schema: &SchemaRef,
+    counts: impl IntoIterator<Item = (ScalarValue, u64)>,
+    nulls: u64,
+) -> Result<Option<RecordBatch>, QueryError> {
+    let value_type = schema.field(0).data_type();
+    let mut values = Vec::new();
+    let mut tallies = Vec::new();
+    let null_group = (nulls > 0).then_some((ScalarValue::Null, nulls));
+    for (value, count) in counts.into_iter().chain(null_group) {
+        let Ok(count) = i64::try_from(count) else {
+            return Ok(None);
+        };
+        let value = match value.is_null() {
+            true => ScalarValue::try_from(value_type),
+            false => value.cast_to(value_type),
+        };
+        values.push(value.map_err(QueryError::DataFusion)?);
+        tallies.push(count);
+    }
+    // A table with no rows has neither a value nor a null.
+    let values = if values.is_empty() {
+        new_empty_array(value_type)
+    } else {
+        ScalarValue::iter_to_array(values).map_err(QueryError::DataFusion)?
+    };
+    RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![values, Arc::new(Int64Array::from(tallies))],
+    )
+    .map(Some)
+    .map_err(QueryError::internal)
+}
+
+/// [`value_counts_batch`] for values held as UTF-8 bytes, as terms are:
+/// each value of `counts` above zero, then a null-keyed row counting `nulls`
+/// when there are any. Each column is built in one pass, not one scalar per
+/// value, which is slow with many distinct values.
+/// `None` when a value is not UTF-8 or a count is past what the count column
+/// holds.
+fn term_counts_batch(
+    schema: &SchemaRef,
+    counts: &HashMap<Vec<u8>, u64>,
+    nulls: u64,
+) -> Result<Option<RecordBatch>, QueryError> {
+    let held = || counts.iter().filter(|(_, count)| **count > 0);
+    let (terms, bytes) = held().fold((0, 0), |(terms, bytes), (term, _)| {
+        (terms + 1, bytes + term.len())
+    });
+    let rows = terms + usize::from(nulls > 0);
+    let mut values = LargeStringBuilder::with_capacity(rows, bytes);
+    let mut tallies = Vec::with_capacity(rows);
+    for (term, &count) in held() {
+        let (Ok(text), Ok(count)) = (str::from_utf8(term), i64::try_from(count)) else {
+            return Ok(None);
+        };
+        values.append_value(text);
+        tallies.push(count);
+    }
+    if nulls > 0 {
+        let Ok(count) = i64::try_from(nulls) else {
+            return Ok(None);
+        };
+        values.append_null();
+        tallies.push(count);
+    }
+    let value_type = schema.field(0).data_type();
+    // A table with no rows has neither a value nor a null.
+    let values = if rows == 0 {
+        new_empty_array(value_type)
+    } else {
+        cast(&values.finish(), value_type).map_err(QueryError::internal)?
+    };
+    RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![values, Arc::new(Int64Array::from(tallies))],
+    )
+    .map(Some)
+    .map_err(QueryError::internal)
 }
 
 /// The rows of a `GROUP BY column, COUNT(*)` as one batch of `schema`
@@ -735,8 +822,9 @@ impl SupertableReader {
     ///
     /// Read from the manifest's per-file value counts with no statement
     /// planned when those describe every live row
-    /// ([`Self::value_counts_from_stats`]); otherwise the grouped count runs,
-    /// built as a plan.
+    /// ([`Self::value_counts_from_stats`]), else, on a `keyword` column, from
+    /// the term index ([`Self::value_counts_from_terms`]); otherwise the
+    /// grouped count runs, built as a plan.
     pub(crate) fn value_counts(&self, column: &str) -> Result<RecordBatch, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
         let schemas = self.sql_schemas();
@@ -746,6 +834,9 @@ impl SupertableReader {
             .map_err(|_| QueryError::InvalidQuery(format!("no column `{column}` to count")))?;
         let schema = value_count_schema(field)?;
         if let Some(batch) = self.value_counts_from_stats(column, &schema)? {
+            return Ok(batch);
+        }
+        if let Some(batch) = self.value_counts_from_terms(column, &schema)? {
             return Ok(batch);
         }
         let ctx = self.sql_session_context()?;
@@ -786,33 +877,48 @@ impl SupertableReader {
         let Some((counts, nulls)) = value_counts_from_statistics(&provider, column) else {
             return Ok(None);
         };
-        let value_type = schema.field(0).data_type();
-        let mut values = Vec::with_capacity(counts.len() + 1);
-        let mut tallies = Vec::with_capacity(counts.len() + 1);
-        let null_group = (nulls > 0).then_some((ScalarValue::Null, nulls));
-        for (value, count) in counts.iter().chain(null_group.as_ref()) {
-            let Ok(count) = i64::try_from(*count) else {
+        value_counts_batch(schema, counts, nulls)
+    }
+
+    /// [`Self::value_counts`] for a `keyword` column, from the term index:
+    /// there each term is one whole value, so a term's document count in a
+    /// superfile is the rows holding that value. The deleted rows' values
+    /// are taken off and the nulls added, both from the statistics. `None`
+    /// on another analyzer, when those statistics are not exact (see
+    /// [`term_count_inputs`]), or when the terms do not fit the connection
+    /// memory budget (see [`Self::term_doc_counts`]).
+    pub(crate) fn value_counts_from_terms(
+        &self,
+        column: &str,
+        schema: &SchemaRef,
+    ) -> Result<Option<RecordBatch>, QueryError> {
+        let keyword = self
+            .manifest()
+            .try_fts_tokenizer_for(column)
+            .is_some_and(|tokenizer| tokenizer.name() == KEYWORD_TOKENIZER);
+        if !keyword {
+            return Ok(None);
+        }
+        let provider = op_stats::suppressed(|| self.sql_provider());
+        let state = self.sql_session_context()?.state();
+        let Some(inputs) = self.block_on(term_count_inputs(&provider, &state, column)) else {
+            return Ok(None);
+        };
+        let Some(mut counts) = self.block_on(self.term_doc_counts(column, inputs.files))? else {
+            return Ok(None);
+        };
+        for (value, deleted) in inputs.deleted {
+            let held = value.try_as_str().flatten();
+            let Some(count) = held.and_then(|text| counts.get_mut(text.as_bytes())) else {
                 return Ok(None);
             };
-            let value = match value.is_null() {
-                true => ScalarValue::try_from(value_type),
-                false => value.cast_to(value_type),
+            let Some(live) = count.checked_sub(deleted) else {
+                return Ok(None);
             };
-            values.push(value.map_err(QueryError::DataFusion)?);
-            tallies.push(count);
+            *count = live;
         }
-        // A table with no rows has neither a value nor a null.
-        let values = if values.is_empty() {
-            new_empty_array(value_type)
-        } else {
-            ScalarValue::iter_to_array(values).map_err(QueryError::DataFusion)?
-        };
-        RecordBatch::try_new(
-            Arc::clone(schema),
-            vec![values, Arc::new(Int64Array::from(tallies))],
-        )
-        .map(Some)
-        .map_err(QueryError::internal)
+        // `counts` stays charged to the budget until the rows are built.
+        term_counts_batch(schema, counts.counts(), inputs.nulls)
     }
 
     /// The live rows each of `predicates` holds, in order, exactly as

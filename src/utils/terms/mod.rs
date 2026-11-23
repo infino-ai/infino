@@ -53,11 +53,12 @@ pub const KEY_SEPARATOR: u8 = 0x1F;
 /// every term in that column.
 ///
 /// Callers must ensure `column_name` does not itself contain the
-/// separator byte — see [`validate_column_name`]. `term` may be any
-/// bytes a tokenizer produced; the separator `0x1F` is a C0 control
-/// byte, which the shipped tokenizer never emits inside a token
-/// (`StandardTokenizer` emits UAX #29 word segments, which never
-/// contain a control byte), so the separator can never appear in a term.
+/// separator byte — see [`validate_column_name`]. That is the invariant
+/// the encoding rests on. `term` may be any bytes a tokenizer produced,
+/// the separator included: `standard` never emits a control byte inside
+/// a token, but a `keyword` term is the raw value and can hold `0x1F`.
+/// A key still decodes unambiguously because every reader splits it at
+/// the *first* separator, which is always the one after the column name.
 pub fn make_key(column_name: &str, term: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(column_name.len() + 1 + term.len());
     k.extend_from_slice(column_name.as_bytes());

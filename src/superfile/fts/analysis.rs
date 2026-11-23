@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! The per-column analysis chain: the `standard` tokenizer plus optional
-//! stopword removal and stemming, in that order.
+//! The per-column analysis chain: a base tokenizer (`standard`, or
+//! `keyword`) plus, for `standard`, optional stopword removal and
+//! stemming, in that order.
 //!
 //! ## Shape
 //!
 //! Here *tokenizer* means the thing that splits text and *analyzer*
 //! means the whole chain: that tokenizer plus its filters.
 //!
-//! The base is always [`StandardTokenizer`], followed by up to two token
-//! filters:
+//! The base is [`StandardTokenizer`], followed by up to two token
+//! filters (or [`KeywordTokenizer`], which keeps the whole value as one
+//! term and takes no filter: a stopword or a stem of a whole value would
+//! no longer be that value):
 //! stopwords are removed from the *unstemmed* token, then what
 //! survives is stemmed. The order is not configurable and is baked
 //! into the chain's name, so there is exactly one canonical spelling
@@ -40,10 +43,10 @@
 //! ## Persistence: two additive fields, and a derived identity
 //!
 //! A column persists, only when set, a `stopwords` and a `stemmer`
-//! field; the base is not recorded because there is only one. A
-//! recorded `tokenizer` name is checked on read
-//! ([`check_recorded_tokenizer`]): absent or `standard` opens, any
-//! other name refuses the table. Absent `stopwords` / `stemmer` means
+//! field, and always its base as `tokenizer`. A recorded `tokenizer`
+//! name is checked on read ([`check_recorded_tokenizer`]): absent or
+//! `standard` opens as `standard`, `keyword` as `keyword`, any other
+//! name refuses the table. Absent `stopwords` / `stemmer` means
 //! the filter is off.
 //!
 //! The chain also has a **name** — `"standard+stop=english+stem=english"`
@@ -93,7 +96,9 @@ use std::{any::Any, borrow::Cow, sync::Arc};
 
 use rust_stemmers::{Algorithm, Stemmer as Snowball};
 
-use super::tokenize::{STANDARD_TOKENIZER, StandardTokenizer, Tokenizer};
+use super::tokenize::{
+    KEYWORD_TOKENIZER, KeywordTokenizer, STANDARD_TOKENIZER, StandardTokenizer, Tokenizer,
+};
 use crate::superfile::error::ReadError;
 
 /// Stopword set applied to a column, after the base tokenizer and
@@ -207,22 +212,87 @@ impl Stopwords {
 /// chain's output, not the changes that produced it.
 const STANDARD_REVISION: u32 = 1;
 
-/// Accept the base-tokenizer name a column recorded, if any.
+/// The `keyword` tokenizer's analysis revision. Starts at 1, not 0, so a
+/// column recording no revision ([`UNKNOWN_ANALYSIS_REVISION`]) still
+/// reads as older than it.
+const KEYWORD_REVISION: u32 = 1;
+
+/// The base tokenizer a column's analysis starts from. A column names it
+/// with [`FtsField::analyzer`](crate::FtsField::analyzer); see there for
+/// what each one indexes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// `#[non_exhaustive]` for the same reason as [`Stopwords`].
+#[non_exhaustive]
+pub enum Analyzer {
+    /// Split into words and lowercase them (the default).
+    #[default]
+    Standard,
+    /// Keep the whole value as one term, byte for byte. Takes no
+    /// stopwords or stemmer.
+    Keyword,
+}
+
+impl Analyzer {
+    /// Resolve an analyzer by name — `"standard"` or `"keyword"` — or
+    /// `None` for a name this engine does not ship. Exact match, like
+    /// [`Stopwords::from_name`].
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            STANDARD_TOKENIZER => Some(Self::Standard),
+            KEYWORD_TOKENIZER => Some(Self::Keyword),
+            _ => None,
+        }
+    }
+
+    /// The name this analyzer is recorded under.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => STANDARD_TOKENIZER,
+            Self::Keyword => KEYWORD_TOKENIZER,
+        }
+    }
+
+    fn revision(self) -> u32 {
+        match self {
+            Self::Standard => STANDARD_REVISION,
+            Self::Keyword => KEYWORD_REVISION,
+        }
+    }
+}
+
+/// Resolve the base-tokenizer name a column recorded, if any. Absent
+/// means `standard`, as in every older file.
 ///
-/// Only `standard` is reproducible. Aliasing another name to it would
-/// query an index split one way with terms split another, so any other
-/// name refuses the table instead.
+/// Any other name refuses the table. Reading it as a known analyzer would
+/// query an index split one way with terms split another.
 pub(crate) fn check_recorded_tokenizer(
     column: &str,
     recorded: Option<&str>,
-) -> Result<(), ReadError> {
+) -> Result<Analyzer, ReadError> {
     match recorded {
-        None | Some(STANDARD_TOKENIZER) => Ok(()),
-        Some(name) => Err(ReadError::RemovedAnalyzer {
+        None => Ok(Analyzer::Standard),
+        Some(name) => Analyzer::from_name(name).ok_or_else(|| ReadError::RemovedAnalyzer {
             column: column.to_string(),
             analyzer: name.to_string(),
         }),
     }
+}
+
+/// The one analyzer a past release shipped that this engine cannot read.
+/// Any other unknown name comes from a newer engine.
+pub(crate) const REMOVED_ANALYZER: &str = "ascii_lower";
+
+/// Refuse a chain that cannot be built: `keyword` keeps the whole value,
+/// so it takes no stopwords or stemmer.
+pub(crate) fn check_chain(
+    analyzer: Analyzer,
+    stopwords: Stopwords,
+    stemmer: Stemmer,
+) -> Result<(), String> {
+    if analyzer == Analyzer::Keyword && (stopwords != Stopwords::None || stemmer != Stemmer::None) {
+        return Err("the keyword analyzer takes no stopwords or stemmer".to_string());
+    }
+    Ok(())
 }
 
 /// Scan `text` with the base tokenizer into `(token, position)` pairs.
@@ -372,8 +442,8 @@ impl Tokenizer for ChainTokenizer {
     }
 }
 
-/// A chain's identity as one string — `standard` when no filter is
-/// active, otherwise `standard` followed by its filters.
+/// A chain's identity as one string — `keyword`, `standard` when no
+/// filter is active, otherwise `standard` followed by its filters.
 ///
 /// **Derived, never persisted.** It is what [`Tokenizer::name`] reports,
 /// so the three places that reason about a column's analysis as a single
@@ -385,7 +455,14 @@ impl Tokenizer for ChainTokenizer {
 /// sets are a closed set: two stopword settings × two stemmer settings. Component order is fixed (`stop` before `stem`,
 /// matching the order the filters run), so one chain has exactly one
 /// spelling and the options-hash is stable.
-pub(crate) fn chain_name(stopwords: Stopwords, stemmer: Stemmer) -> &'static str {
+pub(crate) fn chain_name(
+    analyzer: Analyzer,
+    stopwords: Stopwords,
+    stemmer: Stemmer,
+) -> &'static str {
+    if analyzer == Analyzer::Keyword {
+        return KEYWORD_TOKENIZER;
+    }
     match (stopwords, stemmer) {
         (Stopwords::None, Stemmer::None) => STANDARD_TOKENIZER,
         (Stopwords::English, Stemmer::None) => "standard+stop=english",
@@ -412,8 +489,12 @@ pub(crate) fn chain_name(stopwords: Stopwords, stemmer: Stemmer) -> &'static str
 ///
 /// The chain's revision is the sum of its parts', so each part moves it
 /// independently — see [`combine_revisions`].
-pub(crate) fn chain_revision(stopwords: Stopwords, stemmer: Stemmer) -> u32 {
-    combine_revisions(STANDARD_REVISION, stopwords.revision(), stemmer.revision())
+pub(crate) fn chain_revision(analyzer: Analyzer, stopwords: Stopwords, stemmer: Stemmer) -> u32 {
+    combine_revisions(
+        analyzer.revision(),
+        stopwords.revision(),
+        stemmer.revision(),
+    )
 }
 
 /// The revision to credit terms whose own is unknown.
@@ -432,20 +513,28 @@ fn combine_revisions(base: u32, stopwords: u32, stemmer: u32) -> u32 {
     base + stopwords + stemmer
 }
 
-/// Build the tokenizer for a chain: the bare [`StandardTokenizer`] when
-/// no filter is active, otherwise a [`ChainTokenizer`].
+/// Build the tokenizer for a chain: [`KeywordTokenizer`] for `keyword`,
+/// the bare [`StandardTokenizer`] when no filter is active, otherwise a
+/// [`ChainTokenizer`].
 ///
 /// A filterless chain must *not* be wrapped — the wrapper would report a
 /// composite name no plain column has and would hide the base from the
 /// build path's downcast, costing ingest throughput for no behaviour
 /// change.
-pub(crate) fn chain_tokenizer(stopwords: Stopwords, stemmer: Stemmer) -> Arc<dyn Tokenizer> {
+pub(crate) fn chain_tokenizer(
+    analyzer: Analyzer,
+    stopwords: Stopwords,
+    stemmer: Stemmer,
+) -> Arc<dyn Tokenizer> {
+    if analyzer == Analyzer::Keyword {
+        return Arc::new(KeywordTokenizer);
+    }
     if stopwords == Stopwords::None && stemmer == Stemmer::None {
         return Arc::new(StandardTokenizer);
     }
     Arc::new(ChainTokenizer {
         stopwords,
-        name: chain_name(stopwords, stemmer),
+        name: chain_name(Analyzer::Standard, stopwords, stemmer),
         snowball: match stemmer {
             Stemmer::None => None,
             Stemmer::English => Some(Snowball::create(Algorithm::English)),
@@ -526,8 +615,8 @@ mod tests {
     fn chain(name: &str) -> Arc<dyn Tokenizer> {
         for stop in [Stopwords::None, Stopwords::English] {
             for stem in [Stemmer::None, Stemmer::English] {
-                if chain_name(stop, stem) == name {
-                    return chain_tokenizer(stop, stem);
+                if chain_name(Analyzer::Standard, stop, stem) == name {
+                    return chain_tokenizer(Analyzer::Standard, stop, stem);
                 }
             }
         }
@@ -658,8 +747,11 @@ mod tests {
         // Not merely an optimization: the wrapper would persist under a
         // name no plain column carries, so the round-trip below is the
         // format guarantee that a default column is unchanged.
-        let tok = chain_tokenizer(Stopwords::None, Stemmer::None);
-        assert_eq!(tok.name(), chain_name(Stopwords::None, Stemmer::None));
+        let tok = chain_tokenizer(Analyzer::Standard, Stopwords::None, Stemmer::None);
+        assert_eq!(
+            tok.name(),
+            chain_name(Analyzer::Standard, Stopwords::None, Stemmer::None)
+        );
         assert!(
             tok.as_any().downcast_ref::<ChainTokenizer>().is_none(),
             "a filterless chain must not wrap"
@@ -676,17 +768,23 @@ mod tests {
         let mut seen: Vec<&str> = Vec::new();
         for stop in [Stopwords::None, Stopwords::English] {
             for stem in [Stemmer::None, Stemmer::English] {
-                let name = chain_name(stop, stem);
+                let name = chain_name(Analyzer::Standard, stop, stem);
                 assert!(!seen.contains(&name), "{name:?} is not unique");
                 seen.push(name);
                 assert_eq!(
-                    chain_tokenizer(stop, stem).name(),
+                    chain_tokenizer(Analyzer::Standard, stop, stem).name(),
                     name,
                     "{name:?}: the built tokenizer must report its own name"
                 );
             }
         }
         assert_eq!(seen.len(), 4, "two stopword sets x two stemmers");
+        let keyword = chain_name(Analyzer::Keyword, Stopwords::None, Stemmer::None);
+        assert!(!seen.contains(&keyword));
+        assert_eq!(
+            chain_tokenizer(Analyzer::Keyword, Stopwords::None, Stemmer::None).name(),
+            keyword
+        );
     }
 
     /// Every shipped chain emits exactly these tokens. A change here is a
@@ -748,9 +846,9 @@ mod tests {
     fn every_shipped_chain_is_at_revision_one() {
         for stop in [Stopwords::None, Stopwords::English] {
             for stem in [Stemmer::None, Stemmer::English] {
-                let name = chain_name(stop, stem);
+                let name = chain_name(Analyzer::Standard, stop, stem);
                 assert_eq!(
-                    chain_revision(stop, stem),
+                    chain_revision(Analyzer::Standard, stop, stem),
                     1,
                     "{name:?} moved off revision 1 — every file it wrote \
                      reads as stale, so this needs to be deliberate"
@@ -869,9 +967,15 @@ mod tests {
     }
 
     #[test]
-    fn only_an_absent_or_standard_recorded_tokenizer_is_accepted() {
-        check_recorded_tokenizer("body", None).expect("absent opens");
-        check_recorded_tokenizer("body", Some(STANDARD_TOKENIZER)).expect("standard opens");
+    fn only_a_shipped_recorded_tokenizer_is_accepted() {
+        let open = |name| check_recorded_tokenizer("body", name).expect("opens");
+        assert_eq!(open(None), Analyzer::Standard);
+        assert_eq!(open(Some(STANDARD_TOKENIZER)), Analyzer::Standard);
+        assert_eq!(open(Some(KEYWORD_TOKENIZER)), Analyzer::Keyword);
+        for name in [Analyzer::Standard, Analyzer::Keyword] {
+            assert_eq!(Analyzer::from_name(name.as_str()), Some(name));
+        }
+        assert_eq!(Analyzer::from_name("Keyword"), None, "exact match");
         let msg = check_recorded_tokenizer("body", Some("ascii_lower"))
             .expect_err("a removed analyzer is refused")
             .to_string();
@@ -883,5 +987,44 @@ mod tests {
                 && msg.contains("re-create"),
             "the error names the analyzer, the release to copy out with, and the fix: {msg}"
         );
+    }
+
+    /// `keyword` keeps every value whole: no split, no case fold, no trim,
+    /// no length cap, and the empty string is a term.
+    #[test]
+    fn keyword_keeps_each_value_whole() {
+        let tok = chain_tokenizer(Analyzer::Keyword, Stopwords::None, Stemmer::None);
+        let long = "x".repeat(1000);
+        for value in [
+            "Foo",
+            "foo",
+            "foo.",
+            "/a/b c",
+            "",
+            " Café ☕ ",
+            long.as_str(),
+        ] {
+            assert_eq!(tok.tokenize(value).collect::<Vec<_>>(), vec![value]);
+            let mut each = Vec::new();
+            tok.tokenize_each_positioned(value, &mut |t, p| each.push((t.to_owned(), p)));
+            assert_eq!(each, vec![(value.to_owned(), 0)]);
+        }
+        // A query is one value too: spaces, quotes and signs are not syntax.
+        let parsed = tok.parse("+a \"b\" -c");
+        assert_eq!(parsed.positives, vec!["+a \"b\" -c"]);
+        assert!(parsed.musts.is_empty() && parsed.negatives.is_empty());
+        assert!(parsed.positive_phrases.is_empty());
+    }
+
+    #[test]
+    fn keyword_takes_no_filter() {
+        check_chain(Analyzer::Keyword, Stopwords::None, Stemmer::None).expect("bare keyword");
+        check_chain(Analyzer::Standard, Stopwords::English, Stemmer::English).expect("standard");
+        for (stop, stem) in [
+            (Stopwords::English, Stemmer::None),
+            (Stopwords::None, Stemmer::English),
+        ] {
+            check_chain(Analyzer::Keyword, stop, stem).expect_err("keyword with a filter");
+        }
     }
 }

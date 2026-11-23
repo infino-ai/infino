@@ -1966,7 +1966,8 @@ fn admits(token: LikeToken, fold: bool) -> Option<LikeToken> {
 
 /// Build a `TermsAll` leaf for `column = value`, or `Unbounded` if the
 /// column isn't FTS-indexed, the value isn't a string, or it tokenizes
-/// to nothing (e.g. the empty string — no tokens to bound with).
+/// to nothing (e.g. the empty string under `standard` — no tokens to
+/// bound with; under `keyword` the empty string is itself one term).
 fn terms_all(
     column: &str,
     value: &ScalarValue,
@@ -2136,7 +2137,7 @@ mod tests {
             BytesLazyByteSource, LazyByteSource, LazyByteSourceError, OpenOptions,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
             fts::{
-                analysis::{Stemmer, Stopwords, chain_tokenizer},
+                analysis::{Analyzer, Stemmer, Stopwords, chain_tokenizer},
                 tokenize::{STANDARD_TOKENIZER, StandardTokenizer},
             },
             vector::layout::VectorLayout,
@@ -2246,12 +2247,20 @@ mod tests {
     /// Resolver whose column carries an analysis chain — the case the
     /// `LIKE` lowering must refuse to bound.
     fn stemming_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
-        Some(chain_tokenizer(Stopwords::None, Stemmer::English))
+        Some(chain_tokenizer(
+            Analyzer::Standard,
+            Stopwords::None,
+            Stemmer::English,
+        ))
     }
 
     /// Resolver for a stopworded column.
     fn stopping_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
-        Some(chain_tokenizer(Stopwords::English, Stemmer::None))
+        Some(chain_tokenizer(
+            Analyzer::Standard,
+            Stopwords::English,
+            Stemmer::None,
+        ))
     }
 
     /// The guard is that a chain's *derived name* is not plain
@@ -2260,16 +2269,16 @@ mod tests {
     /// all — a false pass that would hide the guard disappearing.
     #[test]
     fn a_chains_name_is_not_plain_standard() {
-        let plain = chain_tokenizer(Stopwords::None, Stemmer::None);
+        let plain = chain_tokenizer(Analyzer::Standard, Stopwords::None, Stemmer::None);
         assert_eq!(plain.name(), STANDARD_TOKENIZER);
         assert!(
             is_plain_standard(plain.as_ref()),
             "a plain column must still be bounded"
         );
         for chained in [
-            chain_tokenizer(Stopwords::English, Stemmer::None),
-            chain_tokenizer(Stopwords::None, Stemmer::English),
-            chain_tokenizer(Stopwords::English, Stemmer::English),
+            chain_tokenizer(Analyzer::Standard, Stopwords::English, Stemmer::None),
+            chain_tokenizer(Analyzer::Standard, Stopwords::None, Stemmer::English),
+            chain_tokenizer(Analyzer::Standard, Stopwords::English, Stemmer::English),
         ] {
             assert!(
                 !is_plain_standard(chained.as_ref()),

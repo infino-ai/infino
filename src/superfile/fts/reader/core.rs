@@ -63,7 +63,7 @@ use crate::{
             },
         },
         fts::{
-            analysis::{chain_tokenizer, check_recorded_tokenizer},
+            analysis::{chain_tokenizer, check_chain, check_recorded_tokenizer},
             bm25,
             builder::doc_lengths_entry_size,
             positions::GroupIndex,
@@ -1330,7 +1330,7 @@ impl FtsReader {
             };
             let baked_avgdl = (avgdl_x1000 as f32) / format::fts::AVGDL_FIXED_POINT_SCALE;
             let params = col_cfg.params();
-            check_recorded_tokenizer(&col_cfg.name, col_cfg.tokenizer.as_deref())
+            let analyzer = check_recorded_tokenizer(&col_cfg.name, col_cfg.tokenizer.as_deref())
                 .map_err(FtsError::Read)?;
             let (stopwords, stemmer) = col_cfg.filters().map_err(|(field, value)| {
                 FtsError::Read(ReadError::Malformed(format!(
@@ -1338,7 +1338,13 @@ impl FtsReader {
                     col_cfg.name
                 )))
             })?;
-            let tokenizer = chain_tokenizer(stopwords, stemmer);
+            check_chain(analyzer, stopwords, stemmer).map_err(|reason| {
+                FtsError::Read(ReadError::Malformed(format!(
+                    "inf.fts.columns: column {:?}: {reason}",
+                    col_cfg.name
+                )))
+            })?;
+            let tokenizer = chain_tokenizer(analyzer, stopwords, stemmer);
             // The length array is not decoded here: the norms scoring
             // needs from it are built on first scored use
             // (`ColumnMeta::norms`), so a match-only query, or one a
@@ -1357,6 +1363,7 @@ impl FtsReader {
                 params,
                 positions: col_cfg.positions,
                 tokenizer,
+                analyzer,
                 stopwords,
                 stemmer,
                 stored: col_cfg.stored,

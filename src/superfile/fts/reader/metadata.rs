@@ -20,7 +20,7 @@ use crate::{
         error::FtsError,
         format::{CRC_BYTES, checksum::crc32c},
         fts::{
-            analysis::{Stemmer, Stopwords},
+            analysis::{Analyzer, Stemmer, Stopwords},
             bm25,
             reader::core::read_doc_length,
             tokenize::Tokenizer,
@@ -571,6 +571,7 @@ pub struct ColumnMeta {
     pub params: bm25::Bm25Params,
     pub positions: bool,
     pub tokenizer: Arc<dyn Tokenizer>,
+    pub analyzer: Analyzer,
     pub stopwords: Stopwords,
     pub stemmer: Stemmer,
     pub stored: bool,
@@ -928,8 +929,9 @@ pub struct FtsColumnConfig {
     /// The column's stable id, when the writer stamped one.
     #[serde(default)]
     pub field_id: Option<u32>,
-    /// Base tokenizer name. Absent or `"standard"` opens; any other name
-    /// refuses the file (see `check_recorded_tokenizer`).
+    /// Base tokenizer name. Absent means `"standard"`; `"standard"` and
+    /// `"keyword"` open; any other name refuses the file (see
+    /// `check_recorded_tokenizer`).
     #[serde(default)]
     pub tokenizer: Option<String>,
     /// Whether this column's index records token positions (phrase

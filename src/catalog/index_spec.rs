@@ -16,7 +16,7 @@ use crate::{
     superfile::{
         builder::FtsConfig,
         fts::{
-            analysis::{Stemmer, Stopwords},
+            analysis::{Analyzer, Stemmer, Stopwords, check_chain},
             bm25::Bm25Params,
             tokenize::STANDARD_TOKENIZER,
         },
@@ -61,7 +61,10 @@ struct VectorIndex {
 #[derive(Debug, Clone)]
 pub struct FtsField {
     column: String,
-    analyzer: String,
+    analyzer: Analyzer,
+    /// A name given to [`FtsField::analyzer`] that is not an analyzer.
+    /// Kept only so `create_table` can refuse it by name.
+    unknown_analyzer: Option<String>,
     stopwords: Stopwords,
     stemmer: Stemmer,
     positions: bool,
@@ -77,7 +80,8 @@ impl FtsField {
     pub fn new(column: impl Into<String>) -> Self {
         Self {
             column: column.into(),
-            analyzer: STANDARD_TOKENIZER.to_string(),
+            analyzer: Analyzer::Standard,
+            unknown_analyzer: None,
             stopwords: Stopwords::None,
             stemmer: Stemmer::None,
             positions: false,
@@ -86,10 +90,26 @@ impl FtsField {
         }
     }
 
-    /// Name the column's base tokenizer. `"standard"`, the default, is the
-    /// only one; any other name is refused at `create_table`.
+    /// Set the column's base tokenizer: `"standard"` (the default) or
+    /// `"keyword"`. `create_table` refuses any other name.
+    ///
+    /// `keyword` indexes each value as one term, exactly as written. It
+    /// does not split, lowercase or trim, so `Foo`, `foo` and `foo.` are
+    /// three different terms. Use it for exact values such as host names,
+    /// paths or status codes. A query on the column is one whole value too.
+    /// It takes no [`stopwords`](FtsField::stopwords) or
+    /// [`stemmer`](FtsField::stemmer). A value is at most 32,766 bytes, the
+    /// same limit as Lucene. An append with a longer value is refused whole
+    /// with [`SchemaError::KeywordTooLong`](crate::SchemaError::KeywordTooLong).
     pub fn analyzer(mut self, name: impl Into<String>) -> Self {
-        self.analyzer = name.into();
+        let name = name.into();
+        match Analyzer::from_name(&name) {
+            Some(analyzer) => {
+                self.analyzer = analyzer;
+                self.unknown_analyzer = None;
+            }
+            None => self.unknown_analyzer = Some(name),
+        }
         self
     }
 
@@ -255,13 +275,16 @@ impl IndexSpec {
     }
 
     /// Mark a column as full-text (BM25) indexed. Takes a plain column
-    /// name for the defaults, or an [`FtsField`] to set the analysis
-    /// filters and whether the raw text is stored:
+    /// name for the defaults, or an [`FtsField`] to set the analyzer, the
+    /// analysis filters and whether the raw text is stored. Below, `host`
+    /// uses the `keyword` analyzer: one exact term per value (see
+    /// [`FtsField::analyzer`]):
     ///
     /// ```
     /// use infino::{FtsField, IndexSpec, Stopwords};
     /// let spec = IndexSpec::new()
     ///     .fts("title")
+    ///     .fts(FtsField::new("host").analyzer("keyword"))
     ///     .fts(FtsField::new("body").stopwords(Stopwords::English).stored(false));
     /// # let _ = spec;
     /// ```
@@ -496,15 +519,30 @@ impl IndexSpec {
         self
     }
 
-    /// Refuses an FTS column that names an analyzer other than `standard`.
+    /// Refuses an FTS column that names an unknown analyzer, or a
+    /// `keyword` column with stopwords or a stemmer. Every path that builds
+    /// a table from a spec runs this first.
     pub(crate) fn check_analyzers(&self) -> Result<(), InfinoError> {
-        match self.fts.iter().find(|f| f.analyzer != STANDARD_TOKENIZER) {
-            Some(f) => Err(InfinoError::Config(format!(
-                "FTS column {:?}: unsupported analyzer {:?}; the only analyzer is {STANDARD_TOKENIZER:?}",
-                f.column, f.analyzer
-            ))),
-            None => Ok(()),
+        for f in &self.fts {
+            if let Some(name) = &f.unknown_analyzer {
+                return Err(InfinoError::Config(format!(
+                    "FTS column {:?}: unsupported analyzer {name:?}; the analyzers are \
+                     {STANDARD_TOKENIZER:?} and {:?}",
+                    f.column,
+                    Analyzer::Keyword.as_str()
+                )));
+            }
+            check_chain(f.analyzer, f.stopwords, f.stemmer).map_err(|reason| {
+                InfinoError::Config(format!("FTS column {:?}: {reason}", f.column))
+            })?;
         }
+        Ok(())
+    }
+
+    /// FTS analyzers, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)).
+    pub(crate) fn fts_analyzers(&self) -> Vec<Analyzer> {
+        self.fts.iter().map(|f| f.analyzer).collect()
     }
 
     /// FTS column names, in declaration order.
@@ -562,6 +600,7 @@ impl IndexSpec {
             .iter()
             .map(|f| {
                 FtsConfig::new(f.column.clone())
+                    .analyzer(f.analyzer)
                     .stopwords(f.stopwords)
                     .stemmer(f.stemmer)
                     .positions(f.positions)
@@ -639,5 +678,30 @@ mod tests {
         assert_eq!(spec.fts_stemmers(), vec![Stemmer::None]);
         assert_eq!(spec.fts_positions(), vec![false]);
         assert_eq!(spec.fts_stored(), vec![true]);
+        assert_eq!(spec.fts_analyzers(), vec![Analyzer::Standard]);
+    }
+
+    /// An unknown analyzer name is refused by name, naming the column. A
+    /// later valid name replaces it.
+    #[test]
+    fn an_unknown_analyzer_is_refused_by_name() {
+        let spec = IndexSpec::new()
+            .fts(FtsField::new("host").analyzer("keyword"))
+            .fts(FtsField::new("title").analyzer("whitespace"));
+        let err = spec.check_analyzers().expect_err("unknown analyzer");
+        assert!(matches!(err, InfinoError::Config(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("title") && message.contains("whitespace"),
+            "{message}"
+        );
+
+        let spec = IndexSpec::new().fts(
+            FtsField::new("host")
+                .analyzer("whitespace")
+                .analyzer("keyword"),
+        );
+        spec.check_analyzers().expect("the later name wins");
+        assert_eq!(spec.fts_analyzers(), vec![Analyzer::Keyword]);
     }
 }

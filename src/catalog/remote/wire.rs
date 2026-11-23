@@ -22,7 +22,7 @@ use arrow_schema::Schema;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
-use crate::{IndexSpec, InfinoError, Metric, superfile::fts::tokenize::STANDARD_TOKENIZER};
+use crate::{IndexSpec, InfinoError, Metric};
 
 /// Content type for an Arrow IPC streaming body — the encoding for `append`
 /// bodies and read responses.
@@ -67,8 +67,9 @@ fn param_as_f64(v: f32) -> f64 {
 /// the stored score bounds, and a server that filled in its own default
 /// would build bounds the client never asked for.
 ///
-/// Each entry names `analyzer: "standard"`, the only analyzer. A
-/// stopword set and a stemmer ride as their own `stopwords` / `stemmer`
+/// Each entry names its `analyzer`. The client sends only `standard`
+/// until the service supports `keyword` (see `RemoteCatalog::create_table`).
+/// A stopword set and a stemmer ride as their own `stopwords` / `stemmer`
 /// keys, each emitted only when set. A server that does not implement a named filter must reject the
 /// request rather than build a table analyzed differently than the
 /// client asked for — which is the request schema's job
@@ -85,11 +86,12 @@ pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
             .zip(spec.fts_positions())
             .zip(spec.fts_stopwords())
             .zip(spec.fts_stemmers())
+            .zip(spec.fts_analyzers())
             .map(
-                |(((((column, stored), bm25), positions), stopwords), stemmer)| {
+                |((((((column, stored), bm25), positions), stopwords), stemmer), analyzer)| {
                     let mut entry = serde_json::Map::new();
                     entry.insert("column".to_string(), json!(column));
-                    entry.insert("analyzer".to_string(), json!(STANDARD_TOKENIZER));
+                    entry.insert("analyzer".to_string(), json!(analyzer.as_str()));
                     entry.insert("k1".to_string(), json!(param_as_f64(bm25.k1)));
                     entry.insert("b".to_string(), json!(param_as_f64(bm25.b)));
                     if !stored {

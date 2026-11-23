@@ -320,16 +320,57 @@ token, because stopword lists are written in surface forms (`are`,
 
 ### Base tokenizer
 
-Every column is tokenized by `standard`; there is no other base to
-choose. See [`src/superfile/fts/tokenize.rs`](../src/superfile/fts/tokenize.rs).
+Set a column's base with `FtsField::analyzer` (`analyzer=` in the
+bindings): `standard` (the default) or `keyword`. `create_table` refuses
+any other name. See
+[`src/superfile/fts/tokenize.rs`](../src/superfile/fts/tokenize.rs).
 
-| | `standard` |
-| --- | --- |
-| Splitting | Unicode UAX #29 word boundaries; segments containing an alphanumeric or an emoji are kept |
-| Case | Full Unicode lowercasing |
-| Non-ASCII | Preserved, so accented and non-Latin scripts stay searchable |
+| | `standard` | `keyword` |
+| --- | --- | --- |
+| Splitting | Unicode UAX #29 word boundaries; segments containing an alphanumeric or an emoji are kept | None: the whole value is one term |
+| Case | Full Unicode lowercasing | Kept: `Foo` and `foo` are different terms |
+| Non-ASCII | Preserved, so accented and non-Latin scripts stay searchable | Preserved, byte for byte |
+| Length cap | 255 characters per token | 32,766 bytes per value; an append with a longer value is refused |
+| Empty string | No tokens | One term, the empty string |
+| Filters | Stopwords and a stemmer may follow | None; declaring either is refused |
 
-Two details that surprise people:
+`standard` is for text people search by word. `keyword` is for values
+matched whole: host names, paths, status codes, user ids, tags. On a
+`keyword` column:
+
+- **A query is one value.** Spaces, quotes and `+` / `-` are part of the
+  value, not query syntax. `bm25_search`, `token_match` and `exact_match`
+  all return the rows whose value equals the query exactly. Each such row
+  holds the term once, so BM25 gives them all the same score.
+- **Prefix search keeps case.** `Fo` finds `Foo` and not `foo`.
+- **`value_counts` reads the term index.** Each term is one whole value,
+  so `Table::value_counts` adds up the term counts, minus deleted rows,
+  instead of grouping the rows. When the terms do not fit the connection
+  memory budget, it groups the rows instead.
+- **`text_match` still means words.** The SQL function always uses
+  `standard` tokens, whatever the column's index. So a `keyword` index
+  does not answer it, and does not narrow a `LIKE` scan either.
+- **Older engines cannot open the table.** An engine older than the
+  release that adds `keyword` refuses a table with a `keyword` column,
+  with an error that names the column and the analyzer.
+
+```rust
+use infino::{FtsField, IndexSpec};
+
+let spec = IndexSpec::new()
+    .fts("message")
+    .fts(FtsField::new("host").analyzer("keyword"));
+```
+
+```python
+spec = IndexSpec().fts("message").fts("host", analyzer="keyword")
+```
+
+```js
+const spec = new IndexSpec().fts("message").fts("host", { analyzer: "keyword" });
+```
+
+Two `standard` details that surprise people:
 
 - **No Unicode normalization.** A token is indexed in the code points it
   arrived in, so precomposed `é` and `e` plus a combining acute are
@@ -448,14 +489,15 @@ guess.
 
 ### Picking a chain
 
-| Column | Stopwords | Stemmer | Typical `k1` / `b` |
-| --- | --- | --- | --- |
-| Titles, product names | off | off | 1.0 to 1.2 / 0.0 to 0.4 |
-| Long English prose | `english` | `english` | 1.2 to 1.6 / 0.75 |
-| Multilingual or mixed-script text | off | off | 1.2 / 0.75 |
-| Identifiers, SKUs, codes | off | off | 1.2 / 0.0 |
-| Log lines, machine output | off | off | 0.4 to 0.9 / 0.3 |
-| Code or symbol-heavy text | off | off | 1.2 / 0.3 to 0.5 |
+| Column | Analyzer | Stopwords | Stemmer | Typical `k1` / `b` |
+| --- | --- | --- | --- | --- |
+| Titles, product names | `standard` | off | off | 1.0 to 1.2 / 0.0 to 0.4 |
+| Long English prose | `standard` | `english` | `english` | 1.2 to 1.6 / 0.75 |
+| Multilingual or mixed-script text | `standard` | off | off | 1.2 / 0.75 |
+| Identifiers, SKUs, codes searched by part | `standard` | off | off | 1.2 / 0.0 |
+| Host names, paths, status codes, tags matched whole | `keyword` | off | off | any; every match scores alike |
+| Log lines, machine output | `standard` | off | off | 0.4 to 0.9 / 0.3 |
+| Code or symbol-heavy text | `standard` | off | off | 1.2 / 0.3 to 0.5 |
 
 Declaring a chain in each language:
 
@@ -502,6 +544,7 @@ text.
 
 | Lever | Where | Changeable later | What it does |
 | --- | --- | --- | --- |
+| Analyzer | `FtsField::analyzer` | No | `standard` splits text into lowercased words; `keyword` keeps each value as one exact term. See [Base tokenizer](#base-tokenizer). |
 | Stopwords | `FtsField::stopwords` | No | Drops very common words from index and query. See [Stopwords](#stopwords). |
 | Stemmer | `FtsField::stemmer` | No | Folds inflections onto one term, so one form finds the others. See [Stemming](#stemming). |
 | Positions | `FtsField::positions` | No | Required for exact phrase queries. Roughly doubles the column's index footprint. A phrase against a positionless column is a typed error, never a silent bag-of-words fallback. |
@@ -581,6 +624,7 @@ Two debugging helpers repay the time they take:
 | A query of only common words returns nothing | The column declares `stopwords`, so no clause survived parsing. An empty result, not an error. |
 | A `LIKE` predicate got slower after declaring a filter | Superfile skip pruning for `LIKE` / `ILIKE` turns off on a column carrying a stopword set or stemmer. |
 | Prefix search finds nothing on a stemmed column | The dictionary holds stems and the prefix is not stemmed. |
+| A search on a `keyword` column misses a value that differs only in case | `keyword` keeps case and punctuation: `Foo`, `foo` and `foo.` are three values. Normalize them upstream if they should match. |
 | Accented text matches inconsistently | `standard` applies no Unicode normalization. Normalize upstream. |
 
 ## File map

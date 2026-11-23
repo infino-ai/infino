@@ -563,7 +563,7 @@ impl FtsReader {
         let (docs, walk_ns) = timed_section(|| self.collect_and_intersect(cursors));
         work.kernel_cpu_ns = walk_ns;
         let col = &self.columns[column_id as usize];
-        let current = chain_revision(col.stopwords, col.stemmer);
+        let current = chain_revision(col.analyzer, col.stopwords, col.stemmer);
         let docs = match col.analysis_revision.is_some_and(|r| r >= current) && !docs.is_empty() {
             true => {
                 // The writer caps a stored length before bucketing it.
@@ -1153,7 +1153,7 @@ mod tests {
         superfile::{
             BytesLazyByteSource,
             fts::{
-                analysis::{Stemmer, Stopwords},
+                analysis::{Analyzer, Stemmer, Stopwords},
                 builder::FtsBuilder,
                 posting::{self, BLOCK_LEN, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
             },
@@ -2214,7 +2214,7 @@ mod tests {
         ]);
         let current = format!(
             r#"[{{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":{}}}]"#,
-            chain_revision(Stopwords::None, Stemmer::None)
+            chain_revision(Analyzer::Standard, Stopwords::None, Stemmer::None)
         );
         let open_lazy = |json: String| {
             let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob.clone()));
@@ -2264,7 +2264,7 @@ mod tests {
         let (blob, _) = build_standard_blob(&[&value, "x"]);
         let json = format!(
             r#"[{{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":{}}}]"#,
-            chain_revision(Stopwords::None, Stemmer::None)
+            chain_revision(Analyzer::Standard, Stopwords::None, Stemmer::None)
         );
         let r = FtsReader::open(blob, &json).expect("open");
         let tokens = vec!["x"; len];

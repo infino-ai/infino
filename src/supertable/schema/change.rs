@@ -22,7 +22,7 @@ use super::{
     error::SchemaError,
     types::{data_type_from_keys, type_keys},
 };
-use crate::superfile::range::KeyKind;
+use crate::superfile::{fts::analysis::check_chain, range::KeyKind};
 
 /// One change to the schema. Not public API: the write is the patch.
 #[derive(Debug, Clone, PartialEq)]
@@ -723,7 +723,17 @@ fn check_index_fits(
                 reason: format!("a full-text index needs a string column, not `{data_type}`"),
             })
         }
-        ColumnIndex::Fts { .. } => Ok(()),
+        ColumnIndex::Fts {
+            analyzer,
+            stopwords,
+            stemmer,
+            ..
+        } => check_chain(*analyzer, *stopwords, *stemmer).map_err(|reason| {
+            SchemaError::InvalidIndex {
+                column: column.to_owned(),
+                reason,
+            }
+        }),
         ColumnIndex::Vector { .. } => Err(SchemaError::InvalidIndex {
             column: column.to_owned(),
             reason: "a vector index is declared when the table is created".to_owned(),
@@ -991,6 +1001,7 @@ mod tests {
         let analysis = SchemaPatch {
             fields: vec![FieldPatch {
                 index: Some(ColumnIndex::Fts {
+                    analyzer: Default::default(),
                     stopwords: Stopwords::English,
                     stemmer: Default::default(),
                     positions: false,
