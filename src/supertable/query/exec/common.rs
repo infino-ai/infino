@@ -66,8 +66,9 @@ use parquet::{
     },
     errors::{ParquetError, Result as ParquetResult},
     file::{
-        metadata::ParquetMetaData,
+        metadata::{ParquetMetaData, RowGroupMetaData},
         reader::{ChunkReader, Length},
+        statistics::Statistics as ParquetStatistics,
     },
 };
 use rayon::{ThreadPool, prelude::*};
@@ -2213,6 +2214,9 @@ fn constant_row_groups(
         StatisticsConverter::try_new(name, schema, metadata.file_metadata().schema_descr()).ok()?;
     let column = converter.parquet_column_index()?;
     let row_groups = metadata.row_groups();
+    if !decimal_statistics_fit(field.data_type(), row_groups, column) {
+        return None;
+    }
     let mins = converter.row_group_mins(row_groups.iter()).ok()?;
     let maxes = converter.row_group_maxes(row_groups.iter()).ok()?;
     if mins.data_type() != field.data_type() {
@@ -2235,11 +2239,50 @@ fn constant_row_groups(
     Some((mins, constant))
 }
 
+/// Whether every byte-array minimum and maximum of decimal `column` is
+/// 1 to the decimal's width in bytes long. Parquet's statistics converter
+/// panics on any other length (it indexes the first byte and asserts the
+/// width), and a footer that holds one still parses and decodes. `true` for
+/// a column that is not a decimal.
+fn decimal_statistics_fit(
+    data_type: &DataType,
+    row_groups: &[RowGroupMetaData],
+    column: usize,
+) -> bool {
+    let width = match data_type {
+        DataType::Decimal32(..)
+        | DataType::Decimal64(..)
+        | DataType::Decimal128(..)
+        | DataType::Decimal256(..) => data_type.primitive_width().unwrap_or(0),
+        _ => return true,
+    };
+    row_groups
+        .iter()
+        .all(|rg| match rg.column(column).statistics() {
+            Some(
+                s @ (ParquetStatistics::ByteArray(_) | ParquetStatistics::FixedLenByteArray(_)),
+            ) => [s.min_bytes_opt(), s.max_bytes_opt()]
+                .into_iter()
+                .flatten()
+                .all(|b| (1..=width).contains(&b.len())),
+            _ => true,
+        })
+}
+
+/// Whether `rg` is a row group the column of `constant` holds one value in.
+fn constant_in(constant: &Option<(ArrayRef, Vec<bool>)>, rg: usize) -> bool {
+    constant
+        .as_ref()
+        .is_some_and(|(_, flags)| flags.get(rg).copied().unwrap_or(false))
+}
+
 /// A take where some projected column is constant in some of the hit row
 /// groups: those rows come from the footer, and each column reads only its
 /// other rows. A filtered take over hour-long superfiles otherwise spends
 /// one small GET per row group on a column (such as `time`) whose value the
-/// footer already holds. `None` when no column has such a row group.
+/// footer already holds. Columns reading the same rows read them in one
+/// take, so their ranges coalesce as in a take without constants. `None`
+/// when no column has such a row group.
 async fn take_with_constant_chunks(
     reader: &SuperfileReader,
     metadata: &Arc<ParquetMetaData>,
@@ -2274,89 +2317,121 @@ async fn take_with_constant_chunks(
         .iter()
         .map(|name| constant_row_groups(metadata, schema, name))
         .collect();
-    let is_constant = |c: &Option<(ArrayRef, Vec<bool>)>, rg: usize| {
-        c.as_ref()
-            .is_some_and(|(_, flags)| flags.get(rg).copied().unwrap_or(false))
-    };
     if !constants
         .iter()
-        .any(|c| doc_rgs.iter().any(|&rg| is_constant(c, rg)))
+        .any(|c| doc_rgs.iter().any(|&rg| constant_in(c, rg)))
     {
         return Ok(None);
     }
-    let reads = names.iter().zip(&constants).map(|(name, c)| {
+    // Columns grouped by the hit rows they read, in first-seen order, with
+    // each column's group.
+    let mut groups: Vec<(Vec<u32>, Vec<&str>)> = Vec::new();
+    let mut slots: Vec<Option<usize>> = Vec::with_capacity(names.len());
+    for (name, c) in names.iter().zip(&constants) {
         let read_ids: Vec<u32> = local_doc_ids
             .iter()
             .zip(&doc_rgs)
-            .filter(|(_, rg)| !is_constant(c, **rg))
+            .filter(|(_, rg)| !constant_in(c, **rg))
             .map(|(d, _)| *d)
             .collect();
-        async move {
-            if read_ids.is_empty() {
-                return Ok::<Option<ArrayRef>, DataFusionError>(None);
-            }
-            let mut sorted = read_ids.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            let roots: Vec<usize> = schema.index_of(name).ok().into_iter().collect();
-            let spans = take_prefetch_spans(
-                metadata,
-                &sorted,
-                &roots,
-                TAKE_PREFETCH_MAX_BYTES,
-                EXACT_MERGE_GAP_BYTES,
-            );
-            let batch = take_prefetched(
-                reader,
-                Source::Lazy(reader.byte_source()),
-                Arc::clone(metadata),
-                spans,
-                &read_ids,
-                &[*name],
-                pool,
-                budget,
-            )
-            .await?;
-            Ok::<Option<ArrayRef>, DataFusionError>(Some(Arc::clone(batch.column(0))))
+        if read_ids.is_empty() {
+            slots.push(None);
+            continue;
         }
+        let group = match groups.iter().position(|(ids, _)| *ids == read_ids) {
+            Some(group) => group,
+            None => {
+                groups.push((read_ids, Vec::new()));
+                groups.len() - 1
+            }
+        };
+        slots.push(Some(group));
+        groups[group].1.push(name);
+    }
+    let reads = groups.iter().map(|(read_ids, group_names)| async move {
+        let mut sorted = read_ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let roots: Vec<usize> = group_names
+            .iter()
+            .filter_map(|name| schema.index_of(name).ok())
+            .collect();
+        let spans = take_prefetch_spans(
+            metadata,
+            &sorted,
+            &roots,
+            TAKE_PREFETCH_MAX_BYTES,
+            EXACT_MERGE_GAP_BYTES,
+        );
+        take_prefetched(
+            reader,
+            Source::Lazy(reader.byte_source()),
+            Arc::clone(metadata),
+            spans,
+            read_ids,
+            group_names,
+            pool,
+            budget,
+        )
+        .await
     });
     let read = futures::future::try_join_all(reads).await?;
     let mut fields = Vec::with_capacity(names.len());
     let mut columns = Vec::with_capacity(names.len());
-    for ((name, c), read) in names.iter().zip(&constants).zip(read) {
-        let field = schema.field_with_name(name).map_err(QueryError::internal)?;
-        let column = match (c, read) {
-            (None, Some(read)) => read,
-            (Some((mins, _)), read) => {
-                let mut k = 0;
-                let picks: Vec<(usize, usize)> = doc_rgs
-                    .iter()
-                    .map(|&rg| match is_constant(c, rg) {
-                        true => (0, rg),
-                        false => {
-                            k += 1;
-                            (1, k - 1)
-                        }
-                    })
-                    .collect();
-                let mut sources: Vec<&dyn Array> = vec![mins.as_ref()];
-                if let Some(read) = &read {
-                    sources.push(read.as_ref());
-                }
-                interleave(&sources, &picks).map_err(QueryError::internal)?
-            }
-            (None, None) => return Ok(None),
+    for ((name, c), slot) in names.iter().zip(constants).zip(slots) {
+        fields.push(
+            schema
+                .field_with_name(name)
+                .map_err(QueryError::internal)?
+                .clone(),
+        );
+        let read = match slot {
+            Some(group) => Some(Arc::clone(read[group].column_by_name(name).ok_or_else(
+                || QueryError::Internal(format!("take read no column {name}")),
+            )?)),
+            None => None,
         };
-        fields.push(field.clone());
-        columns.push(column);
+        columns.push((c, read));
     }
-    RecordBatch::try_new_with_options(
-        Arc::new(Schema::new(fields)),
-        columns,
-        &RecordBatchOptions::new().with_row_count(Some(local_doc_ids.len())),
-    )
-    .map(Some)
-    .map_err(|e| QueryError::internal(e).into())
+    let n_hits = local_doc_ids.len();
+    // Assembling the rows is CPU over every hit, so it runs on the reader
+    // pool as the column decodes do.
+    let assembled = run_on_pool_unless_blocking(pool, "take assembly", move || {
+        let mut assembled = Vec::with_capacity(columns.len());
+        for (constant, read) in columns {
+            assembled.push(match (constant, read) {
+                (None, Some(read)) => read,
+                (Some((mins, flags)), read) => {
+                    let mut k = 0;
+                    let picks: Vec<(usize, usize)> = doc_rgs
+                        .iter()
+                        .map(|&rg| match flags.get(rg).copied().unwrap_or(false) {
+                            true => (0, rg),
+                            false => {
+                                k += 1;
+                                (1, k - 1)
+                            }
+                        })
+                        .collect();
+                    let mut sources: Vec<&dyn Array> = vec![mins.as_ref()];
+                    if let Some(read) = &read {
+                        sources.push(read.as_ref());
+                    }
+                    interleave(&sources, &picks)?
+                }
+                (None, None) => return Ok(None),
+            });
+        }
+        RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(fields)),
+            assembled,
+            &RecordBatchOptions::new().with_row_count(Some(n_hits)),
+        )
+        .map(Some)
+    })
+    .await
+    .map_err(QueryError::internal)?;
+    assembled.map_err(|e| QueryError::internal(e).into())
 }
 
 /// Takes whose decode read outside their prefetch and decoded again through
@@ -2849,9 +2924,10 @@ mod tests {
     use datafusion::prelude::{col, lit};
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory, path::Path as ObjPath};
     use parquet::{
-        arrow::ArrowWriter,
+        arrow::{ArrowSchemaConverter, ArrowWriter},
+        data_type::FixedLenByteArray,
         file::{
-            metadata::{FileMetaData, PageIndexPolicy, ParquetMetaDataReader},
+            metadata::{ColumnChunkMetaData, FileMetaData, PageIndexPolicy, ParquetMetaDataReader},
             properties::WriterProperties,
         },
         schema::types::{SchemaDescriptor, Type},
@@ -4193,14 +4269,22 @@ mod tests {
         )
         .expect("build batch");
         b.add_batch(&batch, &[]).expect("add_batch");
-        let source = Superfile::new(Bytes::from(b.finish().expect("finish")), false);
-        let reader = SuperfileReader::open_lazy(Arc::clone(&source) as Arc<dyn LazyByteSource>)
-            .await
-            .expect("open lazy");
-        let metadata = reader
-            .parquet_metadata_with_page_index()
-            .await
-            .expect("metadata");
+        let bytes = Bytes::from(b.finish().expect("finish"));
+        // A reader over its own recording source, with its footer and page
+        // index loaded, and the ranges it has read so far.
+        let open = || async {
+            let source = Arc::new(RecordingSource::new(bytes.clone()));
+            let reader = SuperfileReader::open_lazy(Arc::clone(&source) as Arc<dyn LazyByteSource>)
+                .await
+                .expect("open lazy");
+            let metadata = reader
+                .parquet_metadata_with_page_index()
+                .await
+                .expect("metadata");
+            let read = source.ranges().len();
+            (source, reader, metadata, read)
+        };
+        let (source, reader, metadata, _) = open().await;
         let (_, constant) =
             constant_row_groups(&metadata, reader.schema(), "day").expect("statistics");
         assert_eq!(constant, vec![true, false, true]);
@@ -4238,6 +4322,95 @@ mod tests {
                 .data_type(),
             &DataType::Int64
         );
+
+        // `day` alone in its constant row groups reads nothing past the
+        // footer and page index.
+        let read = source.ranges().len();
+        let constant_ids = [2500u32, 10, 999];
+        let days = take_rows_byte_source(&reader, &constant_ids, &["day"], None, None)
+            .await
+            .expect("take");
+        assert_eq!(
+            days.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64")
+                .values()
+                .to_vec(),
+            vec![9, 7, 7]
+        );
+        assert_eq!(
+            source.ranges().len(),
+            read,
+            "a constant take reads no column"
+        );
+
+        // Columns reading the same rows read them together: with `day`
+        // served from the footer, `views` and `doc_id` read the same ranges
+        // as a take of those two alone.
+        let ranges_of = |names: &'static [&'static str]| {
+            let open = &open;
+            async move {
+                let (source, reader, _, read) = open().await;
+                take_rows_byte_source(&reader, &constant_ids, names, None, None)
+                    .await
+                    .expect("take");
+                source.ranges().split_off(read)
+            }
+        };
+        let together = ranges_of(&["views", "doc_id"]).await;
+        assert!(!together.is_empty());
+        assert_eq!(ranges_of(&["day", "views", "doc_id"]).await, together);
+    }
+
+    /// The bytes of a `Decimal128` value.
+    const DECIMAL128_BYTES: usize = 16;
+
+    /// A footer whose decimal minimum or maximum is empty, or wider than the
+    /// decimal, leaves the column without constant row groups rather than
+    /// panicking in Parquet's statistics converter; one of the decimal's
+    /// width still reads.
+    #[test]
+    fn malformed_decimal_statistics_are_not_constant() {
+        let schema = Schema::new(vec![decimal128_id_field("doc_id")]);
+        let descr = Arc::new(
+            ArrowSchemaConverter::new()
+                .convert(&schema)
+                .expect("parquet schema"),
+        );
+        let metadata = |min: Vec<u8>| {
+            let stats = ParquetStatistics::fixed_len_byte_array(
+                Some(FixedLenByteArray::from(min)),
+                Some(FixedLenByteArray::from(vec![0u8; DECIMAL128_BYTES])),
+                None,
+                Some(0),
+                false,
+            );
+            let column = ColumnChunkMetaData::builder(descr.column(0))
+                .set_statistics(stats)
+                .build()
+                .expect("column");
+            let row_group = RowGroupMetaData::builder(Arc::clone(&descr))
+                .set_num_rows(1)
+                .set_column_metadata(vec![column])
+                .build()
+                .expect("row group");
+            ParquetMetaData::new(
+                FileMetaData::new(0, 1, None, None, Arc::clone(&descr), None),
+                vec![row_group],
+            )
+        };
+        for min in [Vec::new(), vec![0u8; DECIMAL128_BYTES + 1]] {
+            let len = min.len();
+            assert!(
+                constant_row_groups(&metadata(min), &schema, "doc_id").is_none(),
+                "a {len}-byte minimum"
+            );
+        }
+        let (_, constant) =
+            constant_row_groups(&metadata(vec![0u8; DECIMAL128_BYTES]), &schema, "doc_id")
+                .expect("statistics");
+        assert_eq!(constant, vec![true]);
     }
 
     /// A take reserves its prefetch from the connection's budget and gives it

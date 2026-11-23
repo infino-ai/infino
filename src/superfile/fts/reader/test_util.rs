@@ -5,7 +5,11 @@
 //! plant small, known corpora so each test asserts against a fixed layout.
 
 use std::{
-    sync::atomic::{AtomicUsize, Ordering},
+    ops::Range,
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -184,6 +188,42 @@ impl LazyByteSource for GatedSource {
         self.started.fetch_add(1, Ordering::Relaxed);
         let _open = self.gate.read().await;
         AsyncOnlySource(self.blob.clone()).range(start, len).await
+    }
+}
+
+/// [`AsyncOnlySource`] that refuses any read overlapping `refused` once a
+/// test sets it, so a query that must not touch a region (such as the
+/// dictionary) fails if it does.
+pub(super) struct RefusingSource {
+    pub(super) blob: Bytes,
+    pub(super) refused: OnceLock<Range<usize>>,
+}
+
+#[async_trait]
+impl LazyByteSource for RefusingSource {
+    fn size(&self) -> u64 {
+        self.blob.len() as u64
+    }
+
+    async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        let (s, e) = (start as usize, (start + len) as usize);
+        if let Some(refused) = self.refused.get()
+            && s < refused.end
+            && e > refused.start
+        {
+            // Reported as out of bounds: the region is outside what the
+            // test lets the query read.
+            return Err(LazyByteSourceError::OutOfBounds {
+                start,
+                len,
+                size: self.size(),
+            });
+        }
+        AsyncOnlySource(self.blob.clone()).range(start, len).await
+    }
+
+    fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+        None
     }
 }
 
