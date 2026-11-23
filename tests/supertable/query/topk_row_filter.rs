@@ -633,17 +633,20 @@ fn one_file_fixture() -> (TempDir, Connection) {
     (dir, db)
 }
 
-/// Asserts `SELECT n, s WHERE n >= from LIMIT limit OFFSET offset` returns
-/// the `limit` rows from `from + offset` on in file order, and that its scan
-/// ran the `WHERE` as a row filter and took the limit. Returns them sorted:
-/// the order within a page is not pinned, as an exchange above the scan may
-/// hand its batches on in any order.
-fn assert_page_in_file_order(db: &Connection, from: i64, limit: i64, offset: i64) -> Vec<i64> {
-    let sql = format!("SELECT n, s FROM t WHERE n >= {from} LIMIT {limit} OFFSET {offset}");
-    let mut got = n_values(&db.query_sql(&sql).expect("sql"));
-    got.sort_unstable();
-    let start = from + offset;
-    assert_eq!(got, (start..start + limit).collect::<Vec<i64>>(), "{sql}");
+/// Asserts `SELECT n, s WHERE <filter> LIMIT limit OFFSET offset` returns
+/// the slice of `matches` from `offset` on, in that order, and that its scan
+/// ran the `WHERE` as a row filter and took the limit. Returns the page.
+fn assert_page_of(
+    db: &Connection,
+    filter: &str,
+    matches: &[i64],
+    limit: usize,
+    offset: usize,
+) -> Vec<i64> {
+    let sql = format!("SELECT n, s FROM t WHERE {filter} LIMIT {limit} OFFSET {offset}");
+    let got = n_values(&db.query_sql(&sql).expect("sql"));
+    let end = matches.len().min(offset + limit);
+    assert_eq!(got, matches[offset.min(end)..end], "{sql}");
     assert!(row_filter_ran(db, &sql), "no row filter for: {sql}");
     let plan = explain(db, "", &sql);
     assert!(
@@ -651,6 +654,19 @@ fn assert_page_in_file_order(db: &Connection, from: i64, limit: i64, offset: i64
         "{plan}"
     );
     got
+}
+
+/// [`assert_page_of`] for `WHERE n >= from` on the one-superfile table.
+fn assert_page_in_file_order(db: &Connection, from: i64, limit: i64, offset: i64) -> Vec<i64> {
+    let matches: Vec<i64> = (from..ONE_FILE_ROWS).collect();
+    let size = |v: i64| usize::try_from(v).expect("non-negative");
+    assert_page_of(
+        db,
+        &format!("n >= {from}"),
+        &matches,
+        size(limit),
+        size(offset),
+    )
 }
 
 #[test]
@@ -690,5 +706,76 @@ fn a_plain_limit_page_that_spans_two_batches_keeps_file_order() {
     let second_batch = SECOND_GROUP + MAX_FETCH as i64;
     for offset in [second_batch - from - 15, second_batch - from - 5] {
         assert_page_in_file_order(&db, from, 10, offset);
+    }
+}
+
+#[test]
+fn rows_inside_a_plain_limit_page_keep_file_order() {
+    // `WHERE n >= 60000 LIMIT 10 OFFSET 5530` on one superfile, a single
+    // partition: the scan takes the limit, and under the `OFFSET` a limit
+    // node sits between the scan and its meter.
+    //  - DataFusion puts a round-robin exchange over a single partition to
+    //    spread a projection, which hands the page's batches on in any order.
+    //    The exchange is dropped once the scan reads in file order.
+    // This test pins the page's rows in order, on every run, and that no
+    // exchange is left.
+    let (_dir, db) = one_file_fixture();
+    let sql = "SELECT n, s FROM t WHERE n >= 60000 LIMIT 10 OFFSET 5530";
+    for _ in 0..10 {
+        assert_page_in_file_order(&db, 60_000, 10, 5_530);
+    }
+    let plan = explain(&db, "", sql);
+    assert!(!plan.contains("RoundRobinBatch"), "{plan}");
+}
+
+/// Superfiles of the several-file table.
+const FILES: i64 = 3;
+/// Rows of each of those superfiles, one row group each.
+const FILE_ROWS: i64 = 4_000;
+
+/// Whether a `WHERE` keeps the row with this `n`.
+type Keeps = fn(i64) -> bool;
+
+/// A no-index table `t` of [`FILES`] superfiles, appended one after another,
+/// `n` from 0 to `FILES * FILE_ROWS` in file order.
+fn several_files_fixture() -> (TempDir, Connection) {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect_with(
+        dir.path().join("db").to_str().expect("utf-8 path"),
+        ConnectOptions::new().with_read_consistency(Consistency::Strong),
+    )
+    .expect("connect");
+    let table = db
+        .create_table("t", schema(), IndexSpec::new())
+        .expect("create_table");
+    for f in 0..FILES {
+        table
+            .append(&batch_of((f * FILE_ROWS..(f + 1) * FILE_ROWS).collect()))
+            .expect("append");
+    }
+    (dir, db)
+}
+
+#[test]
+fn pages_of_a_plain_limit_over_several_files_return_each_row_once_in_order() {
+    // Three superfiles of 4,000 rows, read in three partitions, paged 700
+    // rows at a time with the row filter on.
+    //  - `WHERE n >= 3000` keeps the last 1,000 rows of the first file and
+    //    every row of the others. Given the limit, the Parquet reader would
+    //    read first the files the statistics prove match.
+    //  - `WHERE m < 5` keeps half the rows of every file, spread out.
+    //  - the partitions are gathered one after another, each reading its own
+    //    file in order.
+    // This test pins that every page is the slice of the matches it starts
+    // at, in order, and that paging walks the matches once each.
+    const PAGE: usize = 700;
+    let (_dir, db) = several_files_fixture();
+    let filters: [(&str, Keeps); 2] = [("n >= 3000", |n| n >= 3_000), ("m < 5", |n| n % 10 < 5)];
+    for (filter, keeps) in filters {
+        let matches: Vec<i64> = (0..FILES * FILE_ROWS).filter(|&n| keeps(n)).collect();
+        let walked: Vec<i64> = (0..matches.len().div_ceil(PAGE))
+            .flat_map(|p| assert_page_of(&db, filter, &matches, PAGE, p * PAGE))
+            .collect();
+        assert_eq!(walked, matches, "{filter}");
     }
 }

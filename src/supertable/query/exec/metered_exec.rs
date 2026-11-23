@@ -61,7 +61,6 @@ use datafusion::{
         filter_pushdown::{
             ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
         },
-        limit::{GlobalLimitExec, LocalLimitExec},
         projection::ProjectionExec,
     },
 };
@@ -72,7 +71,9 @@ use crate::{
         cpu,
         op_stats::{OpStatsCollector, OuterBracketGuard, metering_active, outer_bracket_active},
     },
-    supertable::query::{provider::ScanFooters, read_ahead::ScanReadAhead},
+    supertable::query::{
+        provider::ScanFooters, read_ahead::ScanReadAhead, scan_order::can_read_in_file_order,
+    },
 };
 
 /// What a meter does with a `LIMIT` fetch from above.
@@ -192,14 +193,36 @@ impl MeteredExec {
     /// partition of such a scan stops after the fetch, so it gains nothing
     /// from more partitions, and an exchange below this node would keep the
     /// fetch from reaching it.
+    ///
+    /// Given the limit, the Parquet reader reads only the row groups its
+    /// statistics prove match, skipping earlier ones, and which it skips
+    /// depends on the limit, so pages of one statement would skip or repeat
+    /// rows. `ScanOrderUnderLimit` reads such a scan in file order once the
+    /// limits are placed; a scan that can't read in file order is refused the
+    /// limit, which stays above this meter.
     pub(crate) fn passing_limits(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        Arc::new(self.rewrapped_with(input, Limits::PassToRowFilter))
+        Arc::new(MeteredExec {
+            limits: Limits::PassToRowFilter,
+            ..self.rewrapped(input)
+        })
     }
 
     /// Whether this meter passes a `LIMIT` to a scan that runs its whole
     /// `WHERE` as a row filter ([`Self::passing_limits`]).
     pub(crate) fn passes_limits_to_row_filter(&self) -> bool {
         self.limits == Limits::PassToRowFilter
+    }
+
+    /// Whether a `LIMIT` fetch may pass this meter into its scan: not for a
+    /// scan with filters ([`Self::without_limit_pushdown`]), and for one that
+    /// runs its `WHERE` as a row filter only when it can read in file order
+    /// ([`Self::passing_limits`]).
+    fn passes_limits(&self) -> bool {
+        match self.limits {
+            Limits::Pass => true,
+            Limits::Refuse => false,
+            Limits::PassToRowFilter => can_read_in_file_order(&self.input),
+        }
     }
 
     /// A meter over `input` with this node's collector and limit policy.
@@ -209,48 +232,15 @@ impl MeteredExec {
 
     /// [`Self::rewrap`], unboxed.
     fn rewrapped(&self, input: Arc<dyn ExecutionPlan>) -> MeteredExec {
-        self.rewrapped_with(input, self.limits)
-    }
-
-    /// As [`Self::rewrapped`], with `limits`. A scan given a plain `LIMIT`
-    /// ([`Limits::PassToRowFilter`]) keeps file order ([`in_file_order`]),
-    /// whatever a rewrite below this meter set: given the limit, the Parquet
-    /// reader would otherwise read only the row groups its statistics prove
-    /// match, skipping earlier ones, and which it skips depends on the limit,
-    /// so pages of one statement would skip or repeat rows.
-    fn rewrapped_with(&self, input: Arc<dyn ExecutionPlan>, limits: Limits) -> MeteredExec {
-        let input = match limits {
-            Limits::PassToRowFilter => in_file_order(input),
-            Limits::Pass | Limits::Refuse => input,
-        };
         MeteredExec {
             input,
             op_stats: self.op_stats.clone(),
             footers: self.footers.clone(),
             read_ahead: self.read_ahead.clone(),
-            limits,
+            limits: self.limits,
             note: self.note.clone(),
         }
     }
-}
-
-/// `plan` with the scan it is, or the scan under its limits, reading its
-/// files in order. DataFusion's `LimitPushdown` hands a fetch to the scan and
-/// resets its order, and under an `OFFSET` it leaves a `GlobalLimitExec` with
-/// the skip between this meter and the scan, so the order is set through it.
-fn in_file_order(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-    let is_limit = plan.downcast_ref::<GlobalLimitExec>().is_some()
-        || plan.downcast_ref::<LocalLimitExec>().is_some();
-    if !is_limit {
-        return plan.with_preserve_order(true).unwrap_or(plan);
-    }
-    let [child] = plan.children()[..] else {
-        return plan;
-    };
-    let child = in_file_order(Arc::clone(child));
-    Arc::clone(&plan)
-        .with_new_children(vec![child])
-        .unwrap_or(plan)
 }
 
 impl DisplayAs for MeteredExec {
@@ -326,8 +316,8 @@ impl ExecutionPlan for MeteredExec {
     fn supports_limit_pushdown(&self) -> bool {
         // `false` makes `LimitPushdown` keep its limit node above this
         // meter instead of walking into the scan; see
-        // [`Self::without_limit_pushdown`].
-        self.limits != Limits::Refuse
+        // [`Self::passes_limits`].
+        self.passes_limits()
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -404,8 +394,8 @@ impl ExecutionPlan for MeteredExec {
         // the walk may not pass, this is exactly the question that must
         // be refused: with no fetch-capable node here, `LimitPushdown`
         // keeps a limit node above the meter (see
-        // [`Self::without_limit_pushdown`]).
-        if self.limits == Limits::Refuse {
+        // [`Self::passes_limits`]).
+        if !self.passes_limits() {
             return None;
         }
         self.input.with_fetch(limit).map(|input| self.rewrap(input))
