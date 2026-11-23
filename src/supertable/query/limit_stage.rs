@@ -75,6 +75,7 @@ use datafusion::{
 
 use crate::supertable::query::exec::{
     metered_exec::MeteredExec,
+    ordered_coalesce_exec::OrderedCoalesceExec,
     staged_coalesce_exec::{ScanGateExec, StagedCoalesceExec},
 };
 
@@ -97,9 +98,13 @@ impl PhysicalOptimizerRule for StageLimitGathers {
         // gate would always open and the query would only pay the wait.
         let max_fetch = config.execution.batch_size;
         plan.transform_down(|node| {
+            // `ScanOrderUnderLimit` has put an ordered gather on a scan read
+            // in file order; the staged gather keeps that order.
+            let ordered = node.downcast_ref::<OrderedCoalesceExec>().is_some();
             let Some(fetch) = node
                 .downcast_ref::<CoalescePartitionsExec>()
                 .and_then(|coalesce| coalesce.fetch())
+                .or_else(|| ordered.then(|| node.fetch()).flatten())
                 .filter(|&fetch| fetch <= max_fetch)
             else {
                 return Ok(Transformed::no(node));
@@ -113,7 +118,8 @@ impl PhysicalOptimizerRule for StageLimitGathers {
             if input.output_partitioning().partition_count() <= 1 {
                 return Ok(Transformed::no(node));
             }
-            let staged: Arc<dyn ExecutionPlan> = Arc::new(StagedCoalesceExec::new(input, fetch));
+            let staged: Arc<dyn ExecutionPlan> =
+                Arc::new(StagedCoalesceExec::new(input, fetch, ordered));
             Ok(Transformed::yes(staged))
         })
         .map(|t| t.data)
@@ -207,7 +213,7 @@ fn split_first_file(
 }
 
 /// The input of `node` when it is a round-robin exchange, else `None`.
-fn round_robin_input(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
+pub(super) fn round_robin_input(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
     node.downcast_ref::<RepartitionExec>()
         .filter(|exchange| matches!(exchange.partitioning(), Partitioning::RoundRobinBatch(_)))
         .map(RepartitionExec::input)

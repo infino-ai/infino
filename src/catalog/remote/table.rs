@@ -30,14 +30,16 @@ use serde_json::{Value, json};
 
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
-    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, ReindexError, ReindexOptions, StagedAppend, Supertable, VectorFilter,
+    Bm25FieldsOptions, Bm25SearchOptions, BoolMode, FieldClause, GcError, GcReport, InfinoError,
+    MutationStats, OptimizeError, OptimizeOptions, ReindexError, ReindexOptions, StagedAppend,
+    Supertable, VectorFilter,
     catalog::table::Table,
     dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
     supertable::{
         options::default_id_column,
         query::{
+            multi_field::{FieldsQuery, fields_statement},
             sorted::sorted_statement,
             sql::{
                 conform_value_counts, count_where_exprs, count_where_row, holds_subquery,
@@ -330,6 +332,27 @@ impl Table for RemoteTable {
         });
         let response = self.catalog.post_json("bm25_search", body)?;
         read_arrow("bm25_search", response)
+    }
+
+    /// The wire has no multi-field call, so the search travels as SQL
+    /// ([`fields_statement`]) and the hosted side answers it with the
+    /// `bm25_search_fields` table function. The statement is built from the
+    /// checked query, so a malformed query fails as it does locally.
+    fn bm25_search_fields(
+        &self,
+        clauses: &[FieldClause],
+        k: usize,
+        opts: &Bm25FieldsOptions,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
+        let query = FieldsQuery::new(clauses, opts)?;
+        self.catalog.query_sql(&fields_statement(
+            &self.table_name,
+            &query,
+            k,
+            projection,
+            &default_id_column(),
+        ))
     }
 
     fn token_match(

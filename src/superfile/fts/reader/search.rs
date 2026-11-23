@@ -8,7 +8,7 @@
 //! Its own `impl FtsReader` block, split from the reader `core`.
 
 use std::{
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, hash_map::Entry},
     ops::Range,
 };
 
@@ -52,6 +52,9 @@ use crate::{
     utils::terms::{DictEntry, make_key},
 };
 
+/// Clause-term lists up to this long are deduplicated by scanning the terms
+/// kept so far; longer ones, which only a prefix expansion produces, by a map.
+const DEDUP_SCAN_MAX_TERMS: usize = 64;
 /// Bytes per doc-id map entry: one little-endian `u32` row.
 const DOC_MAP_ENTRY_BYTES: usize = 4;
 /// Bytes of the doc-id map a sparse translation reads at a time. Small
@@ -620,25 +623,39 @@ impl FtsReader {
             .await
     }
 
-    /// I/O half of an un-ranged clause search: resolve the column,
-    /// classify the query shape, and fetch every cursor
-    /// [`Self::run_prepared`] needs to score. The single-atom shape
-    /// finishes here since it's cheap; the phrase-atom shape also
-    /// finishes here, but only because it isn't wired to the reader
-    /// pool yet, not because it's cheap.
     /// Collapse repeated clause terms into distinct terms plus a per-term repeat
-    /// count (query-term-frequency). Order-preserving; O(n²) over the handful of
-    /// query terms (the same shape the count path already dedups with). Returns
-    /// each term with count 1 — a no-op — for a distinct-term query.
+    /// count (query-term-frequency), in first-seen order. Returns each term with
+    /// count 1, a no-op, for a distinct-term query.
+    ///
+    /// A typed query has a handful of terms, where scanning the terms kept so
+    /// far beats hashing each one. A prefix query hands over every term the
+    /// prefix expands to in this superfile, thousands for a short prefix, and
+    /// the scan is quadratic there, so past [`DEDUP_SCAN_MAX_TERMS`] a map
+    /// finds each term's slot instead. Both give the same output.
     fn dedup_terms_with_qtf<'a>(terms: &[&'a str]) -> (Vec<&'a str>, Vec<u32>) {
         let mut distinct: Vec<&str> = Vec::with_capacity(terms.len());
         let mut qtf: Vec<u32> = Vec::with_capacity(terms.len());
-        for &t in terms {
-            match distinct.iter().position(|&d| d == t) {
-                Some(i) => qtf[i] += 1,
-                None => {
-                    distinct.push(t);
-                    qtf.push(1);
+        if terms.len() <= DEDUP_SCAN_MAX_TERMS {
+            for &t in terms {
+                match distinct.iter().position(|&d| d == t) {
+                    Some(i) => qtf[i] += 1,
+                    None => {
+                        distinct.push(t);
+                        qtf.push(1);
+                    }
+                }
+            }
+        } else {
+            let mut slot: FxHashMap<&str, usize> =
+                FxHashMap::with_capacity_and_hasher(terms.len(), Default::default());
+            for &t in terms {
+                match slot.entry(t) {
+                    Entry::Occupied(e) => qtf[*e.get()] += 1,
+                    Entry::Vacant(e) => {
+                        e.insert(distinct.len());
+                        distinct.push(t);
+                        qtf.push(1);
+                    }
                 }
             }
         }
@@ -655,6 +672,12 @@ impl FtsReader {
         }
     }
 
+    /// I/O half of an un-ranged clause search: resolve the column,
+    /// classify the query shape, and fetch every cursor
+    /// [`Self::run_prepared`] needs to score. The single-atom shape
+    /// finishes here since it's cheap; the phrase-atom shape also
+    /// finishes here, but only because it isn't wired to the reader
+    /// pool yet, not because it's cheap.
     pub(crate) async fn prepare_clauses(
         &self,
         column: &str,
@@ -1260,7 +1283,10 @@ impl FtsReader {
 
     /// An error naming the first of `ids` past this blob's documents, which the map has no entry
     /// for.
-    fn check_ids_in_map(&self, mut ids: impl Iterator<Item = FtsDocId>) -> Result<(), FtsError> {
+    pub(super) fn check_ids_in_map(
+        &self,
+        mut ids: impl Iterator<Item = FtsDocId>,
+    ) -> Result<(), FtsError> {
         match ids.find(|id| id.get() >= self.n_docs()) {
             Some(id) => Err(FtsError::Read(ReadError::Malformed(format!(
                 "fts doc-map has no entry for blob doc id {}",
@@ -1823,8 +1849,31 @@ impl FtsReader {
         // that parks the runtime's own core on a storage read. This path had
         // no prewarm of its own, and two cold scored queries racing on one
         // column could park every core with nothing left to drive the read
-        // that would release them.
-        self.ensure_norms(column_id).await?;
+        // that would release them. A term of one block or less scores from
+        // its own documents' buckets when those can be read alone: on a
+        // large superfile the whole array is megabytes for a handful of
+        // postings. A weight from this file's own counts reads the array
+        // anyway.
+        let few = match &source {
+            _ if !matches!(idf, TermIdf::Table(_)) => None,
+            SingleSource::Inline { doc_id, .. } => self.few_norms(column_id, &[*doc_id]).await?,
+            SingleSource::Bytes { bytes, short: true } => {
+                let mut buf_d = [0u32; BLOCK_LEN];
+                let mut buf_t = [0u32; BLOCK_LEN];
+                match decode_short(bytes.as_ref(), col_meta.positions, &mut buf_d, &mut buf_t) {
+                    Some(decoded) => self.few_norms(column_id, &buf_d[..decoded.n]).await?,
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        if few.is_none() {
+            self.ensure_norms(column_id).await?;
+        }
+        let dl_norm_of = |doc: u32| match &few {
+            Some(few) => few.get(doc),
+            None => col_meta.dl_norm_k1().get(doc),
+        };
         let term_bytes = match source {
             SingleSource::Absent => return Ok((Vec::new(), MatchWork::default(), 0)),
             SingleSource::Inline { doc_id, tf } => {
@@ -1850,7 +1899,7 @@ impl FtsReader {
                 {
                     return Ok((Vec::new(), MatchWork::default(), 0));
                 }
-                let dl_norm_k1 = col_meta.dl_norm_k1().get(doc_id);
+                let dl_norm_k1 = dl_norm_of(doc_id);
                 let score = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1);
                 if score <= floor_eff {
                     return Ok((Vec::new(), MatchWork::default(), 0));
@@ -1871,7 +1920,6 @@ impl FtsReader {
                     decode_short(bytes.as_ref(), col_meta.positions, &mut buf_d, &mut buf_t)
                         .ok_or_else(short_body_malformed)?;
                 let idf_weight = idf.resolve(col_meta, decoded.n as u64)?;
-                let dl_norm_k1 = col_meta.dl_norm_k1();
                 let mut heap: BinaryHeap<TopKEntry> =
                     BinaryHeap::with_capacity(k.min(decoded.n).max(1));
                 for j in 0..decoded.n {
@@ -1882,7 +1930,7 @@ impl FtsReader {
                         continue;
                     }
                     let score =
-                        bm25::score_with_dl_norm_k1(idf_weight, buf_t[j], dl_norm_k1.get(doc_id));
+                        bm25::score_with_dl_norm_k1(idf_weight, buf_t[j], dl_norm_of(doc_id));
                     if score <= floor_eff {
                         continue;
                     }
@@ -2509,6 +2557,7 @@ mod tests {
 
     /// A `k` above the fixture's match count.
     const TABLE_IDF_K: usize = 10;
+
     /// An arbitrary table-wide idf to score with.
     const TABLE_IDF: f32 = 1.5;
     /// Score slack between the ranked and the exact-count walks: they add
@@ -2539,6 +2588,56 @@ mod tests {
     const BETA_EVERY: u32 = 3;
     /// Every this many rows carry `rare`: a match sparse enough to be sorted.
     const RARE_EVERY: u32 = 128;
+    /// Seed of the term lists the dedup test draws.
+    const DEDUP_SEED: u64 = 11;
+    /// A term list well past the scan's cut.
+    const DEDUP_LONG_TERMS: usize = 500;
+    /// A term list as long as a short prefix's expansion.
+    const DEDUP_PREFIX_TERMS: usize = 5_000;
+
+    /// The map path, which a prefix expansion's long term list takes, must
+    /// give the scan path's output: distinct terms in first-seen order, each
+    /// with its repeat count. Lists either side of the cut, with and without
+    /// repeats, are checked against a plain scan.
+    #[test]
+    fn long_and_short_term_lists_dedup_alike() {
+        let scan = |terms: &[&str]| {
+            let mut distinct: Vec<String> = Vec::new();
+            let mut qtf: Vec<u32> = Vec::new();
+            for &t in terms {
+                match distinct.iter().position(|d| d == t) {
+                    Some(i) => qtf[i] += 1,
+                    None => {
+                        distinct.push(t.to_owned());
+                        qtf.push(1);
+                    }
+                }
+            }
+            (distinct, qtf)
+        };
+        let mut rng = xorshift(DEDUP_SEED);
+        for len in [
+            0,
+            1,
+            2,
+            DEDUP_SCAN_MAX_TERMS,
+            DEDUP_SCAN_MAX_TERMS + 1,
+            DEDUP_LONG_TERMS,
+            DEDUP_PREFIX_TERMS,
+        ] {
+            for vocab in [len.max(1), (len / 3).max(1), 2] {
+                let owned: Vec<String> = (0..len)
+                    .map(|_| format!("t{}", rng() % vocab as u64))
+                    .collect();
+                let terms: Vec<&str> = owned.iter().map(String::as_str).collect();
+                let (distinct, qtf) = FtsReader::dedup_terms_with_qtf(&terms);
+                let (want_distinct, want_qtf) = scan(&terms);
+                assert_eq!(distinct, want_distinct, "len {len}, vocab {vocab}");
+                assert_eq!(qtf, want_qtf, "len {len}, vocab {vocab}");
+                assert_eq!(qtf.iter().sum::<u32>() as usize, len);
+            }
+        }
+    }
 
     /// An unranked match on a reordered blob comes back as its rows,
     /// ascending, whether it is dense enough to be put in order through a

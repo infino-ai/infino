@@ -118,6 +118,7 @@ live on the [`Connection`] and [`Supertable`] pages:
   [`query_sql`](Connection::query_sql).
 - [`Supertable`] — a single table:
   - **Search** — [`bm25_search`](Supertable::bm25_search),
+    [`bm25_search_fields`](Supertable::bm25_search_fields),
     [`vector_search`](Supertable::vector_search),
     [`hybrid_search`](Supertable::hybrid_search),
     [`token_match`](Supertable::token_match),

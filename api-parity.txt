@@ -16,6 +16,7 @@ Connection::schema	covered	(&self, &str) -> Result<TableSchema, InfinoError>
 Supertable::append	covered	(&self, &RecordBatch) -> Result<(), InfinoError>
 Supertable::append_named	covered	(&self, &RecordBatch, &str) -> Result<(), InfinoError>
 Supertable::bm25_search	covered	(&self, &str, &str, usize, Bm25SearchOptions, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
+Supertable::bm25_search_fields	covered	(&self, &[FieldClause], usize, &Bm25FieldsOptions, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
 Supertable::count	covered	(&self, &str, &str, BoolMode) -> Result<u64, InfinoError>
 Supertable::count_where	covered	(&self, &[Expr]) -> Result<Vec<u64>, InfinoError>
 Supertable::delete	covered	(&self, Expr) -> Result<MutationStats, InfinoError>
