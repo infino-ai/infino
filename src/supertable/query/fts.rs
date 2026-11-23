@@ -3354,6 +3354,9 @@ impl SupertableReader {
             self,
             units,
             |answered| order.walk_window(answered, widest),
+            // The walk's window is the one it wants from the start: a walk
+            // that cannot pass superfiles opens them all at once.
+            false,
             |(best, _): &(u64, P)| order.passed(*best),
             ordered,
             |_| {},

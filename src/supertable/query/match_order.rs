@@ -271,32 +271,9 @@ impl MatchOrder {
         let Some(worst) = self.worst() else {
             return Ok(candidates);
         };
-        let budget = &self.manifest.options.connection_memory_budget;
         let mut placing = Vec::new();
         for chunk in candidates.chunks(EXACT_SCOPE_TAKE_ROWS) {
-            let batch = take_file_columns(
-                &self.manifest,
-                r,
-                chunk.to_vec(),
-                &[self.column.as_str()],
-                &self.key_schema,
-                &self.op_stats,
-            )
-            .await
-            .map_err(QueryError::DataFusion)?;
-            let _held = budget
-                .try_reserve(batch.get_array_memory_size())
-                .map_err(|over| {
-                    QueryError::OverBudget(format!("during an ordered match walk, {over}"))
-                })?;
-            let (kind, descending) = (self.kind, self.descending);
-            let (ranks, _) = run_on_pool(
-                Some(&self.manifest.options.reader_pool),
-                "ordered match keys",
-                move || ranks_of_chunk(&batch, kind, descending, 0),
-            )
-            .await
-            .map_err(QueryError::internal)??;
+            let (ranks, _) = self.chunk_ranks(r, chunk, 0).await?;
             placing.extend(
                 chunk
                     .iter()
@@ -306,6 +283,44 @@ impl MatchOrder {
             );
         }
         Ok(placing)
+    }
+
+    /// The rank of each of `rows`' keys in one superfile read through `r`,
+    /// in `rows`' order, and the best `fetch` of them. The keys are reserved
+    /// against the connection's budget while they are ranked, and ranked on
+    /// the reader pool.
+    async fn chunk_ranks(
+        &self,
+        r: &Arc<SuperfileReader>,
+        rows: &[u32],
+        fetch: usize,
+    ) -> Result<(Vec<u64>, Vec<u64>), QueryError> {
+        let batch = take_file_columns(
+            &self.manifest,
+            r,
+            rows.to_vec(),
+            &[self.column.as_str()],
+            &self.key_schema,
+            &self.op_stats,
+        )
+        .await
+        .map_err(QueryError::DataFusion)?;
+        let _held = self
+            .manifest
+            .options
+            .connection_memory_budget
+            .try_reserve(batch.get_array_memory_size())
+            .map_err(|over| {
+                QueryError::OverBudget(format!("during an ordered match walk, {over}"))
+            })?;
+        let (kind, descending) = (self.kind, self.descending);
+        run_on_pool(
+            Some(&self.manifest.options.reader_pool),
+            "ordered match keys",
+            move || ranks_of_chunk(&batch, kind, descending, fetch),
+        )
+        .await
+        .map_err(QueryError::internal)?
     }
 
     /// The `fetch`-th best rank so far, once `fetch` rows are in hand.
@@ -340,11 +355,8 @@ impl MatchOrder {
         if hits.is_empty() {
             return Ok(hits);
         }
-        // The keys are read in chunks, each reserved against the
-        // connection's budget while it is folded, and folded on the reader
-        // pool: a chunk's best `fetch` ranks are all the walk's best can
-        // take from it, so only those reach the lock.
-        let budget = &self.manifest.options.connection_memory_budget;
+        // The keys are read in chunks: a chunk's best `fetch` ranks are all
+        // the walk's best can take from it, so only those reach the lock.
         let mut placing = RoaringBitmap::new();
         let mut remaining = kept.iter();
         loop {
@@ -352,29 +364,7 @@ impl MatchOrder {
             if chunk.is_empty() {
                 break;
             }
-            let batch = take_file_columns(
-                &self.manifest,
-                r,
-                chunk.clone(),
-                &[self.column.as_str()],
-                &self.key_schema,
-                &self.op_stats,
-            )
-            .await
-            .map_err(QueryError::DataFusion)?;
-            let _held = budget
-                .try_reserve(batch.get_array_memory_size())
-                .map_err(|over| {
-                    QueryError::OverBudget(format!("during an ordered match walk, {over}"))
-                })?;
-            let (kind, descending, fetch) = (self.kind, self.descending, self.fetch);
-            let (ranks, best) = run_on_pool(
-                Some(&self.manifest.options.reader_pool),
-                "ordered match keys",
-                move || ranks_of_chunk(&batch, kind, descending, fetch),
-            )
-            .await
-            .map_err(QueryError::internal)??;
+            let (ranks, best) = self.chunk_ranks(r, &chunk, self.fetch).await?;
             let worst = {
                 let mut found = self.found.lock().expect("match order mutex poisoned");
                 for rank in best {
@@ -438,5 +428,183 @@ fn keep_best(best: &mut BinaryHeap<Reverse<u64>>, fetch: usize, rank: u64) {
     } else if best.peek().is_some_and(|Reverse(worst)| rank > *worst) {
         best.pop();
         best.push(Reverse(rank));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::scalar::ScalarValue;
+
+    use super::{MatchOrder, keep_best};
+    use crate::{
+        IndexSpec, connect,
+        superfile::SuperfileReader,
+        supertable::{
+            handle::SupertableReader,
+            manifest::SuperfileEntry,
+            query::{SuperfileHit, candidate::literal_key},
+        },
+    };
+
+    /// The fixture's table.
+    const TABLE: &str = "views";
+    /// Each row's `hour` in the fixture's one superfile: below, at and above
+    /// the seeded threshold, with a tie at it.
+    const HOURS: [i64; 5] = [10, 30, 40, 40, 60];
+    /// The walk's limit.
+    const FETCH: usize = 2;
+    /// The hours of the matches already in hand when a test starts, best
+    /// last: their worst, [`THRESHOLD_HOUR`], is the walk's `FETCH`-th best.
+    const SEEDED: [i64; FETCH] = [THRESHOLD_HOUR, 50];
+    /// The worst of [`SEEDED`].
+    const THRESHOLD_HOUR: i64 = 40;
+
+    /// A walk ordering one superfile of [`HOURS`] by `hour DESC LIMIT FETCH`,
+    /// the table's reader, and that superfile's entry and reader.
+    fn fixture() -> (
+        MatchOrder,
+        SupertableReader,
+        Arc<SuperfileEntry>,
+        Arc<SuperfileReader>,
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("hour", DataType::Int64, false),
+        ]));
+        let conn = connect("memory://").expect("connect");
+        let table = conn
+            .create_table(TABLE, Arc::clone(&schema), IndexSpec::new().fts("title"))
+            .expect("create");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(vec!["Zyzzyva"; HOURS.len()])),
+                Arc::new(Int64Array::from(HOURS.to_vec())),
+            ],
+        )
+        .expect("batch");
+        table.append(&batch).expect("append");
+        let reader = table.local_handle().reader().expect("reader");
+        let entry = Arc::clone(&reader.manifest().superfiles[0]);
+        let r = reader.open_superfile(&entry).expect("open");
+        let order = MatchOrder::new(
+            &reader,
+            "hour",
+            true,
+            FETCH,
+            &[],
+            &reader.manifest().scalar_schema(),
+        )
+        .expect("order")
+        .expect("the walk orders by hour");
+        (order, reader, entry, r)
+    }
+
+    /// `hour`'s rank in `order`.
+    fn rank(order: &MatchOrder, hour: i64) -> u64 {
+        let (_, key) = literal_key(&ScalarValue::Int64(Some(hour)), &DataType::Int64).expect("key");
+        order.rank(key)
+    }
+
+    /// Fold verified matches of `hours` into `order`'s best.
+    fn seed(order: &MatchOrder, hours: &[i64]) {
+        let mut found = order.found.lock().expect("match order mutex poisoned");
+        for &hour in hours {
+            keep_best(&mut found, order.fetch, rank(order, hour));
+        }
+    }
+
+    /// The walk's `FETCH`-th best rank, which must be in hand.
+    fn threshold(order: &MatchOrder) -> u64 {
+        order.worst().expect("FETCH matches in hand")
+    }
+
+    /// The fixture's rows whose hour passes `keep`.
+    fn rows_where(keep: impl Fn(i64) -> bool) -> Vec<u32> {
+        (0..)
+            .zip(HOURS)
+            .filter(|&(_, hour)| keep(hour))
+            .map(|(row, _)| row)
+            .collect()
+    }
+
+    /// Hits on the fixture's `rows`.
+    fn hits(entry: &SuperfileEntry, rows: &[u32]) -> Vec<SuperfileHit> {
+        rows.iter()
+            .map(|&local_doc_id| SuperfileHit {
+                superfile: entry.uri,
+                local_doc_id,
+                score: 0.0,
+                stable_id: None,
+            })
+            .collect()
+    }
+
+    /// With `FETCH` matches in hand, `keep` drops the hits whose key is below
+    /// the `FETCH`-th best, keeps those tied with it, and leaves the
+    /// threshold where hits no better than it put it.
+    #[test]
+    fn keep_drops_hits_below_the_threshold_and_keeps_ties() {
+        let (order, reader, entry, r) = fixture();
+        seed(&order, &SEEDED);
+        let below_top: Vec<u32> = rows_where(|hour| hour <= THRESHOLD_HOUR);
+        let kept = reader
+            .block_on(order.keep(&r, hits(&entry, &below_top)))
+            .expect("keep");
+        let kept: Vec<u32> = kept.iter().map(|h| h.local_doc_id).collect();
+        assert_eq!(kept, rows_where(|hour| hour == THRESHOLD_HOUR));
+        assert_eq!(threshold(&order), rank(&order, THRESHOLD_HOUR));
+    }
+
+    /// Until `FETCH` matches are in hand nothing is dropped: a hit worse
+    /// than every other still counts towards the limit.
+    #[test]
+    fn keep_drops_nothing_before_fetch_matches_are_in_hand() {
+        let (order, reader, entry, r) = fixture();
+        let worst_row = rows_where(|hour| hour < THRESHOLD_HOUR);
+        let kept = reader
+            .block_on(order.keep(&r, hits(&entry, &worst_row[..1])))
+            .expect("keep");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(order.worst(), None);
+    }
+
+    /// `prefilter` drops candidates below the `FETCH`-th best and keeps ties,
+    /// but a candidate is not yet a match: one better than every match in
+    /// hand does not raise the threshold, while the same row as a verified
+    /// match through `keep` does.
+    #[test]
+    fn prefilter_drops_candidates_below_the_threshold_without_raising_it() {
+        let (order, reader, entry, r) = fixture();
+        let every_row = rows_where(|_| true);
+        let unseeded = reader
+            .block_on(order.prefilter(&r, every_row.clone()))
+            .expect("prefilter");
+        assert_eq!(unseeded, every_row, "nothing to compare against yet");
+
+        seed(&order, &SEEDED);
+        let placing = reader
+            .block_on(order.prefilter(&r, every_row))
+            .expect("prefilter");
+        assert_eq!(placing, rows_where(|hour| hour >= THRESHOLD_HOUR));
+        assert_eq!(
+            threshold(&order),
+            rank(&order, THRESHOLD_HOUR),
+            "candidate keys leave the threshold alone"
+        );
+
+        let top = rows_where(|hour| hour > *SEEDED.last().expect("seeded"));
+        reader
+            .block_on(order.keep(&r, hits(&entry, &top)))
+            .expect("keep");
+        assert_eq!(
+            threshold(&order),
+            rank(&order, *SEEDED.last().expect("seeded")),
+            "a verified match raises it"
+        );
     }
 }
