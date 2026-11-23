@@ -690,7 +690,11 @@ mod tests {
         superfile::builder::FtsConfig,
         supertable::{
             Supertable, SupertableOptions, SupertableReader,
-            query::{sql::value_count_schema, value_count_carry::MAX_TABLE_VALUE_COUNTS},
+            query::{
+                covered_agg::{TERM_COUNTS_MIN_ROWS_PER_TERM, TERM_COUNTS_TABLE},
+                sql::value_count_schema,
+                value_count_carry::MAX_TABLE_VALUE_COUNTS,
+            },
         },
         test_helpers::{default_disk_cache, xorshift},
     };
@@ -714,16 +718,50 @@ mod tests {
     /// values of `w` than a superfile counts exactly.
     const WIDE_ROWS: i64 = 300;
 
-    /// Files in the keyword value-count fixture, and rows in each.
-    const KEYWORD_FILES: usize = 5;
-    const KEYWORD_ROWS: usize = 2_000;
-    /// Distinct numbers the fixture's values are made from: well past the
-    /// table-wide limit, so the statistics decline.
-    const KEYWORD_POOL: u64 = 1_500;
-    /// `n` is drawn from `0..KEYWORD_N_RANGE`; rows below
-    /// `KEYWORD_DELETED_BELOW` are deleted, about one in ten.
+    /// `n` is drawn from `0..KEYWORD_N_RANGE`; a fixture deletes the rows
+    /// below its `deleted_below`.
     const KEYWORD_N_RANGE: u64 = 1_000;
-    const KEYWORD_DELETED_BELOW: i64 = 100;
+    /// Spellings each number of a keyword fixture's pool takes (see
+    /// [`keyword_value_table`]); with the empty string, the distinct values
+    /// a file holding every spelling has.
+    const KEYWORD_SPELLINGS: u64 = 4;
+
+    /// The shape of a keyword value-count fixture.
+    struct KeywordShape {
+        /// Files holding live rows, beside one whose rows are all deleted.
+        files: usize,
+        /// Rows in each file.
+        rows: usize,
+        /// Distinct numbers the values are made from.
+        pool: u64,
+        /// Rows whose `n` is below this are deleted.
+        deleted_below: i64,
+    }
+
+    /// Few rows per value, about one in ten deleted: the term counts are
+    /// not worth reading, so a grouping is scanned.
+    const SPARSE: KeywordShape = KeywordShape {
+        files: 5,
+        rows: 2_000,
+        pool: 1_500,
+        deleted_below: 100,
+    };
+
+    /// Distinct numbers of [`DENSE`]: with their spellings and the empty
+    /// string, just past the table-wide limit, so the statistics decline. A
+    /// prime, so a row's spelling (its draw modulo ten) leaves every number
+    /// free.
+    const DENSE_POOL: u64 = 263;
+    /// Each file's distinct values in [`DENSE`].
+    const DENSE_TERMS: usize = (DENSE_POOL * KEYWORD_SPELLINGS) as usize + 1;
+    /// Many rows per value, one in a thousand deleted (their values few
+    /// enough to be counted): the term counts answer a grouping.
+    const DENSE: KeywordShape = KeywordShape {
+        files: 2,
+        rows: DENSE_TERMS * (TERM_COUNTS_MIN_ROWS_PER_TERM as usize) * 5 / 4,
+        pool: DENSE_POOL,
+        deleted_below: 1,
+    };
 
     struct Table {
         table: Supertable,
@@ -1052,12 +1090,15 @@ mod tests {
         assert_eq!(reader.deleted_stats().len(), 1);
     }
 
-    /// The keyword value-count fixture: `n`, a `keyword` column `tag` and
-    /// the same text in a `standard` column `plain`, over
-    /// [`KEYWORD_FILES`] files and one more whose rows are all deleted,
-    /// with about one row in ten deleted from the rest. The table is
+    /// A keyword value-count fixture of `shape`: `n`, a `keyword` column
+    /// `tag` and the same text in a `standard` column `plain`, over
+    /// `shape.files` files and one more whose rows are all deleted, with the
+    /// rows below `shape.deleted_below` deleted from the rest. The table is
     /// returned with the directories that hold it.
-    fn keyword_value_table(term_index: bool) -> (TempDir, TempDir, Supertable, SchemaRef) {
+    fn keyword_value_table(
+        term_index: bool,
+        shape: &KeywordShape,
+    ) -> (TempDir, TempDir, Supertable, SchemaRef) {
         let dir = TempDir::new().expect("tempdir");
         let cache_dir = TempDir::new().expect("cache dir");
         let storage: Arc<dyn StorageProvider> =
@@ -1082,19 +1123,19 @@ mod tests {
         let mut next = xorshift(0x5EED);
         // The last file's rows are all deleted: it holds no live value,
         // and its deleted rows are not read.
-        for file in 0..=KEYWORD_FILES {
-            let n: Vec<i64> = (0..KEYWORD_ROWS)
-                .map(|_| match file {
-                    KEYWORD_FILES => KEYWORD_N_RANGE as i64,
-                    _ => (next() % KEYWORD_N_RANGE) as i64,
+        for file in 0..=shape.files {
+            let n: Vec<i64> = (0..shape.rows)
+                .map(|_| match file == shape.files {
+                    true => KEYWORD_N_RANGE as i64,
+                    false => (next() % KEYWORD_N_RANGE) as i64,
                 })
                 .collect();
             // Spellings `standard` would fold together, the empty
             // string, non-ASCII, and a null in about one row in ten.
-            let tags: Vec<Option<String>> = (0..KEYWORD_ROWS)
+            let tags: Vec<Option<String>> = (0..shape.rows)
                 .map(|_| {
                     let r = next();
-                    let v = r % KEYWORD_POOL;
+                    let v = r % shape.pool;
                     match r % 10 {
                         0 => None,
                         1 => Some(String::new()),
@@ -1118,7 +1159,7 @@ mod tests {
         table
             .delete(
                 col("n")
-                    .lt(lit(KEYWORD_DELETED_BELOW))
+                    .lt(lit(shape.deleted_below))
                     .or(col("n").eq(lit(KEYWORD_N_RANGE as i64))),
             )
             .expect("delete");
@@ -1132,9 +1173,9 @@ mod tests {
     /// go through the grouped count.
     #[test]
     fn keyword_value_counts_sum_the_terms_less_the_deleted_rows() {
-        assert!(MAX_TABLE_VALUE_COUNTS < KEYWORD_POOL as usize);
+        const { assert!(MAX_TABLE_VALUE_COUNTS < DENSE_TERMS) };
         for term_index in [true, false] {
-            let (_dir, _cache_dir, table, schema) = keyword_value_table(term_index);
+            let (_dir, _cache_dir, table, schema) = keyword_value_table(term_index, &DENSE);
             let reader = table.reader().expect("reader");
             for (column, reads_rows) in [("tag", false), ("plain", true)] {
                 let label = format!("{column}, term index {term_index}");
@@ -1220,7 +1261,7 @@ mod tests {
     fn keyword_value_counts_over_the_budget_run_the_grouped_count() {
         for term_index in [true, false] {
             let label = format!("term index {term_index}");
-            let (_dir, _cache_dir, table) = long_keyword_table(term_index);
+            let (_dir, _cache_dir, table, _schema) = keyword_value_table(term_index, &DENSE);
             let reader = table.reader().expect("reader");
             let grouped = rows(&reader, "SELECT tag, COUNT(*) FROM supertable GROUP BY tag");
             let tag = Field::new("tag", DataType::LargeUtf8, true);
@@ -1298,6 +1339,116 @@ mod tests {
         }
     }
 
+    /// Groupings of a keyword column that SQL answers from its term counts
+    /// once the statistics decline, each beside the same query forced to the
+    /// scan by a `random() >= 0` every row passes.
+    const KEYWORD_GROUPINGS: [(&str, &str); 5] = [
+        (
+            "SELECT tag, COUNT(*) FROM supertable GROUP BY tag",
+            "SELECT tag, COUNT(*) FROM supertable WHERE random() >= 0 GROUP BY tag",
+        ),
+        (
+            "SELECT tag, COUNT(*) FROM supertable WHERE tag IS NOT NULL GROUP BY tag",
+            "SELECT tag, COUNT(*) FROM supertable WHERE tag IS NOT NULL AND random() >= 0 \
+             GROUP BY tag",
+        ),
+        (
+            "SELECT tag, COUNT(*) AS c FROM supertable GROUP BY tag ORDER BY c DESC, tag LIMIT 7",
+            "SELECT tag, COUNT(*) AS c FROM supertable WHERE random() >= 0 GROUP BY tag \
+             ORDER BY c DESC, tag LIMIT 7",
+        ),
+        (
+            "SELECT COUNT(DISTINCT tag) FROM supertable",
+            "SELECT COUNT(DISTINCT tag) FROM supertable WHERE random() >= 0",
+        ),
+        (
+            "SELECT DISTINCT tag FROM supertable",
+            "SELECT DISTINCT tag FROM supertable WHERE random() >= 0",
+        ),
+    ];
+
+    /// On a keyword column past the statistics' limit, a grouped count, a
+    /// distinct count and a distinct listing answer as the scan does, with
+    /// nulls, the empty string, case variants and deletes, and read no row:
+    /// from the term index, and from each file's dictionary on a table that
+    /// keeps no index. The same text in a `standard` column is scanned.
+    #[test]
+    fn keyword_groupings_in_sql_answer_from_the_terms() {
+        const { assert!(MAX_TABLE_VALUE_COUNTS < DENSE_TERMS) };
+        for term_index in [true, false] {
+            let (_dir, _cache_dir, table, _schema) = keyword_value_table(term_index, &DENSE);
+            let reader = table.reader().expect("reader");
+            for (sql, forced) in KEYWORD_GROUPINGS {
+                let label = format!("{sql}, term index {term_index}");
+                let (answered, stats) = with_op_stats(|| rows(&reader, sql));
+                assert_eq!(answered, rows(&reader, forced), "{label}");
+                assert_eq!(stats.rows_materialized, 0, "{label}: {stats:?}");
+                assert!(
+                    explain(&reader, sql).contains(TERM_COUNTS_TABLE),
+                    "{label}: {}",
+                    explain(&reader, sql)
+                );
+                let plain = sql.replace("tag", "plain");
+                let (scanned, stats) = with_op_stats(|| rows(&reader, &plain));
+                assert_eq!(scanned, rows(&reader, &forced.replace("tag", "plain")));
+                assert!(stats.rows_materialized > 0, "{plain}: {stats:?}");
+            }
+        }
+    }
+
+    /// When a keyword column's term counts do not fit the connection memory
+    /// budget, SQL groupings of it run as planned, holding nothing for the
+    /// refused counts; with room again, they answer from the terms.
+    #[test]
+    fn keyword_groupings_over_the_budget_run_as_planned() {
+        let (_dir, _cache_dir, table, _schema) = keyword_value_table(true, &DENSE);
+        let reader = table.reader().expect("reader");
+        let budget = &reader.manifest().options.connection_memory_budget;
+        for (sql, forced) in KEYWORD_GROUPINGS {
+            let expected = rows(&reader, forced);
+            let held = budget.hold_all();
+            let used = budget.used();
+            let err = reader
+                .query_sql(sql)
+                .expect_err("the grouping meets the full budget");
+            assert!(
+                err.to_string().contains("during SQL query"),
+                "{sql}: refused by the grouping, not the terms: {err}"
+            );
+            assert_eq!(
+                budget.used(),
+                used,
+                "{sql}: the refused counts hold nothing"
+            );
+            drop(held);
+            let (answered, stats) = with_op_stats(|| rows(&reader, sql));
+            assert_eq!(answered, expected, "{sql}: with room");
+            assert_eq!(stats.rows_materialized, 0, "{sql}: {stats:?}");
+        }
+    }
+
+    /// With few rows per value, reading a keyword column's term counts costs
+    /// more than scanning it: `value_counts` and the SQL groupings scan, and
+    /// answer as the grouped plan does.
+    #[test]
+    fn keyword_groupings_with_few_rows_per_value_are_scanned() {
+        assert!(MAX_TABLE_VALUE_COUNTS < SPARSE.pool as usize);
+        let (_dir, _cache_dir, table, _schema) = keyword_value_table(true, &SPARSE);
+        let reader = table.reader().expect("reader");
+        let (counted, stats) = with_op_stats(|| reader.value_counts("tag").expect("value counts"));
+        assert_eq!(
+            sorted_rows(from_ref(&counted)),
+            rows(&reader, KEYWORD_GROUPINGS[0].1)
+        );
+        assert!(stats.rows_materialized > 0, "value_counts: {stats:?}");
+        for (sql, forced) in KEYWORD_GROUPINGS {
+            let (answered, stats) = with_op_stats(|| rows(&reader, sql));
+            assert_eq!(answered, rows(&reader, forced), "{sql}");
+            assert!(stats.rows_materialized > 0, "{sql}: {stats:?}");
+            assert!(!explain(&reader, sql).contains(TERM_COUNTS_TABLE), "{sql}");
+        }
+    }
+
     /// Filters on a keyword column, `{c}` standing for it: the postings
     /// answer them exactly on `tag`, and no index answers them on
     /// `tag || ''`, so each row is checked.
@@ -1318,7 +1469,7 @@ mod tests {
     #[test]
     fn keyword_equalities_select_rows_from_the_postings() {
         for term_index in [true, false] {
-            let (_dir, _cache_dir, table, _schema) = keyword_value_table(term_index);
+            let (_dir, _cache_dir, table, _schema) = keyword_value_table(term_index, &SPARSE);
             let reader = table.reader().expect("reader");
             for filter in KEYWORD_EQUALITIES {
                 let checked = filter.replace("{c}", "(tag || '')");

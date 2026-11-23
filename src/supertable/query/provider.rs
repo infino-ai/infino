@@ -55,7 +55,7 @@ use std::{
     fmt,
     future::Future,
     slice,
-    sync::{Arc, atomic},
+    sync::{Arc, Mutex, PoisonError, atomic},
     time::Instant,
 };
 
@@ -133,7 +133,7 @@ use crate::{
                 CandidatePlan, ExactFilter, PoolFile, Resolved, SelectionGate, TermMemos,
                 exact_filter, exact_range, like_prune_leaves, single_range,
             },
-            covered_agg::not_null_column,
+            covered_agg::{LiveTermCounts, not_null_column},
             deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
             dispatch::tag_hits,
@@ -536,6 +536,10 @@ pub(crate) struct SupertableProvider {
     /// The statistics of superfiles' deleted rows, kept for the table (see
     /// [`DeletedStatsCache`]).
     deleted_stats: Arc<DeletedStatsCache>,
+    /// `keyword` columns' live value counts, read from the term index
+    /// before a statement is optimized and taken by the covered-aggregate
+    /// rewrite (see [`LiveTermCounts`]), by column.
+    term_counts: Arc<Mutex<HashMap<String, LiveTermCounts>>>,
 }
 
 /// What [`SupertableProvider::count_range`] carries: the column, its id
@@ -641,6 +645,7 @@ impl SupertableProvider {
             count_range: None,
             read_rows: None,
             deleted_stats: Arc::default(),
+            term_counts: Arc::default(),
         }
     }
 
@@ -661,6 +666,33 @@ impl SupertableProvider {
     /// The statistics of superfiles' deleted rows kept for the table.
     pub(crate) fn deleted_stats(&self) -> &DeletedStatsCache {
         &self.deleted_stats
+    }
+
+    /// Keep `column`'s live term counts for the covered-aggregate rewrite,
+    /// in place of any kept before.
+    pub(crate) fn keep_term_counts(&self, column: &str, counts: LiveTermCounts) {
+        self.term_counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(column.to_string(), counts);
+    }
+
+    /// Whether `other` keeps its term counts where this provider does.
+    pub(crate) fn shares_term_counts(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.term_counts, &other.term_counts)
+    }
+
+    /// Take `column`'s kept term counts, if any.
+    pub(crate) fn take_term_counts(&self, column: &str) -> Option<LiveTermCounts> {
+        self.term_counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(column)
+    }
+
+    /// The reader over this provider's snapshot, while its table is open.
+    pub(crate) fn reader(&self) -> Option<Arc<SupertableReader>> {
+        self.walk_reader.upgrade()
     }
 
     /// Clone of this provider whose scan reads `rows` of superfile `entry`
@@ -829,6 +861,7 @@ impl SupertableProvider {
             count_range: self.count_range.clone(),
             read_rows: self.read_rows.clone(),
             deleted_stats: Arc::clone(&self.deleted_stats),
+            term_counts: Arc::clone(&self.term_counts),
         }
     }
 
@@ -849,6 +882,8 @@ impl SupertableProvider {
             }),
             scan_store: Arc::new(SuperfileObjectStore::new()),
             scan_footers: Arc::default(),
+            // Counts read over another snapshot are not this one's.
+            term_counts: Arc::default(),
             ..self.sibling()
         }
     }
