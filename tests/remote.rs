@@ -133,7 +133,8 @@ async fn create_table_posts_expected_shape() {
 /// The hosted service builds `standard` indexes only, so a `keyword`
 /// column is refused on the client, at create and in a schema patch,
 /// before any request is sent: a service that did not know the analyzer
-/// could build the column as `standard`.
+/// could build the column as `standard`. An unknown analyzer name is
+/// refused there too.
 #[tokio::test]
 async fn a_keyword_column_is_refused_before_any_request() {
     let server = MockServer::start().await;
@@ -146,8 +147,15 @@ async fn a_keyword_column_is_refused_before_any_request() {
         let created = db
             .create_table(
                 "posts",
-                schema,
+                Arc::clone(&schema),
                 IndexSpec::new().fts(FtsField::new("tag").analyzer("keyword")),
+            )
+            .err();
+        let unknown = db
+            .create_table(
+                "posts",
+                schema,
+                IndexSpec::new().fts(FtsField::new("tag").analyzer("whitespace")),
             )
             .err();
         let patched = db
@@ -161,13 +169,17 @@ async fn a_keyword_column_is_refused_before_any_request() {
                 None,
             )
             .err();
-        [created, patched]
+        [
+            (created, "\"keyword\""),
+            (patched, "\"keyword\""),
+            (unknown, "unsupported analyzer \"whitespace\""),
+        ]
     })
     .await;
-    for err in errors {
-        let err = err.expect("a keyword column is refused");
+    for (err, expected) in errors {
+        let err = err.expect("the column is refused");
         assert!(matches!(err, InfinoError::Config(_)), "{err:?}");
-        assert!(err.to_string().contains("\"keyword\""), "{err}");
+        assert!(err.to_string().contains(expected), "{err}");
     }
     let requests = server
         .received_requests()

@@ -149,11 +149,12 @@ impl RemoteCatalog {
         schema: SchemaRef,
         indexes: IndexSpec,
     ) -> Result<Supertable, InfinoError> {
-        only_standard_analyzers(indexes.fts_analyzers()?)?;
+        indexes.check_analyzers()?;
+        only_standard_analyzers(indexes.fts_analyzers())?;
         let body = json!({
             "table_name": name,
             "schema_ipc": wire::schema_to_ipc_base64(&schema)?,
-            "indexes": wire::index_spec_to_json(&indexes)?,
+            "indexes": wire::index_spec_to_json(&indexes),
         });
         self.post_json("create_table", body)?;
         Ok(Supertable::from_table(Arc::new(table::RemoteTable::new(

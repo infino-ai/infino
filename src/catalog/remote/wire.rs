@@ -74,9 +74,8 @@ fn param_as_f64(v: f32) -> f64 {
 /// request rather than build a table analyzed differently than the
 /// client asked for — which is the request schema's job
 /// (`additionalProperties: false`), not something an encoding trick in
-/// this client can guarantee. An analyzer this engine does not ship is
-/// an error, as at `create_table`.
-pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Result<Value, InfinoError> {
+/// this client can guarantee.
+pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
     let mut indexes = serde_json::Map::new();
     let columns = spec.fts_columns();
     if !columns.is_empty() {
@@ -87,7 +86,7 @@ pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Result<Value, InfinoError>
             .zip(spec.fts_positions())
             .zip(spec.fts_stopwords())
             .zip(spec.fts_stemmers())
-            .zip(spec.fts_analyzers()?)
+            .zip(spec.fts_analyzers())
             .map(
                 |((((((column, stored), bm25), positions), stopwords), stemmer), analyzer)| {
                     let mut entry = serde_json::Map::new();
@@ -134,7 +133,7 @@ pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Result<Value, InfinoError>
     if !ranges.is_empty() {
         indexes.insert("range".to_string(), Value::Array(ranges));
     }
-    Ok(Value::Object(indexes))
+    Value::Object(indexes)
 }
 
 /// Encode record batches as one Arrow IPC stream. An empty slice yields an
@@ -232,7 +231,7 @@ mod tests {
         let spec = IndexSpec::new()
             .fts("body")
             .vector("embedding", 384, Metric::Cosine);
-        let json = index_spec_to_json(&spec).expect("spec");
+        let json = index_spec_to_json(&spec);
         assert_eq!(
             json["fts"],
             json!([{"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75}])
@@ -258,7 +257,7 @@ mod tests {
                 .stemmer(Stemmer::English),
         );
         assert_eq!(
-            index_spec_to_json(&spec).expect("spec")["fts"],
+            index_spec_to_json(&spec)["fts"],
             json!([{
                 "column": "body", "analyzer": "standard",
                 "k1": 1.2,
@@ -270,7 +269,7 @@ mod tests {
         // One filter, not both.
         let spec = IndexSpec::new().fts(FtsField::new("body").stemmer(Stemmer::English));
         assert_eq!(
-            index_spec_to_json(&spec).expect("spec")["fts"],
+            index_spec_to_json(&spec)["fts"],
             json!([{
                 "column": "body", "analyzer": "standard",
                 "k1": 1.2, "b": 0.75, "stemmer": "english",
@@ -279,7 +278,7 @@ mod tests {
         // And neither: no keys at all, not empty strings.
         let spec = IndexSpec::new().fts("body");
         assert_eq!(
-            index_spec_to_json(&spec).expect("spec")["fts"],
+            index_spec_to_json(&spec)["fts"],
             json!([{"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75}])
         );
     }
@@ -289,7 +288,7 @@ mod tests {
         // `stored: false` appears only when it is not the default.
         let spec = IndexSpec::new().fts(FtsField::new("body").stored(false));
         assert_eq!(
-            index_spec_to_json(&spec).expect("spec")["fts"],
+            index_spec_to_json(&spec)["fts"],
             json!([
                 {"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75, "stored": false}
             ])
@@ -307,7 +306,7 @@ mod tests {
             .fts(FtsField::new("title").bm25(1.6, 0.4))
             .fts("body");
         assert_eq!(
-            index_spec_to_json(&spec).expect("spec")["fts"],
+            index_spec_to_json(&spec)["fts"],
             json!([
                 {"column": "title", "analyzer": "standard", "k1": 1.6, "b": 0.4},
                 {"column": "body", "analyzer": "standard", "k1": 1.2, "b": 0.75}
@@ -318,10 +317,7 @@ mod tests {
 
     #[test]
     fn empty_index_spec_is_empty_object() {
-        assert_eq!(
-            index_spec_to_json(&IndexSpec::new()).expect("spec"),
-            json!({})
-        );
+        assert_eq!(index_spec_to_json(&IndexSpec::new()), json!({}));
     }
 
     #[test]

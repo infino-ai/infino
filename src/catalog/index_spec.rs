@@ -61,7 +61,10 @@ struct VectorIndex {
 #[derive(Debug, Clone)]
 pub struct FtsField {
     column: String,
-    analyzer: String,
+    analyzer: Analyzer,
+    /// A name given to [`FtsField::analyzer`] that is not an analyzer.
+    /// Kept only so `create_table` can refuse it by name.
+    unknown_analyzer: Option<String>,
     stopwords: Stopwords,
     stemmer: Stemmer,
     positions: bool,
@@ -77,7 +80,8 @@ impl FtsField {
     pub fn new(column: impl Into<String>) -> Self {
         Self {
             column: column.into(),
-            analyzer: STANDARD_TOKENIZER.to_string(),
+            analyzer: Analyzer::Standard,
+            unknown_analyzer: None,
             stopwords: Stopwords::None,
             stemmer: Stemmer::None,
             positions: false,
@@ -98,7 +102,14 @@ impl FtsField {
     /// longest term Lucene takes too: an append carrying a longer one is
     /// refused whole, as [`SchemaError::KeywordTooLong`](crate::SchemaError::KeywordTooLong).
     pub fn analyzer(mut self, name: impl Into<String>) -> Self {
-        self.analyzer = name.into();
+        let name = name.into();
+        match Analyzer::from_name(&name) {
+            Some(analyzer) => {
+                self.analyzer = analyzer;
+                self.unknown_analyzer = None;
+            }
+            None => self.unknown_analyzer = Some(name),
+        }
         self
     }
 
@@ -470,17 +481,17 @@ impl IndexSpec {
     }
 
     /// The declared companions, lowered to what the table options carry.
-    pub(crate) fn companion_specs(&self) -> Result<Vec<CompanionSpec>, InfinoError> {
+    pub(crate) fn companion_specs(&self) -> Vec<CompanionSpec> {
         self.companions
             .iter()
             .map(|companion| {
-                let (fts_columns, vector_columns) = companion.indexes.to_configs()?;
-                Ok(CompanionSpec {
+                let (fts_columns, vector_columns) = companion.indexes.to_configs();
+                CompanionSpec {
                     purpose: companion.purpose.clone(),
                     schema: Arc::clone(&companion.schema),
                     fts_columns,
                     vector_columns,
-                })
+                }
             })
             .collect()
     }
@@ -508,36 +519,30 @@ impl IndexSpec {
         self
     }
 
-    /// Refuses an FTS column that names an analyzer this engine does not
-    /// ship, or a `keyword` column with stopwords or a stemmer.
+    /// Refuses an FTS column that names an unknown analyzer, or a
+    /// `keyword` column with stopwords or a stemmer. Every path that builds
+    /// a table from a spec runs this first.
     pub(crate) fn check_analyzers(&self) -> Result<(), InfinoError> {
-        for (f, analyzer) in self.fts.iter().zip(self.fts_analyzers()?) {
-            check_chain(analyzer, f.stopwords, f.stemmer).map_err(|reason| {
+        for f in &self.fts {
+            if let Some(name) = &f.unknown_analyzer {
+                return Err(InfinoError::Config(format!(
+                    "FTS column {:?}: unsupported analyzer {name:?}; the analyzers are \
+                     {STANDARD_TOKENIZER:?} and {:?}",
+                    f.column,
+                    Analyzer::Keyword.as_str()
+                )));
+            }
+            check_chain(f.analyzer, f.stopwords, f.stemmer).map_err(|reason| {
                 InfinoError::Config(format!("FTS column {:?}: {reason}", f.column))
             })?;
         }
         Ok(())
     }
 
-    /// FTS base tokenizers, in declaration order (parallel to
-    /// [`fts_columns`](Self::fts_columns)). A name this engine does not
-    /// ship is a [`InfinoError::Config`] naming the column, never a
-    /// column built under another analyzer.
-    pub(crate) fn fts_analyzers(&self) -> Result<Vec<Analyzer>, InfinoError> {
-        self.fts
-            .iter()
-            .map(|f| {
-                Analyzer::from_name(&f.analyzer).ok_or_else(|| {
-                    InfinoError::Config(format!(
-                        "FTS column {:?}: unsupported analyzer {:?}; the analyzers are \
-                         {STANDARD_TOKENIZER:?} and {:?}",
-                        f.column,
-                        f.analyzer,
-                        Analyzer::Keyword.as_str()
-                    ))
-                })
-            })
-            .collect()
+    /// FTS analyzers, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)).
+    pub(crate) fn fts_analyzers(&self) -> Vec<Analyzer> {
+        self.fts.iter().map(|f| f.analyzer).collect()
     }
 
     /// FTS column names, in declaration order.
@@ -588,16 +593,14 @@ impl IndexSpec {
     /// supertable options take. `rot_seed` / `rerank_codec` are not part of
     /// the public spec, so a column declared through [`Self::vector`]
     /// carries the defaults; one replayed from a schema document carries
-    /// what that document recorded. An analyzer this engine does not ship
-    /// is an error (see [`fts_analyzers`](Self::fts_analyzers)).
-    pub(crate) fn to_configs(&self) -> Result<(Vec<FtsConfig>, Vec<VectorConfig>), InfinoError> {
+    /// what that document recorded.
+    pub(crate) fn to_configs(&self) -> (Vec<FtsConfig>, Vec<VectorConfig>) {
         let fts = self
             .fts
             .iter()
-            .zip(self.fts_analyzers()?)
-            .map(|(f, analyzer)| {
+            .map(|f| {
                 FtsConfig::new(f.column.clone())
-                    .analyzer(analyzer)
+                    .analyzer(f.analyzer)
                     .stopwords(f.stopwords)
                     .stemmer(f.stemmer)
                     .positions(f.positions)
@@ -616,7 +619,7 @@ impl IndexSpec {
                 }
             })
             .collect();
-        Ok((fts, vectors))
+        (fts, vectors)
     }
 }
 
@@ -675,36 +678,30 @@ mod tests {
         assert_eq!(spec.fts_stemmers(), vec![Stemmer::None]);
         assert_eq!(spec.fts_positions(), vec![false]);
         assert_eq!(spec.fts_stored(), vec![true]);
-        assert_eq!(
-            spec.fts_analyzers().expect("shipped"),
-            vec![Analyzer::Standard]
-        );
+        assert_eq!(spec.fts_analyzers(), vec![Analyzer::Standard]);
     }
 
-    /// An analyzer this engine does not ship is an error naming the column
-    /// wherever the spec is lowered, whether or not `check_analyzers` ran
-    /// first: never a panic, and never a column built under another one.
+    /// An unknown analyzer name is refused by name, naming the column. A
+    /// later valid name replaces it.
     #[test]
-    fn an_unknown_analyzer_is_an_error_wherever_the_spec_is_lowered() {
+    fn an_unknown_analyzer_is_refused_by_name() {
         let spec = IndexSpec::new()
             .fts(FtsField::new("host").analyzer("keyword"))
             .fts(FtsField::new("title").analyzer("whitespace"));
-        for err in [
-            spec.check_analyzers().expect_err("check"),
-            spec.fts_analyzers().expect_err("analyzers"),
-            spec.to_configs().expect_err("configs"),
-        ] {
-            assert!(matches!(err, InfinoError::Config(_)), "{err:?}");
-            let message = err.to_string();
-            assert!(
-                message.contains("title") && message.contains("whitespace"),
-                "{message}"
-            );
-        }
-        let spec = IndexSpec::new().fts(FtsField::new("host").analyzer("keyword"));
-        assert_eq!(
-            spec.fts_analyzers().expect("shipped"),
-            vec![Analyzer::Keyword]
+        let err = spec.check_analyzers().expect_err("unknown analyzer");
+        assert!(matches!(err, InfinoError::Config(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("title") && message.contains("whitespace"),
+            "{message}"
         );
+
+        let spec = IndexSpec::new().fts(
+            FtsField::new("host")
+                .analyzer("whitespace")
+                .analyzer("keyword"),
+        );
+        spec.check_analyzers().expect("the later name wins");
+        assert_eq!(spec.fts_analyzers(), vec![Analyzer::Keyword]);
     }
 }
