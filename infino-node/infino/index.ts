@@ -93,10 +93,11 @@ export interface SchemaPatch {
 /**
  * Storage and cache config the `connect` URI can't carry. All optional.
  *
- * Which options apply depends on the backend: `apiKey` is for a hosted
- * (Infino Cloud) connection, while the storage/cache options — `storageOptions`,
- * `cacheDir`, `cacheBudgetBytes`, `coldFetchMode`, `validate` — apply to **local
- * connections only**; Infino Cloud manages storage, so it ignores them.
+ * Which options apply depends on the backend: `apiKey` and `requestTimeoutMs`
+ * are for a hosted (Infino Cloud) connection, while the storage/cache options —
+ * `storageOptions`, `cacheDir`, `cacheBudgetBytes`, `coldFetchMode`, `validate`
+ * — apply to **local connections only**; Infino Cloud manages storage, so it
+ * ignores them.
  * `connectionMemoryBudgetBytes` applies to both.
  */
 export interface ConnectOptions {
@@ -132,6 +133,14 @@ export interface ConnectOptions {
    * `INFINO_API_KEY` environment variable when omitted.
    */
   apiKey?: string;
+  /**
+   * Deadline for each request on a hosted connection, in milliseconds, from
+   * connecting to the last byte of the answer. Past it the call throws an
+   * Error whose message starts with `Unavailable:`. Default 620000, a little
+   * past the longest a hosted request can run (600 s). A write that times out
+   * may still commit, so check before reissuing it. Ignored by local backends.
+   */
+  requestTimeoutMs?: number;
 }
 
 /** Row counts returned by `update` / `delete`. */

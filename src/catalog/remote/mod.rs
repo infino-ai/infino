@@ -34,7 +34,8 @@ const DOCUMENT_ENCODING: &str = "document";
 /// Longest wait to open the TCP and TLS connection to the endpoint.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Deadline for a request, from connecting to the last byte of the answer.
+/// Default deadline for a request, from connecting to the last byte of the
+/// answer; `ConnectOptions::with_request_timeout` overrides it.
 /// A hosted request can run up to 600 s, and an append, update or delete
 /// commits inside its request and answers after the commit. The client waits
 /// a little longer than that, so it never gives up on a write that still
@@ -42,7 +43,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// ureq 2 uses what is left of it as the timeout of each read and write, in
 /// place of `timeout_read` and `timeout_write`. It does not cover the DNS
 /// lookup.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(620);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(620);
 
 /// The HTTP client for a hosted connection. Without these bounds, a request on
 /// a connection that stops making progress waits forever, and so does every
@@ -74,12 +75,21 @@ pub(crate) struct RemoteCatalog {
 impl RemoteCatalog {
     /// Build a hosted connection. The key comes from `api_key` or, when unset,
     /// the `INFINO_API_KEY` environment variable; a hosted connection without a
-    /// key is a configuration error.
+    /// key is a configuration error. `request_timeout` is the deadline of each
+    /// request ([`DEFAULT_REQUEST_TIMEOUT`] when unset); zero is a
+    /// configuration error.
     pub(crate) fn new(
         base_url: String,
         database: String,
         api_key: Option<String>,
+        request_timeout: Option<Duration>,
     ) -> Result<Self, InfinoError> {
+        let request_timeout = request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+        if request_timeout.is_zero() {
+            return Err(InfinoError::Config(
+                "the request timeout of a hosted connection must be greater than zero".to_string(),
+            ));
+        }
         let api_key = api_key
             .or_else(|| std::env::var(API_KEY_ENV).ok())
             .filter(|k| !k.is_empty())
@@ -89,8 +99,8 @@ impl RemoteCatalog {
                 ))
             })?;
         Ok(Self {
-            agent: agent(CONNECT_TIMEOUT, REQUEST_TIMEOUT, true),
-            arrow_agent: agent(CONNECT_TIMEOUT, REQUEST_TIMEOUT, false),
+            agent: agent(CONNECT_TIMEOUT, request_timeout, true),
+            arrow_agent: agent(CONNECT_TIMEOUT, request_timeout, false),
             base_url,
             database,
             api_key,
@@ -324,13 +334,11 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{RemoteCatalog, agent, read_json};
+    use super::{RemoteCatalog, read_json};
     use crate::InfinoError;
 
     /// The request deadline of the test client.
     const TEST_TIMEOUT: Duration = Duration::from_millis(300);
-    /// The connect bound of the test client, longer than the test needs.
-    const TEST_CONNECT: Duration = Duration::from_secs(2);
     /// How long a stalled endpoint holds the connection before closing it.
     /// A client with no bound waits this long, past [`LATEST_RETURN`].
     const HOLD: Duration = Duration::from_secs(5);
@@ -350,15 +358,26 @@ mod tests {
     const LARGE_BODY: usize = 64 << 20;
 
     fn catalog(addr: &str) -> RemoteCatalog {
-        let mut catalog = RemoteCatalog::new(
+        RemoteCatalog::new(
             format!("http://{addr}"),
             "db".to_string(),
             Some("ik_test".to_string()),
+            Some(TEST_TIMEOUT),
         )
-        .expect("catalog");
-        catalog.agent = agent(TEST_CONNECT, TEST_TIMEOUT, true);
-        catalog.arrow_agent = agent(TEST_CONNECT, TEST_TIMEOUT, false);
-        catalog
+        .expect("catalog")
+    }
+
+    /// A zero deadline would fail every request at once; it is refused when
+    /// the connection is built.
+    #[test]
+    fn a_zero_request_timeout_is_refused() {
+        let result = RemoteCatalog::new(
+            "http://127.0.0.1:1".to_string(),
+            "db".to_string(),
+            Some("ik_test".to_string()),
+            Some(Duration::ZERO),
+        );
+        assert!(matches!(result, Err(InfinoError::Config(_))));
     }
 
     /// Read one request: the head, then the body its Content-Length names.

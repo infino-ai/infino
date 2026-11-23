@@ -727,9 +727,13 @@ mod tests {
     #[test]
     fn hydrate_is_unsupported_over_remote() {
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
-        let catalog =
-            RemoteCatalog::new("http://127.0.0.1:1".into(), "db".into(), Some("key".into()))
-                .expect("catalog");
+        let catalog = RemoteCatalog::new(
+            "http://127.0.0.1:1".into(),
+            "db".into(),
+            Some("key".into()),
+            None,
+        )
+        .expect("catalog");
         let table = RemoteTable::new(Arc::new(catalog), "t".into(), Arc::clone(&schema));
         let mut empty =
             RecordBatchIterator::new(Vec::<Result<RecordBatch, ArrowError>>::new(), schema);

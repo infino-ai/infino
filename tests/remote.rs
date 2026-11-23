@@ -722,6 +722,59 @@ async fn create_database_conflict_maps_to_already_exists() {
     assert!(matches!(err, InfinoError::AlreadyExists(_)), "got {err:?}");
 }
 
+/// A request timeout set on `ConnectOptions` ends a request whose answer
+/// comes later, as `Unavailable`, at that deadline rather than the default.
+#[tokio::test]
+async fn request_timeout_from_connect_options_ends_a_slow_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/list_tables/mydb"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([]))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let (result, waited) = tokio::task::spawn_blocking(move || {
+        let db = infino::connect_with(
+            format!("{uri}/mydb"),
+            ConnectOptions::new()
+                .with_api_key(KEY)
+                .with_request_timeout(Duration::from_millis(300)),
+        )
+        .expect("connect");
+        let start = std::time::Instant::now();
+        let result = db.list_tables();
+        (result, start.elapsed())
+    })
+    .await
+    .expect("blocking task");
+    assert!(
+        matches!(result, Err(InfinoError::Unavailable(_))),
+        "got {result:?}"
+    );
+    assert!(waited < Duration::from_secs(4), "waited {waited:?}");
+}
+
+/// A zero request timeout is refused at connect.
+#[test]
+fn zero_request_timeout_is_refused_at_connect() {
+    let result = infino::connect_with(
+        "http://127.0.0.1:1/mydb",
+        ConnectOptions::new()
+            .with_api_key(KEY)
+            .with_request_timeout(Duration::ZERO),
+    );
+    assert!(
+        matches!(result, Err(InfinoError::Config(_))),
+        "got {:?}",
+        result.err()
+    );
+}
+
 /// Collect the sorted, deduped `<op>` segment from each `/v1/<op>/…` path.
 fn path_segments(paths: impl Iterator<Item = String>) -> Vec<String> {
     let mut segs: Vec<String> = paths

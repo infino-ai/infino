@@ -302,8 +302,12 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             ));
         }
     };
-    let remote =
-        remote::RemoteCatalog::new(base_url, database, options.api_key().map(str::to_owned))?;
+    let remote = remote::RemoteCatalog::new(
+        base_url,
+        database,
+        options.api_key().map(str::to_owned),
+        options.request_timeout(),
+    )?;
     let connection_memory_budget = ConnectionMemoryBudget::from_budget_bytes(
         options
             .connection_memory_budget_bytes

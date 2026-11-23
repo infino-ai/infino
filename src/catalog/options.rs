@@ -6,7 +6,7 @@
 //! [`connect_with`](crate::connect_with); plain [`connect`](crate::connect)
 //! uses the default.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 #[cfg(any(test, feature = "test-helpers"))]
 use std::{
     fmt::{Debug, Formatter, Result as FmtResult},
@@ -97,6 +97,11 @@ pub struct ConnectOptions {
     /// When unset, a hosted connection falls back to the `INFINO_API_KEY`
     /// environment variable.
     pub(crate) api_key: Option<String>,
+    /// Deadline for each request on a hosted connection, from connecting to
+    /// the last byte of the answer. `None` (default) → 620 s, a little past
+    /// the longest a hosted request can run (600 s). Ignored by local
+    /// backends.
+    pub(crate) request_timeout: Option<Duration>,
     /// Test-only: wraps every storage provider the connection builds (the
     /// catalog root and each table's), so a test can slow or count reads.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -230,6 +235,29 @@ impl ConnectOptions {
         self
     }
 
+    /// Set the deadline for each request on a hosted (`https://<host>/<db>`)
+    /// connection, from connecting to the last byte of the answer. A request
+    /// that has not finished by then fails with
+    /// [`InfinoError::Unavailable`](crate::InfinoError::Unavailable).
+    /// Ignored by local backends. Chainable.
+    ///
+    /// The default, 620 s, is a little past the longest a hosted request can
+    /// run (600 s). A shorter deadline returns sooner from a stuck request,
+    /// but an append, update or delete commits inside its request: one that
+    /// times out may still commit, so check before retrying it. A zero
+    /// deadline is rejected at connect.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// The configured request deadline, if any (used by the hosted
+    /// transport).
+    #[cfg_attr(not(feature = "remote"), allow(dead_code))]
+    pub(crate) fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
+    }
+
     /// The configured API key, if any (used by the hosted transport). Only the
     /// `remote` transport reads this, so it is dead code in a build without it.
     #[cfg_attr(not(feature = "remote"), allow(dead_code))]
@@ -273,5 +301,12 @@ mod tests {
         let o = ConnectOptions::new().with_api_key("ik_test");
         assert_eq!(o.api_key(), Some("ik_test"));
         assert_eq!(ConnectOptions::new().api_key(), None);
+    }
+
+    #[test]
+    fn with_request_timeout_round_trips() {
+        let o = ConnectOptions::new().with_request_timeout(Duration::from_secs(30));
+        assert_eq!(o.request_timeout(), Some(Duration::from_secs(30)));
+        assert_eq!(ConnectOptions::new().request_timeout(), None);
     }
 }
