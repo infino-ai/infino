@@ -28,18 +28,18 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::create_exception;
-use pyo3::sync::PyOnceLock;
 use pyo3::exceptions::{
     PyException, PyKeyError, PyNotImplementedError, PyRuntimeError, PyValueError,
 };
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyList, PyModule};
 
 use infino::{
-    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, GcError,
-    InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
-    ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions,
-    SchemaError as SchemaCause, SchemaPatch, Stemmer,
+    Bm25FieldsOptions, Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings,
+    ConnectOptions, FieldClause, GcError, InfinoError as CoreError, Metric, OptimizeError,
+    OptimizeOptions, RecalibratePolicy, ReindexError, ReindexMode,
+    ReindexOptions as CoreReindexOptions, SchemaError as SchemaCause, SchemaPatch, Stemmer,
     Stopwords, VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
@@ -1000,6 +1000,47 @@ impl Table {
         batches_to_pyarrow_table(py, batches)
     }
 
+    /// BM25 over several FTS columns at once, scored *best fields*. Returns
+    /// a pyarrow `Table`, best first, ties by ascending `_id`.
+    ///
+    /// `clauses` is a sequence of `{"query": str, "fields": [str, ...]}`
+    /// dicts (or `(query, fields)` pairs). Each clause scores a row by its
+    /// best column (the largest `weight * BM25` among its `fields`), and the
+    /// row's score is the sum over the clauses it matches: one `dis_max`
+    /// (tie breaker 0) per clause, summed, as a multi-field `query_string`
+    /// or `multi_match` of type `best_fields` ranks. Each column keeps its
+    /// own analyzer and table-wide statistics.
+    ///
+    /// `mode` is `"or"` (default: a row matching any clause is a hit) or
+    /// `"and"` (it must match every clause), and is also the mode of each
+    /// clause's bare terms, as in `bm25_search`. `weights` maps a column to
+    /// what its scores are multiplied by (1 for a column not named).
+    /// `projection` is as for `bm25_search`.
+    #[pyo3(signature = (clauses, k, mode=None, weights=None, projection=None))]
+    fn bm25_search_fields<'py>(
+        &self,
+        py: Python<'py>,
+        clauses: &Bound<'py, PyAny>,
+        k: usize,
+        mode: Option<&str>,
+        weights: Option<HashMap<String, f32>>,
+        projection: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let clauses = field_clauses(clauses)?;
+        let mut opts = Bm25FieldsOptions::new().with_mode(parse_mode(mode)?);
+        for (column, weight) in weights.unwrap_or_default() {
+            opts = opts.with_weight(column, weight);
+        }
+        let batches = py
+            .detach(|| {
+                let names = projection_refs(&projection);
+                self.inner
+                    .bm25_search_fields(&clauses, k, &opts, names.as_deref())
+            })
+            .map_err(py_err)?;
+        batches_to_pyarrow_table(py, batches)
+    }
+
     /// Vector kNN over one vector column. `query` is a `list[float]`.
     /// Returns a pyarrow `Table`. `projection` names the output columns
     /// (`_id`, any scalar column, or the trailing `score` — a distance,
@@ -1497,6 +1538,37 @@ fn batches_to_pyarrow_table<'py>(
         .call_method1("from_batches", (py_batches,))
 }
 
+/// `bm25_search_fields` clauses from a sequence of `{"query", "fields"}`
+/// dicts or `(query, fields)` pairs.
+fn field_clauses(clauses: &Bound<'_, PyAny>) -> PyResult<Vec<FieldClause>> {
+    let invalid = || {
+        pyo3::exceptions::PyTypeError::new_err(
+            "bm25_search_fields: each clause must be a {\"query\": str, \"fields\": [str]} \
+             dict or a (query, fields) pair",
+        )
+    };
+    let mut out = Vec::new();
+    for item in clauses.try_iter()? {
+        let item = item?;
+        let (query, fields): (String, Vec<String>) = match item.cast::<PyDict>() {
+            Ok(dict) => {
+                if dict.len() != 2 {
+                    return Err(invalid());
+                }
+                let query = dict.get_item("query")?.ok_or_else(invalid)?;
+                let fields = dict.get_item("fields")?.ok_or_else(invalid)?;
+                (
+                    query.extract().map_err(|_| invalid())?,
+                    fields.extract().map_err(|_| invalid())?,
+                )
+            }
+            Err(_) => item.extract().map_err(|_| invalid())?,
+        };
+        out.push(FieldClause::new(query, fields));
+    }
+    Ok(out)
+}
+
 /// Parse the `"or"` (default) / `"and"` boolean mode argument.
 fn parse_mode(mode: Option<&str>) -> PyResult<BoolMode> {
     match mode.unwrap_or("or").to_ascii_lowercase().as_str() {
@@ -1708,7 +1780,8 @@ def nulled(value):
         .unbind())
     })?;
     let cleaned = nulled.bind(py).call1((records,))?;
-    json.call_method("dumps", (cleaned,), Some(strict))?.extract()
+    json.call_method("dumps", (cleaned,), Some(strict))?
+        .extract()
 }
 
 /// Rows carrying values JSON cannot spell, as one batch typed by the table's

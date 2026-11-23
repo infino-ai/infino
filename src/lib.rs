@@ -212,7 +212,10 @@ pub use superfile::{
 };
 pub use supertable::{
     Consistency, GcError, GcReport, MutationStats, OptimizeError, ReindexError,
-    query::vector::VectorFilter,
+    query::{
+        multi_field::{Bm25FieldsOptions, FieldClause},
+        vector::VectorFilter,
+    },
     reindex::{PlannedRepair, ReindexReport, StalenessReport},
     schema::{
         ColumnIndex, FieldDef, FieldId, TableSchema,

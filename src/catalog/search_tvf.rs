@@ -4,7 +4,7 @@
 //! Catalog-level search table-valued functions.
 //!
 //! The single-table search TVFs (`bm25_search` / `bm25_search_prefix` /
-//! `vector_search` / `hybrid_search` / `token_match` / `exact_match`)
+//! `bm25_search_fields` / `vector_search` / `hybrid_search` / `token_match` / `exact_match`)
 //! capture one supertable reader and take column-first arguments — they
 //! bind to the lone `FROM supertable` provider. Under the catalog,
 //! several tables share one session, so the TVF can't know which table
@@ -44,6 +44,7 @@ use crate::{
         handle::SupertableReader,
         query::exec::{
             common::{Arity, arg_to_string},
+            fields_exec::{BM25_FIELDS_ARITY, BM25_FIELDS_UDTF, Bm25FieldsFunc},
             fts_exec::{
                 BM25_PREFIX_SEARCH_ARITY, BM25_PREFIX_UDTF, BM25_SEARCH_ARITY, BM25_SEARCH_UDTF,
                 Bm25PrefixFunc, Bm25SearchFunc,
@@ -289,7 +290,8 @@ impl TableResolver {
 /// full-text ones.
 #[derive(Debug, Clone, Copy)]
 enum IndexedColumns {
-    /// `bm25_search`, `bm25_search_prefix`, `token_match`, `exact_match`.
+    /// `bm25_search`, `bm25_search_prefix`, `bm25_search_fields`,
+    /// `token_match`, `exact_match`.
     FullText,
     /// `vector_search`.
     Vector,
@@ -311,6 +313,12 @@ pub(crate) fn register_search_tvfs(
     ctx.register_udtf(
         BM25_SEARCH_UDTF,
         Arc::new(Bm25SearchCatalogFunc {
+            resolver: Arc::clone(&resolver),
+        }),
+    );
+    ctx.register_udtf(
+        BM25_FIELDS_UDTF,
+        Arc::new(Bm25FieldsCatalogFunc {
             resolver: Arc::clone(&resolver),
         }),
     );
@@ -433,6 +441,24 @@ impl TableFunctionImpl for Bm25SearchCatalogFunc {
         )?;
 
         Bm25SearchFunc::new(t.reader, t.scalar_schema)
+            .call_with_args(TableFunctionArgs::new(rest, args.session()))
+    }
+}
+
+#[derive(Debug)]
+struct Bm25FieldsCatalogFunc {
+    resolver: Arc<TableResolver>,
+}
+impl TableFunctionImpl for Bm25FieldsCatalogFunc {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let (t, rest) = self.resolver.split_checked(
+            args.exprs(),
+            BM25_FIELDS_UDTF,
+            BM25_FIELDS_ARITY,
+            IndexedColumns::FullText,
+        )?;
+
+        Bm25FieldsFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
     }
 }

@@ -4511,7 +4511,7 @@ async fn narrow_ties_by_id(
 /// single-segment engine's docid-ordered ties, independent of layout or
 /// completion order. `_id`s are resolved up front here — cheap because the
 /// shared floor caps the candidate set near k.
-async fn select_top_k_stable(
+pub(crate) async fn select_top_k_stable(
     tr: &SupertableReader,
     per_unit: Vec<Vec<SuperfileHit>>,
     k: usize,

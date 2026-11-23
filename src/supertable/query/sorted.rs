@@ -972,7 +972,7 @@ pub(crate) fn sorted_statement(
 }
 
 /// `name` as a quoted SQL identifier.
-fn quote(name: &str) -> String {
+pub(crate) fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 

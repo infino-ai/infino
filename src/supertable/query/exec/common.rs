@@ -158,7 +158,7 @@ static SEARCH_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 /// fewer than `k` rows standing (see [`fill_top_k`]). Doubling bounds the
 /// total work at about twice the final round's, whatever the predicate's
 /// selectivity turns out to be.
-const OVER_FETCH_GROWTH: usize = 2;
+pub(crate) const OVER_FETCH_GROWTH: usize = 2;
 
 /// How many times `k` a fill may grow to before it gives up and returns
 /// what it has (see [`over_fetch_ceiling`]). Without a ceiling the growth
@@ -2474,12 +2474,13 @@ impl Arity {
     }
 
     /// The count an error states with `leading` more arguments in front:
-    /// `3`, or `3 or 4` when the last is optional.
+    /// `3`, `3 or 4` when the last is optional, `3 to 5` when more are.
     pub(crate) fn count(&self, leading: usize) -> String {
-        if self.min == self.max {
-            (self.min + leading).to_string()
-        } else {
-            format!("{} or {}", self.min + leading, self.max + leading)
+        let (min, max) = (self.min + leading, self.max + leading);
+        match max - min {
+            0 => min.to_string(),
+            1 => format!("{min} or {max}"),
+            _ => format!("{min} to {max}"),
         }
     }
 

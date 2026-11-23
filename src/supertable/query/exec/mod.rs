@@ -14,11 +14,13 @@
 
 pub(crate) mod cached_scan_exec;
 pub mod common;
+pub mod fields_exec;
 pub mod fts_exec;
 #[cfg(feature = "graph-index")]
 pub mod graph_exec;
 pub mod hybrid_exec;
 pub mod match_exec;
 pub mod metered_exec;
+pub(crate) mod ordered_coalesce_exec;
 pub(crate) mod staged_coalesce_exec;
 pub mod vector_exec;

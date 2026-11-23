@@ -2685,6 +2685,8 @@ impl TableProvider for SupertableProvider {
             }
             _ => (None, None),
         };
+        #[cfg(test)]
+        walk_probe::scan_handed(&self.manifest.superfiles, top_k_rows.as_ref());
         let survivor_entries = match &top_k_rows {
             Some(rows) => survivor_entries
                 .into_iter()
@@ -4052,8 +4054,9 @@ fn walk_fell_back(
     Err(cause)
 }
 
-/// Test hooks into the top-k walk over one table, named by one of its files: run an action between
-/// the walk and its deletes check, make the walk fail, and count walks and why they fell back.
+/// Test hooks into the top-k over one table, named by one of its files: run an action between the
+/// walk and its deletes check, make the walk or the id read fail, count walks and why they fell
+/// back, and record the rows the top-k handed its scan.
 #[cfg(test)]
 pub(crate) mod walk_probe {
     use std::{
@@ -4061,6 +4064,7 @@ pub(crate) mod walk_probe {
         sync::{Arc, Mutex},
     };
 
+    use roaring::RoaringBitmap;
     use uuid::Uuid;
 
     use crate::supertable::{
@@ -4076,6 +4080,7 @@ pub(crate) mod walk_probe {
         fail_with: Option<QueryError>,
         fail_id_read: Option<QueryError>,
         fallbacks: Vec<WalkFallback>,
+        handed: Option<u64>,
         walks: usize,
         windows: usize,
         walked: usize,
@@ -4124,6 +4129,26 @@ pub(crate) mod walk_probe {
     /// Make the next id read of a top-k over the watched table fail with `error`.
     pub(crate) fn fail_next_id_read(superfile: Uuid, error: QueryError) {
         watched(superfile, |a| a.fail_id_read = Some(error));
+    }
+
+    /// Whether an id-read failure armed for the watched table is still waiting to fire.
+    pub(crate) fn id_read_armed(superfile: Uuid) -> bool {
+        watched(superfile, |a| a.fail_id_read.is_some()).unwrap_or(false)
+    }
+
+    /// Rows the top-k of the last scan over the watched table handed it, `None` when it handed no
+    /// rows (no top-k, or one that scans every file).
+    pub(crate) fn rows_handed(superfile: Uuid) -> Option<u64> {
+        watched(superfile, |a| a.handed).flatten()
+    }
+
+    /// A scan over the table of `files` was handed `rows` by its top-k.
+    pub(super) fn scan_handed(
+        files: &[Arc<SuperfileEntry>],
+        rows: Option<&HashMap<Uuid, RoaringBitmap>>,
+    ) {
+        let handed = rows.map(|rows| rows.values().map(RoaringBitmap::len).sum());
+        with(files, |a| a.handed = handed);
     }
 
     /// Walks started over the watched table.
