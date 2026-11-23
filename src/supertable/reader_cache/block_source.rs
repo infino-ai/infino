@@ -2078,7 +2078,7 @@ impl BlockCachedSource {
         Some(Bytes::from(out))
     }
 
-    /// Marks the file as being opened. Until [`Self::opened`], a read that
+    /// Marks the file as being opened. Until [`Self::end_opening`], a read that
     /// misses fetches the whole blocks it touches and holds them: a source
     /// whose entry is not live yet fills no blocks itself, so without this
     /// every open would fetch the open batch and the page index again.
@@ -2086,18 +2086,29 @@ impl BlockCachedSource {
         *self.opening.lock().expect("opening mutex poisoned") = Some(OpeningReads::default());
     }
 
-    /// The open is over. Keeps the blocks it read when this source is the live
-    /// entry; drops them otherwise. An open that fails never gets here, and
-    /// the held blocks go with the source.
-    pub(crate) fn opened(&self) {
-        let opening = self.opening.lock().expect("opening mutex poisoned").take();
-        for (start, bytes) in opening.map(|opening| opening.reads).unwrap_or_default() {
+    /// The open is over: stops holding reads and returns the ones held, for
+    /// [`Self::keep_held`] once the entry is live. Called before the entry is
+    /// shared, so no other query's read is held. An open that fails never gets
+    /// here, and the held blocks go with the source.
+    pub(crate) fn end_opening(&self) -> Vec<(u64, Bytes)> {
+        self.opening
+            .lock()
+            .expect("opening mutex poisoned")
+            .take()
+            .map(|opening| opening.reads)
+            .unwrap_or_default()
+    }
+
+    /// Keeps the blocks of reads [`Self::end_opening`] returned when this
+    /// source is the live entry; drops them otherwise.
+    pub(crate) fn keep_held(&self, reads: Vec<(u64, Bytes)>) {
+        for (start, bytes) in reads {
             self.keep(start, &bytes);
         }
     }
 
     /// A read that misses while the file is being opened: fetches the whole
-    /// blocks it touches and holds them for [`Self::opened`]. `None` when not
+    /// blocks it touches and holds them for [`Self::end_opening`]. `None` when not
     /// opening, or when holding the blocks would pass
     /// [`OPENING_HOLD_MAX_BYTES`] or the store could not write them anyway.
     async fn read_while_opening(
@@ -3301,8 +3312,9 @@ mod tests {
         let _ = src.range(past, 100).await.expect("read past the cap");
         assert_eq!(inner.calls(), 2);
 
+        let held = src.end_opening();
         store.install_block_entry_for_test(uri, Arc::clone(&src));
-        src.opened();
+        src.keep_held(held);
         store.block_writes_settled().await;
         assert_eq!(
             src.filled_bytes_handle().load(Ordering::Acquire),
@@ -3325,7 +3337,8 @@ mod tests {
         let (_uri, _inner, src) = opening_source(dir.path(), &store, 4 * b as usize);
 
         let _ = src.range(b + 5, 100).await.expect("read while opening");
-        src.opened();
+        let held = src.end_opening();
+        src.keep_held(held);
         store.block_writes_settled().await;
         assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 0);
         assert_eq!(store.stats().current_bytes, 0);

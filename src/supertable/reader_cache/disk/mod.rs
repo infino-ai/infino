@@ -822,6 +822,7 @@ impl DiskCacheStore {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::{
+        iter,
         ops::Range,
         os::unix::fs::MetadataExt,
         sync::{
@@ -831,7 +832,7 @@ pub(crate) mod test_support {
         time::{Duration, Instant},
     };
 
-    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_array::{ArrayRef, Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -1220,6 +1221,31 @@ pub(crate) mod test_support {
             vec![Arc::new(ids), Arc::new(LargeStringArray::from(titles))],
         )
         .expect("batch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(b.finish().expect("finish"))
+    }
+
+    /// Columns in [`wide_superfile_bytes`]: enough that its footer and page index don't fit in
+    /// the tail a lazy open reads first.
+    const WIDE_COLUMNS: usize = 1_000;
+    /// Rows in [`wide_superfile_bytes`].
+    const WIDE_ROWS: u64 = 16;
+
+    /// A scalar superfile with many columns, so a lazy open reads the footer and page index past
+    /// its first tail read, through its block source.
+    pub(crate) fn wide_superfile_bytes() -> Bytes {
+        let fields: Vec<Field> = iter::once(decimal128_id_field("doc_id"))
+            .chain((0..WIDE_COLUMNS).map(|c| Field::new(format!("c{c}"), DataType::Int64, false)))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let values = Int64Array::from((0..WIDE_ROWS as i64).collect::<Vec<i64>>());
+        let columns: Vec<ArrayRef> =
+            iter::once(Arc::new(decimal128_ids((1..=WIDE_ROWS).collect::<Vec<u64>>())) as ArrayRef)
+                .chain((0..WIDE_COLUMNS).map(|_| Arc::new(values.clone()) as ArrayRef))
+                .collect();
+        let batch = RecordBatch::try_new(schema, columns).expect("batch");
         b.add_batch(&batch, &[]).expect("add_batch");
         Bytes::from(b.finish().expect("finish"))
     }

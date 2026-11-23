@@ -904,6 +904,8 @@ impl DiskCacheStore {
         });
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
 
+        // Before admission shares the entry, so no other query's read is held.
+        let held = block_source.end_opening();
         // Admission may return an existing whole file instead; serve what it returns. Either way
         // admission takes the reserved bytes over: the new entry holds them, or admission
         // releases them when a whole file already holds the slot.
@@ -915,7 +917,7 @@ impl DiskCacheStore {
             unadmitted.admitted();
         }
         // The entry is live now, so the blocks the open read can be kept.
-        block_source.opened();
+        block_source.keep_held(held);
 
         Ok(admitted)
     }
@@ -5584,14 +5586,16 @@ mod tests {
         assert_eq!(restarted.stats().current_bytes, 0);
     }
 
-    /// A lazy open keeps what it reads, so once its entry leaves the cache a reopen of the file
-    /// reads the open batch and the page index from disk and sends no GET.
+    /// A lazy open keeps what it reads, both its open batch and what the reader reads past it (the
+    /// footer and page index of a file whose metadata outgrows the tail read), so once its entry
+    /// leaves the cache a reopen of the file reads them from disk and sends no GET.
     #[tokio::test]
     async fn a_reopen_reads_its_open_batch_from_disk() {
         let (_dir, store, recording) = store_over_recording();
         let uri = SuperfileUri::new_v4();
-        let bytes = tiny_superfile_bytes();
-        let offsets = offsets_without_open_blob(bytes.len() as u64);
+        let bytes = wide_superfile_bytes();
+        let size = bytes.len() as u64;
+        let offsets = offsets_without_open_blob(size);
         put_superfile(&store, &uri, bytes).await;
         let storage = Arc::clone(&recording) as Arc<dyn StorageProvider>;
         let key = uri.storage_path();
@@ -5599,7 +5603,12 @@ mod tests {
 
         let first = store.open_for_query(&uri, &key, Some(&offsets), Some(&storage), intent);
         drop(first.await.expect("first open"));
-        assert!(recording.n_ranges() > 0, "the first open reads the object");
+        let tail_start = size - DEFAULT_TAIL_SPECULATIVE_BYTES;
+        let gets = recording.ranges_since(0);
+        assert!(
+            gets.iter().any(|range| range.start < tail_start),
+            "the open reads past its tail read: {gets:?}"
+        );
         store.block_writes_settled().await;
         assert!(
             store.release_lazy_entry(&uri, store.now_us()).is_some(),
