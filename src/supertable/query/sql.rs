@@ -65,7 +65,9 @@ use arrow::{
     compute::{cast, concat_batches},
     record_batch::RecordBatch,
 };
-use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
+use arrow_array::{
+    Array, Decimal128Array, Int64Array, builder::LargeStringBuilder, new_empty_array,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
     catalog::{CatalogProviderList, MemoryCatalogProviderList},
@@ -228,6 +230,53 @@ fn value_counts_batch(
         new_empty_array(value_type)
     } else {
         ScalarValue::iter_to_array(values).map_err(QueryError::DataFusion)?
+    };
+    RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![values, Arc::new(Int64Array::from(tallies))],
+    )
+    .map(Some)
+    .map_err(QueryError::internal)
+}
+
+/// [`value_counts_batch`] for values held as UTF-8 bytes, as terms are:
+/// each value of `counts` above zero, then a null-keyed row counting `nulls`
+/// when there are any. Both columns are built whole rather than one scalar
+/// per value, which a table of many distinct values makes the larger cost.
+/// `None` when a value is not UTF-8 or a count is past what the count column
+/// holds.
+fn term_counts_batch(
+    schema: &SchemaRef,
+    counts: &HashMap<Vec<u8>, u64>,
+    nulls: u64,
+) -> Result<Option<RecordBatch>, QueryError> {
+    let held = || counts.iter().filter(|(_, count)| **count > 0);
+    let (terms, bytes) = held().fold((0, 0), |(terms, bytes), (term, _)| {
+        (terms + 1, bytes + term.len())
+    });
+    let rows = terms + usize::from(nulls > 0);
+    let mut values = LargeStringBuilder::with_capacity(rows, bytes);
+    let mut tallies = Vec::with_capacity(rows);
+    for (term, &count) in held() {
+        let (Ok(text), Ok(count)) = (str::from_utf8(term), i64::try_from(count)) else {
+            return Ok(None);
+        };
+        values.append_value(text);
+        tallies.push(count);
+    }
+    if nulls > 0 {
+        let Ok(count) = i64::try_from(nulls) else {
+            return Ok(None);
+        };
+        values.append_null();
+        tallies.push(count);
+    }
+    let value_type = schema.field(0).data_type();
+    // A table with no rows has neither a value nor a null.
+    let values = if rows == 0 {
+        new_empty_array(value_type)
+    } else {
+        cast(&values.finish(), value_type).map_err(QueryError::internal)?
     };
     RecordBatch::try_new(
         Arc::clone(schema),
@@ -865,14 +914,7 @@ impl SupertableReader {
             };
             *count = live;
         }
-        let mut values = Vec::with_capacity(counts.len());
-        for (term, count) in counts.into_iter().filter(|(_, count)| *count > 0) {
-            let Ok(text) = String::from_utf8(term) else {
-                return Ok(None);
-            };
-            values.push((ScalarValue::LargeUtf8(Some(text)), count));
-        }
-        value_counts_batch(schema, values, inputs.nulls)
+        term_counts_batch(schema, &counts, inputs.nulls)
     }
 
     /// The live rows each of `predicates` holds, in order, exactly as
