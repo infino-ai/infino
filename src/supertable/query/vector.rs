@@ -1473,9 +1473,8 @@ fn column_metric(
 ///   clamped to ≈ the total has no subset to concentrate on, so the graph buys
 ///   nothing. An unstamped table (`None`) carries no concentration signal →
 ///   `stamped`.
-/// - SCALE — `n_docs >= scale_floor_docs`. The selected clusters coalesce into
-///   a cold-read win only at large N (the graph measured a win at 10M+, a loss
-///   at 1M, where the selection is spread too thin across cells to coalesce).
+/// - SCALE: `n_docs >= scale_floor_docs`. On a very small table the selection
+///   is spread too thin across cells for the graph to pay off.
 pub(crate) fn auto_router_choice(
     stamped_fanout: Option<usize>,
     total_fine_clusters: usize,
