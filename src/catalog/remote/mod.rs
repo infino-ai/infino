@@ -35,11 +35,14 @@ const DOCUMENT_ENCODING: &str = "document";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Deadline for a request, from connecting to the last byte of the answer.
-/// The service ends its own requests at 600 s; the rest is for connecting.
+/// A hosted request can run up to 600 s, and an append, update or delete
+/// commits inside its request and answers after the commit. The client waits
+/// a little longer than that, so it never gives up on a write that still
+/// commits: a retry of that write would apply it twice.
 /// ureq 2 uses what is left of it as the timeout of each read and write, in
 /// place of `timeout_read` and `timeout_write`. It does not cover the DNS
 /// lookup.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(610);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(620);
 
 /// The HTTP client for a hosted connection. Without these bounds, a request on
 /// a connection that stops making progress waits forever, and so does every
