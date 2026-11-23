@@ -875,6 +875,14 @@ impl SharedTopK {
             last.score == floor && last.id_max < id_min
         }
     }
+
+    /// The floor for a unit [`Self::tie_skippable`] judged at `tied`: only
+    /// scores above `tied` can enter, since its ties lose. A floor raised
+    /// past `tied` since then is kept as is, ties included: the scores that
+    /// raised it came from `_id`s this unit was never compared against.
+    fn strict_floor(&self, tied: f32) -> f32 {
+        self.floor().max(tied.next_up())
+    }
 }
 
 /// Where each kept superfile's postings for a query's terms sit, per the
@@ -2071,9 +2079,12 @@ impl SupertableReader {
                 // the tied score), so it scores from candidate norms too
                 // rather than reading the whole length array. Not under a
                 // score tolerance, whose floor is not the k-th score.
+                // The floor the tie was judged at: one that rises before
+                // scoring has ties this unit's `_id`s were never compared to.
+                let tied_floor = shared.floor();
                 let ties_lose = !exact_count
                     && score_tolerance <= 0.0
-                    && shared.tie_skippable(shared.floor(), params.id_min);
+                    && shared.tie_skippable(tied_floor, params.id_min);
                 let lone_term = must_arc.len() + should_arc.len() == 1
                     && neg_arc.is_empty()
                     && must_ph_arc.is_empty()
@@ -2082,11 +2093,7 @@ impl SupertableReader {
                 // One bare term with a block or less of postings here scores
                 // from those documents' buckets alone (see `few_norms`), so
                 // prewarming the whole length array would only add its bytes.
-                let few_postings = must_arc.len() + should_arc.len() == 1
-                    && neg_arc.is_empty()
-                    && must_ph_arc.is_empty()
-                    && should_ph_arc.is_empty()
-                    && neg_ph_arc.is_empty()
+                let few_postings = lone_term
                     && must_arc
                         .iter()
                         .chain(should_arc.iter())
@@ -2173,7 +2180,7 @@ impl SupertableReader {
                 // An exact count prunes nothing, so it takes no floor.
                 let floor = match (exact_count, ties_lose) {
                     (true, _) => f32::NEG_INFINITY,
-                    (false, true) => shared.floor().next_up(),
+                    (false, true) => shared.strict_floor(tied_floor),
                     (false, false) => shared.floor(),
                 };
                 // Few documents of a multi-term or phrase query can reach the
@@ -5276,6 +5283,25 @@ mod tests {
         assert!(
             seeded.tie_skippable(1.0, 100),
             "real scores equal to the seeds replace them"
+        );
+    }
+
+    #[test]
+    fn a_strict_floor_keeps_ties_at_a_floor_raised_after_the_tie_check() {
+        let shared = SharedTopK::new(1);
+        shared.merge(50, [1.0]);
+        let tied = shared.floor();
+        assert!(shared.tie_skippable(tied, 100));
+        assert!(
+            shared.strict_floor(tied) > tied,
+            "a tie at the checked floor loses"
+        );
+        // A unit at id 200 raises the floor before the one at 100 scores.
+        shared.merge(200, [2.0]);
+        assert_eq!(
+            shared.strict_floor(tied),
+            2.0,
+            "id 100 wins a tie at the raised floor, so a score of 2 is kept"
         );
     }
 
