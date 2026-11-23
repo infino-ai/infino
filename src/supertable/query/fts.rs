@@ -3384,7 +3384,10 @@ impl SupertableReader {
         dispatch::fanout_with_ordered(
             self,
             units,
-            |answered| MatchOrder::window(answered, widest),
+            |answered| order.walk_window(answered, widest),
+            // The walk's window is the one it wants from the start: a walk
+            // that cannot pass superfiles opens them all at once.
+            false,
             |(best, _): &(u64, P)| order.passed(*best),
             ordered,
             |_| {},
@@ -4076,11 +4079,13 @@ impl SupertableReader {
         let op_stats = self.op_stats.clone();
         let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
         let budget = Arc::clone(&self.manifest().options.connection_memory_budget);
+        let walk = order.cloned();
         let body = move |r: Arc<SuperfileReader>,
                          entry: Arc<SuperfileEntry>,
                          tombstone_cache: Option<Arc<SidecarCache>>,
                          now: Instant,
                          _: ()| {
+            let walk = walk.clone();
             let column_arc = Arc::clone(&column_arc);
             let value_arc = Arc::clone(&value_arc);
             let tokens_arc = Arc::clone(&tokens_arc);
@@ -4127,6 +4132,14 @@ impl SupertableReader {
                     if let Some(rows) = filter.rows(&r, entry.superfile_id, hits, false).await? {
                         candidates.retain(|d| rows.contains(*d));
                     }
+                }
+                // Under an ORDER BY walk, a candidate whose key cannot place
+                // is dropped before its value is read: the sort key is a
+                // fixed-width column, the value a string.
+                if let Some(walk) = &walk
+                    && !candidates.is_empty()
+                {
+                    candidates = walk.prefilter(&r, candidates).await?;
                 }
                 if candidates.is_empty() {
                     return Ok(Vec::new());

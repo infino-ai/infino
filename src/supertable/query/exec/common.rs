@@ -900,6 +900,7 @@ pub(crate) async fn exact_scope(
         reader,
         units,
         |_| window,
+        true,
         |_| false,
         body,
         |_| {},
