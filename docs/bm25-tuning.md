@@ -330,7 +330,7 @@ refused at `create_table`. See
 | Splitting | Unicode UAX #29 word boundaries; segments containing an alphanumeric or an emoji are kept | None: the whole value is one term |
 | Case | Full Unicode lowercasing | Kept: `Foo` and `foo` are different terms |
 | Non-ASCII | Preserved, so accented and non-Latin scripts stay searchable | Preserved, byte for byte |
-| Length cap | 255 characters per token | None |
+| Length cap | 255 characters per token | 32,766 bytes per value; an append carrying a longer one is refused |
 | Empty string | No tokens | One term, the empty string |
 | Filters | Stopwords and a stemmer may follow | None; declaring either is refused |
 

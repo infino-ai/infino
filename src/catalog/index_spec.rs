@@ -94,7 +94,9 @@ impl FtsField {
     /// three different terms. It suits exact values such as host names,
     /// paths or status codes. A query on such a column is one whole value
     /// too. It takes no [`stopwords`](FtsField::stopwords) or
-    /// [`stemmer`](FtsField::stemmer).
+    /// [`stemmer`](FtsField::stemmer). A value is at most 32,766 bytes, the
+    /// longest term Lucene takes too: an append carrying a longer one is
+    /// refused whole, as [`SchemaError::KeywordTooLong`](crate::SchemaError::KeywordTooLong).
     pub fn analyzer(mut self, name: impl Into<String>) -> Self {
         self.analyzer = name.into();
         self

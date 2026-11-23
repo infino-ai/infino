@@ -379,6 +379,10 @@ pub infino::SchemaError::InvalidRow::row: usize
 pub infino::SchemaError::InvalidType
 pub infino::SchemaError::InvalidType::column: alloc::string::String
 pub infino::SchemaError::InvalidType::reason: alloc::string::String
+pub infino::SchemaError::KeywordTooLong
+pub infino::SchemaError::KeywordTooLong::column: alloc::string::String
+pub infino::SchemaError::KeywordTooLong::len: usize
+pub infino::SchemaError::KeywordTooLong::max: usize
 pub infino::SchemaError::MissingColumn
 pub infino::SchemaError::MissingColumn::column: alloc::string::String
 pub infino::SchemaError::MixedArray

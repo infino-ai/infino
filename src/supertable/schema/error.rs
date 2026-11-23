@@ -56,6 +56,22 @@ pub enum SchemaError {
         /// The column's name.
         column: String,
     },
+    /// A value of a column indexed by the `keyword` analyzer is longer than
+    /// a term may be. The whole value is one term, kept in the column's
+    /// dictionary and in the bounds each file records, so it is refused at
+    /// append rather than carried in every one of them.
+    #[error(
+        "column `{column}` is indexed by the keyword analyzer, which keeps each value as one \
+         term of at most {max} bytes, and the batch carries a value of {len} bytes"
+    )]
+    KeywordTooLong {
+        /// The column's name.
+        column: String,
+        /// The value's length in bytes.
+        len: usize,
+        /// The longest a keyword term may be, in bytes.
+        max: usize,
+    },
     /// A value does not fit the column's type. The mapper picks a type the
     /// values fit, so this is a value the type was not picked from: one the
     /// table already froze, or one a wider value shares a column with.
@@ -289,6 +305,7 @@ impl SchemaError {
             SchemaError::IdentityMismatch { .. } => "IdentityMismatch",
             SchemaError::MissingColumn { .. } => "MissingColumn",
             SchemaError::NullInNonNullable { .. } => "NullInNonNullable",
+            SchemaError::KeywordTooLong { .. } => "KeywordTooLong",
             SchemaError::ValueOutOfRange { .. } => "ValueOutOfRange",
             SchemaError::IntegerNotExactInFloat { .. } => "IntegerNotExactInFloat",
             SchemaError::MixedArray { .. } => "MixedArray",
@@ -338,6 +355,11 @@ mod tests {
             },
             SchemaError::MissingColumn { column: column() },
             SchemaError::NullInNonNullable { column: column() },
+            SchemaError::KeywordTooLong {
+                column: column(),
+                len: 2,
+                max: 1,
+            },
             SchemaError::ValueOutOfRange {
                 column: column(),
                 value: "1".into(),
@@ -416,6 +438,7 @@ mod tests {
             | SchemaError::IdentityMismatch { .. }
             | SchemaError::MissingColumn { .. }
             | SchemaError::NullInNonNullable { .. }
+            | SchemaError::KeywordTooLong { .. }
             | SchemaError::ValueOutOfRange { .. }
             | SchemaError::IntegerNotExactInFloat { .. }
             | SchemaError::MixedArray { .. }

@@ -1176,8 +1176,16 @@ impl Tokenizer for StandardTokenizer {
 /// Name of the keyword tokenizer.
 pub const KEYWORD_TOKENIZER: &str = "keyword";
 
+/// The longest value, in bytes, a `keyword` column takes: an append
+/// carrying a longer one is refused. A keyword value is one term, held whole
+/// in the column's dictionary and in the lowest and highest term each file
+/// and part records, so one very long value would ride in every manifest
+/// load. Lucene caps a term at the same length.
+pub(crate) const KEYWORD_TERM_MAX_BYTES: usize = 32_766;
+
 /// The whole value is one term, byte for byte: no splitting, case
-/// folding, trimming or length cap. The empty string is a term too.
+/// folding or trimming. The empty string is a term too. Appends refuse a
+/// value past [`KEYWORD_TERM_MAX_BYTES`], so no longer term reaches it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KeywordTokenizer;
 

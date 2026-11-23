@@ -3414,6 +3414,66 @@ mod tests {
         }
     }
 
+    /// A keyword value of 32,766 bytes, the longest a term may be, is
+    /// stored; one byte more refuses the whole batch, naming the column and
+    /// the length, and writes none of it. A `standard` column beside it takes
+    /// the same long text.
+    #[test]
+    fn a_keyword_value_past_the_term_cap_refuses_its_batch() {
+        const KEYWORD_TERM_MAX: usize = 32_766;
+        let (conn, _dir) = storage_conn();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("kw", DataType::LargeUtf8, true),
+            Field::new("body", DataType::LargeUtf8, true),
+        ]));
+        let table = conn
+            .create_table(
+                "capped_kws",
+                Arc::clone(&schema),
+                IndexSpec::new()
+                    .fts(FtsField::new("kw").analyzer("keyword"))
+                    .fts("body"),
+            )
+            .expect("create");
+        let batch = |value: &str| {
+            let kw: ArrayRef = Arc::new(LargeStringArray::from(vec![
+                Some("short"),
+                Some(value),
+                None,
+            ]));
+            let body: ArrayRef = Arc::new(LargeStringArray::from(vec![value; 3]));
+            RecordBatch::try_new(Arc::clone(&schema), vec![kw, body]).expect("batch")
+        };
+        let at_cap = "x".repeat(KEYWORD_TERM_MAX);
+        table
+            .append(&batch(&at_cap))
+            .expect("a value at the cap is stored");
+        assert_eq!(count_rows(&conn, "capped_kws"), 3);
+        let hits = table
+            .exact_match("kw", &at_cap, Some(&["kw"][..]))
+            .expect("exact_match");
+        assert_eq!(n_rows(&hits), 1, "and matched whole");
+
+        let past = "x".repeat(KEYWORD_TERM_MAX + 1);
+        let err = table
+            .append(&batch(&past))
+            .expect_err("one byte past is refused");
+        assert!(
+            matches!(
+                &err,
+                InfinoError::Schema(SchemaError::KeywordTooLong { column, len, max })
+                    if column == "kw" && *len == KEYWORD_TERM_MAX + 1 && *max == KEYWORD_TERM_MAX
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("32767"), "{err}");
+        assert_eq!(
+            count_rows(&conn, "capped_kws"),
+            3,
+            "nothing of the batch was written"
+        );
+    }
+
     /// An analyzer this engine does not ship is refused, and so is a
     /// keyword column with a filter, at create and in a schema patch.
     #[test]
