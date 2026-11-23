@@ -3210,6 +3210,10 @@ impl SupertableReader {
         let column_arc: Arc<str> = Arc::from(column);
         let pool = Arc::clone(&self.manifest().options.reader_pool);
         let units = rest.into_iter().map(|entry| (entry, ())).collect();
+        // Set once any file's list is refused by the budget. The answer is
+        // then thrown away, so the other files check it and stop before
+        // reading or charging anything more.
+        let refused = Arc::new(AtomicBool::new(false));
         let per_superfile: Vec<Option<(Vec<(Vec<u8>, u64)>, Reservation)>> = dispatch::fanout_with(
             self,
             units,
@@ -3219,16 +3223,24 @@ impl SupertableReader {
                 let column_arc = Arc::clone(&column_arc);
                 let pool = Arc::clone(&pool);
                 let budget = Arc::clone(&budget);
+                let refused = Arc::clone(&refused);
                 async move {
+                    if refused.load(AtomicOrdering::Relaxed) {
+                        return Ok(None);
+                    }
                     let fts = r
                         .fts()
                         .ok_or_else(|| QueryError::Internal("superfile has no FTS index".into()))?;
                     let column = r.column_alias(field, &column_arc);
                     let terms = fts.terms_with_prefix(column, b"", Some(&pool)).await?;
+                    if refused.load(AtomicOrdering::Relaxed) {
+                        return Ok(None);
+                    }
                     // Each file's list is held until the merge below takes
                     // it.
                     let bytes = terms.iter().map(|t| term_entry_bytes(t.len())).sum();
                     let Ok(held) = budget.try_reserve(bytes) else {
+                        refused.store(true, AtomicOrdering::Relaxed);
                         return Ok(None);
                     };
                     let texts = terms

@@ -1169,6 +1169,11 @@ mod tests {
     /// Bytes of each of its values, all distinct: its term counts take
     /// several MiB.
     const LONG_VALUE_LEN: usize = 600;
+    /// Budget bytes [`keyword_value_counts_short_of_the_budget_stop_partway`]
+    /// leaves free: about one and a half files' worth of term counts, so the
+    /// term-index walk fits some terms but not all, and one file's term list
+    /// fits but not the next.
+    const PARTIAL_ROOM: usize = LONG_ROWS * LONG_VALUE_LEN * 3 / 2;
     /// A table of one `keyword` column `tag` whose values are all distinct
     /// and [`LONG_VALUE_LEN`] bytes long, over [`LONG_FILES`] files, with
     /// one row in ten null.
@@ -1253,6 +1258,43 @@ mod tests {
                 stats.rows_materialized, 0,
                 "{label}: from the terms: {stats:?}"
             );
+        }
+    }
+
+    /// When the budget fits some of a keyword column's term counts but not
+    /// all, the term path stops partway and releases what it charged: the
+    /// term-index walk is refused after some terms are added, and without
+    /// the index one file's list is charged before the next is refused.
+    /// With room again, `value_counts` equals `GROUP BY` and the budget holds
+    /// nothing afterwards.
+    #[test]
+    fn keyword_value_counts_short_of_the_budget_stop_partway() {
+        for term_index in [true, false] {
+            let label = format!("term index {term_index}");
+            let (_dir, _cache_dir, table) = long_keyword_table(term_index);
+            let reader = table.reader().expect("reader");
+            let grouped = rows(&reader, "SELECT tag, COUNT(*) FROM supertable GROUP BY tag");
+            let tag = Field::new("tag", DataType::LargeUtf8, true);
+            let value_schema = value_count_schema(&tag).expect("schema");
+            let budget = &reader.manifest().options.connection_memory_budget;
+
+            let before = budget.used();
+            let mut held = budget.hold_all();
+            held.shrink(PARTIAL_ROOM);
+            let used = budget.used();
+            let from_terms = reader
+                .value_counts_from_terms("tag", &value_schema)
+                .expect("from terms");
+            assert!(from_terms.is_none(), "{label}: not every term fits");
+            assert_eq!(
+                budget.used(),
+                used,
+                "{label}: what the refused counts charged is released"
+            );
+            drop(held);
+            let counted = reader.value_counts("tag").expect("value counts");
+            assert_eq!(sorted_rows(from_ref(&counted)), grouped, "{label}");
+            assert_eq!(budget.used(), before, "{label}: nothing held afterwards");
         }
     }
 }
