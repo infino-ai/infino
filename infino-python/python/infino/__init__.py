@@ -24,6 +24,7 @@ from infino._infino import (
     ReindexReport,
     StalenessReport,
     Table,
+    UnavailableError,
     connect,
 )
 
@@ -38,6 +39,7 @@ __all__ = [
     "InfinoError",
     "ConnectionMemoryBudgetError",
     "ConflictError",
+    "UnavailableError",
     "SchemaError",
     "AlreadyRunningError",
     "Table",

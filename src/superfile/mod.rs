@@ -38,6 +38,7 @@ pub mod ids;
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) mod ids;
 pub mod lazy_source;
+pub(crate) mod load_watch;
 pub(crate) mod range;
 pub mod reader;
 pub mod stats;
@@ -47,5 +48,5 @@ pub use error::{BuildError, FtsError, ReadError, VectorError};
 pub use lazy_source::{
     BytesLazyByteSource, CacheBlocks, CacheRoom, LazyByteSource, LazyByteSourceError,
 };
-pub(crate) use lazy_source::{LazySubSource, PrefetchedSource};
+pub(crate) use lazy_source::{LazySubSource, PrefetchedSource, held_buffer_bytes};
 pub use reader::{OpenOptions, SuperfileReader, VectorSearchOptions};

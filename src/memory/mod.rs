@@ -129,6 +129,7 @@ mod resident;
 pub(crate) use datafusion_pool::{SqlSpill, budgeted_session_context};
 pub(crate) use resident::{
     over_process_limit, process_limit, process_limit_exceeded, process_over_limit,
+    recent_anon_rss_bytes,
 };
 
 test_visible! {
@@ -145,6 +146,10 @@ test_visible! {
 /// once, in [`ConnectionMemoryBudget::with_limit`].
 const ENFORCED_BUDGET_NUMERATOR: u128 = 9;
 const ENFORCED_BUDGET_DENOMINATOR: u128 = 10;
+
+/// The limit of [`ConnectionMemoryBudget::with_room`]: far past what any test holds.
+#[cfg(test)]
+const ROOM_FOR_TESTS: u64 = 1 << 40;
 
 /// Longest a cold read waits for room before it fails with [`OverBudget`].
 /// Far longer than a cold read takes to finish, so a read still waiting this
@@ -202,6 +207,28 @@ pub(crate) trait Reclaim: Send + Sync {
 }
 
 impl ConnectionMemoryBudget {
+    /// A bounded budget no test fills, for a test of what only a limited budget does.
+    #[cfg(test)]
+    pub(crate) fn with_room() -> Arc<Self> {
+        Self::with_limit(ROOM_FOR_TESTS)
+    }
+
+    /// Hold every byte the budget has room for, once the holders that can give memory back have
+    /// given it, so a test's next reservation fits only in what the test frees.
+    #[cfg(test)]
+    pub(crate) fn hold_all(self: &Arc<Self>) -> Reservation {
+        let mut held = Reservation {
+            budget: Arc::clone(self),
+            size: 0,
+        };
+        // A request past the room asks those holders first.
+        while held
+            .try_grow(self.remaining().expect("a bounded budget").max(1))
+            .is_ok()
+        {}
+        held
+    }
+
     /// A measure-only budget: counts usage but never refuses. The default when
     /// no limit is configured.
     pub fn measured() -> Arc<Self> {
@@ -650,6 +677,25 @@ impl Reservation {
         self.size += extra;
 
         Ok(())
+    }
+
+    /// [`Self::try_grow`] for a [`Reclaim`] holder: it never asks the others
+    /// to give memory back, so one holder can't take another's (nor ask
+    /// itself while it is changing what it holds).
+    pub(crate) fn try_grow_without_reclaim(&mut self, extra: usize) -> Result<(), OverBudget> {
+        self.budget.grow_within_limit(extra).inspect_err(|_| {
+            self.budget.denials.fetch_add(1, Ordering::Relaxed);
+        })?;
+        self.size += extra;
+        Ok(())
+    }
+
+    /// Give `by` bytes of the reservation back to the budget, at most what
+    /// it holds.
+    pub(crate) fn shrink(&mut self, by: usize) {
+        let by = by.min(self.size);
+        self.size -= by;
+        self.budget.release(by);
     }
 
     /// Bytes currently held.

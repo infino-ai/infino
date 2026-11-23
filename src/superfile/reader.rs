@@ -22,6 +22,7 @@
 
 use std::{
     borrow::Cow,
+    cmp::Reverse,
     collections::HashMap,
     fmt, io,
     ops::{Deref, Range},
@@ -64,6 +65,8 @@ use tracing::warn;
 
 #[cfg(test)]
 use crate::superfile::fts::reader::TermIndexFact;
+#[cfg(test)]
+use crate::supertable::reader_cache::disk::HeapBudget;
 use crate::{
     memory::ConnectionMemoryBudget,
     runtime_bridge::run_on_pool_unless_blocking,
@@ -75,12 +78,15 @@ use crate::{
             bm25::Bm25Params,
             reader::{
                 self as fts_reader, BoolMode, ClauseLists, ContainsRows, FetchedTermMemo,
-                FtsReader, MatchWork, OrCursorSet, PreparedClauses, ScoringView, TermPattern,
+                FtsReader, MatchWork, OrCursorSet, PreparedClauses, QueryDict, ScoringView,
+                TermPattern,
             },
             tokenize::{Phrase, Tokenizer},
         },
+        held_buffer_bytes,
         id_space::{FtsDocId, RowId},
         ids::{self, PackedIds},
+        load_watch::{LoadListener, LoadWatch},
         range::{KeyKind, RangeDirectory, same_keys},
         vector::{
             layout::VectorLayout,
@@ -315,6 +321,10 @@ pub struct SuperfileReader {
     /// reads take `_id` from Parquet, so the sidecar is not retried or warned
     /// about again.
     id_sidecar_broken: AtomicBool,
+    /// Each sidecar block's `_id` bounds and the blocks' orders by them,
+    /// read from the headers on the first read in `_id` order and kept for
+    /// the reader's life ([`id_blocks`](Self::id_blocks)): 40 bytes a block.
+    id_blocks: OnceCell<Arc<IdBlocks>>,
     /// Where the range index region sits, when the superfile carries one
     /// (`superfile::range`): absent on a table with no range-indexed column
     /// and on superfiles written before the region existed.
@@ -328,6 +338,9 @@ pub struct SuperfileReader {
     ///
     /// [`install_resident_parquet`]: Self::install_resident_parquet
     resident_hole: Option<(u64, u64)>,
+    /// Told when a read loads something this reader keeps
+    /// ([`Self::watch_loads`]).
+    loads: LoadWatch,
 }
 
 /// What [`SuperfileReader::range_ends`] keeps of a superfile: its first rows
@@ -338,6 +351,33 @@ pub struct SuperfileReader {
 pub(crate) struct RangeEnds {
     pub(crate) pairs: Vec<(u64, u32)>,
     pub(crate) ties_in_id_order: bool,
+}
+
+/// Each block of [`ids::BLOCK_DOCS`] rows of a superfile, by the `_id`
+/// bounds its sidecar header records ([`SuperfileReader::id_blocks`]).
+#[derive(Debug)]
+pub(crate) struct IdBlocks {
+    /// Each block's lowest and highest possible `_id`, in row order.
+    pub(crate) bounds: Box<[(i128, i128)]>,
+    /// The blocks, by lowest bound ascending; ties in row order.
+    pub(crate) by_lowest: Box<[u32]>,
+    /// The blocks, by highest bound descending; ties in row order.
+    pub(crate) by_highest: Box<[u32]>,
+}
+
+impl IdBlocks {
+    fn new(bounds: Vec<(i128, i128)>) -> Self {
+        let blocks = || (0..bounds.len() as u32).collect::<Vec<u32>>();
+        let mut by_lowest = blocks();
+        by_lowest.sort_by_key(|&b| bounds[b as usize].0);
+        let mut by_highest = blocks();
+        by_highest.sort_by_key(|&b| Reverse(bounds[b as usize].1));
+        Self {
+            bounds: bounds.into(),
+            by_lowest: by_lowest.into(),
+            by_highest: by_highest.into(),
+        }
+    }
 }
 
 /// Where a superfile's stable-id sidecar lives and how it is laid out, from
@@ -987,9 +1027,11 @@ impl SuperfileReader {
             // one fetches the sidecar through `fetch_id_sidecar`.
             id_sidecar,
             id_sidecar_broken: AtomicBool::new(false),
+            id_blocks: OnceCell::new(),
             range_region,
             range_directory: OnceCell::new(),
             resident_hole: None,
+            loads: LoadWatch::default(),
         })
     }
 
@@ -1133,10 +1175,88 @@ impl SuperfileReader {
             vec,
             id_sidecar,
             id_sidecar_broken: AtomicBool::new(false),
+            id_blocks: OnceCell::new(),
             range_region,
             range_directory: OnceCell::new(),
             resident_hole: None,
+            loads: LoadWatch::default(),
         })
+    }
+
+    /// The memory this reader holds beyond its file's bytes, as far as it is
+    /// counted: the parsed footer (with its page index once a scan loaded
+    /// it), the scan's own copy when it is a separate parse, and what reads
+    /// have loaded since open: the FTS doc-id map, norms and block tables,
+    /// the scored view's decode tables, the vector columns' parsed quantizer
+    /// and norms, and the range directory. Grows as reads load more, so a
+    /// holder that keeps the reader watches its loads ([`Self::watch_loads`])
+    /// and weighs it again as each lands.
+    ///
+    /// The Arrow schema counts too: each reader parses its own, field names
+    /// and the footer's key-value metadata included, so on a wide table it
+    /// rivals the parsed footer.
+    ///
+    /// A lazy reader also counts the buffers its sources keep: the open
+    /// batch (the file's tail, which carries the footer, and the vector and
+    /// FTS open ranges), and the headers and directories the vector and FTS
+    /// readers read as they opened. A byte several of them share counts once.
+    ///
+    /// Not counted: the vector columns' transposed codes, which hold their
+    /// own reservations against the connection's budget, and the fixed size
+    /// of the reader's own structures.
+    pub(crate) fn held_bytes(&self) -> usize {
+        let footer = self.footer.load();
+        let parquet = footer.parquet();
+        let scan = self
+            .scan_footer
+            .get()
+            .filter(|scan| !Arc::ptr_eq(*scan, parquet))
+            .map_or(0, |scan| scan.memory_size());
+        let scored = self
+            .scored_fts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |(_, view)| view.view_held_bytes());
+        let mut buffers = Vec::new();
+        if let Some(source) = &self.source {
+            source.held_buffers(&mut buffers);
+        }
+        if let Some(fts) = &self.fts {
+            fts.held_buffers(&mut buffers);
+        }
+        if let Some(vec) = &self.vec {
+            vec.held_buffers(&mut buffers);
+        }
+        parquet.memory_size()
+            + schema_heap_bytes(&self.schema)
+            + scan
+            + scored
+            + held_buffer_bytes(&mut buffers)
+            + self.fts.as_ref().map_or(0, FtsReader::held_bytes)
+            + self.vec.as_ref().map_or(0, VectorReader::held_bytes)
+            + self
+                .range_directory
+                .get()
+                .map_or(0, |directory| directory.held_bytes())
+    }
+
+    /// Call `listener` after each read that loads something this reader
+    /// keeps, with none of the reader's locks held, so it can weigh the
+    /// reader again ([`Self::held_bytes`]). The first listener set stays.
+    ///
+    /// Not reported: a scored view's decode tables, a kilobyte a column
+    /// derived as the view first scores, and loads made by the blocking
+    /// fallbacks that callers outside a query use. Those count from the
+    /// reader's next weighing.
+    pub(crate) fn watch_loads(&self, listener: LoadListener) {
+        self.loads.watch(&listener);
+        if let Some(fts) = &self.fts {
+            fts.watch_loads(&listener);
+        }
+        if let Some(vec) = &self.vec {
+            vec.watch_loads(&listener);
+        }
     }
 
     /// The file's footer metadata: the parse made at open, or the
@@ -1205,6 +1325,7 @@ impl SuperfileReader {
                     (None, None) => return Ok(()),
                 };
                 self.footer.store(Arc::new(current.over(indexed)?));
+                self.loads.loaded();
                 Ok::<_, ReadError>(())
             })
             .await?;
@@ -1231,7 +1352,11 @@ impl SuperfileReader {
             return Ok(Arc::clone(footer));
         }
         let derived = derive(indexed)?;
-        Ok(Arc::clone(self.scan_footer.get_or_init(|| derived)))
+        let kept = Arc::clone(self.scan_footer.get_or_init(|| Arc::clone(&derived)));
+        if Arc::ptr_eq(&kept, &derived) {
+            self.loads.loaded();
+        }
+        Ok(kept)
     }
 
     /// True for the first caller only: the one that should count what this reader keeps decoded
@@ -1321,6 +1446,13 @@ impl SuperfileReader {
             Some(r) => r.fts_columns().collect(),
             None => Vec::new(),
         }
+    }
+
+    /// This reader with its text index's kept doc-id map charged to `budget`, for a test of one.
+    #[cfg(test)]
+    pub(crate) fn with_fts_heap_budget(mut self, budget: &'static HeapBudget) -> Self {
+        self.fts = self.fts.map(|fts| fts.with_heap_budget(budget));
+        self
     }
 
     /// Underlying FTS reader. `None` if this superfile has no FTS index.
@@ -1662,6 +1794,47 @@ impl SuperfileReader {
             && covers_row_share(local_doc_ids, self.n_docs)
     }
 
+    /// The lowest and highest `_id` each block of [`ids::BLOCK_DOCS`] rows
+    /// can hold, from the packed stable-id sidecar's block headers, and the
+    /// blocks ordered by them ([`IdBlocks`]): the order a read sorted on
+    /// `_id` takes the rows in. Read on the first call, from the resident
+    /// bytes or one fetch of the sidecar, and kept. `None` when the
+    /// superfile has no packed sidecar, the sidecar was found broken, or the
+    /// read fails; the caller then reads in another order. A header that
+    /// does not parse marks the sidecar broken, as a block that does not
+    /// decode does.
+    pub(crate) async fn id_blocks(&self) -> Option<Arc<IdBlocks>> {
+        let loc = self.id_sidecar?;
+        if !loc.packed || self.id_sidecar_broken.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.id_blocks
+            .get_or_try_init(|| async {
+                let sidecar = match self.resident_id_sidecar() {
+                    Some(sidecar) => sidecar,
+                    None => self.fetch_id_sidecar().await?.ok_or_else(|| {
+                        ReadError::MalformedKv("the stable-id sidecar is gone".into())
+                    })?,
+                };
+                let bounds =
+                    PackedIds::open(&sidecar.bytes, self.n_docs as usize).and_then(|packed| {
+                        packed.block_bounds().ok_or_else(|| {
+                            "a block header of the stable-id sidecar is malformed".to_owned()
+                        })
+                    });
+                match bounds {
+                    Ok(bounds) => Ok(Arc::new(IdBlocks::new(bounds))),
+                    Err(what) => {
+                        self.mark_id_sidecar_broken();
+                        Err(ReadError::MalformedKv(what))
+                    }
+                }
+            })
+            .await
+            .ok()
+            .cloned()
+    }
+
     /// Record that this superfile's sidecar does not decode, so later reads
     /// take `_id` from another source without fetching it again.
     pub(crate) fn mark_id_sidecar_broken(&self) {
@@ -1703,6 +1876,7 @@ impl SuperfileReader {
         if !written_with.is_some_and(|t| same_keys(t, data_type)) {
             return Ok(None);
         }
+        let loading = !self.range_directory.initialized();
         let directory = self
             .range_directory
             .get_or_try_init(|| async {
@@ -1714,6 +1888,9 @@ impl SuperfileReader {
                     .map_err(ReadError::Malformed)
             })
             .await?;
+        if loading {
+            self.loads.loaded();
+        }
         let indexed = directory.column(field.0).is_some_and(|c| c.kind() == kind);
         Ok(indexed.then(|| (Arc::clone(directory), field.0)))
     }
@@ -1926,6 +2103,54 @@ impl SuperfileReader {
             .collect();
         indexed
             .count(lo, hi, &boundary)
+            .map(Some)
+            .map_err(ReadError::Malformed)
+    }
+
+    /// [`Self::range_count`] of each of `ranges` (`lo..=hi` pairs) over one
+    /// column, with each block the ranges cut read once: a histogram's
+    /// buckets share their boundaries, and one pass over this superfile
+    /// counts them all. `None` when the superfile does not range-index the
+    /// column with keys of `data_type`.
+    pub(crate) async fn range_counts(
+        &self,
+        field: FieldId,
+        data_type: &DataType,
+        ranges: &[(u64, u64)],
+    ) -> Result<Option<Vec<u64>>, ReadError> {
+        let Some((directory, field_id)) = self.range_column(field, data_type).await? else {
+            return Ok(None);
+        };
+        let Some(loc) = self.range_region else {
+            return Ok(None);
+        };
+        let Some(indexed) = directory.column(field_id) else {
+            return Ok(None);
+        };
+        let mut wanted: Vec<usize> = ranges
+            .iter()
+            .flat_map(|&(lo, hi)| indexed.boundary_blocks(lo, hi))
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let fetched = try_join_all(wanted.into_iter().map(|b| {
+            let span = indexed.block_span(b);
+            async move {
+                let bytes = self
+                    .range_region_bytes(loc, span, "range index boundary block")
+                    .await?;
+                Ok::<_, ReadError>((b, bytes))
+            }
+        }))
+        .await?;
+        let boundary: Vec<(usize, &[u8])> = fetched
+            .iter()
+            .map(|(b, bytes)| (*b, bytes.as_ref()))
+            .collect();
+        ranges
+            .iter()
+            .map(|&(lo, hi)| indexed.count(lo, hi, &boundary))
+            .collect::<Result<Vec<u64>, String>>()
             .map(Some)
             .map_err(ReadError::Malformed)
     }
@@ -2691,12 +2916,29 @@ impl SuperfileReader {
         tokens: &[&str],
         mode: BoolMode,
         prefetched: Option<&FetchedTermMemo>,
+        dict: &QueryDict,
     ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .token_match_prefetched(column, tokens, mode, prefetched)
+            .token_match_prefetched(column, tokens, mode, prefetched, dict)
+            .await?)
+    }
+
+    /// [`FtsReader::exact_match_candidates`] on this superfile's index.
+    pub(crate) async fn exact_match_candidates(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        prefetched: Option<&FetchedTermMemo>,
+        dict: &QueryDict,
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .exact_match_candidates(column, tokens, prefetched, dict)
             .await?)
     }
 
@@ -2716,18 +2958,43 @@ impl SuperfileReader {
     }
 
     /// One doc-id slice of an `Or` match against cursors
-    /// [`Self::match_cursor_set`] built. Delegates to
-    /// [`FtsReader::token_match_range_prebuilt`].
-    pub(crate) fn token_match_range_prebuilt(
+    /// [`Self::match_cursor_set`] built, in blob ids. Delegates to
+    /// [`FtsReader::token_match_range_in_blob_ids`].
+    pub(crate) fn token_match_range_in_blob_ids(
         &self,
         set: &OrCursorSet,
         start: u32,
         end: u32,
-    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
+    ) -> Result<(Vec<FtsDocId>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.token_match_range_prebuilt(set, start, end)?)
+        Ok(fts.token_match_range_in_blob_ids(set, start, end)?)
+    }
+
+    /// Unranked blob ids of this superfile's FTS index as ascending rows through the held doc-id
+    /// map; `None` while none is held. Delegates to [`FtsReader::held_ids_to_rows`].
+    pub(crate) fn held_ids_to_rows(
+        &self,
+        ids: &[FtsDocId],
+    ) -> Result<Option<Vec<RowId>>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.held_ids_to_rows(ids)?)
+    }
+
+    /// Unranked blob ids as ascending rows through the doc-id map's pages, keeping nothing.
+    /// Delegates to [`FtsReader::ids_to_rows_in_pages`].
+    pub(crate) async fn ids_to_rows_in_pages(
+        &self,
+        ids: Vec<FtsDocId>,
+        set: &OrCursorSet,
+    ) -> Result<Vec<RowId>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.ids_to_rows_in_pages(ids, set).await?)
     }
 
     /// Widen the tokens of one `LIKE` leaf to the indexed terms of
@@ -2743,12 +3010,21 @@ impl SuperfileReader {
         max_terms: usize,
         allow_full_walk: bool,
         pool: Option<&ThreadPool>,
+        dict: &QueryDict,
     ) -> Result<(Vec<Option<Vec<String>>>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .expand_terms(column, patterns, fold, max_terms, allow_full_walk, pool)
+            .expand_terms(
+                column,
+                patterns,
+                fold,
+                max_terms,
+                allow_full_walk,
+                pool,
+                dict,
+            )
             .await?)
     }
 
@@ -2778,11 +3054,12 @@ impl SuperfileReader {
         column: &str,
         terms: &[&str],
         prefetched: Option<&FetchedTermMemo>,
+        dict: &QueryDict,
     ) -> Result<(Vec<ContainsRows>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.term_rows(column, terms, prefetched).await?)
+        Ok(fts.term_rows(column, terms, prefetched, dict).await?)
     }
 
     /// Unranked token-match **count**: the number of `local_doc_id`s
@@ -2910,6 +3187,19 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts.term_dfs(column, tokens).await?)
+    }
+
+    /// [`Self::term_dfs`] with the dictionary read through `dict`, which may already hold it.
+    pub(crate) async fn term_dfs_with_dict(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        dict: &QueryDict,
+    ) -> Result<(Vec<u64>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_dfs_with_dict(column, tokens, dict).await?)
     }
 
     /// Open-wave fetch of `terms`' dictionary slots + postings ranges
@@ -3102,6 +3392,7 @@ impl SuperfileReader {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
+            && scoring.norms.is_none()
             && cached.matches(scoring)
         {
             return Ok(ScoredFts::Derived(Arc::clone(view)));
@@ -3110,6 +3401,9 @@ impl SuperfileReader {
             return Ok(ScoredFts::Baked(fts));
         };
         let view = Arc::new(view);
+        if scoring.norms.is_some() {
+            return Ok(ScoredFts::Derived(view));
+        }
         // Last writer wins. Two queries racing here derive the same view
         // from the same inputs — `with_scoring` is deterministic — so which
         // one lands is immaterial.
@@ -3118,6 +3412,7 @@ impl SuperfileReader {
             .write()
             .unwrap_or_else(PoisonError::into_inner) =
             Some((ScoringKey::of(scoring), Arc::clone(&view)));
+        self.loads.loaded();
         Ok(ScoredFts::Derived(view))
     }
 
@@ -3918,6 +4213,18 @@ fn fts_reader_error_to_read(e: FtsError) -> ReadError {
     }
 }
 
+/// Heap bytes an Arrow schema holds: its fields (names, types, field
+/// metadata) and its own key-value metadata.
+fn schema_heap_bytes(schema: &Schema) -> usize {
+    size_of::<Schema>()
+        + schema.fields().size()
+        + schema
+            .metadata()
+            .iter()
+            .map(|(k, v)| size_of::<(String, String)>() + k.capacity() + v.capacity())
+            .sum::<usize>()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, thread};
@@ -3935,6 +4242,7 @@ mod tests {
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
             format::footer::with_forged_footer_kv,
             ids,
+            lazy_source::PrefetchedSource,
             vector::distance::normalize,
         },
         supertable::query::{
@@ -4862,6 +5170,7 @@ mod tests {
         });
         assert!(poisoner.is_err() && r.scored_fts.is_poisoned());
         let at = ScoringView {
+            norms: None,
             params: Some(Bm25Params::new(1.4, 0.6)),
             avgdl: None,
         };
@@ -4888,6 +5197,7 @@ mod tests {
         let a = Bm25Params::new(1.4, 0.6);
         let b = Bm25Params::new(0.9, 0.4);
         let at = |params| ScoringView {
+            norms: None,
             params: Some(params),
             avgdl: None,
         };
@@ -4928,6 +5238,7 @@ mod tests {
         let column = fts.fts_columns_config().next().expect("column");
         let (name, baked) = (column.name.clone(), column.avgdl());
         let at = |avgdl| ScoringView {
+            norms: None,
             params: None,
             avgdl: Some((name.as_str(), avgdl)),
         };
@@ -4969,6 +5280,112 @@ mod tests {
         let meta = r.parquet_metadata();
         let total: i64 = meta.row_groups().iter().map(|rg| rg.num_rows()).sum();
         assert_eq!(total, 4);
+    }
+
+    /// A lazy reader counts the open batch its source keeps, as the
+    /// storage-only tier builds it: the file's tail in an overlay. The FTS
+    /// reader's own overlay holds slices of that tail, which count once.
+    #[tokio::test]
+    async fn a_lazy_reader_counts_the_tail_it_keeps_once() {
+        let bytes = build_simple_fts_only_superfile();
+        let total = bytes.len() as u64;
+        let tail_len = DEFAULT_TAIL_SPECULATIVE_BYTES.min(total);
+        let plain: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes.clone()));
+        let mut tailed = PrefetchedSource::new(Arc::clone(&plain));
+        tailed.install(
+            total - tail_len,
+            Bytes::copy_from_slice(&bytes[(total - tail_len) as usize..]),
+        );
+        let opts = OpenOptions { verify_crc: false };
+        let tailed = SuperfileReader::open_lazy_with(Arc::new(tailed), opts)
+            .await
+            .expect("open over the tail");
+        let bare = SuperfileReader::open_lazy_with(plain, opts)
+            .await
+            .expect("open bare");
+
+        let fts_overlay = {
+            let mut buffers = Vec::new();
+            bare.fts.as_ref().expect("fts").held_buffers(&mut buffers);
+            held_buffer_bytes(&mut buffers)
+        };
+        assert!(fts_overlay > 0, "the FTS open keeps what it read");
+        assert_eq!(
+            tailed.held_bytes(),
+            bare.held_bytes() - fts_overlay + tail_len as usize,
+            "the tail counts, and the FTS overlay's slices of it do not again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lazy_reader_counts_its_schema() {
+        // A wide table, where the schema's field names and metadata rival
+        // the parsed footer.
+        let mut fields = vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ];
+        fields.extend((0..100).map(|i| {
+            Field::new(
+                format!("event.attributes.field_{i:03}"),
+                DataType::Int64,
+                true,
+            )
+        }));
+        let schema = Arc::new(Schema::new(fields));
+        let opts = BuilderOptions::new(
+            schema.clone(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let mut builder = SuperfileBuilder::new(opts).expect("builder");
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(decimal128_ids(0..4u64)),
+            Arc::new(LargeStringArray::from(vec!["a b", "c d", "e f", "g h"])),
+        ];
+        columns.extend((0..100).map(|_| Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef));
+        let batch = RecordBatch::try_new(schema, columns).expect("batch");
+        builder.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = Bytes::from(builder.finish().expect("finish"));
+
+        let source: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+        let reader = SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
+            .await
+            .expect("open");
+        let schema_bytes = schema_heap_bytes(reader.schema());
+        let names: usize = reader
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().len())
+            .sum();
+        let kv: usize = reader
+            .schema()
+            .metadata()
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum();
+        assert!(
+            schema_bytes >= names + kv,
+            "the schema's names and metadata are counted"
+        );
+
+        let mut buffers = Vec::new();
+        reader
+            .source
+            .as_ref()
+            .expect("lazy")
+            .held_buffers(&mut buffers);
+        reader.fts.as_ref().expect("fts").held_buffers(&mut buffers);
+        let without_schema = reader.parquet_metadata().memory_size()
+            + held_buffer_bytes(&mut buffers)
+            + reader.fts.as_ref().map_or(0, FtsReader::held_bytes);
+        assert_eq!(
+            reader.held_bytes(),
+            without_schema + schema_bytes,
+            "the schema counts on top of the footer, the buffers and the FTS reader"
+        );
     }
 
     #[tokio::test]

@@ -1211,13 +1211,13 @@ pub struct DiagnosticsSettings {
     /// read behavior can be measured (A/B measurement).
     pub disable_background_fill: bool,
     /// Choose a ranked query's superfiles by their stored ceilings alone,
-    /// never from the term index's tiers, so the tiers' effect on the same
-    /// index can be measured (A/B measurement).
+    /// never from the term index's tiers or level heads, so their effect on
+    /// the same index can be measured (A/B measurement).
     pub disable_tier_selection: bool,
-    /// Most rounds a tier merge reads — a round is a block per term per
-    /// superfile in play — so the opens saved by further rounds can be
-    /// measured against their cost; `0` leaves the merge to its own stop
-    /// rule (A/B measurement).
+    /// Most rounds a tier merge or a level-head selection reads — a round
+    /// is a block per term per superfile in play, or a level per term and
+    /// layer — so the opens saved by further rounds can be measured against
+    /// their cost; `0` leaves each to its own stop rule (A/B measurement).
     pub tier_rounds: u32,
 }
 

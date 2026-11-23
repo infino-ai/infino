@@ -10,7 +10,7 @@
 //! documents that carry both terms before any superfile is read.
 #![deny(clippy::unwrap_used)]
 
-use std::sync::Arc;
+use std::{iter::repeat_n, sync::Arc};
 
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
 use datafusion::prelude::{col, lit};
@@ -19,7 +19,7 @@ use infino::{
     runtime_metrics::op_stats::with_op_stats,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::builder::FtsConfig,
-    supertable::{Supertable, SupertableOptions},
+    supertable::{Supertable, SupertableOptions, query::SuperfileHit},
 };
 use tempfile::TempDir;
 
@@ -115,9 +115,12 @@ fn a_rare_conjunction_opens_only_its_holders() {
     );
 }
 
-/// A document deleted after the index was built is in the tiers but not
-/// in the table: a superfile the index answers for leaves it out, as an
-/// opened one would.
+/// A document deleted after the index was built is in the heads but not
+/// in the table. The heads name documents by the superfile's own id, which
+/// its deleted rows are not keyed by, so the superfile holding the delete
+/// is opened, where it can still place, rather than answered from the
+/// index — and leaves it out; the others are still answered from the
+/// index.
 #[test]
 fn a_resolved_superfile_respects_tombstones() {
     let with_dir = TempDir::new().expect("tempdir");
@@ -138,18 +141,20 @@ fn a_resolved_superfile_respects_tombstones() {
             a.iter().all(|&(sf, row, _)| !(sf == 0 && row == 97)),
             "k={k}: the deleted document is not returned"
         );
-        assert_eq!(opened(&stats), 0, "k={k}: still answered from the index");
+        assert!(
+            opened(&stats) <= 1,
+            "k={k}: at most the superfile with the delete is opened: {}",
+            opened(&stats)
+        );
     }
 }
 
-/// With every superfile's head cut to 64 documents, a common term's head
-/// is read a block at a time and the superfiles it cannot rule out are
-/// opened — and the answer is still hit for hit the ceiling path's, at
-/// every k, for every shape, with fewer opens over the whole matrix. (A
-/// single query can open one more: a head cut this short may not hold the
-/// best joint document, so the survivors' open order can differ from the
-/// ceilings'.) The heads of rare terms stay whole, so their conjunction is
-/// still answered in the index.
+/// With a shallow head depth asked for, each superfile still keeps a
+/// common term's proportional share, so the level heads cut from them
+/// read a level at a time and open what they cannot rule out — and the
+/// answer is still hit for hit the ceiling path's, at every k, for every
+/// shape, with fewer opens over the whole matrix. The heads of rare terms
+/// stay whole, so their conjunction is still answered in the index.
 #[test]
 fn heads_cut_to_a_depth_answer_the_same_and_resolve_the_rare() {
     const DEPTH: usize = 64;
@@ -184,13 +189,6 @@ fn heads_cut_to_a_depth_answer_the_same_and_resolve_the_rare() {
         opened(&stats),
         0,
         "the rare conjunction is still answered in the index"
-    );
-    let (_, stats, _) = run(&with, "the data", BoolMode::And, 10);
-    let held = (2 * SUPERFILES * DEPTH) as u64;
-    assert!(
-        stats.tier_entries <= held,
-        "a common pair reads at most the cut heads: {} entries",
-        stats.tier_entries
     );
 }
 
@@ -570,22 +568,19 @@ fn an_unreadable_tier_leaves_the_query_to_its_ceilings() {
     }
 }
 
-/// With the gate on, the table learns whether to merge by trying both
-/// ways: every try answers the same. The way without the merge is always
-/// among the tries; the merge is, unless the measured costs rule it out
-/// before it runs — which a loaded machine can do for some shapes.
+/// Asks of one query on one handle: more than the gate's measuring
+/// phase, in which it alternates with and without the index's reads.
+const GATED_ASKS: usize = 20;
+
+/// With the learned gate on, the level heads are weighed as the tier merge
+/// is: within one open window the gate measures asks with the heads and
+/// without them before it settles, so some asks read the heads and some do
+/// not, and every one answers the same.
 ///
-/// Each shape asks through a handle opened for it. The policy is learned
-/// per handle and per class of query, and shapes here share classes ("the
-/// data", "search index" and "quokka tensor" as conjunctions are all two
-/// terms of the commonest rarity bucket): through one handle a later shape
-/// meets a decision the earlier ones made, which tries the other way only
-/// one query in 64 once it is clear, and its asks can all go one way.
-///
-/// The handle opens every superfile in one window: past a window the merge
-/// runs for every query and the gate has nothing to decide.
+/// The handle opens every superfile in one window, where the gate has a
+/// choice to make.
 #[test]
-fn the_learned_gate_answers_the_same_whichever_way_it_goes() {
+fn the_learned_gate_weighs_the_level_heads_and_answers_the_same() {
     let with_dir = TempDir::new().expect("tempdir");
     let without_dir = TempDir::new().expect("tempdir");
     let gated = Build {
@@ -595,7 +590,6 @@ fn the_learned_gate_answers_the_same_whichever_way_it_goes() {
     };
     drop(table_with(&with_dir, gated));
     let without = table(&without_dir, false);
-    let mut merged_any = false;
     for (query, mode) in [
         ("the data", BoolMode::Or),
         ("the data", BoolMode::And),
@@ -609,27 +603,21 @@ fn the_learned_gate_answers_the_same_whichever_way_it_goes() {
             )
             .expect("open");
             let (expected, _, _) = run(&without, query, mode, k);
-            let mut plain = false;
-            // Every ask observed: the policy alternates between asks.
-            for _ in 0..20 {
+            let mut served = 0usize;
+            for _ in 0..GATED_ASKS {
                 let (a, stats, _) = run_once(&with, query, mode, k);
                 assert_eq!(
                     a, expected,
                     "{query:?} {mode:?} k={k}: same answer every time"
                 );
-                if stats.tier_entries > 0 {
-                    merged_any = true;
-                } else {
-                    plain = true;
-                }
+                served += usize::from(stats.tier_entries > 0);
             }
             assert!(
-                plain,
-                "{query:?} {mode:?} k={k}: the way without the merge was tried"
+                served > 0 && served < GATED_ASKS,
+                "{query:?} {mode:?} k={k}: the gate measured both ways ({served} of {GATED_ASKS} read the heads)"
             );
         }
     }
-    assert!(merged_any, "the merge was tried for some shape");
 }
 
 /// Null bodies: the heads name rows, not the column's document ids, so a
@@ -668,39 +656,6 @@ fn nulls_in_the_column_answer_the_same_and_still_resolve() {
         0,
         "the rare conjunction is still answered from the index"
     );
-}
-
-/// A cap on a term's entries cuts every superfile's head to the same
-/// shallower depth: the bounds hold through the raised tails and the
-/// answers do not change.
-#[test]
-fn a_per_term_budget_cuts_heads_and_answers_the_same() {
-    let with_dir = TempDir::new().expect("tempdir");
-    let without_dir = TempDir::new().expect("tempdir");
-    let with = table_with(
-        &with_dir,
-        Build {
-            tiers: true,
-            budget: Some(100),
-            ..Build::default()
-        },
-    );
-    let without = table(&without_dir, false);
-    let mut served = 0usize;
-    for (query, mode) in queries() {
-        for k in [10usize, 100] {
-            let (a, stats, _) = run(&with, &query, mode, k);
-            let (b, _, _) = run(&without, &query, mode, k);
-            assert_eq!(
-                a, b,
-                "{query:?} {mode:?} k={k}: same answer under the budget"
-            );
-            if stats.tier_entries > 0 {
-                served += 1;
-            }
-        }
-    }
-    assert!(served > 0, "the cut heads still serve queries");
 }
 
 /// The merge serves up to sixty-four distinct terms, a bit each; one more
@@ -984,4 +939,345 @@ fn a_table_indexed_by_the_layout_before_tiers_serves_as_before_and_rebuilds() {
         served |= stats.tier_entries > 0 || stats.superfiles_resolved > 0;
     }
     assert!(served, "after the rebuild the tiers serve");
+}
+
+/// A prefix over a table the term index covers scores each document by the
+/// sum over every completion it holds, as a disjunction of the completions
+/// does: "t" completes to "the" and "tensor", and a document holding both
+/// scores as both.
+#[test]
+fn a_prefix_scores_as_the_disjunction_of_its_completions() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = table(&dir, true);
+    let reader = st.reader().expect("reader");
+    let all = SUPERFILES * DOCS_PER_SUPERFILE;
+    let key = |h: &SuperfileHit| {
+        (
+            format!("{:?}", h.superfile),
+            h.local_doc_id,
+            h.score.to_bits(),
+        )
+    };
+    for k in [1usize, 10, 100, all] {
+        let prefix = reader.bm25_search_prefix("body", "t", k).expect("prefix");
+        let both = reader
+            .bm25_hits("body", "the tensor", k, Bm25SearchOptions::new())
+            .expect("hits");
+        assert_eq!(
+            prefix.iter().map(key).collect::<Vec<_>>(),
+            both.iter().map(key).collect::<Vec<_>>(),
+            "k={k}: the prefix answers as its completions' disjunction"
+        );
+    }
+}
+
+/// A pair of common terms whose best documents for one term sit past the
+/// other term's head: the heads bound every unread document under the
+/// threshold, and the candidates' missing frequencies are probed from the
+/// covering posting blocks, so the answer is the ceiling path's with no
+/// superfile opened.
+#[test]
+fn probes_settle_candidates_the_heads_leave_open() {
+    /// Superfiles, one commit each.
+    const PROBE_SUPERFILES: usize = 3;
+    /// Documents per superfile: past the whole-list size, so heads are cut.
+    const PROBE_DOCS: usize = 5_000;
+    /// The documents, late in each superfile, where `alpha` is frequent.
+    const HOT: std::ops::Range<usize> = 4_500..4_520;
+    /// Tokens per document, so every document has the same length.
+    const LEN: usize = 60;
+    let build = |dir: &TempDir, heads: bool| {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut options = SupertableOptions::new(schema(), vec![FtsConfig::new("body")], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_bound_ordered_open_window(1);
+        if !heads {
+            options = options.with_term_tier_entries_per_term(0);
+        }
+        let st = Supertable::create(options).expect("create");
+        for s in 0..PROBE_SUPERFILES {
+            let docs: Vec<String> = (0..PROBE_DOCS)
+                .map(|i| {
+                    let alpha = 1 + if HOT.contains(&i) {
+                        5 + i - HOT.start + 20 * s
+                    } else {
+                        0
+                    };
+                    let mut words = vec!["alpha"; alpha];
+                    words.push("beta");
+                    words.resize(LEN, "filler");
+                    words.join(" ")
+                })
+                .collect();
+            let col: ArrayRef = Arc::new(LargeStringArray::from(
+                docs.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            let mut w = st.writer().expect("writer");
+            w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st
+    };
+    let (with_dir, without_dir) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let (with, without) = (build(&with_dir, true), build(&without_dir, false));
+    for mode in [BoolMode::Or, BoolMode::And] {
+        for k in [1usize, 10] {
+            let (a, stats, _) = run(&with, "alpha beta", mode, k);
+            let (b, _, _) = run(&without, "alpha beta", mode, k);
+            assert_eq!(a, b, "{mode:?} k={k}: the probed answer is the ceilings'");
+            // Probes run beside the opens: the first open window (one
+            // superfile here) is under way before they report, and they
+            // settle the rest unopened.
+            assert!(
+                opened(&stats) <= OPEN_WINDOW as u64,
+                "{mode:?} k={k}: probes settle all but the first window: {}",
+                opened(&stats)
+            );
+        }
+    }
+}
+
+/// A phrase of two common words whose occurrences sit in a few late
+/// documents of each superfile: the heads bound the rest, the candidates'
+/// occurrences are probed from the members' covering blocks and position
+/// groups, and the answer is the ceiling path's with no superfile opened.
+#[test]
+fn phrase_probes_settle_a_phrase_of_common_words() {
+    /// Superfiles, one commit each.
+    const PHRASE_SUPERFILES: usize = 3;
+    /// Documents per superfile: past the whole-list size.
+    const PHRASE_DOCS: usize = 5_000;
+    /// The documents, late in each superfile, holding the phrase.
+    const HOT: std::ops::Range<usize> = 4_500..4_520;
+    let build = |dir: &TempDir, heads: bool| {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut fts = FtsConfig::new("body");
+        fts.positions = true;
+        let mut options = SupertableOptions::new(schema(), vec![fts], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_bound_ordered_open_window(1);
+        if !heads {
+            options = options.with_term_tier_entries_per_term(0);
+        }
+        let st = Supertable::create(options).expect("create");
+        for s in 0..PHRASE_SUPERFILES {
+            let docs: Vec<String> = (0..PHRASE_DOCS)
+                .map(|i| match HOT.contains(&i) {
+                    // The phrase once or more, tied nowhere across superfiles.
+                    true => {
+                        let mut words = Vec::new();
+                        for _ in 0..(1 + (i - HOT.start + s) % 4) {
+                            words.extend(["alpha", "beta"]);
+                        }
+                        words.resize(40, "filler");
+                        words.join(" ")
+                    }
+                    // Both words, never adjacent in order.
+                    false => {
+                        let mut words = vec!["beta", "filler", "alpha"];
+                        words.resize(40, "filler");
+                        words.join(" ")
+                    }
+                })
+                .collect();
+            let col: ArrayRef = Arc::new(LargeStringArray::from(
+                docs.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            let mut w = st.writer().expect("writer");
+            w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st
+    };
+    let (with_dir, without_dir) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let (with, without) = (build(&with_dir, true), build(&without_dir, false));
+    for k in [1usize, 10] {
+        let (a, stats, _) = run(&with, "\"alpha beta\"", BoolMode::Or, k);
+        let (b, _, _) = run(&without, "\"alpha beta\"", BoolMode::Or, k);
+        assert!(!a.is_empty(), "k={k}: the phrase matches");
+        assert_eq!(a, b, "k={k}: the probed answer is the ceilings'");
+        assert!(
+            opened(&stats) <= OPEN_WINDOW as u64,
+            "k={k}: phrase probes settle all but the first window: {}",
+            opened(&stats)
+        );
+    }
+}
+
+/// A phrase whose members' best documents never hold it: the first wave of
+/// probes reads only the best-bounded candidates, finds no threshold among
+/// them, and leaves the rest to the opens, which answer as the ceilings do.
+/// Probing every candidate would find the few that hold the phrase, at a
+/// read per superfile per member for each wave.
+#[test]
+fn a_phrase_its_best_candidates_lack_is_left_to_the_opens() {
+    /// Superfiles, one commit each.
+    const SUPERFILES: usize = 3;
+    /// Documents per superfile: past the whole-list size.
+    const DOCS: usize = 5_000;
+    /// Documents with both members often, never adjacent: the best bounds.
+    const DECOYS: std::ops::Range<usize> = 4_000..4_040;
+    /// Documents with the phrase, each member less often than a decoy's.
+    const HOLDERS: std::ops::Range<usize> = 4_500..4_510;
+    /// Tokens per document, so every document has the same length.
+    const LEN: usize = 40;
+    /// How often a decoy holds each member.
+    const DECOY_TF: usize = 8;
+    /// How often a holder holds the phrase.
+    const HOLDER_TF: usize = 3;
+    let build = |dir: &TempDir, heads: bool| {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut fts = FtsConfig::new("body");
+        fts.positions = true;
+        let mut options = SupertableOptions::new(schema(), vec![fts], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_bound_ordered_open_window(OPEN_WINDOW);
+        if !heads {
+            options = options.with_term_tier_entries_per_term(0);
+        }
+        let st = Supertable::create(options).expect("create");
+        for _ in 0..SUPERFILES {
+            let docs: Vec<String> = (0..DOCS)
+                .map(|i| {
+                    let mut words = Vec::new();
+                    if DECOYS.contains(&i) {
+                        for _ in 0..DECOY_TF {
+                            words.extend(["alpha", "filler", "beta", "filler"]);
+                        }
+                    } else if HOLDERS.contains(&i) {
+                        for _ in 0..HOLDER_TF {
+                            words.extend(["alpha", "beta", "filler"]);
+                        }
+                    } else {
+                        words.extend(["beta", "filler", "alpha"]);
+                    }
+                    words.resize(LEN, "filler");
+                    words.join(" ")
+                })
+                .collect();
+            let col: ArrayRef = Arc::new(LargeStringArray::from(
+                docs.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            let mut w = st.writer().expect("writer");
+            w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st
+    };
+    let (with_dir, without_dir) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let (with, without) = (build(&with_dir, true), build(&without_dir, false));
+    let (a, stats, _) = run(&with, "\"alpha beta\"", BoolMode::Or, 1);
+    let (b, _, _) = run(&without, "\"alpha beta\"", BoolMode::Or, 1);
+    assert!(!a.is_empty(), "the phrase matches");
+    assert_eq!(a, b, "the answer is the ceilings'");
+    assert_eq!(
+        opened(&stats),
+        SUPERFILES as u64,
+        "the first wave found no threshold, so the opens settle every superfile"
+    );
+}
+
+/// A phrase, alone or required, over heads many levels deep: the heads
+/// hold no positions, so they find no threshold, and without one no bound
+/// rules a superfile out. Its first round names the candidates to probe; deeper
+/// rounds wait for the threshold the probes find, and the answer is the
+/// ceilings'. Reading them before it bounded every candidate they added
+/// each round, and on a warm table cost more than the opens.
+#[test]
+fn a_phrase_reads_one_round_before_its_threshold() {
+    /// Superfiles, one commit each.
+    const SUPERFILES: usize = 3;
+    /// Documents per superfile, each holding both members: heads several
+    /// levels deep.
+    const DOCS: usize = 5_000;
+    /// The documents holding the phrase.
+    const HOLDERS: std::ops::Range<usize> = 4_500..4_520;
+    /// Fewest tokens per document.
+    const MIN_LEN: usize = 64;
+    /// Distinct lengths past the fewest.
+    const LEN_SPREAD: usize = 97;
+    /// Distinct frequencies of each member past the first.
+    const TF_SPREAD: usize = 30;
+    /// A head's first level: its entries the first round reads.
+    const FIRST_LEVEL: u64 = 64;
+    /// The first round: a level of each member's head in each layer, one
+    /// layer a commit.
+    const FIRST_ROUND: u64 = 2 * SUPERFILES as u64 * FIRST_LEVEL;
+    let build = |dir: &TempDir, heads: bool| {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut fts = FtsConfig::new("body");
+        fts.positions = true;
+        let mut options = SupertableOptions::new(schema(), vec![fts], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_bound_ordered_open_window(OPEN_WINDOW);
+        if !heads {
+            options = options.with_term_tier_entries_per_term(0);
+        }
+        let st = Supertable::create(options).expect("create");
+        for s in 0..SUPERFILES {
+            let docs: Vec<String> = (0..DOCS)
+                .map(|i| {
+                    let mut words = match HOLDERS.contains(&i) {
+                        true => vec!["alpha", "beta"],
+                        false => vec!["beta", "filler", "alpha"],
+                    };
+                    // Members' frequencies and lengths vary, so the heads'
+                    // keys fall level by level and each round lowers the
+                    // bounds.
+                    words.extend(repeat_n("alpha", (i + s) % TF_SPREAD));
+                    words.push("filler");
+                    words.extend(repeat_n("beta", (i * 7 + s) % TF_SPREAD));
+                    words.resize(MIN_LEN + i % LEN_SPREAD, "filler");
+                    words.join(" ")
+                })
+                .collect();
+            let col: ArrayRef = Arc::new(LargeStringArray::from(
+                docs.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            let mut w = st.writer().expect("writer");
+            w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st
+    };
+    let (with_dir, without_dir) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let (with, without) = (build(&with_dir, true), build(&without_dir, false));
+    for (mode, k) in [BoolMode::And, BoolMode::Or]
+        .into_iter()
+        .flat_map(|m| [(m, 1usize), (m, 10)])
+    {
+        let (a, stats, _) = run(&with, "\"alpha beta\"", mode, k);
+        let (b, _, _) = run(&without, "\"alpha beta\"", mode, k);
+        assert!(!a.is_empty(), "{mode:?} k={k}: the phrase matches");
+        assert_eq!(a, b, "{mode:?} k={k}: the answer is the ceilings'");
+        assert!(
+            stats.tier_entries > 0 && stats.tier_entries <= FIRST_ROUND,
+            "{mode:?} k={k}: one round of heads before the opens, read {}",
+            stats.tier_entries
+        );
+    }
 }

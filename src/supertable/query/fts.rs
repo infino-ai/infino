@@ -117,6 +117,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError, config,
+    memory::ConnectionMemoryBudget,
     runtime_bridge::run_on_pool_unless_blocking,
     runtime_metrics::op_stats,
     superfile::{
@@ -126,13 +127,14 @@ use crate::{
             bm25,
             bm25::Bm25Params,
             reader::{
-                Bm25SearchOptions, ClauseLists, ColumnLengthStats, FetchedTermMemo, GlobalTermIdf,
-                LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryIdf,
-                ScoringView,
+                Bm25SearchOptions, CANDIDATE_MAX_POSTINGS, CANDIDATE_MAX_TERMS, CandidateNorms,
+                ClauseLists, ColumnLengthStats, ColumnNorms, FEW_NORMS_MAX_DOCS, FetchedTermMemo,
+                GlobalTermIdf, LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet,
+                PreparedClauses, QueryDict, QueryIdf, ScoringView,
             },
             tokenize::Phrase,
         },
-        id_space::RowId,
+        id_space::{FtsDocId, RowId, row_bitmap},
     },
     supertable::{
         error::QueryError,
@@ -149,6 +151,7 @@ use crate::{
                 candidate_plan_for_filters, hit_output_schema, resolve_hits_named,
                 take_file_columns, take_rows_byte_source,
             },
+            heads,
             match_order::MatchOrder,
             provider::{holds_no_postings, prune_leaves_for_filters},
             prune::{PruneLeaf, select_superfiles},
@@ -304,6 +307,24 @@ struct MatchKernel {
     /// The pushed-down `WHERE`'s rows, when its indexes can bound them.
     row_filter: Option<RowFilter>,
     op_stats: Option<Arc<op_stats::OpStatsCollector>>,
+    /// The budget a file's kept dictionary is reserved from.
+    budget: Arc<ConnectionMemoryBudget>,
+}
+
+/// The dictionary copy a file's match walks share: kept only when the positive walk and the negated
+/// walk both read the dictionary, i.e. the memo answers neither; otherwise it keeps nothing.
+fn walk_dict(
+    phrase_involved: bool,
+    memo: Option<&FetchedTermMemo>,
+    positive: &[&str],
+    negated: &[&str],
+    budget: &Arc<ConnectionMemoryBudget>,
+) -> QueryDict {
+    let reads = |tokens: &[&str]| !memo.is_some_and(|m| m.covers(tokens));
+    match !phrase_involved && !negated.is_empty() && reads(positive) && reads(negated) {
+        true => QueryDict::with_budget(budget),
+        false => QueryDict::default(),
+    }
 }
 
 impl MatchKernel {
@@ -354,6 +375,14 @@ impl MatchKernel {
     /// keeps: the positive walk minus any row a negated atom reaches.
     async fn docs(&self, r: &Arc<SuperfileReader>, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
         let (column, memo, refs) = self.file_inputs(r, suid).await;
+        let neg_refs: Vec<&str> = self.negatives.iter().map(String::as_str).collect();
+        let dict = walk_dict(
+            self.phrase_involved,
+            memo.as_deref(),
+            &refs,
+            &neg_refs,
+            &self.budget,
+        );
         // Any phrase atom (match or negated) takes the phrase-aware walk;
         // plain-token queries keep the optimized token_match path.
         let (docs, mut work) = match self.phrase_involved {
@@ -362,7 +391,7 @@ impl MatchKernel {
                     .await?
             }
             false => {
-                r.token_match_prefetched(&column, &refs, self.mode, memo.as_deref())
+                r.token_match_prefetched(&column, &refs, self.mode, memo.as_deref(), &dict)
                     .await?
             }
         };
@@ -370,11 +399,16 @@ impl MatchKernel {
         // of the negatives). The df / count fast paths can't express
         // exclusion, so negation forces a materialized walk over both sets.
         let docs = if self.has_negatives {
-            let neg_refs: Vec<&str> = self.negatives.iter().map(String::as_str).collect();
             let (neg_docs, neg_work) = match self.negative_phrases.is_empty() {
                 true => {
-                    r.token_match_prefetched(&column, &neg_refs, BoolMode::Or, memo.as_deref())
-                        .await?
+                    r.token_match_prefetched(
+                        &column,
+                        &neg_refs,
+                        BoolMode::Or,
+                        memo.as_deref(),
+                        &dict,
+                    )
+                    .await?
                 }
                 false => {
                     r.atoms_match_ids(&column, &neg_refs, &self.negative_phrases, BoolMode::Or)
@@ -382,13 +416,15 @@ impl MatchKernel {
                 }
             };
             work.merge(neg_work);
-            let excluded: RoaringBitmap = neg_docs.into_iter().map(RowId::get).collect();
+            let excluded = row_bitmap(&neg_docs);
             docs.into_iter()
                 .filter(|d| !excluded.contains(d.get()))
                 .collect::<Vec<_>>()
         } else {
             docs
         };
+        // The row filter reads the dictionary on its own; the kept copy is not held through it.
+        drop(dict);
         // One flush per superfile: positive + negation walks.
         self.flush(&work);
         let hits = docs.len() as u64;
@@ -413,24 +449,36 @@ impl MatchKernel {
         Ok(set)
     }
 
-    /// The rows in doc-id slice `[start, end)` of a superfile that `set`,
-    /// its [`Self::cursor_set`], matches. A [`Self::slices`] kernel only.
+    /// What doc-id slice `[start, end)` of a superfile matches against `set`, its
+    /// [`Self::cursor_set`]: its rows when the file holds its doc-id map, else its blob ids for
+    /// the page read. A [`Self::slices`] kernel only.
     fn slice(
         &self,
         r: &SuperfileReader,
         set: &OrCursorSet,
         start: u32,
         end: u32,
-    ) -> Result<Vec<RowId>, QueryError> {
-        let (rows, work) = r.token_match_range_prebuilt(set, start, end)?;
+    ) -> Result<SliceMatch, QueryError> {
+        let (ids, work) = r.token_match_range_in_blob_ids(set, start, end)?;
         self.flush(&work);
-        Ok(rows)
+        Ok(match r.held_ids_to_rows(&ids)? {
+            Some(rows) => SliceMatch::Rows(rows),
+            None => SliceMatch::Unmapped(ids),
+        })
     }
 
     /// Adds a walk's work to the statement's statistics.
     fn flush(&self, work: &MatchWork) {
         add_match_work(&self.op_stats, work);
     }
+}
+
+/// What one slice of a sliced match found.
+enum SliceMatch {
+    /// Its rows, translated through the doc-id map the file holds.
+    Rows(Vec<RowId>),
+    /// Its blob ids, when the file keeps no map, for a read of the map's pages.
+    Unmapped(Vec<FtsDocId>),
 }
 
 /// The row filter walks a superfile's postings only when the match keeps at
@@ -525,7 +573,10 @@ impl RowFilter {
             locations: &self.locations,
             superfile: suid,
         };
-        let estimated = self.plan.estimate(r, Some(&self.pool), Some(located)).await;
+        let estimated = self
+            .plan
+            .estimate(r, Some(&self.pool), Some(located), &QueryDict::default())
+            .await;
         let (estimate, work) = match estimated {
             Ok(estimated) => estimated,
             // A superfile written before a filter column was indexed holds
@@ -540,7 +591,14 @@ impl RowFilter {
         // The walk is CPU work: on the pool, not on a runtime worker.
         let memos = memos_from_plan_locations(r, &self.locations, suid).await;
         let (rows, work) = Arc::clone(&self.plan)
-            .evaluate_on_pool(Arc::clone(r), suid, &self.pool, &self.slots, memos)
+            .evaluate_on_pool(
+                Arc::clone(r),
+                suid,
+                &self.pool,
+                &self.slots,
+                memos,
+                Arc::default(),
+            )
             .await?;
         self.flush(&work);
         Ok(rows.map(Arc::new))
@@ -1022,6 +1080,71 @@ pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
     ceiling.partial_cmp(&floor) != Some(std::cmp::Ordering::Less)
 }
 
+/// Wall a ranked query's opens may take before a query that accepts an
+/// approximate answer (a score tolerance above zero) takes one: past it,
+/// such a query whose bounds leave too many superfiles in play keeps only
+/// those that can matter most.
+const APPROXIMATE_BUDGET_NS: u64 = 60_000_000_000;
+/// What one open is taken to cost before the table has measured it: a
+/// cold read of a superfile's dictionary and postings from object storage.
+const UNMEASURED_OPEN_COST_NS: u64 = 50_000_000;
+/// Parts per million, the unit an approximate answer's gap is noted in.
+const PPM: f32 = 1_000_000.0;
+
+/// How many of a ranked query's superfiles to open, in descending bound
+/// order, and the gap that leaves.
+#[derive(Debug, PartialEq)]
+struct ApproximateCut {
+    keep: usize,
+    gap_ppm: u64,
+}
+
+/// Where to cut a ranked query's superfiles, `ceilings` in descending
+/// order, given its threshold `theta`, what an open costs and the caller's
+/// score `tolerance`. Every one is kept — the answer is exact — unless the
+/// caller accepts an approximate answer (`tolerance` above zero), a
+/// threshold is known, and opening those in play would run past
+/// [`APPROXIMATE_BUDGET_NS`]. Then first those bounded more than the
+/// tolerance above the threshold are kept; still past it, as many of those
+/// as fit, best first. The gap is the largest bound left unopened over the
+/// threshold, less one: no missed document scores further above the
+/// returned k-th score, which is at least the threshold.
+fn approximate_cut(
+    ceilings: &[f32],
+    theta: f32,
+    open_cost_ns: u64,
+    tolerance: f32,
+) -> ApproximateCut {
+    let exact = ApproximateCut {
+        keep: ceilings.len(),
+        gap_ppm: 0,
+    };
+    let accepts = tolerance.is_finite() && tolerance > 0.0;
+    let bounded = theta.is_finite() && theta > 0.0;
+    if !(accepts && bounded) {
+        return exact;
+    }
+    let per_open = match open_cost_ns {
+        0 => UNMEASURED_OPEN_COST_NS,
+        ns => ns,
+    };
+    let fit = (APPROXIMATE_BUDGET_NS / per_open).max(1) as usize;
+    let in_play = ceilings.iter().filter(|c| **c > theta).count();
+    if in_play <= fit {
+        return exact;
+    }
+    let past_tolerance = ceilings
+        .iter()
+        .filter(|c| **c > theta * (1.0 + tolerance))
+        .count();
+    let keep = past_tolerance.min(fit);
+    let gap_ppm = match ceilings.get(keep) {
+        None => 0,
+        Some(&next) => (((next / theta) - 1.0).max(0.0) * PPM).ceil() as u64,
+    };
+    ApproximateCut { keep, gap_ppm }
+}
+
 /// The score a superfile's ceiling is actually tested against: the running
 /// k-th score, raised by the caller's tolerance.
 ///
@@ -1044,6 +1167,7 @@ pub(crate) fn competitive_floor(floor: f32, tolerance: f32) -> f32 {
 /// is scored at the table's.
 fn table_scoring(column: &str, params: Option<Bm25Params>, avgdl: Option<f32>) -> ScoringView<'_> {
     ScoringView {
+        norms: None,
         params,
         avgdl: avgdl.map(|avgdl| (column, avgdl)),
     }
@@ -1511,12 +1635,13 @@ impl SupertableReader {
         // order, and its kernel seeds its own floor from its own blocks; the
         // merge would only cost its reads and rounds on every query, and the
         // gate its samples learning so.
-        let tiers_serve = index_column.is_some()
+        let rows_scoped = scope.is_some_and(|s| s.bounds_rows(&kept));
+        let index_serves = index_column.is_some()
             && kept.len() > 1
-            && scope.is_none_or(|s| !s.bounds_rows(&kept))
             && all_terms.len() <= tier::MAX_TIER_TERMS
             && manifest.term_index_complete()
             && !config::global().diagnostics.disable_tier_selection;
+        let tiers_serve = index_serves && !rows_scoped;
         // Whether to merge at all is the table's learned call per class of
         // query; the search is timed from here so the call can be judged.
         let rarest_idf = all_terms
@@ -1541,8 +1666,30 @@ impl SupertableReader {
         // decide how deep it reads. Within a window the table's learned
         // call stands.
         let forced = tiers_serve && kept.len() > manifest.options.ordered_open_window();
+        // Whether the index chooses this query's superfiles before any
+        // open: forced past one window, else the table's learned call for
+        // the class, which times the search with the index's reads against
+        // without them and keeps the cheaper. Level heads take the same
+        // call as tiers: on a table whose opens are cheap — warm, or few
+        // superfiles — reading a level per term and layer can cost more
+        // than the opens it saves, and only the measured walls say which.
         let merge_now =
             tiers_serve && (forced || !learned || self.tier_policy().merge(policy_class));
+        // A term index with level heads for every term the query scores
+        // serves a merge from them. A query whose scope admits only some
+        // rows keeps the ceilings' path, as it does without heads: the k-th
+        // score over every row is no floor for the admitted ones. A `WHERE`
+        // that only chooses superfiles is ranked over their rows and its
+        // predicate applied by the widening fill, as the tiers serve it. A
+        // negated query is bounded by its positive terms only, and takes
+        // the ceilings' path too.
+        let every_row = !rows_scoped && negatives.is_empty() && negative_phrases.is_empty();
+        let heads_serve = match (merge_now && every_row, index_column) {
+            (true, Some((index, column_id))) => heads::available(index, column_id, &all_terms)
+                .await
+                .unwrap_or(false),
+            _ => false,
+        };
         // The deny sets, resolved only for a merge: it reads past the
         // deleted rows, and the units then admit rows by the same sets, so
         // a delete committed between the two reads cannot leave the
@@ -1645,6 +1792,11 @@ impl SupertableReader {
                     required,
                     scoring,
                     phrases: tier_phrases,
+                    phrase_offsets: must_phrases
+                        .iter()
+                        .chain(should_phrases.iter())
+                        .map(|p| p.offsets.clone())
+                        .collect(),
                     // A negated phrase excludes as a negated term does: the
                     // heads cannot see the adjacency that unmakes a match.
                     negated: !negatives.is_empty() || !negative_phrases.is_empty(),
@@ -1657,6 +1809,8 @@ impl SupertableReader {
                     merge_gate: manifest.options.tier_merge_gate,
                     forced,
                     budget: Arc::clone(&manifest.options.connection_memory_budget),
+                    rows_scoped,
+                    score_tolerance,
                 });
             }
         }
@@ -1757,6 +1911,28 @@ impl SupertableReader {
         let must_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(must_phrases);
         let should_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(should_phrases);
         let neg_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(negative_phrases);
+        // A multi-term or phrase query with nothing negated and no exact
+        // count scores only what can reach the floor.
+        let candidate_shape = !exact_count
+            && neg_arc.is_empty()
+            && neg_ph_arc.is_empty()
+            && (must_arc.len() + should_arc.len() >= 2
+                || !must_ph_arc.is_empty()
+                || !should_ph_arc.is_empty());
+        let bare_counts: Arc<Vec<(String, u32)>> = Arc::new({
+            let mut counts: Vec<(String, u32)> = Vec::new();
+            let mut at: HashMap<&str, usize> = HashMap::new();
+            for term in must_arc.iter().chain(should_arc.iter()) {
+                match at.get(term.as_str()) {
+                    Some(&i) => counts[i].1 += 1,
+                    None => {
+                        at.insert(term, counts.len());
+                        counts.push((term.clone(), 1));
+                    }
+                }
+            }
+            counts
+        });
         let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column_owned);
         // Exact count only: each superfile's row count, to turn its
@@ -1788,6 +1964,11 @@ impl SupertableReader {
         // 2.5x cold bytes when slicing widened. The OnceCell coalesces
         // concurrent slices of a file; un-ranged units never touch this.
         let cursor_sets = SharedCursorSets::default();
+        // Slices of one superfile share its candidate norms too: built once,
+        // at the floor the first slice reads. The floor only rises, so every
+        // later slice's candidates are among them. An un-ranged unit builds
+        // its own and drops them once scored.
+        let candidate_cells = SharedCandidateNorms::default();
         // Ranged kernels are multi-millisecond SYNC scans; run them as a
         // rayon wave on the reader pool, bridged with a oneshot, per the
         // concurrency contract. Inline on tokio workers they block the
@@ -1834,8 +2015,10 @@ impl SupertableReader {
             let must_ph_arc = Arc::clone(&must_ph_arc);
             let should_ph_arc = Arc::clone(&should_ph_arc);
             let neg_ph_arc = Arc::clone(&neg_ph_arc);
+            let bare_counts = Arc::clone(&bare_counts);
             let shared = Arc::clone(&shared);
             let cursor_sets = Arc::clone(&cursor_sets);
+            let candidate_cells = Arc::clone(&candidate_cells);
             let reader_pool = Arc::clone(&reader_pool);
             let tombstones = tombstones.clone();
             let deny_by_superfile = Arc::clone(&deny_by_superfile);
@@ -1881,12 +2064,76 @@ impl SupertableReader {
                 // A resident superfile has every byte in memory: nothing to
                 // prewarm, and on a warm table a future per superfile is
                 // measurable against a query of a millisecond.
+                // One bare term with a block or less of postings here scores
+                // from those documents' buckets alone (see `few_norms`), so
+                // prewarming the whole length array would only add its bytes.
+                let few_postings = must_arc.len() + should_arc.len() == 1
+                    && neg_arc.is_empty()
+                    && must_ph_arc.is_empty()
+                    && should_ph_arc.is_empty()
+                    && neg_ph_arc.is_empty()
+                    && must_arc
+                        .iter()
+                        .chain(should_arc.iter())
+                        .next()
+                        .and_then(|term| index_locations.held(suid)?.df(term))
+                        .is_some_and(|df| df as usize <= FEW_NORMS_MAX_DOCS);
+                // Candidate norms are worth trying only where the term index
+                // says the postings to decode are few: all the query's terms
+                // this superfile holds, or a lone phrase's rarest word, over
+                // few terms. Only those terms go on: a prefix's other
+                // expansions, thousands of them, are absent here. Elsewhere
+                // the length array is prewarmed and read as before.
+                let candidate_terms = candidate_shape
+                    .then(|| index_locations.held(suid))
+                    .flatten()
+                    .and_then(|held| {
+                        let mut bare: Vec<(&str, u32)> = Vec::new();
+                        let mut work = 0u64;
+                        let mut distinct: HashSet<&str> = HashSet::new();
+                        for (term, count) in bare_counts.iter() {
+                            let df = held.df(term)?;
+                            if df > 0 {
+                                bare.push((term.as_str(), *count));
+                                work += df;
+                                distinct.insert(term.as_str());
+                            }
+                        }
+                        let mut phrases: Vec<(&[String], Vec<u64>)> = Vec::new();
+                        for phrase in must_ph_arc.iter().chain(should_ph_arc.iter()) {
+                            let dfs = phrase
+                                .terms
+                                .iter()
+                                .map(|t| held.df(t))
+                                .collect::<Option<Vec<u64>>>()?;
+                            // A phrase missing a word here cannot match here.
+                            if dfs.iter().all(|&df| df > 0) {
+                                distinct.extend(phrase.terms.iter().map(String::as_str));
+                                phrases.push((phrase.terms.as_slice(), dfs));
+                            }
+                        }
+                        work = match (bare.is_empty(), phrases.as_slice()) {
+                            (true, [(_, dfs)]) => dfs.iter().copied().min().unwrap_or(0),
+                            _ => work + phrases.iter().flat_map(|(_, dfs)| dfs).sum::<u64>(),
+                        };
+                        let cheap = !distinct.is_empty()
+                            && distinct.len() <= CANDIDATE_MAX_TERMS
+                            && work <= CANDIDATE_MAX_POSTINGS;
+                        cheap.then(|| {
+                            let phrases: Vec<&[String]> =
+                                phrases.into_iter().map(|(terms, _)| terms).collect();
+                            (bare, phrases)
+                        })
+                    });
+                let candidate_cheap = candidate_terms.is_some();
                 let prewarm = async {
                     if r.parquet_bytes().is_some() {
                         return;
                     }
                     let scoring = async {
-                        if let Some(fts) = r.fts()
+                        if !few_postings
+                            && !candidate_cheap
+                            && let Some(fts) = r.fts()
                             && let Err(error) = fts.prewarm_scoring(&column_arc).await
                         {
                             debug!(%error, "prewarm of the scoring reads failed; the kernel reads them");
@@ -1912,6 +2159,52 @@ impl SupertableReader {
                 let floor = match exact_count {
                     true => f32::NEG_INFINITY,
                     false => shared.floor(),
+                };
+                // Few documents of a multi-term or phrase query can reach the
+                // floor: scoring reads only their length buckets (see
+                // `candidate_norms`). Anything it cannot read that way keeps
+                // the column's own norms.
+                let candidates = match (r.fts(), &candidate_terms) {
+                    (Some(fts), Some((bare, phrases))) if r.parquet_bytes().is_none() => {
+                        let build = || async {
+                            fts.candidate_norms(
+                                &column_arc,
+                                bare,
+                                phrases,
+                                &global_idf,
+                                &scoring,
+                                floor,
+                                memo.as_deref(),
+                                Some(&reader_pool),
+                            )
+                            .await
+                            .unwrap_or_else(|error| {
+                                debug!(
+                                    %error,
+                                    "candidate norms unreadable; scoring reads the column's"
+                                );
+                                None
+                            })
+                            .map(Arc::new)
+                        };
+                        match range.is_some() {
+                            true => cell_for(&candidate_cells, suid)
+                                .get_or_init(build)
+                                .await
+                                .clone(),
+                            // The file's only unit: a shared cell would hold
+                            // its norms until the whole fan-out returns.
+                            false => build().await,
+                        }
+                    }
+                    _ => None,
+                };
+                let scoring = ScoringView {
+                    norms: candidates.as_ref().map(|norms| CandidateNorms {
+                        column: &column_arc,
+                        norms,
+                    }),
+                    ..scoring
                 };
                 let (live_floor, allow) = {
                     // The set the merge read for this superfile, when every
@@ -2013,6 +2306,7 @@ impl SupertableReader {
                             let kernel_set = Arc::clone(set);
                             let kernel_stats = op_stats.clone();
                             let kernel_column = column_arc.clone();
+                            let kernel_candidates = candidates.clone();
                             run_on_pool_unless_blocking(
                                 Some(&reader_pool),
                                 "ranged fts kernel",
@@ -2024,7 +2318,15 @@ impl SupertableReader {
                                             start,
                                             end,
                                             floor,
-                                            &table_scoring(&kernel_column, bm25_params, avgdl),
+                                            &ScoringView {
+                                                norms: kernel_candidates.as_ref().map(|norms| {
+                                                    CandidateNorms {
+                                                        column: &kernel_column,
+                                                        norms,
+                                                    }
+                                                }),
+                                                ..table_scoring(&kernel_column, bm25_params, avgdl)
+                                            },
                                         )
                                     })
                                 },
@@ -2086,6 +2388,7 @@ impl SupertableReader {
                                     let kernel_reader = Arc::clone(&r);
                                     let kernel_stats = op_stats.clone();
                                     let kernel_column = column_arc.clone();
+                                    let kernel_candidates = candidates.clone();
                                     run_on_pool_unless_blocking(
                                         Some(&reader_pool),
                                         "exact-count fts kernel",
@@ -2093,11 +2396,19 @@ impl SupertableReader {
                                             op_stats::timed_kernel(&kernel_stats, || {
                                                 kernel_reader.run_prepared_with_count_in_blob_ids(
                                                     prep,
-                                                    &table_scoring(
-                                                        &kernel_column,
-                                                        bm25_params,
-                                                        avgdl,
-                                                    ),
+                                                    &ScoringView {
+                                                        norms: kernel_candidates.as_ref().map(
+                                                            |norms| CandidateNorms {
+                                                                column: &kernel_column,
+                                                                norms,
+                                                            },
+                                                        ),
+                                                        ..table_scoring(
+                                                            &kernel_column,
+                                                            bm25_params,
+                                                            avgdl,
+                                                        )
+                                                    },
                                                 )
                                             })
                                         },
@@ -2129,6 +2440,7 @@ impl SupertableReader {
                                     let kernel_reader = Arc::clone(&r);
                                     let kernel_stats = op_stats.clone();
                                     let kernel_column = column_arc.clone();
+                                    let kernel_candidates = candidates.clone();
                                     run_on_pool_unless_blocking(
                                         Some(&reader_pool),
                                         "un-ranged fts kernel",
@@ -2136,11 +2448,19 @@ impl SupertableReader {
                                             op_stats::timed_kernel(&kernel_stats, || {
                                                 kernel_reader.run_prepared_in_blob_ids(
                                                     prep,
-                                                    &table_scoring(
-                                                        &kernel_column,
-                                                        bm25_params,
-                                                        avgdl,
-                                                    ),
+                                                    &ScoringView {
+                                                        norms: kernel_candidates.as_ref().map(
+                                                            |norms| CandidateNorms {
+                                                                column: &kernel_column,
+                                                                norms,
+                                                            },
+                                                        ),
+                                                        ..table_scoring(
+                                                            &kernel_column,
+                                                            bm25_params,
+                                                            avgdl,
+                                                        )
+                                                    },
                                                 )
                                             })
                                         },
@@ -2186,6 +2506,7 @@ impl SupertableReader {
                 units = units.len(),
                 resolved = tracing::field::Empty,
                 ruled_out = tracing::field::Empty,
+                approximate_skipped = tracing::field::Empty,
             )
         });
         let fanout_records = fanout_span.clone();
@@ -2224,6 +2545,7 @@ impl SupertableReader {
                     m
                 });
             let reader = self;
+            let open_cost_ns = self.open_cost_ns();
             let selected = &selected;
             let pruned = &pruned;
             // What a selection does to the units it is handed: the
@@ -2237,6 +2559,10 @@ impl SupertableReader {
                 if let Some(per_entry) = selection.merge_ns.checked_div(selection.entries_read) {
                     reader.note_tier_entry_cost(per_entry);
                 }
+                // A plan may be made twice, from the heads' reads and then
+                // from their probes, each from its own copies.
+                let (merged_ids, units_of, merger, span) =
+                    (merged_ids.clone(), units_of.clone(), Arc::clone(&merger), span.clone());
                 Box::new(move |remaining: dispatch::Units<UnitParams>| {
                     let bounds_of: HashMap<Uuid, tier::SuperfileBounds> =
                         merged_ids.iter().copied().zip(selection.bounds).collect();
@@ -2292,13 +2618,31 @@ impl SupertableReader {
                             .then(yl.total_cmp(xl))
                             .then(a.id_min.cmp(&b.id_min))
                     });
+                    // Exact unless the caller accepts an approximate answer
+                    // and opening what is still in play would run past the
+                    // budget; then approximate, with the gap noted.
+                    let ceilings: Vec<f32> = keep.iter().map(|(_, p, _)| p.ceiling).collect();
+                    let cut =
+                        approximate_cut(&ceilings, selection.theta_lb, open_cost_ns, score_tolerance);
+                    let cut_any = cut.keep < keep.len();
+                    if cut_any {
+                        let skipped = (keep.len() - cut.keep) as u64;
+                        keep.truncate(cut.keep);
+                        if let Some(stats) = &reader.op_stats {
+                            stats.add_approximate(skipped, cut.gap_ppm);
+                        }
+                        span.record("approximate_skipped", skipped);
+                    }
                     // The tiers' lower bound on the k-th score is a floor
                     // every kernel may prune against; the real scores that
                     // replace these placeholders only raise it. They stand
                     // for k real documents at `_id`s no higher than the
                     // threshold's, so a superfile that can only tie them and
-                    // holds only higher `_id`s is skipped on the tie.
-                    if selection.theta_lb.is_finite() {
+                    // holds only higher `_id`s is skipped on the tie. Not
+                    // after a cut: the documents they stand for may sit in a
+                    // superfile left unopened, and the answer would come back
+                    // short of k.
+                    if selection.theta_lb.is_finite() && !cut_any {
                         merger.merge(selection.theta_id_max, repeat_n(selection.theta_lb, k));
                     }
                     let resolved = answered.len() as u64;
@@ -2321,42 +2665,31 @@ impl SupertableReader {
             let unreadable = |e: term_index::TermIndexError| {
                 warn!(error = %e, "term-index tier unreadable; the query keeps its ceilings");
             };
-            let prepared = tier::prepare_merge(index, &query, &merge_kept, &global_idf, pool)
-                .await
-                .unwrap_or_else(|e| {
-                    unreadable(e);
-                    None
-                });
-            if prepared.is_none() {
-                declined.store(true, AtomicOrdering::Relaxed);
-            }
-            let window = manifest.options.ordered_open_window();
-            match prepared {
-                Some(prepared) if prepared.resident => {
-                    let selection = prepared.run(live_floor).await.unwrap_or_else(|e| {
+            // The level heads choose first, before any open; a query they
+            // cannot serve takes the tier merge.
+            let by_heads = match heads_serve {
+                true => heads::select(index, manifest, column, &query, &merge_kept, &global_idf)
+                    .await
+                    .unwrap_or_else(|e| {
                         unreadable(e);
                         None
-                    });
-                    if let Some(selection) = selection {
-                        let (keep, settled) = make_plan(selection)(units);
-                        units = keep;
-                        settled_before = settled;
-                    }
-                }
-                // On a table whose kept units all issue at once, a merge that
-                // must read its tiers would report after every open is under
-                // way and change none; its reads would only compete with the
-                // opens, and the gate would spend samples on a plan that
-                // cannot act. Its first wave is read without waiting, for the
-                // next query of these terms, and nothing is reported.
-                Some(prepared) if units.len() <= window => {
-                    prepared.prefetch(Arc::clone(index));
-                }
-                Some(prepared) => {
+                    }),
+                false => None,
+            };
+            if let Some(chosen) = by_heads {
+                let (keep, settled) = make_plan(chosen.now)(units);
+                units = keep;
+                settled_before = settled;
+                // Probes run beside the opens, which go in bound order; what
+                // they settle replaces the plan for the units not yet opened.
+                // Where every unit in play issues at once there are none such:
+                // the probes would add their reads to the opens' and change
+                // nothing.
+                let window = manifest.options.ordered_open_window();
+                if let Some(stage) = chosen.probes.filter(|_| units.len() > window) {
                     replan = Some(Box::pin(async move {
-                        match prepared.run(live_floor).await {
-                            Ok(Some(selection)) => Some(make_plan(selection)),
-                            Ok(None) => None,
+                        match stage.run().await {
+                            Ok(selection) => Some(make_plan(selection)),
                             Err(e) => {
                                 unreadable(e);
                                 None
@@ -2364,7 +2697,52 @@ impl SupertableReader {
                         }
                     }));
                 }
-                None => {}
+            } else {
+                let prepared = tier::prepare_merge(index, &query, &merge_kept, &global_idf, pool)
+                    .await
+                    .unwrap_or_else(|e| {
+                        unreadable(e);
+                        None
+                    });
+                if prepared.is_none() {
+                    declined.store(true, AtomicOrdering::Relaxed);
+                }
+                let window = manifest.options.ordered_open_window();
+                match prepared {
+                    Some(prepared) if prepared.resident => {
+                        let selection = prepared.run(live_floor).await.unwrap_or_else(|e| {
+                            unreadable(e);
+                            None
+                        });
+                        if let Some(selection) = selection {
+                            let (keep, settled) = make_plan(selection)(units);
+                            units = keep;
+                            settled_before = settled;
+                        }
+                    }
+                    // On a table whose kept units all issue at once, a merge that
+                    // must read its tiers would report after every open is under
+                    // way and change none; its reads would only compete with the
+                    // opens, and the gate would spend samples on a plan that
+                    // cannot act. Its first wave is read without waiting, for the
+                    // next query of these terms, and nothing is reported.
+                    Some(prepared) if units.len() <= window => {
+                        prepared.prefetch(Arc::clone(index));
+                    }
+                    Some(prepared) => {
+                        replan = Some(Box::pin(async move {
+                            match prepared.run(live_floor).await {
+                                Ok(Some(selection)) => Some(make_plan(selection)),
+                                Ok(None) => None,
+                                Err(e) => {
+                                    unreadable(e);
+                                    None
+                                }
+                            }
+                        }));
+                    }
+                    None => {}
+                }
             }
         }
         let per_unit = match !exact_count && ceilings.is_some() {
@@ -3120,15 +3498,20 @@ impl SupertableReader {
                         // file: a rayon job on the reader pool, so the
                         // slices run side by side and no runtime worker
                         // blocks under one.
-                        let (set, slice_reader, slice_kernel) =
+                        let (slice_set, slice_reader, slice_kernel) =
                             (Arc::clone(set), Arc::clone(&r), Arc::clone(&kernel));
-                        let docs = run_on_pool_unless_blocking(
+                        let found = run_on_pool_unless_blocking(
                             Some(&reader_pool),
                             "match slice",
-                            move || slice_kernel.slice(&slice_reader, &set, start, end),
+                            move || slice_kernel.slice(&slice_reader, &slice_set, start, end),
                         )
                         .await
                         .map_err(|e| QueryError::Internal(e.to_string()))??;
+                        let docs = match found {
+                            SliceMatch::Rows(rows) => rows,
+                            // The file keeps no map: read only this slice's pages of it.
+                            SliceMatch::Unmapped(ids) => r.ids_to_rows_in_pages(ids, set).await?,
+                        };
                         kernel.keep_filtered(&r, suid, hits, true, docs).await?
                     }
                 };
@@ -3199,12 +3582,7 @@ impl SupertableReader {
                          (suid, within): (Uuid, Option<Arc<RoaringBitmap>>)| {
             let kernel = Arc::clone(&kernel);
             async move {
-                let mut rows: RoaringBitmap = kernel
-                    .docs(&r, suid)
-                    .await?
-                    .into_iter()
-                    .map(RowId::get)
-                    .collect();
+                let mut rows = row_bitmap(&kernel.docs(&r, suid).await?);
                 match within {
                     Some(within) => rows &= within.as_ref(),
                     None => {
@@ -3301,6 +3679,7 @@ impl SupertableReader {
             locations,
             row_filter,
             op_stats: self.op_stats.clone(),
+            budget: Arc::clone(&self.manifest().options.connection_memory_budget),
         };
         Ok(Some((units, Arc::new(kernel))))
     }
@@ -3433,6 +3812,7 @@ impl SupertableReader {
         // on the first error. The per-superfile body returns this
         // superfile's match count; the totals are summed.
         let op_stats = self.op_stats.clone();
+        let budget = Arc::clone(&self.manifest().options.connection_memory_budget);
         let per_superfile = dispatch::fanout_with(
             self,
             units,
@@ -3440,6 +3820,7 @@ impl SupertableReader {
             self.open_intent(),
             move |r, entry, tombstone_cache, now, _params: ()| {
                 let op_stats = op_stats.clone();
+                let budget = Arc::clone(&budget);
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);
                 let phrase_arc = Arc::clone(&phrase_arc);
@@ -3472,6 +3853,9 @@ impl SupertableReader {
                     // negatives) or a tombstone. Negation *without* deletes
                     // takes the skip-based counting path below instead.
                     if tomb.is_some() {
+                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                        let dict =
+                            walk_dict(phrase_involved, memo.as_deref(), &refs, &neg_refs, &budget);
                         let (docs, mut work) = match phrase_involved {
                             true => {
                                 r.atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
@@ -3483,12 +3867,12 @@ impl SupertableReader {
                                     &refs,
                                     match_mode,
                                     memo.as_deref(),
+                                    &dict,
                                 )
                                 .await?
                             }
                         };
                         let excluded: RoaringBitmap = if has_negatives {
-                            let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
                             let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
                                 true => {
                                     r.token_match_prefetched(
@@ -3496,6 +3880,7 @@ impl SupertableReader {
                                         &neg_refs,
                                         BoolMode::Or,
                                         memo.as_deref(),
+                                        &dict,
                                     )
                                     .await?
                                 }
@@ -3510,7 +3895,7 @@ impl SupertableReader {
                                 }
                             };
                             work.merge(neg_work);
-                            neg_docs.into_iter().map(RowId::get).collect()
+                            row_bitmap(&neg_docs)
                         } else {
                             RoaringBitmap::new()
                         };
@@ -3678,7 +4063,12 @@ impl SupertableReader {
                     let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                     let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                     let (docs, work) = r
-                        .token_match_prefetched(&column_arc, &refs, BoolMode::And, memo.as_deref())
+                        .exact_match_candidates(
+                            &column_arc,
+                            &refs,
+                            memo.as_deref(),
+                            &QueryDict::default(),
+                        )
                         .await?;
                     // The prune pass's posting walk. The verify pass's own
                     // decode is folded into `rows_materialized` below; its
@@ -3957,6 +4347,10 @@ type SuperfileCells<T> = Mutex<HashMap<Uuid, Arc<OnceCell<T>>>>;
 /// The cursors one superfile's doc-id slices share.
 type SharedCursorSets = Arc<SuperfileCells<Arc<OrCursorSet>>>;
 
+/// The candidate norms one superfile's doc-id slices share; `None` where
+/// the superfile scores with its own.
+type SharedCandidateNorms = Arc<SuperfileCells<Option<Arc<ColumnNorms>>>>;
+
 /// Superfile `suid`'s slot in `cells`, made empty by the first task to
 /// ask; the task then builds or awaits the value through it.
 fn cell_for<T>(cells: &SuperfileCells<T>, suid: Uuid) -> Arc<OnceCell<T>> {
@@ -4197,7 +4591,7 @@ async fn narrow_ties_by_id(
 /// single-segment engine's docid-ordered ties, independent of layout or
 /// completion order. `_id`s are resolved up front here — cheap because the
 /// shared floor caps the candidate set near k.
-async fn select_top_k_stable(
+pub(crate) async fn select_top_k_stable(
     tr: &SupertableReader,
     per_unit: Vec<Vec<SuperfileHit>>,
     k: usize,
@@ -4546,7 +4940,94 @@ mod tests {
         time::Instant,
     };
 
+    use super::{APPROXIMATE_BUDGET_NS, ApproximateCut, UNMEASURED_OPEN_COST_NS, approximate_cut};
     use crate::supertable::manifest::ScalarStats;
+
+    /// The tolerance an over-budget query takes in the cuts below.
+    const TOLERANCE: f32 = 0.05;
+
+    /// Within the budget every superfile opens; past it, first those over
+    /// the tolerance, then as many as fit, and the gap bounds what is left.
+    #[test]
+    fn an_over_budget_query_keeps_what_can_matter_most() {
+        let per_open = APPROXIMATE_BUDGET_NS / 4;
+        // Four fit: every one opens, exactly.
+        let few = [3.0, 2.5, 2.0, 1.5];
+        assert_eq!(
+            approximate_cut(&few, 1.0, per_open, TOLERANCE),
+            ApproximateCut {
+                keep: 4,
+                gap_ppm: 0
+            }
+        );
+        // Bounds at or under the threshold never count against the budget.
+        let tied = [3.0, 2.0, 1.5, 1.2, 1.0, 1.0, 0.5];
+        assert_eq!(approximate_cut(&tied, 1.0, per_open, TOLERANCE).keep, 7);
+        // Six in play: the tolerance leaves those within 5% of the
+        // threshold, and the gap is the largest of them.
+        let near = [3.0, 2.0, 1.5, 1.2, 1.04, 1.02];
+        let cut = approximate_cut(&near, 1.0, per_open, TOLERANCE);
+        assert_eq!(cut.keep, 4);
+        assert!((cut.gap_ppm as f32 - 40_000.0).abs() < 2.0, "{cut:?}");
+        // Still past it: the four best open, the gap is the fifth's bound.
+        let many = [5.0, 4.0, 3.0, 2.5, 2.0, 1.5];
+        let cut = approximate_cut(&many, 1.0, per_open, TOLERANCE);
+        assert_eq!(cut.keep, 4);
+        assert_eq!(cut.gap_ppm, 1_000_000);
+        // Unmeasured opens are priced as cold reads.
+        let wide: Vec<f32> = (0..2000).map(|i| 3.0 - i as f32 * 1e-3).collect();
+        let fit = (APPROXIMATE_BUDGET_NS / UNMEASURED_OPEN_COST_NS) as usize;
+        assert_eq!(approximate_cut(&wide, 1.0, 0, TOLERANCE).keep, fit);
+    }
+
+    /// A query that did not accept an approximate answer, or one with no
+    /// threshold to bound the gap by, opens every superfile however far
+    /// past the budget its opens run.
+    #[test]
+    fn an_exact_or_unbounded_query_is_never_cut() {
+        let per_open = APPROXIMATE_BUDGET_NS / 4;
+        let many = [5.0, 4.0, 3.0, 2.5, 2.0, 1.5];
+        let exact = ApproximateCut {
+            keep: many.len(),
+            gap_ppm: 0,
+        };
+        for tolerance in [0.0, -1.0, f32::NAN] {
+            assert_eq!(approximate_cut(&many, 1.0, per_open, tolerance), exact);
+        }
+        assert_eq!(
+            approximate_cut(&many, f32::NEG_INFINITY, per_open, TOLERANCE),
+            exact
+        );
+    }
+
+    #[test]
+    fn match_walks_keep_the_dictionary_only_when_both_read_it() {
+        // A match with a positive and a negated walk, and a memo that answers some terms.
+        //  - both walks read the dictionary: it is kept;
+        //  - no negated term, a phrase, or a memo answering either walk: nothing is kept.
+        // This test pins a kept copy only where it saves a read.
+        let budget = ConnectionMemoryBudget::with_room();
+        let memo = FetchedTermMemo::from_slots([(Box::from("known"), None)]);
+        let keeps =
+            |phrase: bool, memo: Option<&FetchedTermMemo>, positive: &[&str], negated: &[&str]| {
+                walk_dict(phrase, memo, positive, negated, &budget).keeps()
+            };
+        assert!(keeps(false, None, &["rust"], &["java"]));
+        assert!(keeps(false, Some(&memo), &["rust"], &["java"]));
+        assert!(!keeps(false, None, &["rust"], &[]), "no negated walk");
+        assert!(
+            !keeps(true, None, &["rust"], &["java"]),
+            "a phrase walk reads its own"
+        );
+        assert!(
+            !keeps(false, Some(&memo), &["known"], &["java"]),
+            "memo answers positives"
+        );
+        assert!(
+            !keeps(false, Some(&memo), &["rust"], &["known"]),
+            "memo answers negatives"
+        );
+    }
 
     /// A phrase's members are conjunctive, so a quoted phrase on its own
     /// prunes on all of them.
@@ -4850,10 +5331,11 @@ mod tests {
 
     use super::{
         BoolMode, FanOut, LocatedTerms, SharedTopK, SuperfileHit, SupertableReader,
-        build_work_units, ceilings_at_table_avgdl, fanout_for,
+        build_work_units, ceilings_at_table_avgdl, fanout_for, walk_dict,
     };
     use crate::{
         config::{CompactionSettings, OptimizeOptions},
+        memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
             SuperfileReader,
@@ -4861,7 +5343,9 @@ mod tests {
             fts::{
                 bm25,
                 posting::BLOCK_LEN,
-                reader::{Bm25SearchOptions, ColumnLengthStats, top_k_initial_capacity},
+                reader::{
+                    Bm25SearchOptions, ColumnLengthStats, FetchedTermMemo, top_k_initial_capacity,
+                },
             },
             vector::layout::VectorLayout,
         },

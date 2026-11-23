@@ -74,29 +74,50 @@ use datafusion::{
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use tokio::sync::watch;
 
+use crate::supertable::query::exec::ordered_coalesce_exec::OrderedCoalesceExec;
+
 /// Gathers its input's partitions under a `LIMIT`, as `CoalescePartitionsExec`
 /// does, with a fresh [`ScanGate`] for the [`ScanGateExec`] below; see the
 /// module docs.
 #[derive(Debug)]
 pub(crate) struct StagedCoalesceExec {
-    gather: CoalescePartitionsExec,
+    /// The gather that runs under the gate: a plain `CoalescePartitionsExec`,
+    /// or an [`OrderedCoalesceExec`] that hands the partitions on one after
+    /// another.
+    gather: Arc<dyn ExecutionPlan>,
+    input: Arc<dyn ExecutionPlan>,
     /// The most rows to return: the `LIMIT` (with any `OFFSET`) above.
     fetch: usize,
+    /// Whether `gather` hands the partitions on in order.
+    ordered: bool,
 }
 
 impl StagedCoalesceExec {
-    /// Gathers `input`'s partitions, returning at most `fetch` rows.
-    pub(crate) fn new(input: Arc<dyn ExecutionPlan>, fetch: usize) -> Self {
+    /// Gathers `input`'s partitions, returning at most `fetch` rows; in
+    /// partition order when `ordered`.
+    pub(crate) fn new(input: Arc<dyn ExecutionPlan>, fetch: usize, ordered: bool) -> Self {
+        let gather: Arc<dyn ExecutionPlan> = match ordered {
+            true => Arc::new(OrderedCoalesceExec::new(Arc::clone(&input), Some(fetch))),
+            false => {
+                Arc::new(CoalescePartitionsExec::new(Arc::clone(&input)).with_fetch(Some(fetch)))
+            }
+        };
         Self {
-            gather: CoalescePartitionsExec::new(input).with_fetch(Some(fetch)),
+            gather,
+            input,
             fetch,
+            ordered,
         }
     }
 }
 
 impl DisplayAs for StagedCoalesceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "StagedCoalesceExec: fetch={}", self.fetch)
+        write!(f, "StagedCoalesceExec: fetch={}", self.fetch)?;
+        if self.ordered {
+            write!(f, ", ordered")?;
+        }
+        Ok(())
     }
 }
 
@@ -110,7 +131,7 @@ impl ExecutionPlan for StagedCoalesceExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![self.gather.input()]
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -123,7 +144,11 @@ impl ExecutionPlan for StagedCoalesceExec {
                 children.len()
             )));
         }
-        Ok(Arc::new(Self::new(children.swap_remove(0), self.fetch)))
+        Ok(Arc::new(Self::new(
+            children.swap_remove(0),
+            self.fetch,
+            self.ordered,
+        )))
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -140,7 +165,7 @@ impl ExecutionPlan for StagedCoalesceExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        limit.map(|fetch| Arc::new(Self::new(Arc::clone(self.gather.input()), fetch)) as _)
+        limit.map(|fetch| Arc::new(Self::new(Arc::clone(&self.input), fetch, self.ordered)) as _)
     }
 
     fn execute(
@@ -607,7 +632,10 @@ mod tests {
             }
             Above::Limit => Arc::new(LocalLimitExec::new(gate, fetch)),
         };
-        (Arc::new(StagedCoalesceExec::new(above, fetch)), started)
+        (
+            Arc::new(StagedCoalesceExec::new(above, fetch, false)),
+            started,
+        )
     }
 
     /// The rows `plan` returns.

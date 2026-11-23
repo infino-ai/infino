@@ -23,6 +23,13 @@ pub struct SuperfileStats {
 }
 
 impl SuperfileStats {
+    /// Stats of `batch`, some of a superfile's rows, its id column first.
+    ///
+    /// Its value tables are not held to the superfile's budget: which tables
+    /// a superfile keeps depends on all of its rows, so the stats folded from
+    /// such batches are fitted once they are all in ([`Self::fit_value_tables`],
+    /// which [`Self::from_children`] does). A table past the budget alone is
+    /// dropped here already, as it would be from the whole.
     pub fn try_compute_from_record_batch(batch: &RecordBatch) -> Result<Self, BuildError> {
         let schema = batch.schema();
         let id_idx = 0;
@@ -48,7 +55,7 @@ impl SuperfileStats {
         }
         n_docs += id_col.len() as u64;
 
-        let scalar_stats = ScalarStatsAgg::from_batches(&schema, &[batch]);
+        let scalar_stats = ScalarStatsAgg::from_batches_unbudgeted(&schema, &[batch]);
         Ok(Self {
             n_docs,
             id_min,
@@ -60,16 +67,19 @@ impl SuperfileStats {
     /// Stats of `batch`, some of a superfile's columns of some of its rows,
     /// the id column not among them: its columns' stats alone. The rows
     /// are counted, and the id range taken, from the batch that holds the
-    /// id column.
+    /// id column. Its value tables are not held to the superfile's budget,
+    /// as in [`Self::try_compute_from_record_batch`].
     pub(crate) fn of_columns(batch: &RecordBatch) -> Self {
         Self {
             n_docs: 0,
             id_min: i128::MAX,
             id_max: i128::MIN,
-            scalar_stats: ScalarStatsAgg::from_batches(&batch.schema(), &[batch]),
+            scalar_stats: ScalarStatsAgg::from_batches_unbudgeted(&batch.schema(), &[batch]),
         }
     }
 
+    /// One superfile's stats, folded from the stats of its parts, its value
+    /// tables then fitted to the superfile's budget.
     pub fn from_children(stats: &[Self]) -> Self {
         let mut total = Self {
             n_docs: 0,
@@ -80,6 +90,7 @@ impl SuperfileStats {
         for stat in stats {
             total.merge(stat);
         }
+        total.fit_value_tables();
         total
     }
 
@@ -90,13 +101,23 @@ impl SuperfileStats {
         self.id_max = self.id_max.max(other.id_max);
         ScalarStatsAgg::merge(&mut self.scalar_stats, &other.scalar_stats);
     }
+
+    /// Hold these stats' exact value tables to one superfile's budget, once
+    /// every batch is folded in. The batches' tables are not budgeted, since
+    /// which tables fit depends on every row: a table the budget would drop
+    /// among one batch's columns may be one the whole superfile keeps. So the
+    /// folded tables are fitted once, and a merge keeps the tables a fresh
+    /// build of its rows keeps, however its batches and passes were cut.
+    pub(crate) fn fit_value_tables(&mut self) {
+        ScalarStatsAgg::fit_value_tables(&mut self.scalar_stats);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::LargeStringArray;
+    use arrow_array::{ArrayRef, LargeStringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
@@ -223,6 +244,68 @@ mod tests {
             9_000,
             "every row counted"
         );
+    }
+
+    /// A merge keeps the value tables a fresh build of its rows keeps, even
+    /// where one batch alone would have dropped a table the whole keeps:
+    /// which tables fit the superfile's budget depends on every row, so the
+    /// batches' tables are fitted once, after they are folded.
+    ///
+    /// Setup, three integer columns, 16 bytes a value:
+    ///   - `a` holds 4,000 values (64,000 bytes), all of them in the first
+    ///     batch; `b` holds 625 there and 4,000 in all (64,000 bytes); `c`
+    ///     holds 3,750 there and 4,375 in all (70,000 bytes).
+    ///   - The whole keeps `a` and `b` (128,000 bytes) and sketches `c`. The
+    ///     first batch alone, past the budget, would have dropped `a`, its
+    ///     largest table there.
+    #[test]
+    fn a_merge_keeps_the_tables_a_fresh_build_keeps_whatever_one_batch_holds() {
+        const ROWS: u64 = 4_000;
+        let schema = stamp_ids_by_position(&Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ])));
+        let int =
+            |values: Vec<i64>| -> ArrayRef { Arc::new(arrow_array::Int64Array::from(values)) };
+        let batch = |ids: std::ops::Range<u64>, a: Vec<i64>, b: Vec<i64>, c: Vec<i64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(decimal128_ids(ids)), int(a), int(b), int(c)],
+            )
+            .expect("build RecordBatch")
+        };
+        let rows = || 0..ROWS as i64;
+        let first = batch(
+            0..ROWS,
+            rows().collect(),
+            rows().map(|r| r % 625).collect(),
+            rows().map(|r| r % 3_750).collect(),
+        );
+        let second = batch(
+            ROWS..2 * ROWS,
+            rows().collect(),
+            rows().map(|r| 625 + r % 3_375).collect(),
+            rows().map(|r| 3_750 + r % 625).collect(),
+        );
+        let fresh = ScalarStatsAgg::from_batches(&schema, &[&first, &second]);
+        let has_table = |id: u32| fresh[&FieldId(id)].value_counts.is_some();
+        assert!(
+            has_table(1) && has_table(2) && !has_table(3),
+            "guard: a fresh build keeps `a` and `b` and sketches `c`"
+        );
+        let alone = ScalarStatsAgg::from_batches(&schema, &[&first]);
+        assert!(
+            alone[&FieldId(1)].value_counts.is_none(),
+            "guard: the first batch alone, budgeted, drops `a`"
+        );
+
+        let merged = SuperfileStats::from_children(&[
+            SuperfileStats::try_compute_from_record_batch(&first).expect("stats"),
+            SuperfileStats::try_compute_from_record_batch(&second).expect("stats"),
+        ]);
+        assert_eq!(merged.scalar_stats, fresh);
     }
 
     #[test]

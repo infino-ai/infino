@@ -44,6 +44,8 @@ const HYBRID_SCHEMA_TOP_K: usize = 5;
 const HYBRID_SCORE_TOP_K: usize = 8;
 /// Hybrid-search top-k for the `_id`-projection query.
 const HYBRID_ID_TOP_K: usize = 16;
+/// Rows in the first superfile of the value-set fixture, all titled '!!'.
+const TOKENLESS_ROWS: usize = 8;
 
 fn fixed_list_f32(dim: usize) -> DataType {
     DataType::FixedSizeList(
@@ -208,6 +210,73 @@ fn hybrid_search_star_projection_exposes_scalar_schema_plus_score() {
         b.schema().index_of("emb").is_err(),
         "vector column must never be exposed to SQL"
     );
+}
+
+#[test]
+fn search_where_value_set_keeps_superfiles_whose_value_has_no_tokens() {
+    // The first superfile holds only '!!', which analyzes to no token. A vector or hybrid search
+    // whose `WHERE` names '!!' and 'fig roll', with k over every row, returns all of them.
+    let st = Supertable::create(options_title_emb()).expect("create");
+    let schema = st.options().schema.clone();
+    let mut w = st.writer().expect("writer");
+    w.append(&build_batch(&["!!"; TOKENLESS_ROWS], 0, schema.clone()))
+        .expect("append '!!'");
+    w.commit().expect("commit '!!'");
+    let titles = ["fig roll", "grape jam", "kiwi tart", "lemon cake"];
+    w.append(&build_batch(&titles, TOKENLESS_ROWS, schema))
+        .expect("append titles");
+    w.commit().expect("commit titles");
+    drop(w);
+    let qv = csv_one_hot(0);
+    let k = HYBRID_ID_TOP_K;
+    let wanted = ["!!", "fig roll"];
+    for search in [
+        format!("vector_search('emb', '{qv}', {k})"),
+        format!("hybrid_search('title', 'fig', 'emb', '{qv}', {k})"),
+    ] {
+        // The rows the search finds without a `WHERE`, kept to the wanted titles: what the
+        // filtered search must return, whatever the search's own recall.
+        let unfiltered = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!("SELECT title FROM {search}"))
+            .expect("unfiltered");
+        let expected: usize = unfiltered
+            .iter()
+            .map(|b| {
+                let titles = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("title is LargeUtf8");
+                titles
+                    .iter()
+                    .filter(|t| t.is_some_and(|t| wanted.contains(&t)))
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            expected,
+            TOKENLESS_ROWS + 1,
+            "{search}: every wanted row is found"
+        );
+        for filter in [
+            "title IN ('!!', 'fig roll')",
+            "title = '!!' OR title = 'fig roll'",
+            // Four values: DataFusion turns three or fewer into an `OR`, so this one stays an `IN`.
+            "title IN ('!!', 'fig roll', 'plum cake', 'pear tart')",
+        ] {
+            let rows: usize = st
+                .reader()
+                .expect("reader")
+                .query_sql(&format!("SELECT _id FROM {search} WHERE {filter}"))
+                .expect("query_sql")
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            assert_eq!(rows, expected, "{search} WHERE {filter}");
+        }
+    }
 }
 
 #[test]

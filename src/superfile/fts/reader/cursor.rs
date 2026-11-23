@@ -41,6 +41,7 @@ use crate::superfile::{
         },
         short::decode_short,
     },
+    load_watch::LoadWatch,
 };
 
 /// Parsed per-(column, term) metadata header from the postings
@@ -97,6 +98,38 @@ impl TermMeta {
         metadata_offset: usize,
         positional: bool,
     ) -> Result<Self, FtsError> {
+        let (mut meta, postings_length) = Self::parse_head(postings, metadata_offset, positional)?;
+        // The last block's end offset comes straight from
+        // `postings_length`; bound it now instead of slicing OOB later.
+        if metadata_offset + postings_length > postings.len() {
+            return Err(FtsError::Read(ReadError::Malformed(
+                "term postings length exceeds the fetched term range".into(),
+            )));
+        }
+        // The coarse block-max table: `ceil(num_blocks / span)` slots at
+        // the tail of the term region, so the blocks end where it begins.
+        let coarse_size =
+            meta.num_blocks.div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN) * coarse_slot::BYTES;
+        if coarse_size > postings_length {
+            return Err(FtsError::Read(ReadError::Malformed(
+                "coarse block-max table larger than the term region".into(),
+            )));
+        }
+        meta.coarse_start = metadata_offset + postings_length - coarse_size;
+        meta.has_coarse = true;
+        Ok(meta)
+    }
+
+    /// Parse + bounds-validate the header and its skip table alone, with
+    /// the term's byte length the header records: what a probe reads
+    /// before it fetches only the blocks it needs. The coarse table is
+    /// not read, so `has_coarse` is false and the blocks' ranges are
+    /// found by summing the skip table's block lengths.
+    pub(super) fn parse_head(
+        postings: &[u8],
+        metadata_offset: usize,
+        positional: bool,
+    ) -> Result<(Self, usize), FtsError> {
         let skip_entry_bytes = skip_entry::bytes(positional);
         // Positional columns carry the extended 32-byte header (the
         // term's positions offset + length after `num_blocks`); the
@@ -139,14 +172,6 @@ impl TermMeta {
             ),
             false => (0, 0),
         };
-
-        // The last block's end offset comes straight from
-        // `postings_length`; bound it now instead of slicing OOB later.
-        if metadata_offset + postings_length > postings.len() {
-            return Err(FtsError::Read(ReadError::Malformed(
-                "term postings length exceeds the fetched term range".into(),
-            )));
-        }
         let skip_start = metadata_offset + term_meta_size;
         let skip_end = skip_start + num_blocks * skip_entry_bytes;
         if skip_end > postings.len() {
@@ -154,27 +179,38 @@ impl TermMeta {
                 "skip table runs past postings region".into(),
             )));
         }
-        // The coarse block-max table: `ceil(num_blocks / span)` slots at
-        // the tail of the term region, so the blocks end where it begins.
-        let coarse_size =
-            num_blocks.div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN) * coarse_slot::BYTES;
-        if coarse_size > postings_length {
-            return Err(FtsError::Read(ReadError::Malformed(
-                "coarse block-max table larger than the term region".into(),
-            )));
-        }
-        let coarse_start = metadata_offset + postings_length - coarse_size;
-        Ok(Self {
-            df,
-            num_blocks,
-            skip_start,
-            positions_offset,
-            positions_length,
-            coarse_start,
-            has_coarse: true,
-            short: false,
-            skip_entry_bytes,
-        })
+        Ok((
+            Self {
+                df,
+                num_blocks,
+                skip_start,
+                positions_offset,
+                positions_length,
+                coarse_start: 0,
+                has_coarse: false,
+                short: false,
+                skip_entry_bytes,
+            },
+            postings_length,
+        ))
+    }
+
+    /// The block count a long term's header records, when `bytes` holds
+    /// the header.
+    pub(super) fn header_num_blocks(bytes: &[u8]) -> Option<usize> {
+        bytes
+            .get(term_meta::NUM_BLOCKS_OFF..term_meta::NUM_BLOCKS_OFF + U32_BYTES)
+            .map(|b| read_u32_le(b) as usize)
+    }
+
+    /// Bytes a long term's header and skip table take, for `num_blocks`
+    /// blocks on a column of `positional` layout.
+    pub(super) fn head_len(num_blocks: usize, positional: bool) -> usize {
+        let term_meta_size = match positional {
+            true => TERM_META_POSITIONAL_SIZE,
+            false => TERM_META_SIZE,
+        };
+        term_meta_size + num_blocks * skip_entry::bytes(positional)
     }
 
     /// The metadata a short-form term implies: it has no header to
@@ -253,7 +289,7 @@ impl TermMeta {
 
     /// Block `i`'s encoded byte length.
     #[inline]
-    fn block_len(&self, postings: &[u8], i: usize) -> usize {
+    pub(super) fn block_len(&self, postings: &[u8], i: usize) -> usize {
         let at = self.entry_off(i) + skip_entry::BLOCK_LEN_OFF;
         u16::from_le_bytes([postings[at], postings[at + 1]]) as usize
     }
@@ -315,6 +351,8 @@ impl TermMeta {
 pub(crate) struct BlockTableCache {
     tables: Mutex<HashMap<(u64, u32), (Arc<[BlockMeta]>, f32)>>,
     blocks: AtomicUsize,
+    /// Told when a table is cached: the reader's own watch.
+    loads: LoadWatch,
 }
 
 /// Shortest table worth caching: below it the build costs well under a
@@ -325,6 +363,19 @@ const BLOCK_TABLE_CACHE_MIN_BLOCKS: usize = 256;
 const BLOCK_TABLE_CACHE_MAX_BLOCKS: usize = 1 << 20;
 
 impl BlockTableCache {
+    /// An empty cache that reports each table it caches to `loads`.
+    pub(super) fn new(loads: LoadWatch) -> Self {
+        Self {
+            loads,
+            ..Self::default()
+        }
+    }
+
+    /// Heap bytes the cached block tables hold.
+    pub(super) fn held_bytes(&self) -> usize {
+        self.blocks.load(AtomicOrdering::Relaxed) * size_of::<BlockMeta>()
+    }
+
     /// Blocks held across all cached tables.
     #[cfg(test)]
     pub(super) fn cached_blocks(&self) -> usize {
@@ -346,10 +397,14 @@ impl BlockTableCache {
         {
             return;
         }
-        let mut tables = self.tables.lock().unwrap_or_else(PoisonError::into_inner);
-        if tables.insert(key, (Arc::clone(table), term_max)).is_none() {
+        {
+            let mut tables = self.tables.lock().unwrap_or_else(PoisonError::into_inner);
+            if tables.insert(key, (Arc::clone(table), term_max)).is_some() {
+                return;
+            }
             self.blocks.fetch_add(n, AtomicOrdering::Relaxed);
         }
+        self.loads.loaded();
     }
 }
 

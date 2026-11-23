@@ -6,7 +6,7 @@
 //! [`connect_with`](crate::connect_with); plain [`connect`](crate::connect)
 //! uses the default.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 #[cfg(any(test, feature = "test-helpers"))]
 use std::{
     fmt::{Debug, Formatter, Result as FmtResult},
@@ -61,8 +61,14 @@ pub struct ConnectOptions {
     /// Credentials/tuning for the URI-selected backend, keyed by
     /// `object_store` config strings. Empty → ambient cloud identity.
     pub(crate) storage_options: HashMap<String, String>,
-    /// Disk-cache root. `None` (default) → caching off; cold reads go
-    /// straight to object storage. Set → a local NVMe tier under this
+    /// Disk-cache root. `None` (default) → no disk cache; cold reads go
+    /// straight to object storage, by range. Each open table still keeps
+    /// the lazy readers it opened for later queries, weighed by what they
+    /// hold (the parsed footer and page index, and what later reads loaded
+    /// into them: FTS doc maps and norms, vector norms, the range
+    /// directory), up to 256 MiB a table, charged to the connection's memory
+    /// budget, which takes them back when a query needs the room. Set → a
+    /// local NVMe tier under this
     /// directory, per table (`<cache_dir>/<table>`).
     pub(crate) cache_dir: Option<PathBuf>,
     /// Disk-cache byte budget. `None` → a share of the total size of the
@@ -91,6 +97,11 @@ pub struct ConnectOptions {
     /// When unset, a hosted connection falls back to the `INFINO_API_KEY`
     /// environment variable.
     pub(crate) api_key: Option<String>,
+    /// Deadline for each request on a hosted connection, from connecting to
+    /// the last byte of the answer. `None` (default) → 620 s, a little past
+    /// the longest a hosted request can run (600 s). Ignored by local
+    /// backends.
+    pub(crate) request_timeout: Option<Duration>,
     /// Test-only: wraps every storage provider the connection builds (the
     /// catalog root and each table's), so a test can slow or count reads.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -138,7 +149,10 @@ impl ConnectOptions {
     /// superfile reads are cached to NVMe; per table, under
     /// `<dir>/<table>`. SQL that spills to disk spills under `dir` too,
     /// within a tenth of the disk's size, instead of the OS temp directory.
-    /// No effect on `memory://` catalogs.
+    /// No effect on `memory://` catalogs. Without it, each open table reads
+    /// superfiles from object storage by range and keeps the readers it
+    /// opened for later queries, within a byte bound charged to the
+    /// connection's memory budget (see the `cache_dir` field).
     pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(dir.into());
         self
@@ -171,6 +185,10 @@ impl ConnectOptions {
     /// tracks usage without enforcing; a positive value enforces a ceiling on
     /// what this connection's work may hold. Shared across all of the
     /// connection's tables.
+    ///
+    /// With a budget set, a full-text `LIKE` or `text_match` keeps each file's term dictionary
+    /// across its steps while the budget is at most a quarter full, so it reads it once rather than
+    /// at each step. Unset, it reads it at each step.
     ///
     /// Covers search and ingest. It does **not** cover compaction: a merge is
     /// not work done on behalf of a connection, and sizing it from a budget set
@@ -217,6 +235,29 @@ impl ConnectOptions {
         self
     }
 
+    /// Set the deadline for each request on a hosted (`https://<host>/<db>`)
+    /// connection, from connecting to the last byte of the answer. A request
+    /// that has not finished by then fails with
+    /// [`InfinoError::Unavailable`](crate::InfinoError::Unavailable).
+    /// Ignored by local backends. Chainable.
+    ///
+    /// The default, 620 s, is a little past the longest a hosted request can
+    /// run (600 s). A shorter deadline returns sooner from a stuck request,
+    /// but an append, update or delete commits inside its request: one that
+    /// times out may still commit, so check before retrying it. A zero
+    /// deadline is rejected at connect.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// The configured request deadline, if any (used by the hosted
+    /// transport).
+    #[cfg_attr(not(feature = "remote"), allow(dead_code))]
+    pub(crate) fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
+    }
+
     /// The configured API key, if any (used by the hosted transport). Only the
     /// `remote` transport reads this, so it is dead code in a build without it.
     #[cfg_attr(not(feature = "remote"), allow(dead_code))]
@@ -260,5 +301,12 @@ mod tests {
         let o = ConnectOptions::new().with_api_key("ik_test");
         assert_eq!(o.api_key(), Some("ik_test"));
         assert_eq!(ConnectOptions::new().api_key(), None);
+    }
+
+    #[test]
+    fn with_request_timeout_round_trips() {
+        let o = ConnectOptions::new().with_request_timeout(Duration::from_secs(30));
+        assert_eq!(o.request_timeout(), Some(Duration::from_secs(30)));
+        assert_eq!(ConnectOptions::new().request_timeout(), None);
     }
 }

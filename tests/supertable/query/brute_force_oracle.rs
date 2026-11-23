@@ -40,6 +40,7 @@ use std::{
 use arrow_array::{LargeStringArray, RecordBatch};
 use infino::{
     Bm25SearchOptions,
+    runtime_metrics::op_stats::with_op_stats,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::FtsConfig,
@@ -1028,6 +1029,8 @@ const TIER_DOCS: usize = 4_000;
 const TIER_HEAD_DEPTH: usize = 128;
 /// The `k` values the tier-merge arm compares at.
 const TIER_KS: [usize; 4] = [1, 10, 100, 1000];
+/// Asks of a query that may pass before its tier merge reports: each reads more of its tiers.
+const TIER_MAX_ASKS: usize = 32;
 
 /// The tiers' merge, with heads cut to two blocks, returns hit for hit
 /// and score for score what the ceiling path returns on the same table
@@ -1086,19 +1089,27 @@ fn oracle_tier_merge_with_cut_heads_matches_the_ceiling_path_and_brute_force() {
                 BoolMode::Or,
             ),
         ];
-        let hits_of = |st: &Supertable, q: &str, mode: BoolMode, k: usize| {
-            // Asked twice, the second metered: the first brings the terms'
-            // tiers into memory, after which the merge runs before any open.
-            st.reader()
-                .expect("reader")
-                .bm25_hits("title", q, k, Bm25SearchOptions::new().with_mode(mode))
-                .expect("search");
-            let (hits, stats) = infino::runtime_metrics::op_stats::with_op_stats(|| {
-                st.reader()
-                    .expect("reader")
-                    .bm25_hits("title", q, k, Bm25SearchOptions::new().with_mode(mode))
-                    .expect("search")
-            });
+        let hits_of = |st: &Supertable, q: &str, mode: BoolMode, k: usize, merged: bool| {
+            let ask = || {
+                with_op_stats(|| {
+                    st.reader()
+                        .expect("reader")
+                        .bm25_hits("title", q, k, Bm25SearchOptions::new().with_mode(mode))
+                        .expect("search")
+                })
+            };
+            // A merge whose tiers are not in memory runs beside the opens and is dropped if they
+            // finish first. Ask until one reports: its tiers are then in memory, and the ask
+            // below merges before any open.
+            let mut asks = 0;
+            while merged && asks < TIER_MAX_ASKS && ask().1.tier_entries == 0 {
+                asks += 1;
+            }
+            assert!(
+                asks < TIER_MAX_ASKS,
+                "{q} k={k}: no merge reported in {asks} asks"
+            );
+            let (hits, stats) = ask();
             let ids = supertable_to_global_ids(st, hits.clone(), chunk_size);
             let scored: Vec<(u64, f32)> =
                 ids.into_iter().zip(hits.iter().map(|h| h.score)).collect();
@@ -1114,8 +1125,8 @@ fn oracle_tier_merge_with_cut_heads_matches_the_ceiling_path_and_brute_force() {
                 if stretched && k != TIER_KS[0] && k != TIER_KS[TIER_KS.len() - 1] {
                     continue;
                 }
-                let (tiered, stats) = hits_of(&with_tiers, q, mode, k);
-                let (plain, _) = hits_of(&without_tiers, q, mode, k);
+                let (tiered, stats) = hits_of(&with_tiers, q, mode, k, true);
+                let (plain, _) = hits_of(&without_tiers, q, mode, k, false);
                 assert_eq!(
                     tiered, plain,
                     "{label} k={k}: the tiers' merge must return what the ceiling path returns"
@@ -1151,7 +1162,7 @@ fn oracle_tier_merge_with_cut_heads_matches_the_ceiling_path_and_brute_force() {
         }
         // A rare conjunction's heads are whole, so the index answers it
         // without opening a superfile.
-        let (_, stats) = hits_of(&with_tiers, "term03000 term03001", BoolMode::And, 10);
+        let (_, stats) = hits_of(&with_tiers, "term03000 term03001", BoolMode::And, 10, true);
         assert_eq!(
             stats.score_pruning_survived, 0,
             "a conjunction of rare terms is answered from the index"

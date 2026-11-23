@@ -50,24 +50,24 @@
 //! superfiles has a run in each type's group.
 
 use std::{
-    cmp,
     collections::HashMap,
     fmt,
     io::Cursor,
     sync::{
         Arc, Mutex, OnceLock, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
 
 use arrow::{
+    array::make_comparator,
     buffer::{NullBuffer, OffsetBuffer},
-    compute::{concat, kernels::cmp::eq},
+    compute::{SortOptions, concat},
     ipc::{reader::StreamReader, writer::StreamWriter},
 };
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, ListArray, RecordBatch, Scalar, StructArray, UInt32Array,
-    UInt64Array, new_null_array,
+    Array, ArrayRef, BinaryArray, ListArray, RecordBatch, StructArray, UInt32Array, UInt64Array,
+    cast::AsArray, new_null_array, types::UInt64Type,
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
 use bytes::Bytes;
@@ -81,8 +81,8 @@ use crate::supertable::{
         SuperfileEntry, column_hll,
         disk_cache::{CachePin, MetadataDiskCache},
         encoding::stats_ipc_options,
-        hll::HllSketch,
-        list::{ScalarStatsAgg, ScalarValueCounts},
+        hll::{HLL_REGISTERS, HllSketch},
+        list::{ScalarStatsAgg, ScalarValueCounts, held_rows, value_order},
         part::{ContentHash, PartId},
     },
     schema::FieldId,
@@ -194,12 +194,37 @@ struct Group {
     sum: Option<ArrayRef>,
     hll: Option<BinaryArray>,
     value_counts: Option<ListArray>,
+    /// The sketches of the group's larger value tables, by row, each taken
+    /// the first time it is asked for (see [`ColumnRow::values_sketch`]).
+    values_sketches: Mutex<HashMap<usize, HllSketch>>,
+    /// Whether each row's value table can be searched (see [`table_searchable`]), checked the first
+    /// time an `=` or `IN` reads it: a byte per row, none when the group keeps no tables.
+    searchable: Box<[AtomicU8]>,
 }
+
+/// A row's table not yet checked, in [`Group::searchable`].
+const TABLE_UNCHECKED: u8 = 0;
+/// A row's table checked and searchable.
+const TABLE_SEARCHABLE: u8 = 1;
+/// A row's table checked and not searchable: it settles no literal.
+const TABLE_UNSEARCHABLE: u8 = 2;
+
+/// [`Group::searchable`] for a group of `rows`, every table unchecked.
+fn unchecked_tables(value_counts: Option<&ListArray>, rows: usize) -> Box<[AtomicU8]> {
+    let rows = if value_counts.is_some() { rows } else { 0 };
+    (0..rows).map(|_| AtomicU8::new(TABLE_UNCHECKED)).collect()
+}
+
+/// The fewest entries a value table holds for its sketch to be kept once
+/// taken: its counts alone then take more than the sketch, so the kept
+/// sketches never take more than the tables they stand for. A smaller
+/// table is sketched each time; it hashes fewer values than this.
+const SKETCH_KEPT_ENTRIES: usize = HLL_REGISTERS / size_of::<u64>() + 1;
 
 /// One column's statistics for one superfile, read in place from the
 /// decoded group: each accessor reads the one array it needs. The value
 /// table alone is built on request, since building it converts every
-/// value, and the pruner and the planner's statistics never need it.
+/// value; an `=` or `IN` reads it to skip a file ([`ColumnStats::literal_count`]).
 #[derive(Clone, Copy)]
 pub struct ColumnRow<'a> {
     group: &'a Group,
@@ -261,14 +286,39 @@ impl ColumnRow<'_> {
     /// sketch hashes them, when the superfile carries a table: the
     /// distinct estimate of a column counted exactly, taken from the
     /// table's value array without converting a value.
+    ///
+    /// The planner asks for it on every statement that reads the column's
+    /// statistics, once per superfile, so the sketch of a table of
+    /// [`SKETCH_KEPT_ENTRIES`] or more is taken once and kept with the
+    /// group: hashing a table of hundreds of values on every statement
+    /// costs more than reading a stored sketch.
     pub fn values_sketch(&self) -> Option<HllSketch> {
         let list = self.group.value_counts.as_ref()?;
         if !list.is_valid(self.index) {
             return None;
         }
+        let kept = list.value_length(self.index) as usize >= SKETCH_KEPT_ENTRIES;
+        if kept && let Some(sketch) = self.kept_values_sketches().get(&self.index) {
+            return Some(sketch.clone());
+        }
         let item = list.value(self.index);
         let item = item.as_any().downcast_ref::<StructArray>()?;
-        column_hll(&[Arc::clone(item.column(0))])
+        let sketch = column_hll(&[Arc::clone(item.column(0))])?;
+        if kept {
+            self.kept_values_sketches()
+                .insert(self.index, sketch.clone());
+        }
+        Some(sketch)
+    }
+
+    /// The group's kept table sketches. A sketch is only ever added, the
+    /// same one whoever takes it, so one left by a panicking reader is
+    /// still good.
+    fn kept_values_sketches(&self) -> std::sync::MutexGuard<'_, HashMap<usize, HllSketch>> {
+        self.group
+            .values_sketches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The exact value table as it sits in the section: one list item, a
@@ -290,6 +340,49 @@ impl ColumnRow<'_> {
             .and_then(|item| value_counts_of(&item))
     }
 
+    /// The rows the value table counts for `literals`, searched where it sits in the section (see
+    /// [`ColumnStats::literal_count`]).
+    fn literal_count(&self, literals: &ExactLiterals) -> Option<u64> {
+        let list = self.group.value_counts.as_ref()?;
+        if !list.is_valid(self.index) {
+            return None;
+        }
+        let [values, counts] = list.values().as_struct_opt()?.columns() else {
+            return None;
+        };
+        let counts = counts.as_primitive_opt::<UInt64Type>()?;
+        if values.data_type() != &literals.column_type {
+            return None;
+        }
+        let start = list.value_offsets()[self.index] as usize;
+        let len = list.value_length(self.index) as usize;
+        // Two readers may both check an unchecked table; they store the same answer.
+        let checked = self.group.searchable.get(self.index)?;
+        let searchable = match checked.load(Ordering::Relaxed) {
+            TABLE_UNCHECKED => {
+                let searchable = table_searchable(values, counts, start, len);
+                let state = if searchable {
+                    TABLE_SEARCHABLE
+                } else {
+                    TABLE_UNSEARCHABLE
+                };
+                checked.store(state, Ordering::Relaxed);
+                searchable
+            }
+            state => state == TABLE_SEARCHABLE,
+        };
+        if !searchable {
+            return None;
+        }
+        let order = make_comparator(values, &literals.array, SortOptions::default()).ok()?;
+        held_rows(
+            len,
+            literals.values.len(),
+            |entry, value| order(start + entry, value),
+            |entry| counts.value(start + entry),
+        )
+    }
+
     /// Every statistic, in the decoded shape.
     pub fn stats(&self) -> ScalarStatsAgg {
         ScalarStatsAgg {
@@ -303,77 +396,84 @@ impl ColumnRow<'_> {
     }
 }
 
-/// An exact value table as a superfile keeps it ([`ColumnStats::value_table`]).
-pub(crate) enum ValueTable<'a> {
-    /// A decoded table, its entries sorted by value.
-    Built(&'a ScalarValueCounts),
-    /// A section's table: a struct array of values and `UInt64` counts, neither holding a null.
-    Stored(StructArray),
-}
-
-/// [`ColumnStats::literal_count`] over a decoded table sorted by value: a binary search per
-/// literal.
-fn literal_counts(
-    entries: &[(ScalarValue, u64)],
-    literals: &[ScalarValue],
-    column_type: &DataType,
-) -> Option<u64> {
-    let Some((first, _)) = entries.first() else {
-        return Some(0);
+/// Whether the value table at `start..start + len` of a section's `values` and `counts` can be
+/// searched: not empty, its values distinct, sorted and not null, its counts neither null nor zero.
+/// A file's own table always is; one that is not, from a foreign or damaged section, skips nothing.
+fn table_searchable(values: &ArrayRef, counts: &UInt64Array, start: usize, len: usize) -> bool {
+    let Ok(order) = make_comparator(values, values, SortOptions::default()) else {
+        return false;
     };
-    if first.data_type() != *column_type {
-        return None;
-    }
-    let mut held = 0u64;
-    for literal in literals {
-        if comparison_coercion(column_type, &literal.data_type()).as_ref() != Some(column_type) {
-            return None;
-        }
-        let literal = literal.cast_to(column_type).ok()?;
-        // Values that do not order map to `Equal`, so they reach the equality check below, not a
-        // miss.
-        match entries.binary_search_by(|(value, _)| {
-            value.partial_cmp(&literal).unwrap_or(cmp::Ordering::Equal)
-        }) {
-            Ok(at) if entries[at].0 == literal => {
-                held = held.saturating_add(entries[at].1);
-            }
-            Ok(_) => return None,
-            Err(_) => {}
-        }
-    }
-    Some(held)
+    let rows = start..start + len;
+    len > 0
+        && rows
+            .clone()
+            .all(|at| values.is_valid(at) && counts.is_valid(at) && counts.value(at) != 0)
+        && rows.skip(1).all(|at| order(at - 1, at).is_lt())
 }
 
-/// [`ColumnStats::literal_count`] over a section's table arrays, each literal compared by the
-/// compare kernel without building the table.
-fn stored_literal_counts(
-    table: &StructArray,
-    literals: &[ScalarValue],
-    column_type: &DataType,
-) -> Option<u64> {
-    let values = table.column(0);
-    let counts = table.column(1).as_any().downcast_ref::<UInt64Array>()?;
-    if values.is_empty() {
-        return Some(0);
-    }
-    if values.data_type() != column_type {
-        return None;
-    }
-    let mut held = 0u64;
-    for literal in literals {
-        if comparison_coercion(column_type, &literal.data_type()).as_ref() != Some(column_type) {
+/// `=` and `IN` literals cast once to a column's type, sorted and distinct: built per statement,
+/// read per file by [`ColumnStats::literal_count`].
+pub(crate) struct ExactLiterals {
+    /// The literals in [`value_order`], distinct, for a decoded table's search
+    /// ([`ScalarValueCounts::rows_holding`]).
+    values: Vec<ScalarValue>,
+    /// The same literals as an array of the column's type, for a section's table, searched where it
+    /// sits ([`ColumnRow::literal_count`]).
+    array: ArrayRef,
+    column_type: DataType,
+}
+
+impl ExactLiterals {
+    /// `None` for a float column (`=` on floats is not value identity: `-0.0` and `0.0`, `NaN`),
+    /// when SQL would compare a literal by casting the column (a number against a string column),
+    /// when no literal is left after dropping nulls, which `=` never matches, or when arrow orders
+    /// the literals otherwise than [`value_order`].
+    pub(crate) fn new(literals: &[ScalarValue], column_type: &DataType) -> Option<Self> {
+        if column_type.is_floating() {
             return None;
         }
-        let literal = literal.cast_to(column_type).ok()?.to_array().ok()?;
-        let found = eq(values, &Scalar::new(literal)).ok()?;
-        for (hit, count) in found.iter().zip(counts.values()) {
-            if hit == Some(true) {
-                held = held.saturating_add(*count);
+        let mut values = Vec::with_capacity(literals.len());
+        for literal in literals {
+            if !compares_as_column(column_type, &literal.data_type()) {
+                return None;
+            }
+            let cast = literal.cast_to(column_type).ok()?;
+            if !cast.is_null() {
+                values.push(cast);
             }
         }
+        if values.is_empty() {
+            return None;
+        }
+        values.sort_by(value_order);
+        values.dedup();
+        let array = ScalarValue::iter_to_array(values.iter().cloned()).ok()?;
+        // A section's table is searched in arrow's order, so the literals must sort the same way.
+        let order = make_comparator(&array, &array, SortOptions::default()).ok()?;
+        if !(1..array.len()).all(|at| order(at - 1, at).is_lt()) {
+            return None;
+        }
+        Some(Self {
+            values,
+            array,
+            column_type: column_type.clone(),
+        })
     }
-    Some(held)
+
+    /// How many distinct values are asked for.
+    pub(crate) fn distinct_count(&self) -> usize {
+        self.values.len()
+    }
+}
+
+/// Whether SQL compares `literal_type` with a `column_type` column as the column's own value.
+/// String literals arrive as `Utf8View`, and every string type compares by its bytes.
+fn compares_as_column(column_type: &DataType, literal_type: &DataType) -> bool {
+    match comparison_coercion(column_type, literal_type) {
+        Some(common) if &common == column_type => true,
+        Some(common) => common.is_string() && column_type.is_string(),
+        None => false,
+    }
 }
 
 /// One column's statistics for one superfile, wherever they live, read
@@ -381,7 +481,8 @@ fn stored_literal_counts(
 /// are read from the decoded group's arrays. Only [`Self::value_counts`]
 /// builds anything, so the pruner, the planner's statistics and the
 /// rollup fold, which read bounds, counts, sums and sketches, cost one
-/// array read each per superfile and column.
+/// array read each per superfile and column. An `=` or `IN` searches a
+/// section's value table where it sits ([`Self::literal_count`]).
 #[derive(Clone, Copy)]
 pub enum ColumnStats<'a> {
     Inline(&'a ScalarStatsAgg),
@@ -471,8 +572,8 @@ impl ColumnStats<'_> {
 
     /// The exact value table as a struct array of values and counts, for
     /// the encoder: a section's row is carried over as it is, a decoded
-    /// table is built into one. `None` when the superfile carries no
-    /// table, or the table's values are not of `data_type`.
+    /// table is built into one. `None` when the superfile carries no table,
+    /// or its values are not of `data_type`.
     fn value_table_array(&self, data_type: &DataType) -> Option<ArrayRef> {
         let item = match self {
             Self::Inline(agg) => {
@@ -506,39 +607,23 @@ impl ColumnStats<'_> {
         }
     }
 
-    /// The exact value table as the file keeps it, unbuilt, so looking up a few values skips
-    /// building and sorting it as [`Self::value_counts`] does. `None` with no table, or a section's
-    /// with a null.
-    pub(crate) fn value_table(&self) -> Option<ValueTable<'_>> {
+    /// The rows the exact value table counts for `literals`; `None` when the file has no table, its
+    /// table is in another type, a stored table is malformed (empty, out of order, a null or zero
+    /// count), or the counts sum past u64. An in-memory table is checked once, when it is built; a
+    /// stored one the first time it is read.
+    pub(crate) fn literal_count(&self, literals: &ExactLiterals) -> Option<u64> {
         match self {
-            Self::Inline(agg) => agg.value_counts.as_ref().map(ValueTable::Built),
-            Self::Section(row) => {
-                let item = row.value_table_array()?;
-                let table = item.as_any().downcast_ref::<StructArray>()?.clone();
-                let counts = table.column(1).as_any().downcast_ref::<UInt64Array>()?;
-                (table.column(0).null_count() == 0 && counts.null_count() == 0)
-                    .then_some(ValueTable::Stored(table))
-            }
+            Self::Inline(agg) => agg.value_counts.as_ref()?.rows_holding(&literals.values),
+            Self::Section(row) => row.literal_count(literals),
         }
     }
 
-    /// The rows the exact value table counts for `literals`, compared as a statement compares them.
-    /// `None` when:
-    ///  - there is no table, or its values are not of `column_type`.
-    ///  - a statement would cast the column to compare it, as a string column against a number.
-    ///  - a literal does not cast to `column_type`.
-    pub(crate) fn literal_count(
-        &self,
-        literals: &[ScalarValue],
-        column_type: &DataType,
-    ) -> Option<u64> {
-        match self.value_table()? {
-            ValueTable::Built(table) => literal_counts(table.entries(), literals, column_type),
-            // A float compares as `ScalarValue` does, so a float table is built to be searched.
-            ValueTable::Stored(_) if column_type.is_floating() => {
-                literal_counts(self.value_counts()?.entries(), literals, column_type)
-            }
-            ValueTable::Stored(table) => stored_literal_counts(&table, literals, column_type),
+    /// How many values the exact value table holds, read without building
+    /// it; `None` when the superfile carries no table.
+    pub(crate) fn value_table_len(&self) -> Option<usize> {
+        match self {
+            Self::Inline(agg) => agg.value_counts.as_ref().map(|t| t.entries().len()),
+            Self::Section(row) => row.value_table_array().map(|table| table.len()),
         }
     }
 
@@ -1547,6 +1632,7 @@ fn decode_group(bytes: &[u8]) -> Result<Group, SummariesError> {
         ),
         None => None,
     };
+    let searchable = unchecked_tables(value_counts.as_ref(), superfile.len());
     Ok(Group {
         superfile,
         min: required(MIN_FIELD)?,
@@ -1555,6 +1641,8 @@ fn decode_group(bytes: &[u8]) -> Result<Group, SummariesError> {
         sum: column_by_name(SUM_FIELD),
         hll,
         value_counts,
+        values_sketches: Mutex::default(),
+        searchable,
     })
 }
 
@@ -1579,9 +1667,12 @@ pub fn rows_from_entries(entries: &[Arc<SuperfileEntry>]) -> Vec<SummaryRow<'_>>
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, iter::repeat_n};
 
-    use arrow_array::{BooleanArray, Float64Array, Int64Array, StringArray};
+    use arrow_array::{
+        BooleanArray, Decimal128Array, Float64Array, Int64Array, LargeStringArray, StringArray,
+        UInt16Array,
+    };
     use tempfile::TempDir;
 
     use super::*;
@@ -2263,6 +2354,400 @@ mod tests {
         drop(section);
         assert!(cache.put(other_hash, Bytes::from(other)).await);
         assert!(!cache.contains(&hash), "evicted once no section reads it");
+    }
+
+    /// A section row of one `Int64` column whose value table holds `entries` as persisted,
+    /// without the checks a table built by the writer passes.
+    fn group_with_table(entries: &[(i64, u64)]) -> Group {
+        group_with_tables(&[entries])
+    }
+
+    /// [`group_with_table`] with a row for each of `tables`, in order.
+    fn group_with_tables(tables: &[&[(i64, u64)]]) -> Group {
+        let items: Vec<ArrayRef> = tables
+            .iter()
+            .map(|entries| -> ArrayRef {
+                let values: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                    entries.iter().map(|(value, _)| *value),
+                ));
+                let counts: ArrayRef = Arc::new(UInt64Array::from_iter_values(
+                    entries.iter().map(|(_, count)| *count),
+                ));
+                Arc::new(
+                    StructArray::try_new(
+                        value_table_fields(&DataType::Int64),
+                        vec![values, counts],
+                        None,
+                    )
+                    .expect("a value table item"),
+                )
+            })
+            .collect();
+        let bound: ArrayRef = Arc::new(Int64Array::from(vec![0; tables.len()]));
+        Group {
+            min: Arc::clone(&bound),
+            max: bound,
+            ..group_of_tables(&DataType::Int64, items)
+        }
+    }
+
+    /// A group of one row per value table in `items`, of `data_type`, its bounds null.
+    fn group_of_tables(data_type: &DataType, items: Vec<ArrayRef>) -> Group {
+        let rows = items.len();
+        let (_, list) = value_table_list(
+            data_type,
+            &items,
+            items.iter().map(|item| item.len()).collect(),
+            vec![true; rows],
+        )
+        .expect("a value table list");
+        group_of_list(data_type, list.as_list::<i32>().clone())
+    }
+
+    /// A group of one row per item of `value_counts`, tables of `data_type`, its bounds null.
+    fn group_of_list(data_type: &DataType, value_counts: ListArray) -> Group {
+        let rows = value_counts.len();
+        let bound = new_null_array(data_type, rows);
+        Group {
+            superfile: UInt32Array::from_iter_values(0..rows as u32),
+            min: Arc::clone(&bound),
+            max: bound,
+            null_count: UInt64Array::from(vec![0; rows]),
+            sum: None,
+            hll: None,
+            searchable: unchecked_tables(Some(&value_counts), rows),
+            value_counts: Some(value_counts),
+            values_sketches: Mutex::default(),
+        }
+    }
+
+    /// A row's table sketch is the sketch of the table's values whether it
+    /// is taken or kept. A table of [`SKETCH_KEPT_ENTRIES`] entries or more
+    /// keeps its sketch with the group the first time it is taken, each row
+    /// its own; a smaller one is sketched each time.
+    #[test]
+    fn a_tables_sketch_is_the_same_taken_or_kept() {
+        let table = |len: usize, step: i64| -> Vec<(i64, u64)> {
+            (0..len as i64)
+                .map(|at| (at * step, 1 + at as u64 % 3))
+                .collect()
+        };
+        let tables = [
+            table(1, 1),
+            table(SKETCH_KEPT_ENTRIES - 1, 3),
+            table(SKETCH_KEPT_ENTRIES, 5),
+            table(600, 7),
+            table(600, 11),
+        ];
+        let group = group_with_tables(&tables.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        for _ in 0..2 {
+            for (index, entries) in tables.iter().enumerate() {
+                let values: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                    entries.iter().map(|(value, _)| *value),
+                ));
+                let want = column_hll(&[values]).expect("integers sketch");
+                let row = ColumnRow {
+                    group: &group,
+                    index,
+                };
+                assert_eq!(row.values_sketch(), Some(want), "row {index}");
+                let kept = group
+                    .values_sketches
+                    .lock()
+                    .expect("not poisoned")
+                    .contains_key(&index);
+                assert_eq!(kept, entries.len() >= SKETCH_KEPT_ENTRIES, "row {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_tables_count_for_literals_is_the_rows_equal_to_one_of_them() {
+        // Random columns of every counted type, each counted in memory and as a stored section:
+        //  - literals fewer than the values, about as many, and more, some repeated and some the
+        //    table does not hold.
+        // This test pins that a table's count is the rows equal to one of the literals, the same in
+        // memory and stored.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        let decimal = DataType::Decimal128(12, 2);
+        for _ in 0..40 {
+            let distinct = next(400) as i64 + 1;
+            let rows: Vec<i64> = (0..next(2_000) + 1)
+                .map(|_| next(distinct as u64) as i64)
+                .collect();
+            let int64: ArrayRef = Arc::new(Int64Array::from_iter_values(rows.iter().copied()));
+            let text: ArrayRef = Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| format!("v{row}")),
+            ));
+            let long_text: ArrayRef = Arc::new(LargeStringArray::from_iter_values(
+                rows.iter().map(|row| format!("w{row}")),
+            ));
+            let small: ArrayRef = Arc::new(UInt16Array::from_iter_values(
+                rows.iter().map(|row| *row as u16),
+            ));
+            let flags: ArrayRef = Arc::new(BooleanArray::from_iter(
+                rows.iter().map(|row| Some(row % 3 == 0)),
+            ));
+            let amounts: ArrayRef = Arc::new(
+                Decimal128Array::from_iter_values(rows.iter().map(|row| i128::from(*row) * 25))
+                    .with_data_type(decimal.clone()),
+            );
+            // Fewer literals than values (each searched in the table), about as many (both walked)
+            // and more (both walked, or each value searched in the literals for a small table).
+            for literal_count in [1, 2, 3, 9, 30, 400, 1_000] {
+                // Some held, some repeated, some past the column's values.
+                let wanted: Vec<i64> = (0..literal_count)
+                    .map(|_| next(distinct as u64 + 20) as i64)
+                    .collect();
+                let held = |matches: &dyn Fn(i64) -> bool| -> u64 {
+                    rows.iter().filter(|row| matches(**row)).count() as u64
+                };
+                // Counted in memory and from the table as a section stores it, which must agree.
+                let count = |column: &ArrayRef, literals: Vec<ScalarValue>| {
+                    let agg = ScalarStatsAgg::from_column(column).expect("counted type");
+                    assert!(agg.value_counts.is_some(), "the column is counted");
+                    let literals = ExactLiterals::new(&literals, column.data_type())
+                        .expect("literals of the column's type");
+                    let in_memory = ColumnStats::Inline(&agg).literal_count(&literals);
+                    let table = ColumnStats::Inline(&agg)
+                        .value_table_array(column.data_type())
+                        .expect("a value table item");
+                    let group = group_of_tables(column.data_type(), vec![table]);
+                    let stored = ColumnStats::Section(ColumnRow {
+                        group: &group,
+                        index: 0,
+                    })
+                    .literal_count(&literals);
+                    assert_eq!(stored, in_memory, "{:?} section", column.data_type());
+                    in_memory
+                };
+                assert_eq!(
+                    count(
+                        &int64,
+                        wanted
+                            .iter()
+                            .map(|v| ScalarValue::Int64(Some(*v)))
+                            .collect()
+                    ),
+                    Some(held(&|row| wanted.contains(&row))),
+                    "Int64 {wanted:?}"
+                );
+                assert_eq!(
+                    count(
+                        &text,
+                        wanted
+                            .iter()
+                            .map(|v| ScalarValue::Utf8(Some(format!("v{v}"))))
+                            .collect()
+                    ),
+                    Some(held(&|row| wanted.contains(&row))),
+                    "Utf8 {wanted:?}"
+                );
+                // String literals arrive as `Utf8View`; they are cast to the column's type.
+                assert_eq!(
+                    count(
+                        &text,
+                        wanted
+                            .iter()
+                            .map(|v| ScalarValue::Utf8View(Some(format!("v{v}"))))
+                            .collect()
+                    ),
+                    Some(held(&|row| wanted.contains(&row))),
+                    "Utf8View against Utf8 {wanted:?}"
+                );
+                assert_eq!(
+                    count(
+                        &long_text,
+                        wanted
+                            .iter()
+                            .map(|v| ScalarValue::LargeUtf8(Some(format!("w{v}"))))
+                            .collect()
+                    ),
+                    Some(held(&|row| wanted.contains(&row))),
+                    "LargeUtf8 {wanted:?}"
+                );
+                assert_eq!(
+                    count(
+                        &small,
+                        wanted
+                            .iter()
+                            .map(|v| ScalarValue::UInt16(Some(*v as u16)))
+                            .collect()
+                    ),
+                    Some(held(&|row| wanted.contains(&row))),
+                    "UInt16 {wanted:?}"
+                );
+                let flags_wanted: Vec<bool> = wanted.iter().map(|v| v % 2 == 0).collect();
+                assert_eq!(
+                    count(
+                        &flags,
+                        flags_wanted
+                            .iter()
+                            .map(|v| ScalarValue::Boolean(Some(*v)))
+                            .collect()
+                    ),
+                    Some(held(&|row| flags_wanted.contains(&(row % 3 == 0)))),
+                    "Boolean {flags_wanted:?}"
+                );
+                assert_eq!(
+                    count(
+                        &amounts,
+                        wanted
+                            .iter()
+                            .map(|v| ScalarValue::Decimal128(Some(i128::from(*v) * 25), 12, 2))
+                            .collect()
+                    ),
+                    Some(held(&|row| wanted.contains(&row))),
+                    "Decimal128 {wanted:?}"
+                );
+            }
+        }
+    }
+
+    /// The rows a section's table of `entries` counts for `IN (literals)`.
+    fn persisted_literal_count(entries: &[(i64, u64)], literals: &[i64]) -> Option<u64> {
+        let group = group_with_table(entries);
+        let stats = ColumnStats::Section(ColumnRow {
+            group: &group,
+            index: 0,
+        });
+        let literals: Vec<ScalarValue> = literals
+            .iter()
+            .map(|value| ScalarValue::Int64(Some(*value)))
+            .collect();
+        let literals = ExactLiterals::new(&literals, &DataType::Int64).expect("int literals");
+        stats.literal_count(&literals)
+    }
+
+    /// [`ColumnStats::literal_count`] of `literals` over an in-memory table of `entries`.
+    fn inline_literal_count(entries: &[(i64, u64)], literals: &[i64]) -> Option<u64> {
+        let rows: Vec<i64> = entries
+            .iter()
+            .flat_map(|(value, count)| repeat_n(*value, *count as usize))
+            .collect();
+        let stats = stats_of(Arc::new(Int64Array::from(rows)));
+        let literals: Vec<ScalarValue> = literals
+            .iter()
+            .map(|value| ScalarValue::Int64(Some(*value)))
+            .collect();
+        let literals = ExactLiterals::new(&literals, &DataType::Int64).expect("int literals");
+        ColumnStats::Inline(&stats).literal_count(&literals)
+    }
+
+    #[test]
+    fn an_in_memory_table_counts_as_its_stored_copy() {
+        // One table with counts 2, 3 and 4, read in memory and as a stored section:
+        //  - fewer literals than values search the table; more literals are searched instead.
+        //  - a literal asked twice counts once, and a value the table lacks counts 0.
+        // This test pins that both shapes count every list of literals alike.
+        let table = [(1, 2), (2, 3), (9, 4)];
+        for (literals, rows) in [
+            (&[1, 2][..], 5),
+            (&[2, 2][..], 3),
+            (&[7][..], 0),
+            (&[9, 1, 3, 5, 0][..], 6),
+            (&[0, 3, 4, 5, 6][..], 0),
+        ] {
+            assert_eq!(
+                inline_literal_count(&table, literals),
+                Some(rows),
+                "in memory {literals:?}"
+            );
+            assert_eq!(
+                persisted_literal_count(&table, literals),
+                Some(rows),
+                "stored {literals:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_persisted_table_no_file_can_hold_settles_no_literal() {
+        // A section's table as stored, without the writer's checks:
+        //  - a zero count could prove a value absent from a file that holds it.
+        //  - so could values out of order or repeated, which a search can miss.
+        //  - so could counts whose sum overflows, which wraps to 0.
+        //  - a sound table still counts, and so does a sum that fits.
+        // This test pins that the malformed tables settle nothing.
+        assert_eq!(persisted_literal_count(&[(1, 2), (2, 3)], &[1, 2]), Some(5));
+        assert_eq!(persisted_literal_count(&[(1, 2), (2, 3)], &[7]), Some(0));
+        assert_eq!(persisted_literal_count(&[(1, 0), (2, 3)], &[1]), None);
+        // Out of order, a search could miss 5 and count 0 rows for it; a repeat could count short.
+        assert_eq!(persisted_literal_count(&[(5, 1), (1, 2)], &[5]), None);
+        assert_eq!(persisted_literal_count(&[(1, 1), (1, 2)], &[1]), None);
+        assert_eq!(
+            persisted_literal_count(&[(1, u64::MAX), (2, 1)], &[1, 2]),
+            None
+        );
+        assert_eq!(
+            persisted_literal_count(&[(1, u64::MAX), (2, 1)], &[1]),
+            Some(u64::MAX),
+            "a sum that fits is still counted"
+        );
+    }
+
+    #[test]
+    fn each_row_of_a_section_counts_from_its_own_table() {
+        // A section of three rows, each its own value table, the middle one sound:
+        //  - the middle row counts only its own values, though its neighbours hold the literals.
+        //  - an out-of-order first row and an empty last row count nothing, which the middle row's
+        //    search does not change, read once or again.
+        // This test pins that a row is searched and checked within its own slice of the section.
+        let group = group_with_tables(&[&[(9, 1), (3, 1)], &[(3, 2), (5, 4)], &[]]);
+        let count = |index: usize, literals: &[i64]| {
+            let literals: Vec<ScalarValue> = literals
+                .iter()
+                .map(|v| ScalarValue::Int64(Some(*v)))
+                .collect();
+            let literals = ExactLiterals::new(&literals, &DataType::Int64).expect("int literals");
+            ColumnStats::Section(ColumnRow {
+                group: &group,
+                index,
+            })
+            .literal_count(&literals)
+        };
+        assert_eq!(count(1, &[3]), Some(2));
+        assert_eq!(count(1, &[5, 9]), Some(4));
+        assert_eq!(count(1, &[9]), Some(0));
+        assert_eq!(count(0, &[3]), None);
+        assert_eq!(count(2, &[3]), None);
+        assert_eq!(count(1, &[3, 5]), Some(6));
+        // Read again, each row answers from its remembered check.
+        assert_eq!(count(0, &[3]), None, "out of order, remembered");
+        assert_eq!(count(2, &[3]), None, "empty, remembered");
+        assert_eq!(count(1, &[5]), Some(4), "sound, remembered");
+    }
+
+    #[test]
+    fn a_stored_table_without_its_counts_settles_no_literal() {
+        // A section's value table whose items hold only the values, no counts field, as a foreign
+        // or damaged section could:
+        //  - the `=` check keeps the file rather than panicking.
+        // This test pins that a table of the wrong shape settles nothing.
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        let item_fields = Fields::from(vec![Field::new(VALUE_FIELD, DataType::Int64, false)]);
+        let items = StructArray::try_new(item_fields.clone(), vec![values], None).expect("items");
+        let list = ListArray::try_new(
+            Arc::new(Field::new(ITEM_FIELD, DataType::Struct(item_fields), false)),
+            OffsetBuffer::<i32>::from_lengths([2]),
+            Arc::new(items),
+            None,
+        )
+        .expect("a one-field table list");
+        let group = group_of_list(&DataType::Int64, list);
+        let literals = ExactLiterals::new(&[ScalarValue::Int64(Some(7))], &DataType::Int64)
+            .expect("int literals");
+        let stats = ColumnStats::Section(ColumnRow {
+            group: &group,
+            index: 0,
+        });
+        assert_eq!(stats.literal_count(&literals), None);
     }
 
     /// A section whose counts promise more tables than it holds is refused

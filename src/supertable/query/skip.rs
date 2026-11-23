@@ -44,7 +44,7 @@
 //! without yet committing to a specific early-termination
 //! algorithm.
 
-use std::{cmp::Ordering, sync::Arc};
+use std::{cmp::Ordering, slice, sync::Arc};
 
 use arrow_schema::DataType;
 use datafusion::scalar::ScalarValue;
@@ -55,7 +55,7 @@ use crate::{
         vector::distance::{Metric, distance},
     },
     supertable::{
-        manifest::{ManifestSnapshot, ScalarStatsAgg, SuperfileEntry},
+        manifest::{ManifestSnapshot, ScalarStatsAgg, SuperfileEntry, summaries::ExactLiterals},
         schema::{FieldId, map::Resolution},
     },
 };
@@ -230,7 +230,8 @@ pub struct ScalarPredicate {
 ///
 /// For each superfile, consult the per-column min/max persisted in
 /// [`SuperfileEntry::scalar_stats`] and keep the superfile unless
-/// some predicate *proves* no row in the superfile can satisfy it.
+/// some predicate *proves* no row in the superfile can satisfy it. An `=` also skips a superfile
+/// whose exact value table lacks its literal.
 /// Because the predicates are conjunctive, a single
 /// definitely-false predicate prunes the whole superfile.
 ///
@@ -258,20 +259,26 @@ pub fn scalar_skip(
     if predicates.is_empty() {
         return vec![true; superfiles.len()];
     }
-    let guarded: Vec<(Option<ColumnTypeGuard>, &ScalarPredicate)> = predicates
+    let guarded: Vec<_> = predicates
         .iter()
-        .map(|(id, p)| (id.map(|id| ColumnTypeGuard::new(manifest, id)), *p))
+        .map(|(id, p)| {
+            let guard = id.map(|id| ColumnTypeGuard::new(manifest, id));
+            let exact = guard.as_ref().and_then(|g| equality_literals(g, p));
+            (guard, *p, exact)
+        })
         .collect();
     superfiles
         .iter()
         .map(|entry| {
-            guarded.iter().all(|(guard, p)| match guard {
+            guarded.iter().all(|(guard, p, exact)| match guard {
                 None => true,
                 // Every row reads the column as null, which no comparison
                 // with a literal matches.
                 Some(guard) if guard.absent_from(entry) => false,
                 Some(guard) => {
-                    guard.stats_are_stale(entry) || superfile_may_match(entry, guard.id(), p)
+                    guard.stats_are_stale(entry)
+                        || (superfile_may_match(entry, guard.id(), p)
+                            && !holds_none(entry, guard.id(), exact.as_ref()))
                 }
             })
         })
@@ -279,7 +286,8 @@ pub fn scalar_skip(
 }
 
 /// Keep each superfile whose `column` min/max could hold *any* of
-/// `values` (an `IN` list is a disjunction). Empty `values` keeps all.
+/// `values` (an `IN` list is a disjunction), unless its exact value table holds none of them.
+/// Empty `values` keeps all.
 /// The SQL-side sibling of [`scalar_skip`] for the `IN` shape.
 pub fn scalar_value_set_skip(
     manifest: &ManifestSnapshot,
@@ -292,6 +300,9 @@ pub fn scalar_value_set_skip(
     }
 
     let guard = ColumnTypeGuard::new(manifest, column);
+    let exact = guard
+        .data_type()
+        .and_then(|t| ExactLiterals::new(values, t));
     superfiles
         .iter()
         .map(|entry| {
@@ -301,12 +312,13 @@ pub fn scalar_value_set_skip(
             if guard.stats_are_stale(entry) {
                 return true;
             }
-            match superfile_minmax(entry, column) {
+            let in_bounds = match superfile_minmax(entry, column) {
                 None => true,
                 Some((min, max)) => values
                     .iter()
                     .any(|v| scalar_value_may_match(&min, &max, ScalarOp::Eq, v)),
-            }
+            };
+            in_bounds && !holds_none(entry, column, exact.as_ref())
         })
         .collect()
 }
@@ -408,6 +420,11 @@ impl ColumnTypeGuard {
         self.id
     }
 
+    /// The column's type in the table now; `None` for a column the table lacks.
+    pub(crate) fn data_type(&self) -> Option<&DataType> {
+        self.current.as_ref().map(|c| &c.data_type)
+    }
+
     /// Whether the aggregate statistics a manifest part folds over its
     /// files can mix types, which they do for the whole span of a
     /// conversion: some of the part's files hold the old type and some the
@@ -486,6 +503,24 @@ fn superfile_may_match(entry: &SuperfileEntry, column: FieldId, pred: &ScalarPre
         None => true,
         Some((min, max)) => scalar_value_may_match(&min, &max, pred.op, &pred.value),
     }
+}
+
+/// The literal of a `column = literal` predicate, ready to test against exact value tables;
+/// `None` for any other comparison, or a literal [`ExactLiterals::new`] refuses.
+fn equality_literals(guard: &ColumnTypeGuard, pred: &ScalarPredicate) -> Option<ExactLiterals> {
+    if pred.op != ScalarOp::Eq {
+        return None;
+    }
+    ExactLiterals::new(slice::from_ref(&pred.value), guard.data_type()?)
+}
+
+/// Whether `entry`'s exact value table for `column` counts no row for `literals`; a file without
+/// a table, or no literals to look for, may hold them.
+fn holds_none(entry: &SuperfileEntry, column: FieldId, literals: Option<&ExactLiterals>) -> bool {
+    let (Some(literals), Some(stats)) = (literals, entry.scalar_stats.column(column)) else {
+        return false;
+    };
+    stats.literal_count(literals) == Some(0)
 }
 
 /// The superfile's persisted min/max for `column`, or `None` when the
@@ -1455,5 +1490,552 @@ mod tests {
             scalar_skip(&manifest, &files, &[(Some(FieldId::ID_COLUMN), &id)]),
             vec![true, true, true]
         );
+    }
+
+    /// A file whose exact value table counts none of an `=` or `IN` literal is skipped, even
+    /// inside its min/max bounds.
+    mod exact_values {
+        use arrow_array::{BooleanArray, Decimal128Array, Float64Array};
+
+        use super::*;
+        use crate::supertable::manifest::list::ScalarValueCounts;
+
+        /// The precision and scale of the decimal column `d`.
+        const DECIMAL_PRECISION: u8 = 10;
+        const DECIMAL_SCALE: i8 = 2;
+        /// A scale other than the column's, which SQL compares by casting to a wider decimal.
+        const OTHER_SCALE: i8 = 1;
+        /// 1.7 at [`OTHER_SCALE`]: inside `d`'s bounds and in none of its values.
+        const SEVENTEEN_TENTHS: i128 = 17;
+
+        /// A table with an integer, a string, a float, a decimal and a boolean column.
+        fn manifest() -> ManifestSnapshot {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("s", DataType::LargeUtf8, false),
+                Field::new("f", DataType::Float64, false),
+                Field::new(
+                    "d",
+                    DataType::Decimal128(DECIMAL_PRECISION, DECIMAL_SCALE),
+                    false,
+                ),
+                Field::new("b", DataType::Boolean, false),
+            ]));
+            ManifestSnapshot::empty(Arc::new(
+                SupertableOptions::new(schema, vec![], vec![]).expect("opts"),
+            ))
+        }
+
+        fn id(m: &ManifestSnapshot, name: &str) -> FieldId {
+            m.field_id(name).expect("column")
+        }
+
+        /// A file whose `column` holds exactly `values` (one row each), with bounds and table.
+        fn file(
+            m: &ManifestSnapshot,
+            column: &str,
+            values: Vec<ScalarValue>,
+            min: ArrayRef,
+            max: ArrayRef,
+        ) -> Arc<SuperfileEntry> {
+            let mut e = empty_superfile();
+            let mut agg = ScalarStatsAgg::from_min_max(min, max);
+            agg.value_counts =
+                ScalarValueCounts::from_entries(values.into_iter().map(|v| (v, 1)).collect());
+            e.scalar_stats.insert(id(m, column), agg);
+            Arc::new(e)
+        }
+
+        fn ints(m: &ManifestSnapshot, values: &[i64]) -> Arc<SuperfileEntry> {
+            let lo = *values.iter().min().expect("a file holds a value");
+            let hi = *values.iter().max().expect("a file holds a value");
+            file(
+                m,
+                "k",
+                values
+                    .iter()
+                    .map(|v| ScalarValue::Int64(Some(*v)))
+                    .collect(),
+                Arc::new(Int64Array::from(vec![lo])),
+                Arc::new(Int64Array::from(vec![hi])),
+            )
+        }
+
+        fn int(v: i64) -> ScalarValue {
+            ScalarValue::Int64(Some(v))
+        }
+
+        #[test]
+        fn a_file_whose_table_lacks_every_literal_is_skipped_within_its_bounds() {
+            // Two files, both with bounds 0..=10:
+            //  - the first holds 5, the second holds 4 and 6.
+            //  - `= 5` and `IN (5)` keep only the first; `IN (7, 6)` keeps only the second.
+            // This test pins the skip for `IN` and for `=`.
+            let m = manifest();
+            let files = vec![ints(&m, &[0, 5, 10]), ints(&m, &[0, 4, 6, 10])];
+            assert_eq!(
+                scalar_value_set_skip(&m, &files, id(&m, "k"), &[int(5)]),
+                vec![true, false]
+            );
+            assert_eq!(
+                scalar_value_set_skip(&m, &files, id(&m, "k"), &[int(7), int(6)]),
+                vec![false, true]
+            );
+            let eq = pred("k", ScalarOp::Eq, int(5));
+            assert_eq!(
+                scalar_skip(&m, &files, &[(Some(id(&m, "k")), &eq)]),
+                vec![true, false]
+            );
+        }
+
+        #[test]
+        fn a_file_without_a_table_keeps_its_min_max_answer() {
+            // A file with bounds 0..=10 and no table, as one past its value-table budget has.
+            // This test pins that only its bounds decide.
+            let m = manifest();
+            let mut e = empty_superfile();
+            e.scalar_stats.insert(
+                id(&m, "k"),
+                ScalarStatsAgg::from_min_max(
+                    Arc::new(Int64Array::from(vec![0])),
+                    Arc::new(Int64Array::from(vec![10])),
+                ),
+            );
+            let files = vec![Arc::new(e)];
+            assert_eq!(
+                scalar_value_set_skip(&m, &files, id(&m, "k"), &[int(5)]),
+                vec![true],
+                "over the table cap a file has no table, so only its bounds decide"
+            );
+        }
+
+        #[test]
+        fn literals_the_table_cannot_settle_keep_the_file() {
+            // A file holding 0, 5 and 10 stays for anything the table cannot settle:
+            //  - a null literal alone, and a string the column type cannot take.
+            //  - `'5'`, which SQL compares as the number 5, which the file holds.
+            //  - `!=` and `<` on 7, inside the bounds and not in the table.
+            // This test pins that only an exact `=` can skip a file.
+            let m = manifest();
+            let files = vec![ints(&m, &[0, 5, 10])];
+            assert_eq!(
+                scalar_value_set_skip(&m, &files, id(&m, "k"), &[ScalarValue::Int64(None)]),
+                vec![true]
+            );
+            assert_eq!(
+                scalar_value_set_skip(
+                    &m,
+                    &files,
+                    id(&m, "k"),
+                    &[ScalarValue::Utf8(Some("x".into()))]
+                ),
+                vec![true]
+            );
+            assert_eq!(
+                scalar_value_set_skip(
+                    &m,
+                    &files,
+                    id(&m, "k"),
+                    &[ScalarValue::Utf8(Some("5".into()))]
+                ),
+                vec![true]
+            );
+            let ne = pred("k", ScalarOp::NotEq, int(7));
+            assert_eq!(
+                scalar_skip(&m, &files, &[(Some(id(&m, "k")), &ne)]),
+                vec![true]
+            );
+            let lt = pred("k", ScalarOp::Lt, int(7));
+            assert_eq!(
+                scalar_skip(&m, &files, &[(Some(id(&m, "k")), &lt)]),
+                vec![true]
+            );
+        }
+
+        #[test]
+        fn a_null_literal_beside_values_adds_nothing_to_look_for() {
+            // `k IN (NULL, 7)` matches only 7, since `=` with a null matches no row.
+            // This test pins that the null is dropped, not that it turns the check off.
+            let m = manifest();
+            let files = vec![ints(&m, &[0, 5, 10])];
+            let null = ScalarValue::Int64(None);
+            assert_eq!(
+                scalar_value_set_skip(&m, &files, id(&m, "k"), &[null.clone(), int(7)]),
+                vec![false],
+                "`k IN (NULL, 7)` matches only 7, which the file does not hold"
+            );
+            assert_eq!(
+                scalar_value_set_skip(&m, &files, id(&m, "k"), &[null, int(5)]),
+                vec![true]
+            );
+        }
+
+        #[test]
+        fn a_literal_that_casts_the_column_keeps_the_file() {
+            // A string column holding `'05'`, queried with the number 5:
+            //  - SQL casts the column to a number, so `'05' = 5` is true.
+            //  - the table holds no `'5'`, so it cannot answer that comparison.
+            // This test pins that the file is kept.
+            let m = manifest();
+            let s = |v: &str| ScalarValue::LargeUtf8(Some(v.to_string()));
+            let files = vec![file(
+                &m,
+                "s",
+                vec![s("05")],
+                Arc::new(LargeStringArray::from(vec!["05"])),
+                Arc::new(LargeStringArray::from(vec!["05"])),
+            )];
+            assert_eq!(
+                scalar_value_set_skip(&m, &files, id(&m, "s"), &[int(5)]),
+                vec![true]
+            );
+        }
+
+        #[test]
+        fn decimal_and_boolean_tables_skip_like_integers() {
+            // A decimal column holding 1.50 and 2.00, and a boolean column holding only `true`:
+            //  - `d = 1.75` at the column's scale is inside the bounds and not in the table.
+            //  - `d = 1.7` at scale 1 coerces to another decimal type, so the file is kept.
+            //  - `b = false` inside a file's bounds is not in its table of `true`; `b = true` is.
+            // This test pins the skip for the other counted types, and the scale refusal.
+            let m = manifest();
+            let dec = |cents: i128| {
+                ScalarValue::Decimal128(Some(cents), DECIMAL_PRECISION, DECIMAL_SCALE)
+            };
+            let bounds = |cents: i128| -> ArrayRef {
+                Arc::new(
+                    Decimal128Array::from(vec![cents])
+                        .with_precision_and_scale(DECIMAL_PRECISION, DECIMAL_SCALE)
+                        .expect("decimal"),
+                )
+            };
+            let decimals = vec![file(
+                &m,
+                "d",
+                vec![dec(150), dec(200)],
+                bounds(150),
+                bounds(200),
+            )];
+            assert_eq!(
+                scalar_value_set_skip(&m, &decimals, id(&m, "d"), &[dec(175)]),
+                vec![false]
+            );
+            assert_eq!(
+                scalar_value_set_skip(&m, &decimals, id(&m, "d"), &[dec(150)]),
+                vec![true]
+            );
+            let one_place =
+                ScalarValue::Decimal128(Some(SEVENTEEN_TENTHS), DECIMAL_PRECISION, OTHER_SCALE);
+            assert_eq!(
+                scalar_value_set_skip(&m, &decimals, id(&m, "d"), &[one_place]),
+                vec![true]
+            );
+            let flag = |v: bool| ScalarValue::Boolean(Some(v));
+            let bound = |v: bool| -> ArrayRef { Arc::new(BooleanArray::from(vec![v])) };
+            let booleans = vec![file(&m, "b", vec![flag(true)], bound(false), bound(true))];
+            assert_eq!(
+                scalar_value_set_skip(&m, &booleans, id(&m, "b"), &[flag(false)]),
+                vec![false]
+            );
+            assert_eq!(
+                scalar_value_set_skip(&m, &booleans, id(&m, "b"), &[flag(true)]),
+                vec![true]
+            );
+        }
+
+        #[test]
+        fn a_float_column_carries_no_value_table() {
+            // `=` on floats is not value identity (`-0.0` and `0.0`, `NaN`).
+            // This test pins that no float table is built and no float literal is looked up.
+            assert!(
+                ExactLiterals::new(&[ScalarValue::Float64(Some(0.5))], &DataType::Float64)
+                    .is_none()
+            );
+            assert!(
+                ScalarValueCounts::from_entries(vec![(ScalarValue::Float64(Some(0.0)), 1)])
+                    .is_none()
+            );
+            assert!(
+                ScalarValueCounts::from_entries(vec![(ScalarValue::Float32(Some(0.0)), 1)])
+                    .is_none()
+            );
+            let m = manifest();
+            let files = vec![file(
+                &m,
+                "f",
+                vec![
+                    ScalarValue::Float64(Some(0.0)),
+                    ScalarValue::Float64(Some(1.0)),
+                ],
+                Arc::new(Float64Array::from(vec![0.0])),
+                Arc::new(Float64Array::from(vec![1.0])),
+            )];
+            assert_eq!(
+                scalar_value_set_skip(&m, &files, id(&m, "f"), &[ScalarValue::Float64(Some(0.5))]),
+                vec![true]
+            );
+        }
+
+        #[test]
+        fn strings_match_exactly_and_by_case() {
+            // A string column holding `apple` and `pear`:
+            //  - `banana` and `Apple` are inside its bounds and not in its table.
+            //  - a Utf8 or Utf8View literal compares with the LargeUtf8 column by its bytes.
+            // This test pins exact, case-sensitive matching across the string types.
+            let m = manifest();
+            let s = |v: &str| ScalarValue::LargeUtf8(Some(v.to_string()));
+            let files = vec![file(
+                &m,
+                "s",
+                vec![s("apple"), s("pear")],
+                Arc::new(LargeStringArray::from(vec!["apple"])),
+                Arc::new(LargeStringArray::from(vec!["pear"])),
+            )];
+            assert_eq!(
+                scalar_value_set_skip(&m, &files, id(&m, "s"), &[s("banana")]),
+                vec![false]
+            );
+            assert_eq!(
+                scalar_value_set_skip(&m, &files, id(&m, "s"), &[s("Apple")]),
+                vec![false],
+                "= is case-sensitive"
+            );
+            assert_eq!(
+                scalar_value_set_skip(
+                    &m,
+                    &files,
+                    id(&m, "s"),
+                    &[ScalarValue::Utf8(Some("apple".into()))]
+                ),
+                vec![true],
+                "a Utf8 literal compares with a LargeUtf8 column as its own value"
+            );
+            assert_eq!(
+                scalar_value_set_skip(
+                    &m,
+                    &files,
+                    id(&m, "s"),
+                    &[ScalarValue::Utf8View(Some("banana".into()))]
+                ),
+                vec![false],
+                "the scan reads strings as Utf8View, so SQL's literals arrive as Utf8View"
+            );
+        }
+    }
+
+    /// The same skip through SQL on a real table: the rows match a filter over every row, and
+    /// the skip shows in the files the plan keeps.
+    mod exact_values_through_sql {
+        use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch};
+        use datafusion::prelude::{col, lit};
+        use tempfile::TempDir;
+
+        use super::*;
+        use crate::{
+            CompactionSettings, IndexSpec, OptimizeOptions,
+            catalog::{Connection, connect},
+            runtime_metrics::op_stats::with_op_stats,
+        };
+
+        /// The merge target for the optimize test, in MiB: far above three small files.
+        const MERGE_TARGET_MB: u64 = 1;
+        /// The least fill a merge accepts: any, so the three small files merge.
+        const MERGE_MIN_FILL_PERCENT: u8 = 1;
+        /// Files a merge needs: fewer than the three written.
+        const MERGE_MIN_FILES: u64 = 2;
+
+        /// Three files whose `k` bounds overlap: 1..=9 holding 5, 1..=9 without 5, and 2..=3.
+        const FILES: &[&[i64]] = &[&[1, 5, 9], &[1, 4, 9], &[2, 3]];
+
+        fn table() -> (TempDir, Connection) {
+            let dir = TempDir::new().expect("tempdir");
+            let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("s", DataType::LargeUtf8, false),
+            ]));
+            let t = db
+                .create_table("t", Arc::clone(&schema), IndexSpec::new())
+                .expect("table");
+            for (i, keys) in FILES.iter().enumerate() {
+                let s: Vec<String> = keys.iter().map(|k| format!("f{i}k{k}")).collect();
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(keys.to_vec())),
+                        Arc::new(LargeStringArray::from(s)),
+                    ],
+                )
+                .expect("batch");
+                t.append(&batch, None).expect("append");
+            }
+            (dir, db)
+        }
+
+        /// The sorted `k` values a statement returns, and how many files its plan kept.
+        fn run(db: &Connection, sql: &str) -> (Vec<i64>, u64) {
+            let (batches, stats) = with_op_stats(|| db.query_sql(sql).expect("query"));
+            let mut ks: Vec<i64> = batches
+                .iter()
+                .flat_map(|b| {
+                    let a = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("k");
+                    (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
+                })
+                .collect();
+            ks.sort_unstable();
+            (ks, stats.presence_pruning_survived)
+        }
+
+        /// What a filter over every row keeps, for `keep`.
+        fn expected(keep: impl Fn(i64) -> bool) -> Vec<i64> {
+            let mut ks: Vec<i64> = FILES
+                .iter()
+                .flat_map(|f| f.iter().copied())
+                .filter(|k| keep(*k))
+                .collect();
+            ks.sort_unstable();
+            ks
+        }
+
+        #[test]
+        fn equality_in_and_or_of_equalities_skip_the_file_whose_table_lacks_the_value() {
+            // `k = 5`, `k IN (5, 7)` and `k = 5 OR k = 7` over the three files:
+            //  - min/max keeps both 1..=9 files; the table drops the one without 5.
+            //  - `k = 6` is inside both bounds and in no table, so no file is kept.
+            // This test pins the rows and the files kept for each form.
+            let (_dir, db) = table();
+            let (_, stats) = with_op_stats(|| db.query_sql("SELECT k FROM t").expect("query"));
+            assert_eq!(
+                stats.superfiles_considered, 3,
+                "one file per append, or the counts below prove nothing"
+            );
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k = 5"),
+                (expected(|k| k == 5), 1),
+                "min/max keeps two files, the table one"
+            );
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k IN (5, 7)"),
+                (expected(|k| k == 5 || k == 7), 1)
+            );
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k = 5 OR k = 7"),
+                (expected(|k| k == 5 || k == 7), 1)
+            );
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k = 6"),
+                (expected(|k| k == 6), 0),
+                "no file holds 6"
+            );
+        }
+
+        #[test]
+        fn string_equality_and_in_skip_through_sql() {
+            // `s` is a LargeUtf8 column; SQL hands its literals over as Utf8View:
+            //  - `'f0k4'` lies inside file 0's bounds (`f0k1..=f0k9`) and in no file's table.
+            // This test pins the skip for string `=` and `IN`.
+            let (_dir, db) = table();
+            assert_eq!(run(&db, "SELECT k FROM t WHERE s = 'f0k5'"), (vec![5], 1));
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE s = 'f0k4'"),
+                (vec![], 0),
+                "min/max keeps file 0, its table holds no 'f0k4'"
+            );
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE s IN ('f0k4', 'f1k5')"),
+                (vec![], 0)
+            );
+        }
+
+        #[test]
+        fn a_mixed_or_reads_the_table_and_ranges_keep_what_min_max_keeps() {
+            // NOT IN, a range and an OR of ranges never reach the table; a mixed OR's `=` does:
+            //  - `k = 5 OR k > 8`: `k > 8` keeps both 1..=9 files anyway.
+            //  - `k = 5 OR k > 9`: no file passes `k > 9`, so the table alone narrows `k = 5`.
+            // This test pins the files kept for each, and the table inside an OR branch.
+            let (_dir, db) = table();
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k NOT IN (5)"),
+                (expected(|k| k != 5), 3)
+            );
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k > 4 AND k < 6"),
+                (expected(|k| k > 4 && k < 6), 2)
+            );
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k = 5 OR k > 8"),
+                (expected(|k| k == 5 || k > 8), 2),
+                "`k > 8` keeps both 1..=9 files"
+            );
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k = 5 OR k > 9"),
+                (expected(|k| k == 5 || k > 9), 1),
+                "the `k = 5` branch reads the table"
+            );
+            assert_eq!(
+                run(
+                    &db,
+                    "SELECT k FROM t WHERE (k >= 1 AND k <= 1) OR (k >= 9 AND k <= 9)"
+                ),
+                (expected(|k| k == 1 || k == 9), 2),
+                "an OR of ranges is min/max's, unchanged"
+            );
+        }
+
+        #[test]
+        fn deleted_rows_cannot_make_a_skip_wrong() {
+            // Delete every 5, then ask for 5, 1, and 4 or 5:
+            //  - a table still counts the deleted rows, so it can only keep a file too many.
+            // This test pins the rows after a delete, and that the file that held 5 is still read.
+            let (_dir, db) = table();
+            db.open_table("t")
+                .expect("t")
+                .delete(col("k").eq(lit(5i64)))
+                .expect("delete");
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k = 5"),
+                (Vec::<i64>::new(), 1)
+            );
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k = 1").0,
+                vec![1, 1],
+                "the other value of both files"
+            );
+            assert_eq!(run(&db, "SELECT k FROM t WHERE k IN (4, 5)").0, vec![4]);
+        }
+
+        #[test]
+        fn a_merged_file_keeps_an_exact_table() {
+            // The three files merged into one whose bounds are 1..=9 and whose table holds
+            // 1, 2, 3, 4, 5 and 9:
+            //  - `k IN (4, 5)` reads the merged file and returns both values.
+            //  - `k = 6` lies inside the bounds and in no row, so no file is read.
+            // This test pins that a merge keeps the table exact.
+            let (_dir, db) = table();
+            let settings = CompactionSettings {
+                target_superfile_size_mb: MERGE_TARGET_MB,
+                min_fill_percent: MERGE_MIN_FILL_PERCENT,
+                min_superfiles_for_merge: MERGE_MIN_FILES,
+                ..CompactionSettings::default()
+            };
+            db.open_table("t")
+                .expect("t")
+                .optimize(&OptimizeOptions::compact(settings))
+                .expect("optimize");
+            let (_, stats) = with_op_stats(|| db.query_sql("SELECT k FROM t").expect("query"));
+            assert_eq!(stats.superfiles_considered, 1, "the three files merged");
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k IN (4, 5)"),
+                (expected(|k| k == 4 || k == 5), 1)
+            );
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k = 6"),
+                (Vec::<i64>::new(), 0)
+            );
+        }
     }
 }

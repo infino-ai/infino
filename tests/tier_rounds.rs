@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
-//! The tier merge stops at the configured round cap and still answers as
-//! the table without tiers does: what it has read by then bounds every
+//! The selection from the term index — the level heads a table keeps —
+//! stops at the configured round cap and still answers as the table
+//! without them does: what it has read by then bounds every
 //! superfile soundly, it just stops refining. Its own binary, because the
 //! cap is read from the host configuration once per process.
 #![deny(clippy::unwrap_used)]
@@ -47,8 +48,9 @@ fn a_round_cap_of_one_still_answers_the_same() {
                 a, b,
                 "{query:?} {mode:?} k={k}: same answer under one round"
             );
-            // One round reads at most one block of every term's head per
-            // superfile (an inline head is a few entries).
+            // One round reads at most level 0 of every term's head per layer,
+            // one block (an inline head is a few entries); the fixture's
+            // layers are its superfiles.
             let terms = query.split_whitespace().count() as u64;
             assert!(
                 stats.tier_entries <= SUPERFILES as u64 * terms * 64,

@@ -55,9 +55,12 @@ use crate::{
     memory::ConnectionMemoryBudget,
     supertable::{
         query::{
+            filter_in_scan::FilterIntoCachedScan,
+            id_order::IdOrderUnderTopK,
             join_build_size::RightSizeJoinBuild,
             limit_stage::StageLimitGathers,
             read_ahead_rule::ReadAheadOff,
+            scan_order::ScanOrderUnderLimit,
             sorted_root::{KeepSortedRoot, OrderUnderScalarSubquery},
             topk_row_filter::RowFilterUnderTopK,
             values_subquery::ValuesSubqueryRewrite,
@@ -267,7 +270,7 @@ pub(crate) fn budgeted_session_context(
         .skip_partial_aggregation_probe_ratio_threshold = PARTIAL_AGG_SKIP_PROBE_RATIO;
 
     // Predicates run in a `FilterExec` above the scan, not as Parquet row
-    // filters, except under `ORDER BY ... LIMIT` (see `RowFilterUnderTopK`).
+    // filters, except under a `LIMIT` (see `RowFilterUnderTopK`).
     // Pinned off here because the scan's own flag is ORed with this option.
     config.options_mut().execution.parquet.pushdown_filters = false;
 
@@ -281,6 +284,9 @@ pub(crate) fn budgeted_session_context(
     // DataFusion's rules, with ours at both ends:
     //  - `RowFilterUnderTopK` first, so DataFusion's filter pushdown sees the
     //    marked scans and drops their `FilterExec`.
+    //  - `IdOrderUnderTopK` next, on the scans `RowFilterUnderTopK` left as
+    //    scans of kept columns, so the filter pushdown that hands a top-k's
+    //    bound to the scan finds it already reading in id order.
     //  - `OrderUnderScalarSubquery` before DataFusion's `OutputRequirements`,
     //    which on DataFusion 54 loses the `ORDER BY` of a query under a
     //    `ScalarSubqueryExec` root.
@@ -291,9 +297,16 @@ pub(crate) fn budgeted_session_context(
     //    earlier onto the probe side. It copies build columns whose buffers
     //    are much larger than their rows, so the join is charged for the rows
     //    it keeps.
+    //  - `FilterIntoCachedScan` after DataFusion's rules, once filters sit
+    //    over the scans they read, to check a `WHERE` in a scan of kept
+    //    columns on the columns as kept.
     //  - `KeepSortedRoot` after DataFusion's rules, to remove the round-robin
     //    repartition that `EnforceDistribution` adds above a sorted result,
     //    which would return an `ORDER BY` out of order.
+    //  - `ScanOrderUnderLimit` after DataFusion's rules, once `LimitPushdown`
+    //    has set the gather's fetch, to read a scan under a `LIMIT` with no
+    //    `ORDER BY` in file order, the same rows on every run. Before
+    //    `StageLimitGathers`, which keeps that order.
     //  - `StageLimitGathers` after DataFusion's rules, once `EnforceDistribution`
     //    has split a filtered scan and `LimitPushdown` has set the gather's
     //    fetch, to start its partitions in two stages under a small `LIMIT`.
@@ -301,9 +314,12 @@ pub(crate) fn budgeted_session_context(
     //    read-ahead off for scans a `LIMIT` can stop early.
     let mut rules = PhysicalOptimizer::new().rules;
     rules.insert(0, Arc::new(RowFilterUnderTopK));
-    rules.insert(1, Arc::new(OrderUnderScalarSubquery));
+    rules.insert(1, Arc::new(IdOrderUnderTopK));
+    rules.insert(2, Arc::new(OrderUnderScalarSubquery));
     rules.push(Arc::new(RightSizeJoinBuild));
+    rules.push(Arc::new(FilterIntoCachedScan));
     rules.push(Arc::new(KeepSortedRoot));
+    rules.push(Arc::new(ScanOrderUnderLimit));
     rules.push(Arc::new(StageLimitGathers));
     rules.push(Arc::new(ReadAheadOff));
     let mut builder = SessionStateBuilder::new()

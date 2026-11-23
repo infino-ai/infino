@@ -208,6 +208,13 @@ pub trait LazyByteSource: Send + Sync {
         Some(Box::new(()))
     }
 
+    /// Push the buffers this source keeps in memory to serve reads, and those
+    /// of the sources it reads through. Several sources may push slices of
+    /// one buffer; [`held_buffer_bytes`] counts each byte once. Default:
+    /// none, for a source that keeps nothing or whose bytes are the file
+    /// itself.
+    fn held_buffers(&self, _out: &mut Vec<Bytes>) {}
+
     /// Tail-fetch path: — fetch the last `len` bytes of the
     /// backing object AND surface the total object size.
     ///
@@ -359,6 +366,14 @@ impl fmt::Debug for Source {
 }
 
 impl Source {
+    /// [`LazyByteSource::held_buffers`] of a lazy source. An in-memory one
+    /// is the file's own bytes, so it pushes nothing.
+    pub(crate) fn held_buffers(&self, out: &mut Vec<Bytes>) {
+        if let Self::Lazy(source) = self {
+            source.held_buffers(out);
+        }
+    }
+
     /// Total backing size in bytes.
     pub(crate) fn len(&self) -> usize {
         match self {
@@ -733,6 +748,10 @@ impl LazyByteSource for LazySubSource {
             self.inner.note_read(self.offset + start, len);
         }
     }
+
+    fn held_buffers(&self, out: &mut Vec<Bytes>) {
+        self.inner.held_buffers(out);
+    }
 }
 
 /// Prefetched overlay: — overlay that serves pre-fetched byte ranges
@@ -869,11 +888,69 @@ impl LazyByteSource for PrefetchedSource {
     fn cache_room_ahead(&self, bytes: u64) -> Option<CacheRoom> {
         self.inner.cache_room_ahead(bytes)
     }
+
+    fn held_buffers(&self, out: &mut Vec<Bytes>) {
+        out.extend(self.prefetched.iter().map(|(_, bytes)| bytes.clone()));
+        self.inner.held_buffers(out);
+    }
+}
+
+/// The bytes `buffers` cover in memory, counting a byte several of them
+/// share once: an overlay a sub-reader builds over its parent's often holds
+/// slices of the parent's buffers. A slice keeps its whole allocation alive
+/// but counts only its own length.
+pub(crate) fn held_buffer_bytes(buffers: &mut [Bytes]) -> usize {
+    buffers.sort_unstable_by_key(|bytes| bytes.as_ptr() as usize);
+    let mut held = 0;
+    let mut covered_to = 0usize;
+    for bytes in buffers.iter().filter(|bytes| !bytes.is_empty()) {
+        let start = bytes.as_ptr() as usize;
+        let end = start + bytes.len();
+        held += end.saturating_sub(start.max(covered_to));
+        covered_to = covered_to.max(end);
+    }
+    held
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slices of one buffer count the bytes they cover between them once;
+    /// a separate buffer counts on its own.
+    #[test]
+    fn held_buffer_bytes_counts_a_shared_byte_once() {
+        let parent = Bytes::from(vec![7u8; 100]);
+        let other = Bytes::from(vec![1u8; 10]);
+        let mut buffers = vec![
+            parent.slice(20..60),
+            other.clone(),
+            parent.slice(0..40),
+            parent.slice(70..80),
+            Bytes::new(),
+        ];
+        assert_eq!(held_buffer_bytes(&mut buffers), 60 + 10 + 10);
+        let mut buffers = vec![parent.clone(), parent.slice(10..20)];
+        assert_eq!(held_buffer_bytes(&mut buffers), 100);
+    }
+
+    /// An overlay keeps what was installed in it, and pushes what the source
+    /// it reads through keeps; a sub-source pushes its parent's.
+    #[test]
+    fn an_overlay_pushes_what_it_keeps_and_its_parents() {
+        let file: Arc<dyn LazyByteSource> =
+            Arc::new(BytesLazyByteSource::new(Bytes::from(vec![0u8; 64])));
+        let mut parent = PrefetchedSource::new(file);
+        parent.install(48, Bytes::from(vec![1u8; 16]));
+        let parent: Arc<dyn LazyByteSource> = Arc::new(parent);
+        let mut child =
+            PrefetchedSource::new(Arc::new(LazySubSource::new(Arc::clone(&parent), 32, 32)));
+        child.install(0, Bytes::from(vec![2u8; 4]));
+        let mut buffers = Vec::new();
+        child.held_buffers(&mut buffers);
+        assert_eq!(buffers.len(), 2, "its own and its parent's");
+        assert_eq!(held_buffer_bytes(&mut buffers), 4 + 16);
+    }
 
     #[tokio::test]
     async fn bytes_lazy_source_size_and_range() {

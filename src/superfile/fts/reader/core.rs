@@ -15,26 +15,32 @@
 //! is constructed per call (cheap; opening it reads only its footer, and
 //! then it's a borrowed view).
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap},
     mem,
     num::NonZeroUsize,
     ops::Range,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    ptr,
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak},
     thread::available_parallelism,
 };
 
 use bytes::Bytes;
+use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
+use tracing::debug;
 
 use super::{
     cursor::{BlockTableCache, CursorUse, TermCursor, TermMeta},
     filter::ExcludeFilter,
     metadata::{
-        ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions, StoredNorms,
+        ColumnLengthStats, ColumnMeta, ColumnNorms, FewNorms, FtsColumnConfig, LENGTH_ARRAY,
+        OpenOptions, StoredNorms, build_lut,
     },
     phrase::{AnyCursor, PhraseCursor, distinct_members},
     scorers::{count_and_planned, cursors_max_doc, df_total},
@@ -43,13 +49,18 @@ use super::{
     work::{term_cursor_bytes, term_cursor_ranges},
 };
 use crate::{
+    memory::{ConnectionMemoryBudget, Reclaim, Reservation},
+    runtime_bridge::run_on_pool_unless_blocking,
     superfile::{
         ReadError,
         error::FtsError,
         format::{
             self, KEY_SEPARATOR,
             checksum::crc32c,
-            fts::{HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, VERSION_MIN, hdr, term_meta},
+            fts::{
+                DOC_LENGTH_STORED_MAX, HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, VERSION_MIN,
+                hdr, term_meta,
+            },
         },
         fts::{
             analysis::{chain_tokenizer, check_recorded_tokenizer},
@@ -62,10 +73,19 @@ use crate::{
         },
         id_space::{DocMap, FtsDocId, RowId},
         lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
+        load_watch::{LoadListener, LoadWatch},
     },
-    supertable::schema::FieldId,
+    supertable::{
+        query::read_ahead::BUDGET_SHARE_PERCENT as READ_AHEAD_SHARE_PERCENT,
+        reader_cache::disk::{HeapBudget, HeapReservation},
+        schema::FieldId,
+    },
     utils::terms::{DictEntry, TermBlocks, make_key},
 };
+
+/// Most of the connection's memory budget, in percent, that kept dictionaries may bring it to: half
+/// of read-ahead's share, so read-ahead always keeps room beside them.
+pub(crate) const QUERY_DICT_SHARE_PERCENT: usize = READ_AHEAD_SHARE_PERCENT / 2;
 
 /// Largest gap worth overfetching when adjacent term postings share a request.
 const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
@@ -81,6 +101,23 @@ pub(crate) struct ScoringView<'a> {
     /// The average document length for the one column named, as this file
     /// labels it.
     pub avgdl: Option<(&'a str, f32)>,
+    /// Norms that stand in for one column's own for this query alone, never
+    /// cached (see [`FtsReader::candidate_norms`]).
+    pub norms: Option<CandidateNorms<'a>>,
+}
+
+/// One query's candidate norms for one column, as this file labels it.
+/// Equal only to themselves.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CandidateNorms<'a> {
+    pub column: &'a str,
+    pub norms: &'a ColumnNorms,
+}
+
+impl PartialEq for CandidateNorms<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.column == other.column && std::ptr::eq(self.norms, other.norms)
+    }
 }
 
 /// Per-term table-wide BM25 idf, keyed by term.
@@ -536,6 +573,113 @@ pub(super) fn two_term_has_rare_anchor(cursors: &[TermCursor]) -> bool {
     lo > 0 && hi >= lo.saturating_mul(WAND_BMW_2TERM_DF_RATIO)
 }
 
+/// One file's term dictionary, kept across that file's predicate steps so they read it once. Kept
+/// only under a budget with a limit and room ([`QUERY_DICT_SHARE_PERCENT`]), and given back when a
+/// reservation that asks for memory back needs the room; `default()` keeps nothing.
+#[derive(Default)]
+pub(crate) struct QueryDict {
+    /// The slot a kept dictionary lives in and the budget it is reserved from; `None` keeps nothing.
+    keeping: Option<(Arc<KeptDict>, Arc<ConnectionMemoryBudget>)>,
+}
+
+impl QueryDict {
+    /// Keeps the dictionary while `budget` has room for it. A budget with no limit keeps nothing: it
+    /// never asks for memory back, so kept copies would grow with every file and statement.
+    pub(crate) fn with_budget(budget: &Arc<ConnectionMemoryBudget>) -> Self {
+        if budget.remaining().is_none() {
+            return Self::default();
+        }
+        Self {
+            keeping: Some((Arc::default(), Arc::clone(budget))),
+        }
+    }
+
+    /// Whether this can keep a dictionary at all.
+    pub(crate) fn keeps(&self) -> bool {
+        self.keeping.is_some()
+    }
+
+    /// The kept dictionary and the reader that kept it, if one is kept.
+    fn kept(&self) -> Option<(Bytes, usize)> {
+        let (kept, _) = self.keeping.as_ref()?;
+        match &*kept.lock() {
+            Kept::Dict { bytes, reader, .. } => Some((bytes.clone(), *reader)),
+            Kept::Nothing | Kept::GivenBack => None,
+        }
+    }
+
+    /// Gives a kept dictionary back now; nothing more is kept.
+    pub(crate) fn give_back(&self) {
+        if let Some((kept, _)) = &self.keeping {
+            kept.reclaim();
+        }
+    }
+
+    /// Keeps `bytes`, `reader`'s dictionary, if nothing was kept yet and the budget has room; never
+    /// waits or asks others to free memory.
+    fn keep(&self, bytes: &Bytes, reader: usize) {
+        let Some((slot, budget)) = &self.keeping else {
+            return;
+        };
+        // Registered before anything is reserved, so a reservation refused because of this one
+        // always finds it to give back. Once, and only for a file whose dictionary is downloaded.
+        slot.registered.get_or_init(|| {
+            let holder: Weak<KeptDict> = Arc::downgrade(slot);
+            budget.register_reclaim(holder);
+        });
+        let mut kept = slot.lock();
+        if !matches!(*kept, Kept::Nothing) {
+            return;
+        }
+        let Some(reservation) =
+            budget.try_reserve_within_share(bytes.len(), QUERY_DICT_SHARE_PERCENT)
+        else {
+            return;
+        };
+        *kept = Kept::Dict {
+            bytes: bytes.clone(),
+            reader,
+            _reservation: reservation,
+        };
+    }
+}
+
+/// What a [`QueryDict`] holds.
+#[derive(Default)]
+enum Kept {
+    #[default]
+    Nothing,
+    /// The dictionary, the reader it belongs to ([`FtsReader::identity`]) and its reservation.
+    Dict {
+        bytes: Bytes,
+        reader: usize,
+        _reservation: Reservation,
+    },
+    /// Given back to the budget; nothing more is kept.
+    GivenBack,
+}
+
+#[derive(Default)]
+struct KeptDict {
+    kept: Mutex<Kept>,
+    /// Set once this slot is registered with the budget.
+    registered: OnceLock<()>,
+}
+
+impl KeptDict {
+    fn lock(&self) -> MutexGuard<'_, Kept> {
+        self.kept.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Reclaim for KeptDict {
+    /// Gives the dictionary back; a step already reading it keeps its own handle until it finishes,
+    /// no longer counted against the budget.
+    fn reclaim(&self) {
+        let _given_back = mem::replace(&mut *self.lock(), Kept::GivenBack);
+    }
+}
+
 /// FTS blob reader. Self-contained — owns its `Bytes` (which the storage
 /// layer assembled from mmap / range-fetch / full-read).
 #[derive(Debug, Clone)]
@@ -566,19 +710,25 @@ pub struct FtsReader {
     /// translated once here. That is what lets the writer group
     /// documents by the terms they share without a Parquet row moving.
     ///
-    /// Set at open when the blob is in memory or keeps row order, or when
-    /// the bytes the open read already hold it. Otherwise a query reads it
-    /// whole before it translates a doc id ([`Self::ensure_doc_map`]): at 4
-    /// bytes a document it is hundreds of megabytes on a large file, which an
-    /// open, and so a SQL scan that matches no text, should not pay for.
-    /// Shared by every view cloned from this reader ([`Self::with_scoring`]),
-    /// so one read serves them all.
+    /// Set at open when the blob is in memory or keeps row order. Otherwise it stays empty until a
+    /// query keeps it (4 bytes a document, hundreds of megabytes on a large file); a translation
+    /// that can't keep it reads only the pages it needs. Shared by every view cloned from this
+    /// reader.
     pub(super) doc_map: Arc<OnceCell<DocMap>>,
     /// Where the map's body lies, with its CRC right after it; `None` on a
     /// blob in row order.
     pub(super) doc_map_region: Option<Range<usize>>,
     /// Whether a read after open checks its CRC, as the open's reads did.
-    verify_crc: bool,
+    pub(super) verify_crc: bool,
+    /// Told when a read loads the doc-id map, a column's norms or a block
+    /// table. Shared with `block_tables` and with every view cloned from
+    /// this reader.
+    loads: LoadWatch,
+    /// The heap budget a kept doc-id map is charged to: the process one, or a test's own.
+    pub(super) heap_budget: &'static HeapBudget,
+    /// Page reads of the map from the source, shared with this reader's views.
+    #[cfg(test)]
+    doc_map_reads: Arc<AtomicUsize>,
 }
 
 /// The error for a short-form term body the decoder refuses.
@@ -588,7 +738,152 @@ pub(super) fn short_body_malformed() -> FtsError {
     ))
 }
 
+/// Most postings a term may have for its documents' buckets to be read
+/// one by one instead of with the whole array: the most a short body
+/// holds, the longest list the single-term scorer decodes for them.
+pub(crate) const FEW_NORMS_MAX_DOCS: usize = SHORT_MAX_DF;
+
+/// Documents whose buckets lie at most this many bytes apart are read
+/// together: one storage page.
+const FEW_NORMS_GAP_BYTES: usize = 4096;
+
+/// Most postings [`FtsReader::candidate_norms`] decodes in one superfile:
+/// all of a query's terms, or a lone phrase's rarest word. Past this the
+/// superfile reads its whole array, as it would have anyway.
+pub(crate) const CANDIDATE_MAX_POSTINGS: u64 = 1 << 16;
+
+/// Most of a query's terms one superfile may hold for its candidates to be
+/// bounded term by term.
+pub(crate) const CANDIDATE_MAX_TERMS: usize = 64;
+
+/// Most candidates one superfile may have for its buckets to be read alone.
+const CANDIDATE_MAX_DOCS: usize = 8192;
+
+/// Most bucket reads one superfile's candidates may take: past this, the
+/// whole array costs less than the requests.
+pub(super) const CANDIDATE_MAX_RANGES: usize = 64;
+
+/// A candidate's bound is a sum of a few terms added in another order than
+/// the kernel adds them: widened so a rounding never drops a tie.
+const CANDIDATE_BOUND_SLACK: f32 = 1.0 + 1e-4;
+
+/// The documents of `cursors` (a query's held terms) whose score, bounded
+/// at the shortest length each can have, reaches `floor`, sorted; `None`
+/// when there are too many postings to walk or too many candidates. CPU
+/// over up to [`CANDIDATE_MAX_POSTINGS`] postings, run on the reader pool by
+/// [`FtsReader::candidate_norms`].
+fn candidate_docs(
+    mut cursors: Vec<TermCursor>,
+    weights: &[f32],
+    phrase_parts: &[(Vec<usize>, f32)],
+    lut: &[f32; 256],
+    floor: f32,
+) -> Option<Vec<u32>> {
+    let nt = cursors.len();
+    let df: Vec<u64> = cursors.iter().map(|c| c.df).collect();
+    let mut tfs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let lone_phrase = weights.iter().all(|w| *w == 0.0) && phrase_parts.len() == 1;
+    if lone_phrase {
+        // A match holds every word of the phrase: its documents are the
+        // rarest word's, each looked up in the others, so a stopword's
+        // millions of postings are skipped over rather than decoded.
+        let members = &phrase_parts[0].0;
+        let &lead = members.iter().min_by_key(|&&t| df[t])?;
+        if df[lead] > CANDIDATE_MAX_POSTINGS {
+            return None;
+        }
+        let mut lead_docs: Vec<(u32, u32)> = Vec::with_capacity(df[lead] as usize);
+        let cursor = &mut cursors[lead];
+        while !cursor.is_exhausted() {
+            lead_docs.push((cursor.current_doc_id(), cursor.current_tf()));
+            cursor.next();
+        }
+        for (doc, tf) in lead_docs {
+            let mut row = vec![0; nt];
+            row[lead] = tf;
+            for &m in members.iter().filter(|&&m| m != lead) {
+                let cursor = &mut cursors[m];
+                cursor.skip_to(doc);
+                if !cursor.is_exhausted() && cursor.current_doc_id() == doc {
+                    row[m] = cursor.current_tf();
+                }
+            }
+            tfs.insert(doc, row);
+        }
+    } else {
+        if df.iter().sum::<u64>() > CANDIDATE_MAX_POSTINGS {
+            return None;
+        }
+        for (t, cursor) in cursors.iter_mut().enumerate() {
+            while !cursor.is_exhausted() {
+                tfs.entry(cursor.current_doc_id())
+                    .or_insert_with(|| vec![0; nt])[t] = cursor.current_tf();
+                cursor.next();
+            }
+        }
+    }
+    let mut docs: Vec<u32> = tfs
+        .iter()
+        .filter_map(|(&doc, tf)| {
+            // A document holds at least the query's occurrences, and its
+            // length is scored capped as the writer stores it.
+            let tokens = tf
+                .iter()
+                .fold(0u32, |sum, &t| sum.saturating_add(t))
+                .clamp(1, DOC_LENGTH_STORED_MAX);
+            let norm = lut[usize::from(bm25::quantize_len(tokens))];
+            let mut bound = 0.0f32;
+            for (t, &w) in weights.iter().enumerate() {
+                if w > 0.0 && tf[t] > 0 {
+                    bound += bm25::score_with_dl_norm_k1(w, tf[t], norm);
+                }
+            }
+            for (members, w) in phrase_parts {
+                let occurrences = members.iter().map(|&m| tf[m]).min().unwrap_or(0);
+                if occurrences > 0 {
+                    bound += bm25::score_with_dl_norm_k1(*w, occurrences, norm);
+                }
+            }
+            (bound * CANDIDATE_BOUND_SLACK >= floor).then_some(doc)
+        })
+        .collect();
+    if docs.len() > CANDIDATE_MAX_DOCS {
+        return None;
+    }
+    docs.sort_unstable();
+    Some(docs)
+}
+
 impl FtsReader {
+    /// Push the buffers this reader's source keeps: on a lazy open, the
+    /// header and doc-lengths directory it read.
+    pub(crate) fn held_buffers(&self, out: &mut Vec<Bytes>) {
+        self.source.held_buffers(out);
+    }
+
+    /// Heap bytes reads have loaded into this reader since it opened: the
+    /// doc-id map, each column's norms and long terms' block tables.
+    pub(crate) fn held_bytes(&self) -> usize {
+        let doc_map = match self.doc_map.get() {
+            Some(DocMap::Permuted(map)) => map.len(),
+            _ => 0,
+        };
+        doc_map
+            + self.block_tables.held_bytes()
+            + self
+                .columns
+                .iter()
+                .map(ColumnMeta::held_bytes)
+                .sum::<usize>()
+    }
+
+    /// What a view from [`Self::with_scoring`] holds beyond the reader it
+    /// was derived from, whose doc-id map, norms and block tables it shares:
+    /// its columns' own decode tables.
+    pub(crate) fn view_held_bytes(&self) -> usize {
+        self.columns.iter().map(ColumnMeta::view_held_bytes).sum()
+    }
+
     /// A view of this reader that scores at `scoring` instead of what its
     /// columns declare, or `None` when that changes no column.
     ///
@@ -608,15 +903,22 @@ impl FtsReader {
             };
             (params, avgdl)
         };
-        if self
-            .columns
-            .iter()
-            .all(|col| target(col) == (col.params, col.score_avgdl))
+        if scoring.norms.is_none()
+            && self
+                .columns
+                .iter()
+                .all(|col| target(col) == (col.params, col.score_avgdl))
         {
             return None;
         }
         let mut view = self.clone();
         for col in &mut view.columns {
+            if let Some(candidates) = scoring.norms
+                && candidates.column == col.name
+            {
+                col.base_norms = Arc::new(OnceLock::from(candidates.norms.clone()));
+                col.view_norms = Arc::new(OnceLock::new());
+            }
             let (params, avgdl) = target(col);
             if (params, avgdl) == (col.params, col.score_avgdl) {
                 continue;
@@ -636,6 +938,7 @@ impl FtsReader {
     #[cfg(test)]
     pub(crate) fn with_bm25_override(&self, params: bm25::Bm25Params) -> Self {
         let scoring = ScoringView {
+            norms: None,
             params: Some(params),
             avgdl: None,
         };
@@ -1098,15 +1401,22 @@ impl FtsReader {
                 }
                 let region = mo..body_end;
                 let span = doc_map_span(&region, opts.verify_crc);
-                if let Some(bytes) = source.try_get_range_sync(span) {
-                    let _ = doc_map.set(read_doc_map(&source, &region, bytes, opts.verify_crc)?);
+                // From memory the map is a slice of the blob and costs nothing to keep. A lazy
+                // reader keeps nothing at open, even with the bytes local: the first query that
+                // needs the map asks the heap budget.
+                if let Source::InMemory(_) = source
+                    && let Some(bytes) = source.try_get_range_sync(span)
+                {
+                    let body = checked_doc_map_body(&region, bytes, opts.verify_crc)?;
+                    let _ = doc_map.set(DocMap::permuted(body));
                 }
                 Some(region)
             }
         };
 
+        let loads = LoadWatch::default();
         Ok(FtsReader {
-            block_tables: Arc::default(),
+            block_tables: Arc::new(BlockTableCache::new(loads.clone())),
             source,
             n_docs,
             n_terms_total,
@@ -1119,33 +1429,66 @@ impl FtsReader {
             doc_map,
             doc_map_region,
             verify_crc: opts.verify_crc,
+            loads,
+            heap_budget: default_heap_budget(),
+            #[cfg(test)]
+            doc_map_reads: Arc::default(),
         })
     }
 
-    /// The doc-id map, read on the caller's runtime if no query has read it
-    /// yet. Concurrent first callers share one read, and a failed read is not
-    /// kept: the error goes to this query and the next one reads again.
+    /// Call `listener` after each read that loads the doc-id map, a
+    /// column's norms or a block table into this reader or a view of it.
+    pub(crate) fn watch_loads(&self, listener: &LoadListener) {
+        self.loads.watch(listener);
+    }
+
+    /// The whole doc-id map, read once and kept for the reader's life. Concurrent first callers
+    /// share the read; a failed read isn't kept, so the next call tries again.
     ///
-    /// Every query path awaits this before it translates a doc id, so the
-    /// read never goes through [`Self::doc_map`]'s blocking one.
+    /// Charged to the heap budget even without room, since its callers can't work from pages.
     pub(super) async fn ensure_doc_map(&self) -> Result<&DocMap, FtsError> {
-        self.doc_map
+        if let Some(map) = self.doc_map.get() {
+            return Ok(map);
+        }
+        let map = self
+            .doc_map
             .get_or_try_init(|| async {
-                let region = self
-                    .doc_map_region
-                    .as_ref()
-                    .expect("invariant: a blob without a map has it set at open");
-                let bytes = self
-                    .source
-                    .range_async(doc_map_span(region, self.verify_crc))
-                    .await
-                    .map_err(|e| FtsError::RangeFetch {
-                        what: "fts/doc-map",
-                        source: e,
-                    })?;
-                read_doc_map(&self.source, region, bytes, self.verify_crc)
+                let reservation = self.heap_budget.reserve_map(self.map_region().len() as u64);
+                self.read_whole_doc_map(reservation).await
             })
-            .await
+            .await?;
+        self.loads.loaded();
+        Ok(map)
+    }
+
+    /// The whole doc-id map, read and kept only if the process has memory to spare and kept maps
+    /// stay within the heap budget; `None` means the caller reads pages instead.
+    pub(super) async fn kept_doc_map_within_budget(&self) -> Result<Option<&DocMap>, FtsError> {
+        if let Some(map) = self.doc_map.get() {
+            return Ok(Some(map));
+        }
+        let bytes = self.map_region().len() as u64;
+        // Only the query that does the read reserves, so queries racing for one map charge it once.
+        // `Err(None)` means no room.
+        let kept = self
+            .doc_map
+            .get_or_try_init(|| async {
+                let reservation = self
+                    .heap_budget
+                    .try_reserve_map(bytes)
+                    .ok_or(None::<FtsError>)?;
+                self.read_whole_doc_map(reservation).await.map_err(Some)
+            })
+            .await;
+        match kept {
+            Ok(map) => {
+                // Whoever weighs this reader by what it holds weighs it again with the map.
+                self.loads.loaded();
+                Ok(Some(map))
+            }
+            Err(None) => Ok(None),
+            Err(Some(e)) => Err(e),
+        }
     }
 
     /// The length buckets scoring `column` reads besides the postings,
@@ -1158,28 +1501,77 @@ impl FtsReader {
         self.ensure_norms(column_id).await
     }
 
-    /// The doc-id map, for a translation that runs off the async path.
-    ///
-    /// A query has read it by then ([`Self::ensure_doc_map`]), and a
-    /// compaction input holds its whole file from open, so this reads only
-    /// when neither did, through the source's blocking read. A failed read
-    /// is an error: taking blob ids as rows would silently answer with the
-    /// wrong rows.
+    /// One read of the whole doc-id map, kept with `reservation` paying for its bytes.
+    async fn read_whole_doc_map(&self, reservation: HeapReservation) -> Result<DocMap, FtsError> {
+        let region = self.map_region();
+        let bytes = self
+            .source
+            .range_async(doc_map_span(region, self.verify_crc))
+            .await
+            .map_err(|e| FtsError::RangeFetch {
+                what: "fts/doc-map",
+                source: e,
+            })?;
+        self.doc_map_from(bytes, reservation)
+    }
+
+    /// The map as this reader keeps it, from `bytes` read at [`doc_map_span`]: a slice of an
+    /// in-memory blob (no heap, so `reservation` goes back), or a heap copy holding `reservation`.
+    fn doc_map_from(&self, bytes: Bytes, reservation: HeapReservation) -> Result<DocMap, FtsError> {
+        let body = checked_doc_map_body(self.map_region(), bytes, self.verify_crc)?;
+        Ok(if self.keeps_map_on_heap() {
+            kept_copy(&body, reservation)
+        } else {
+            DocMap::permuted(body)
+        })
+    }
+
+    /// Where the doc-id map's body lies. Only called on a blob that has one.
+    pub(super) fn map_region(&self) -> &Range<usize> {
+        self.doc_map_region
+            .as_ref()
+            .expect("a blob in row order never reads its doc-id map")
+    }
+
+    /// The whole doc-id map, for a caller off the async path: the kept one, or read through the
+    /// source's blocking read and kept, charged to the heap budget even without room. A failed read
+    /// is an error: taking blob ids as rows would silently answer with the wrong rows.
     pub(crate) fn doc_map(&self) -> Result<DocMap, FtsError> {
         if let Some(map) = self.doc_map.get() {
             return Ok(map.clone());
         }
-        let region = self
-            .doc_map_region
-            .as_ref()
-            .expect("invariant: a blob without a map has it set at open");
-        let span = doc_map_span(region, self.verify_crc);
-        let bytes = fetch_source_range(&self.source, span, "fts/doc-map")?;
-        let map = read_doc_map(&self.source, region, bytes, self.verify_crc)?;
+        let region = self.map_region();
+        let reservation = self.heap_budget.reserve_map(region.len() as u64);
+        let bytes = fetch_source_range(
+            &self.source,
+            doc_map_span(region, self.verify_crc),
+            "fts/doc-map",
+        )?;
+        let map = self.doc_map_from(bytes, reservation)?;
         // A concurrent first read may have set it meanwhile; both are the
         // same map.
         let _ = self.doc_map.set(map.clone());
         Ok(map)
+    }
+
+    /// Counts a read of the doc-id map from the source in pages, for the tests that assert how a
+    /// translation reads it.
+    #[cfg(test)]
+    pub(super) fn count_doc_map_read(&self) {
+        self.doc_map_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Page reads of the doc-id map from the source so far, by this reader and its views.
+    #[cfg(test)]
+    pub(crate) fn doc_map_reads(&self) -> usize {
+        self.doc_map_reads.load(Ordering::Relaxed)
+    }
+
+    /// This reader with kept doc-id maps charged to `budget` instead of the process's.
+    #[cfg(test)]
+    pub(crate) fn with_heap_budget(mut self, budget: &'static HeapBudget) -> Self {
+        self.heap_budget = budget;
+        self
     }
 
     /// Whether a query has read the doc-id map yet.
@@ -1192,6 +1584,25 @@ impl FtsReader {
     /// own rather than in row order.
     pub(crate) fn has_doc_map(&self) -> bool {
         self.doc_map_region.is_some()
+    }
+
+    /// Whether a doc-id map this reader keeps is a heap copy charged to its budget: a lazy source
+    /// may hand back a window onto a bigger fetch, so its map is copied; an in-memory one is not.
+    fn keeps_map_on_heap(&self) -> bool {
+        matches!(self.source, Source::Lazy(_))
+    }
+
+    /// Bytes of the doc-id map this reader keeps on the heap charged to `budget`: zero when it
+    /// keeps none, reads it in place from memory, or charges another budget.
+    pub(crate) fn kept_map_bytes(&self, budget: &HeapBudget) -> u64 {
+        match self.doc_map.get() {
+            Some(DocMap::Permuted(region))
+                if self.keeps_map_on_heap() && ptr::eq(self.heap_budget, budget) =>
+            {
+                region.len() as u64
+            }
+            _ => 0,
+        }
     }
 
     pub fn n_docs(&self) -> u32 {
@@ -1259,6 +1670,41 @@ impl FtsReader {
     pub fn column_tokenizer(&self, column: &str) -> Result<Arc<dyn Tokenizer>, FtsError> {
         let id = self.resolve_column_id(column)?;
         Ok(Arc::clone(&self.columns[id as usize].tokenizer))
+    }
+
+    /// This file's dictionary, from `dict` if a step kept it, else read and offered to `dict`. Only
+    /// a downloaded dictionary is kept; the flag says whether this call read it.
+    pub(crate) async fn query_dict(&self, dict: &QueryDict) -> Result<(Bytes, bool), FtsError> {
+        if let Some((bytes, reader)) = dict.kept() {
+            debug_assert_eq!(
+                reader,
+                self.identity(),
+                "a `QueryDict` kept another file's dictionary"
+            );
+            // Another file's copy is never used: this reader reads its own.
+            if reader == self.identity() {
+                return Ok((bytes, false));
+            }
+        }
+        let downloads = dict.keeps()
+            && match &self.source {
+                Source::InMemory(_) => false,
+                Source::Lazy(source) => {
+                    !source.is_local(self.dict_range.start as u64, self.dict_range.len() as u64)
+                }
+            };
+        let bytes = self.dict_bytes_async().await?;
+        self.debug_assert_own_dict(&bytes);
+        if downloads {
+            dict.keep(&bytes, self.identity());
+        }
+        Ok((bytes, true))
+    }
+
+    /// The same for every clone of this reader and different for any other: what a kept
+    /// dictionary is checked against, so a `QueryDict` is never shared across files.
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.block_tables).addr()
     }
 
     pub(crate) fn dict_bytes(&self) -> Result<Bytes, FtsError> {
@@ -1333,7 +1779,305 @@ impl FtsReader {
                 source: e,
             })?;
         col.install_fetched_norms(&array)?;
+        self.loads.loaded();
         Ok(())
+    }
+
+    /// The length buckets of `docs` (sorted, distinct) alone, read as a few
+    /// small ranges instead of the column's whole array. `None` when the
+    /// norms are already in memory, there are too many documents, or the
+    /// column cannot be read that way; the caller then loads the norms.
+    pub(super) async fn few_norms(
+        &self,
+        column_id: u32,
+        docs: &[u32],
+    ) -> Result<Option<FewNorms>, FtsError> {
+        let col = &self.columns[column_id as usize];
+        if col.norms_loaded() || docs.is_empty() || docs.len() > FEW_NORMS_MAX_DOCS {
+            return Ok(None);
+        }
+        let Some(buckets) = col.bucket_bytes() else {
+            return Ok(None);
+        };
+        Ok(self
+            .read_buckets(col, buckets, docs, usize::MAX)
+            .await?
+            .map(|pairs| col.few_norms(pairs)))
+    }
+
+    /// The length bucket of each of `docs` in `column_id`, in `docs`' order:
+    /// from the norms when they are in memory, else from the stored buckets,
+    /// as at most `max_ranges` page reads or else the whole array in one
+    /// read; a column without stored buckets loads its norms.
+    pub(super) async fn doc_buckets(
+        &self,
+        column_id: u32,
+        docs: &[u32],
+        max_ranges: usize,
+    ) -> Result<Vec<u8>, FtsError> {
+        // Ids come from postings: a corrupt one past the documents is an
+        // error, not an index past the norms.
+        self.check_ids_in_map(docs.iter().map(|&d| FtsDocId::new(d)))?;
+        let col = &self.columns[column_id as usize];
+        if !col.norms_loaded()
+            && let Some(buckets) = col.bucket_bytes()
+        {
+            let mut sorted = docs.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let pairs = match self
+                .read_buckets(col, buckets.clone(), &sorted, max_ranges)
+                .await?
+            {
+                Some(pairs) => pairs,
+                None => {
+                    let all = self.source.range_async(buckets).await.map_err(|e| {
+                        FtsError::RangeFetch {
+                            what: LENGTH_ARRAY,
+                            source: e,
+                        }
+                    })?;
+                    let mut pairs = Vec::with_capacity(sorted.len());
+                    for &doc in &sorted {
+                        let Some(&bucket) = all.get(doc as usize) else {
+                            return Err(FtsError::Read(ReadError::Malformed(format!(
+                                "doc {doc} past the bucket array of column '{}'",
+                                col.name
+                            ))));
+                        };
+                        pairs.push((doc, bucket));
+                    }
+                    pairs
+                }
+            };
+            return Ok(docs
+                .iter()
+                .map(|d| {
+                    let at = pairs
+                        .binary_search_by_key(d, |&(doc, _)| doc)
+                        .expect("every document was read");
+                    pairs[at].1
+                })
+                .collect());
+        }
+        self.ensure_norms(column_id).await?;
+        let base = col.base_norms.get().expect("the norms were just loaded");
+        docs.iter()
+            .map(|&doc| {
+                base.dl_norm_k1.bucket(doc).ok_or_else(|| {
+                    FtsError::Read(ReadError::Malformed(format!(
+                        "doc {doc} past the loaded norms of column '{}'",
+                        col.name
+                    )))
+                })
+            })
+            .collect()
+    }
+
+    /// The stored buckets of `docs` (sorted, distinct), documents a page or
+    /// less apart read together; `None` when that takes more than
+    /// `max_ranges` reads.
+    async fn read_buckets(
+        &self,
+        col: &ColumnMeta,
+        buckets: Range<usize>,
+        docs: &[u32],
+        max_ranges: usize,
+    ) -> Result<Option<Vec<(u32, u8)>>, FtsError> {
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        for &doc in docs {
+            let at = buckets.start + doc as usize;
+            if at >= buckets.end {
+                return Err(FtsError::Read(ReadError::Malformed(format!(
+                    "doc {doc} past the bucket array of column '{}'",
+                    col.name
+                ))));
+            }
+            match ranges.last_mut() {
+                Some(r) if at < r.end + FEW_NORMS_GAP_BYTES => r.end = at + 1,
+                _ => ranges.push(at..at + 1),
+            }
+            if ranges.len() > max_ranges {
+                return Ok(None);
+            }
+        }
+        let fetched = futures::future::try_join_all(
+            ranges.iter().map(|r| self.source.range_async(r.clone())),
+        )
+        .await
+        .map_err(|e| FtsError::RangeFetch {
+            what: LENGTH_ARRAY,
+            source: e,
+        })?;
+        let mut pairs = Vec::with_capacity(docs.len());
+        let mut r = 0;
+        for &doc in docs {
+            let at = buckets.start + doc as usize;
+            while at >= ranges[r].end {
+                r += 1;
+            }
+            pairs.push((doc, fetched[r][at - ranges[r].start]));
+        }
+        Ok(Some(pairs))
+    }
+
+    /// Norms for one query in this superfile built from its candidates'
+    /// length buckets alone. A candidate is a document whose score, bounded
+    /// from its postings at the shortest length it can have, reaches
+    /// `floor`; it keeps its stored bucket. Every other document reads the
+    /// longest bucket, where it scores no higher than at its own length and
+    /// so stays under `floor` either way. `bare` pairs each bare term with
+    /// its count in the query. `None` when the norms are already in memory,
+    /// the column cannot be read that way, a term has no table idf, or the
+    /// candidates take too many reads. The postings fetch and bucket reads
+    /// stay on the calling runtime; the walk over the postings runs on
+    /// `pool` (rayon's global pool when `None`) behind a oneshot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn candidate_norms(
+        &self,
+        column: &str,
+        bare: &[(&str, u32)],
+        phrases: &[&[String]],
+        idf: &GlobalTermIdf,
+        scoring: &ScoringView<'_>,
+        floor: f32,
+        prefetched: Option<&FetchedTermMemo>,
+        pool: Option<&ThreadPool>,
+    ) -> Result<Option<ColumnNorms>, FtsError> {
+        if !floor.is_finite() {
+            return Ok(None);
+        }
+        let column_id = self.resolve_column_id(column)?;
+        let col = &self.columns[column_id as usize];
+        if col.norms_loaded() {
+            return Ok(None);
+        }
+        let (Some(buckets), Some(stored)) = (col.bucket_bytes(), col.stored_norms.as_deref())
+        else {
+            return Ok(None);
+        };
+        // The query's distinct terms, each bare one weighted as the kernel
+        // weights it (its idf times its count), phrase members at zero.
+        let mut terms: Vec<&str> = Vec::new();
+        let mut weights: Vec<f32> = Vec::new();
+        let mut slots: FxHashMap<&str, usize> = FxHashMap::default();
+        fn slot<'t>(
+            t: &'t str,
+            slots: &mut FxHashMap<&'t str, usize>,
+            terms: &mut Vec<&'t str>,
+            weights: &mut Vec<f32>,
+        ) -> usize {
+            *slots.entry(t).or_insert_with(|| {
+                terms.push(t);
+                weights.push(0.0);
+                terms.len() - 1
+            })
+        }
+        for &(term, count) in bare {
+            let Some(&w) = idf.get(term) else {
+                return Ok(None);
+            };
+            let at = slot(term, &mut slots, &mut terms, &mut weights);
+            weights[at] += w * count as f32;
+        }
+        let mut phrase_parts: Vec<(Vec<usize>, f32)> = Vec::with_capacity(phrases.len());
+        for phrase in phrases {
+            let mut members = Vec::new();
+            let mut weight = 0.0f32;
+            for term in phrase.iter() {
+                let Some(&w) = idf.get(term.as_str()) else {
+                    return Ok(None);
+                };
+                weight += w;
+                let at = slot(term, &mut slots, &mut terms, &mut weights);
+                if !members.contains(&at) {
+                    members.push(at);
+                }
+            }
+            phrase_parts.push((members, weight));
+        }
+        if terms.is_empty() {
+            return Ok(None);
+        }
+        let params = scoring.params.unwrap_or(col.params);
+        let avgdl = match scoring.avgdl {
+            Some((name, avgdl)) if name == col.name => avgdl,
+            _ => col.score_avgdl,
+        };
+        let lut = build_lut(avgdl, params);
+        let mut built = self
+            .build_term_cursors_opt(
+                column_id,
+                &terms,
+                QueryIdf::ThisFile,
+                CursorUse::Match,
+                None,
+                prefetched,
+                None,
+            )
+            .await?;
+        // Only the terms this superfile holds take part: a prefix query asks
+        // about hundreds of expansions, of which one superfile holds a few. A
+        // phrase missing a word here cannot match here.
+        let held: Vec<usize> = (0..terms.len()).filter(|&t| built[t].is_some()).collect();
+        if held.is_empty() || held.len() > CANDIDATE_MAX_TERMS {
+            return Ok(None);
+        }
+        let mut at = vec![usize::MAX; terms.len()];
+        for (i, &t) in held.iter().enumerate() {
+            at[t] = i;
+        }
+        let cursors: Vec<TermCursor> = held
+            .iter()
+            .map(|&t| built[t].take().expect("a held term has a cursor"))
+            .collect();
+        let weights: Vec<f32> = held.iter().map(|&t| weights[t]).collect();
+        let phrase_parts: Vec<(Vec<usize>, f32)> = phrase_parts
+            .into_iter()
+            .filter_map(|(members, w)| {
+                let members = members
+                    .iter()
+                    .map(|&t| (at[t] != usize::MAX).then_some(at[t]))
+                    .collect::<Option<Vec<usize>>>()?;
+                Some((members, w))
+            })
+            .collect();
+        if weights.iter().all(|w| *w == 0.0) && phrase_parts.is_empty() {
+            return Ok(None);
+        }
+        let docs = run_on_pool_unless_blocking(pool, "candidate norms", move || {
+            candidate_docs(cursors, &weights, &phrase_parts, &lut, floor)
+        })
+        .await
+        .map_err(|_| FtsError::TaskDropped("candidate norms"))?;
+        let Some(docs) = docs else {
+            return Ok(None);
+        };
+        let Some(pairs) = self
+            .read_buckets(col, buckets, &docs, CANDIDATE_MAX_RANGES)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // One byte per document, megabytes on a large superfile, stored
+        // reversed in fresh anonymous memory: its zero pages already read the
+        // longest length, and only the pages holding a candidate are written.
+        // An allocator's zeroed block would be filled first.
+        let Ok(mut table) = memmap2::MmapMut::map_anon(self.n_docs as usize) else {
+            return Ok(None);
+        };
+        for (doc, bucket) in pairs {
+            table[doc as usize] = u8::MAX - bucket;
+        }
+        let Ok(table) = table.make_read_only() else {
+            return Ok(None);
+        };
+        Ok(Some(ColumnNorms::from_reversed(
+            Bytes::from_owner(table),
+            stored,
+            col.declared_params,
+            col.baked_avgdl,
+        )))
     }
 
     /// Async term-dictionary fetch for the query path. Resolves
@@ -1388,19 +2132,35 @@ impl FtsReader {
             }
             ranges.push(base + m..base + m + postings_length);
         }
+        self.fetch_coalesced(&ranges, "fts/postings term body")
+            .await
+    }
+
+    /// Fetch `ranges` of the blob in input order, nearby ones sharing a
+    /// request under the same gap and overfetch limits as a term's
+    /// postings: a probe's covering blocks and position groups are many
+    /// small ranges of one term, which one request serves at little extra.
+    pub(super) async fn fetch_coalesced(
+        &self,
+        ranges: &[Range<usize>],
+        what: &'static str,
+    ) -> Result<Vec<Bytes>, FtsError> {
         let plan = RangeCoalescePlan::new(
-            &ranges,
+            ranges,
             TERM_RANGE_COALESCE_MAX_GAP,
             TERM_RANGE_COALESCE_MAX_OVERFETCH,
+        );
+        debug!(
+            what,
+            ranges = ranges.len(),
+            requests = plan.fetch_ranges().len(),
+            "coalesced fetch"
         );
         let fetched = self
             .source
             .get_ranges_parallel_async(plan.fetch_ranges())
             .await
-            .map_err(|e| FtsError::RangeFetch {
-                what: "fts/postings term body",
-                source: e,
-            })?;
+            .map_err(|e| FtsError::RangeFetch { what, source: e })?;
         Ok(plan.restore(&fetched))
     }
 
@@ -2021,6 +2781,9 @@ pub(super) fn collect_terms_with_prefix(
 pub(crate) struct OrCursorSet {
     pub(super) column_id: u32,
     pub(super) cursors: Vec<TermCursor>,
+    /// Map page reads the set's slices may have in flight together, one permit a read cap: a
+    /// sliced file holds no more than an unsliced one while it reads pages.
+    pub(super) page_reads: Semaphore,
 }
 
 impl OrCursorSet {
@@ -2084,42 +2847,79 @@ fn doc_map_span(region: &Range<usize>, verify_crc: bool) -> Range<usize> {
     }
 }
 
-/// The doc-id map from `bytes`, read at [`doc_map_span`]: checked against its
-/// CRC when `verify_crc`, and owned as the reader keeps it.
-///
-/// From memory the body is a slice of the blob, so the map costs no heap and
-/// its pages stay evictable. A lazy source may answer a read this large with
-/// a window onto a bigger fetch, and keeping the window would keep that whole
-/// fetch alive; the map is the one read the reader holds on to, so over such
-/// a source it takes a copy of the body alone.
-fn read_doc_map(
-    source: &Source,
+/// The map's body from `bytes` read at [`doc_map_span`], after checking it is all there and, with
+/// `verify_crc`, that it matches its CRC.
+fn checked_doc_map_body(
     region: &Range<usize>,
     bytes: Bytes,
     verify_crc: bool,
-) -> Result<DocMap, FtsError> {
+) -> Result<Bytes, FtsError> {
     if bytes.len() < region.len() {
-        return Err(FtsError::Read(ReadError::Malformed(format!(
-            "fts doc-map read {} of its {} bytes",
-            bytes.len(),
-            region.len()
-        ))));
+        return Err(doc_map_short_read("fts doc-map", bytes.len(), region.len()));
     }
     let body = bytes.slice(..region.len());
     if verify_crc {
         let crc = &bytes[region.len()..];
         if crc.len() < format::CRC_BYTES || read_u32_le(crc) != crc32c(&body) {
-            return Err(FtsError::Read(ReadError::ChecksumMismatch {
-                section: "fts/doc-map",
-                column: String::new(),
-            }));
+            return Err(doc_map_crc_mismatch());
         }
     }
-    let body = match source {
-        Source::InMemory(_) => body,
-        Source::Lazy(_) => Bytes::copy_from_slice(&body),
-    };
-    Ok(DocMap::permuted(body))
+    Ok(body)
+}
+
+/// A read of `what` (the whole doc-id map, or one run of its pages) that came back with `got` of
+/// the `want` bytes asked for.
+pub(super) fn doc_map_short_read(what: &str, got: usize, want: usize) -> FtsError {
+    FtsError::Read(ReadError::Malformed(format!(
+        "{what} read {got} of its {want} bytes"
+    )))
+}
+
+/// A doc-id map whose bytes don't match its CRC.
+pub(super) fn doc_map_crc_mismatch() -> FtsError {
+    FtsError::Read(ReadError::ChecksumMismatch {
+        section: "fts/doc-map",
+        column: String::new(),
+    })
+}
+
+/// The budget a reader charges kept doc-id maps to: the process's.
+#[cfg(not(test))]
+fn default_heap_budget() -> &'static HeapBudget {
+    HeapBudget::process()
+}
+
+/// Under test, one with room and no limit, so a test's translations don't depend on the host's
+/// memory; a test of the budget sets its own with [`FtsReader::with_heap_budget`].
+#[cfg(test)]
+fn default_heap_budget() -> &'static HeapBudget {
+    static ROOMY: OnceLock<&'static HeapBudget> = OnceLock::new();
+    ROOMY.get_or_init(|| {
+        let budget = HeapBudget::with_budget(None);
+        budget.set_short_of_memory(false);
+        budget
+    })
+}
+
+/// A lazy reader's map, holding `reservation` until the last copy drops. A copy, because a lazy
+/// source may hand back a window onto a bigger fetch, and keeping the window keeps all of it.
+fn kept_copy(body: &Bytes, reservation: HeapReservation) -> DocMap {
+    DocMap::permuted(Bytes::from_owner(KeptMap {
+        body: body.to_vec(),
+        _reservation: reservation,
+    }))
+}
+
+/// A kept doc-id map's bytes and their heap reservation, given back when it drops.
+struct KeptMap {
+    body: Vec<u8>,
+    _reservation: HeapReservation,
+}
+
+impl AsRef<[u8]> for KeptMap {
+    fn as_ref(&self) -> &[u8] {
+        &self.body
+    }
 }
 
 pub(super) fn fetch_source_range(
@@ -3062,7 +3862,7 @@ mod tests {
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Barrier, Mutex,
-            atomic::{AtomicBool, AtomicU32, Ordering},
+            atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         },
         thread::{self, ThreadId},
         time::Duration,
@@ -3080,7 +3880,12 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::{
         BytesLazyByteSource, LazyByteSourceError,
-        fts::{bm25, builder::FtsBuilder, reader::BoolMode, tokenize::StandardTokenizer},
+        fts::{
+            bm25,
+            builder::FtsBuilder,
+            reader::{BoolMode, ContainsRows},
+            tokenize::StandardTokenizer,
+        },
     };
 
     /// Byte offset of the blob's version field.
@@ -4707,6 +5512,232 @@ mod tests {
         }
     }
 
+    /// A [`RecordingSource`] that serves nothing synchronously, like object storage.
+    struct DownloadSource(RecordingSource);
+
+    #[async_trait]
+    impl LazyByteSource for DownloadSource {
+        fn size(&self) -> u64 {
+            self.0.size()
+        }
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.0.range(start, len).await
+        }
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// A limit this many times a dictionary: half of its 90% holds the dictionary, the share does not.
+    const NO_ROOM_LIMIT_PER_DICTIONARY: u64 = 3;
+
+    /// A limit this many times a dictionary: the share holds the dictionary, with room past it.
+    const ROOM_LIMIT_PER_DICTIONARY: u64 = 8;
+
+    /// A reader opened lazily over a [`DownloadSource`].
+    async fn recorded_lazy_reader() -> (FtsReader, Arc<DownloadSource>) {
+        let (blob, json) = build_blob();
+        let recording = Arc::new(DownloadSource(RecordingSource {
+            inner: BytesLazyByteSource::new(blob),
+            ranges: Mutex::new(Vec::new()),
+        }));
+        let src: Arc<dyn LazyByteSource> = recording.clone();
+        let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        (r, recording)
+    }
+
+    #[tokio::test]
+    async fn query_dict_keeps_the_dictionary_while_the_budget_has_room() {
+        // A dictionary read through a budgeted `QueryDict`, from a source that only downloads.
+        //  - the first step downloads it and reserves its size;
+        //  - a later step downloads nothing and gets the same buffer;
+        //  - the reservation goes when the `QueryDict` drops.
+        // This test pins one download per query and how long the reservation lasts.
+        let (r, recording) = recorded_lazy_reader().await;
+        let dictionary = r.dict_range.clone();
+        let opened = recording.0.len();
+        let budget = ConnectionMemoryBudget::with_room();
+        let dict = QueryDict::with_budget(&budget);
+
+        let (first, fetched) = r.query_dict(&dict).await.expect("first step");
+        assert!(fetched, "the first step reads the dictionary");
+        assert_eq!(
+            budget.used(),
+            dictionary.len(),
+            "the kept dictionary reserves its size"
+        );
+        let (second, fetched) = r.query_dict(&dict).await.expect("second step");
+        assert!(!fetched, "a later step reads nothing");
+        assert_eq!(
+            second.as_ptr(),
+            first.as_ptr(),
+            "and shares the kept buffer, not a copy"
+        );
+        assert_eq!(
+            recording.0.touches(opened, &dictionary),
+            1,
+            "one read for both steps"
+        );
+
+        drop((first, second));
+        drop(dict);
+        assert_eq!(
+            budget.used(),
+            0,
+            "the reservation goes with the `QueryDict`"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_dict_keeps_nothing_without_room() {
+        // A budget whose share cannot hold the dictionary, a budget with no limit, and a `QueryDict`
+        // with no budget.
+        //  - nothing is kept or reserved;
+        //  - each step downloads the dictionary and gets the same bytes.
+        // This test pins one download per step with no room or no limit.
+        let (r, recording) = recorded_lazy_reader().await;
+        let dictionary = r.dict_range.clone();
+        let no_room = ConnectionMemoryBudget::with_limit(
+            dictionary.len() as u64 * NO_ROOM_LIMIT_PER_DICTIONARY,
+        );
+        let no_limit = ConnectionMemoryBudget::measured();
+        for (budget, dict) in [
+            (&no_room, QueryDict::with_budget(&no_room)),
+            (&no_limit, QueryDict::with_budget(&no_limit)),
+            (&no_room, QueryDict::default()),
+        ] {
+            let opened = recording.0.len();
+            let (first, fetched_first) = r.query_dict(&dict).await.expect("first step");
+            assert_eq!(budget.used(), 0, "nothing is reserved");
+            let (second, fetched_second) = r.query_dict(&dict).await.expect("second step");
+            assert!(
+                fetched_first && fetched_second,
+                "each step reads the dictionary"
+            );
+            assert_eq!(first, second, "the same bytes either way");
+            assert_eq!(
+                recording.0.touches(opened, &dictionary),
+                2,
+                "one read per step"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn query_dict_gives_the_dictionary_back_when_a_reservation_needs_the_room() {
+        // A kept dictionary, then a reservation that fits only once the dictionary is given back.
+        //  - the reservation succeeds and holds all that is used;
+        //  - a later step reads the dictionary again and keeps nothing more.
+        // This test pins that a kept dictionary never makes another reservation fail.
+        let (r, recording) = recorded_lazy_reader().await;
+        let dictionary = r.dict_range.clone();
+        let budget =
+            ConnectionMemoryBudget::with_limit(dictionary.len() as u64 * ROOM_LIMIT_PER_DICTIONARY);
+        let dict = QueryDict::with_budget(&budget);
+        r.query_dict(&dict).await.expect("first step");
+        assert_eq!(budget.used(), dictionary.len(), "the dictionary is kept");
+
+        let room = budget.remaining().expect("a set limit") + 1;
+        let needs_the_room = budget
+            .try_reserve(room)
+            .expect("the dictionary is given back");
+        assert_eq!(budget.used(), room, "only the new reservation is held");
+
+        let opened = recording.0.len();
+        let (_, fetched) = r.query_dict(&dict).await.expect("later step");
+        assert!(fetched, "a later step reads the dictionary again");
+        assert_eq!(recording.0.touches(opened, &dictionary), 1);
+        drop(needs_the_room);
+        let (_, fetched) = r.query_dict(&dict).await.expect("step with room again");
+        assert!(fetched, "nothing more is kept, even with room");
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "another file's dictionary")]
+    async fn a_query_dict_refuses_a_dictionary_another_reader_kept() {
+        // Two readers of identical files, so their dictionaries are the same size, and one
+        // `QueryDict` with room.
+        //  - the first reader keeps its dictionary in it;
+        //  - the second asking for it panics in a debug build instead of getting the first's.
+        // This test pins that a kept dictionary never crosses files.
+        let (first, _) = recorded_lazy_reader().await;
+        let (second, _) = recorded_lazy_reader().await;
+        let budget = ConnectionMemoryBudget::with_room();
+        let dict = QueryDict::with_budget(&budget);
+        first.query_dict(&dict).await.expect("kept");
+        let _ = second.query_dict(&dict).await;
+    }
+
+    #[tokio::test]
+    async fn term_rows_share_one_dictionary_read() {
+        // text_match looks its terms up one at a time.
+        //  - through a budgeted `QueryDict`, three terms share one download;
+        //  - through `QueryDict::default()`, each term downloads it;
+        //  - the rows are the same.
+        // This test pins text_match reading the dictionary once.
+        let (r, recording) = recorded_lazy_reader().await;
+        let dictionary = r.dict_range.clone();
+        let terms = ["rust", "runtime", "java"];
+        let budget = ConnectionMemoryBudget::with_room();
+
+        let opened = recording.0.len();
+        let (shared, _) = r
+            .term_rows("body", &terms, None, &QueryDict::with_budget(&budget))
+            .await
+            .expect("terms through a kept dictionary");
+        assert_eq!(
+            recording.0.touches(opened, &dictionary),
+            1,
+            "one read for every term"
+        );
+
+        let opened = recording.0.len();
+        let (each, _) = r
+            .term_rows("body", &terms, None, &QueryDict::default())
+            .await
+            .expect("terms without a kept dictionary");
+        assert_eq!(
+            recording.0.touches(opened, &dictionary),
+            terms.len(),
+            "one read per term"
+        );
+        let rows = |out: &[ContainsRows]| -> Vec<RoaringBitmap> {
+            out.iter().map(|c| c.proven.clone()).collect()
+        };
+        assert_eq!(rows(&shared), rows(&each), "the same rows either way");
+        assert!(
+            rows(&shared).iter().all(|r| !r.is_empty()),
+            "every term matches a row"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_dict_keeps_nothing_for_a_dictionary_already_local() {
+        // A file held whole in memory, and a source that serves the dictionary without a download.
+        //  - nothing is kept or reserved;
+        //  - each step reads it again, for free.
+        // This test pins that only a downloaded dictionary is kept.
+        let (blob, json) = build_blob();
+        let in_memory = FtsReader::open(blob.clone(), &json).expect("open");
+        let local: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob));
+        let lazy_local = FtsReader::open_lazy(local, &json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        for r in [in_memory, lazy_local] {
+            let budget = ConnectionMemoryBudget::with_room();
+            let dict = QueryDict::with_budget(&budget);
+            let (_, fetched) = r.query_dict(&dict).await.expect("first step");
+            assert!(fetched);
+            assert_eq!(budget.used(), 0, "nothing reserved");
+            let (_, fetched) = r.query_dict(&dict).await.expect("second step");
+            assert!(fetched, "nothing kept: each step reads it again");
+        }
+    }
+
     /// A lazy open reads the header and the doc-lengths directory and
     /// nothing else. A match-only query served from a memo of already
     /// resolved terms then reads postings alone — neither the dictionary
@@ -4753,7 +5784,13 @@ mod tests {
             .await
             .expect("memo");
         let (docs, _) = r
-            .token_match_prefetched("body", &["rust"], BoolMode::Or, Some(&memo))
+            .token_match_prefetched(
+                "body",
+                &["rust"],
+                BoolMode::Or,
+                Some(&memo),
+                &QueryDict::default(),
+            )
             .await
             .expect("match from the memo");
         assert!(!docs.is_empty());
@@ -5288,7 +6325,16 @@ mod tests {
                         .await
                         .expect("term facts");
                     let fact = facts[0].as_ref().expect("the term is in the file");
-                    sorted(fact.head.docs.iter().map(|&(row, _, _)| row))
+                    // The head names documents by blob id; its rows are
+                    // read from the map as a query's answer is.
+                    let docs = fact
+                        .head
+                        .docs
+                        .iter()
+                        .map(|&(doc, _, _)| (FtsDocId::new(doc), 0.0))
+                        .collect();
+                    let rows = r.hits_to_rows_async(docs).await.expect("translate");
+                    sorted(rows.into_iter().map(|(row, _)| row.get()))
                 }
                 other => unreachable!("no case {other}"),
             };
@@ -5397,6 +6443,7 @@ mod tests {
             .into_iter()
             .map(|avgdl| {
                 r.with_scoring(&ScoringView {
+                    norms: None,
                     params: None,
                     avgdl: Some(("body", avgdl)),
                 })
@@ -5413,6 +6460,87 @@ mod tests {
         }
         views[2].ensure_doc_map().await.expect("doc-id map");
         assert_eq!(source.map_reads().len(), 1, "one read serves them all");
+    }
+
+    /// A watched reader reports a load once what it loaded is in place, so
+    /// a listener that weighs the reader then counts it. A search through a
+    /// scored view reads the doc-id map and the column's norms into the
+    /// reader the view shares them with, and the last report weighs the
+    /// reader with both; a second search loads nothing and reports nothing.
+    #[tokio::test]
+    async fn a_watched_reader_reports_its_loads_once_they_are_held() {
+        let (_, r) = probed_reader(false).await;
+        let r = Arc::new(r);
+        let before = r.held_bytes();
+        let reports = Arc::new(AtomicU32::new(0));
+        let weighed = Arc::new(AtomicUsize::new(0));
+        let listener: LoadListener = {
+            let reader = Arc::downgrade(&r);
+            let (reports, weighed) = (Arc::clone(&reports), Arc::clone(&weighed));
+            Arc::new(move || {
+                reports.fetch_add(1, Ordering::SeqCst);
+                let held = reader.upgrade().expect("the test holds it").held_bytes();
+                weighed.store(held, Ordering::SeqCst);
+            })
+        };
+        r.watch_loads(&listener);
+        let view = r
+            .with_scoring(&ScoringView {
+                norms: None,
+                params: None,
+                avgdl: Some(("body", VIEW_AVERAGE_LENGTHS[0])),
+            })
+            .expect("a view at a new average length");
+
+        assert_eq!(filtered_search(&view).await.expect("search"), PROBE_ROWS);
+        assert!(r.doc_map_is_read(), "the search read the map");
+        assert!(r.columns[0].norms_loaded(), "the search read the norms");
+        assert!(r.held_bytes() > before, "the reader holds what it loaded");
+        assert!(
+            reports.load(Ordering::SeqCst) > 0,
+            "the loads were reported"
+        );
+        assert_eq!(
+            weighed.load(Ordering::SeqCst),
+            r.held_bytes(),
+            "the last report weighed everything the search loaded"
+        );
+
+        let reported = reports.load(Ordering::SeqCst);
+        assert_eq!(filtered_search(&view).await.expect("search"), PROBE_ROWS);
+        assert_eq!(reports.load(Ordering::SeqCst), reported);
+    }
+
+    /// A map kept within the heap budget is reported as a load, as one kept without asking is,
+    /// so a holder that weighs the reader counts the map as soon as it lands.
+    #[tokio::test]
+    async fn a_map_kept_within_the_budget_is_reported_as_a_load() {
+        let (_, r) = probed_reader(false).await;
+        let budget = HeapBudget::with_budget(None);
+        budget.set_short_of_memory(false);
+        let r = Arc::new(r.with_heap_budget(budget));
+        let weighed = Arc::new(AtomicUsize::new(0));
+        let listener: LoadListener = {
+            let (reader, weighed) = (Arc::downgrade(&r), Arc::clone(&weighed));
+            Arc::new(move || {
+                let held = reader.upgrade().expect("the test holds it").held_bytes();
+                weighed.store(held, Ordering::SeqCst);
+            })
+        };
+        r.watch_loads(&listener);
+        assert!(
+            r.kept_doc_map_within_budget()
+                .await
+                .expect("keep")
+                .is_some(),
+            "room to keep the map"
+        );
+        assert!(r.doc_map_is_read());
+        assert_eq!(
+            weighed.load(Ordering::SeqCst),
+            r.held_bytes(),
+            "the report weighed the kept map"
+        );
     }
 
     #[tokio::test]
@@ -5883,6 +7011,415 @@ mod tests {
                 }
                 assert_eq!(dest, expect, "window at {base}");
             }
+        }
+    }
+
+    /// Documents in [`candidate_corpus`].
+    const CANDIDATE_CORPUS_DOCS: u32 = 3000;
+
+    /// Hits the candidate-norms tests rank.
+    const CANDIDATE_K: usize = 10;
+
+    /// A positional `body` corpus of spread lengths: `alpha` and `beta` are
+    /// common, `the` very common, `zyzzyva` in every 97th document and
+    /// `quux` in one.
+    fn candidate_corpus() -> (Bytes, &'static str) {
+        const FILLER: [&str; 6] = ["red", "green", "blue", "cyan", "pink", "gray"];
+        let mut next = xorshift(0x5eed_cafe);
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), true).expect("register");
+        for doc in 0..CANDIDATE_CORPUS_DOCS {
+            let len = 1 + next() % 40;
+            let mut words: Vec<&str> = (0..len)
+                .map(|_| match next() % 100 {
+                    0..=3 => "alpha",
+                    4..=11 => "beta",
+                    12..=27 => "the",
+                    n => FILLER[(n % 6) as usize],
+                })
+                .collect();
+            if doc % 97 == 0 {
+                words.push("zyzzyva");
+            }
+            if doc == 1234 {
+                words.push("quux");
+            }
+            b.add_doc(0, doc, &words.join(" ")).expect("add doc");
+        }
+        (
+            Bytes::from(b.finish().expect("finish")),
+            r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#,
+        )
+    }
+
+    /// A lazy reader over `blob` that reads single buckets: no CRC check
+    /// needs the whole array.
+    async fn bucket_reader(blob: &Bytes, json: &str) -> FtsReader {
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob.clone()));
+        FtsReader::open_lazy(src, json, OpenOptions { verify_crc: false })
+            .await
+            .expect("open_lazy")
+    }
+
+    /// The top `k` of `lists` on `r` at `floor`, as rows.
+    async fn ranked(r: &FtsReader, lists: ClauseLists<'_>, floor: f32) -> Vec<(RowId, f32)> {
+        let prep = r
+            .prepare_clauses("body", lists, CANDIDATE_K, floor)
+            .await
+            .expect("prepare");
+        r.hits_to_rows_async(r.run_prepared_in_blob_ids(prep).expect("run"))
+            .await
+            .expect("rows")
+    }
+
+    /// Scoring through candidate norms at the kth-best score returns
+    /// exactly the hits, and scores, of scoring with the whole length
+    /// array, for bare terms under either mode and for a lone phrase, and
+    /// never reads that array.
+    #[tokio::test]
+    async fn candidate_norms_rank_as_the_whole_length_array_does() {
+        let (blob, json) = candidate_corpus();
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let idf: GlobalTermIdf = [("alpha", 2.5), ("beta", 1.5), ("the", 0.4)]
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect();
+        let pair: &[&str] = &["alpha", "beta"];
+        let with_the: &[&str] = &["alpha", "the"];
+        let phrase = [Phrase {
+            terms: vec!["the".to_string(), "alpha".to_string()],
+            offsets: vec![0, 1],
+        }];
+        let lists = |name: &str| match name {
+            "or" => ClauseLists {
+                shoulds: pair,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            },
+            "and" => ClauseLists {
+                musts: with_the,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            },
+            _ => ClauseLists {
+                should_phrases: &phrase,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            },
+        };
+        for name in ["or", "and", "phrase"] {
+            let whole = ranked(&eager, lists(name), f32::NEG_INFINITY).await;
+            assert_eq!(
+                whole.len(),
+                CANDIDATE_K,
+                "{name}: the corpus fills the top k"
+            );
+            let floor = whole[CANDIDATE_K - 1].1;
+
+            let lazy = bucket_reader(&blob, json).await;
+            let query = lists(name);
+            let bare: Vec<(&str, u32)> = query
+                .musts
+                .iter()
+                .chain(query.shoulds)
+                .map(|&t| (t, 1))
+                .collect();
+            let phrases: Vec<&[String]> = query
+                .should_phrases
+                .iter()
+                .map(|p| p.terms.as_slice())
+                .collect();
+            let no_view = ScoringView {
+                norms: None,
+                params: None,
+                avgdl: None,
+            };
+            let norms = lazy
+                .candidate_norms("body", &bare, &phrases, &idf, &no_view, floor, None, None)
+                .await
+                .expect("candidate norms")
+                .unwrap_or_else(|| panic!("{name}: the candidates are read alone"));
+            let view = lazy
+                .with_scoring(&ScoringView {
+                    norms: Some(CandidateNorms {
+                        column: "body",
+                        norms: &norms,
+                    }),
+                    ..no_view
+                })
+                .expect("a view over the candidate norms");
+            assert_eq!(ranked(&view, query, floor).await, whole, "{name}");
+            assert!(
+                !lazy.columns[0].norms_loaded(),
+                "{name}: the length array was never read"
+            );
+        }
+    }
+
+    /// Candidate norms are not built where they cannot help: no floor, a
+    /// term without a table idf, or norms already in memory.
+    #[tokio::test]
+    async fn candidate_norms_step_aside_when_they_cannot_help() {
+        let (blob, json) = candidate_corpus();
+        let idf: GlobalTermIdf = [("alpha".to_string(), 2.5)].into_iter().collect();
+        let no_view = ScoringView {
+            norms: None,
+            params: None,
+            avgdl: None,
+        };
+        let lazy = bucket_reader(&blob, json).await;
+        let alpha_beta = [("alpha", 1), ("beta", 1)];
+        for (name, bare, floor) in [
+            ("no floor", &alpha_beta[..1], f32::NEG_INFINITY),
+            ("no idf", &alpha_beta[..], 1.0),
+        ] {
+            let built = lazy
+                .candidate_norms("body", bare, &[], &idf, &no_view, floor, None, None)
+                .await
+                .expect("candidate norms");
+            assert!(built.is_none(), "{name}");
+        }
+        let eager = FtsReader::open(blob, json).expect("open");
+        eager.ensure_norms(0).await.expect("norms");
+        let built = eager
+            .candidate_norms(
+                "body",
+                &alpha_beta[..1],
+                &[],
+                &idf,
+                &no_view,
+                1.0,
+                None,
+                None,
+            )
+            .await
+            .expect("candidate norms");
+        assert!(built.is_none(), "norms in memory");
+    }
+
+    /// A term of one posting, or of one short block, weighted by the
+    /// table, scores from its own documents' buckets as it does from the
+    /// whole array.
+    #[tokio::test]
+    async fn a_rare_term_scores_from_its_own_buckets() {
+        let (blob, json) = candidate_corpus();
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let idf: GlobalTermIdf = [("quux", 6.0), ("zyzzyva", 3.5)]
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect();
+        for term in ["quux", "zyzzyva"] {
+            let terms = [term];
+            let lists = || ClauseLists {
+                shoulds: &terms,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            };
+            let lazy = bucket_reader(&blob, json).await;
+            let whole = ranked(&eager, lists(), f32::NEG_INFINITY).await;
+            assert!(!whole.is_empty(), "{term}: the corpus holds it");
+            assert_eq!(
+                ranked(&lazy, lists(), f32::NEG_INFINITY).await,
+                whole,
+                "{term}"
+            );
+            assert!(!lazy.columns[0].norms_loaded(), "{term}: no array read");
+        }
+    }
+
+    /// A document's bucket is the same whether read alone, with the whole
+    /// array, or from the norms in memory.
+    #[tokio::test]
+    async fn doc_buckets_agree_however_they_are_read() {
+        let (blob, json) = candidate_corpus();
+        let docs: Vec<u32> = (0..CANDIDATE_CORPUS_DOCS).rev().step_by(7).collect();
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let expected = eager
+            .doc_buckets(0, &docs, CANDIDATE_MAX_RANGES)
+            .await
+            .expect("from the norms");
+        for max_ranges in [CANDIDATE_MAX_RANGES, 0] {
+            let lazy = bucket_reader(&blob, json).await;
+            assert_eq!(
+                lazy.doc_buckets(0, &docs, max_ranges)
+                    .await
+                    .expect("from the stored buckets"),
+                expected,
+                "at most {max_ranges} ranges"
+            );
+            assert!(!lazy.columns[0].norms_loaded());
+        }
+    }
+
+    /// A posting's id past the documents is malformed, not an index past
+    /// the norms, whether the norms are in memory, read as single buckets,
+    /// or loaded on demand.
+    #[tokio::test]
+    async fn doc_buckets_refuse_a_document_past_the_column() {
+        let (blob, json) = candidate_corpus();
+        let docs = [0, CANDIDATE_CORPUS_DOCS];
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        eager.ensure_norms(0).await.expect("norms");
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob.clone()));
+        let checked = FtsReader::open_lazy(src, json, OpenOptions { verify_crc: true })
+            .await
+            .expect("open_lazy");
+        let readers = [
+            ("loaded", eager),
+            ("single buckets", bucket_reader(&blob, json).await),
+            ("loaded on demand", checked),
+        ];
+        for (name, r) in &readers {
+            let result = r.doc_buckets(0, &docs, CANDIDATE_MAX_RANGES).await;
+            assert!(
+                matches!(result, Err(FtsError::Read(ReadError::Malformed(_)))),
+                "{name}: {result:?}"
+            );
+        }
+    }
+
+    /// Where a stored-bucket directory entry keeps the column's count of
+    /// scored documents.
+    const N_SCORED_DOCS_IN_ENTRY: Range<usize> = 24..32;
+
+    /// A directory that says the column scores no document loads an empty
+    /// norm table; a document the column does hold is then malformed, not
+    /// an index past that table. The same blob uncorrupted reads it.
+    #[tokio::test]
+    async fn doc_buckets_refuse_a_document_past_empty_loaded_norms() {
+        let (blob, json) = candidate_corpus();
+        let dir_off =
+            read_u64_le(&blob[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
+                as usize;
+        let mut corrupt = blob.to_vec();
+        corrupt[dir_off + N_SCORED_DOCS_IN_ENTRY.start..dir_off + N_SCORED_DOCS_IN_ENTRY.end]
+            .copy_from_slice(&0u64.to_le_bytes());
+        let corrupt = Bytes::from(corrupt);
+        for (name, blob, ok) in [("intact", &blob, true), ("no scored docs", &corrupt, false)] {
+            let r = bucket_reader(blob, json).await;
+            r.ensure_norms(0).await.expect("norms");
+            let result = r.doc_buckets(0, &[0], CANDIDATE_MAX_RANGES).await;
+            match ok {
+                true => assert!(result.is_ok(), "{name}: {result:?}"),
+                false => assert!(
+                    matches!(result, Err(FtsError::Read(ReadError::Malformed(_)))),
+                    "{name}: {result:?}"
+                ),
+            }
+        }
+    }
+
+    /// Occurrences of each of `alpha` and `beta` in the one long document
+    /// of [`a_length_past_the_stored_cap_stays_a_candidate`]: together one
+    /// past the longest stored length.
+    const LONG_DOC_EACH: usize = 1 << 15;
+
+    /// A document longer than the stored cap is scored at the capped
+    /// length; its candidate bound is too, so at its own score as the
+    /// floor it stays a candidate and ranks as with the whole array. Bound
+    /// at its uncapped length, a bucket longer, it would fall under.
+    #[tokio::test]
+    async fn a_length_past_the_stored_cap_stays_a_candidate() {
+        const TABLE_AVGDL: f32 = 2.0;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let long = [vec!["alpha"; LONG_DOC_EACH], vec!["beta"; LONG_DOC_EACH]].concat();
+        b.add_doc(0, 0, &long.join(" ")).expect("add doc");
+        b.add_doc(0, 1, "alpha beta").expect("add doc");
+        b.add_doc(0, 2, "gray").expect("add doc");
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let idf: GlobalTermIdf = [("alpha", 2.5), ("beta", 1.5)]
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect();
+        let terms: &[&str] = &["alpha", "beta"];
+        let lists = || ClauseLists {
+            shoulds: terms,
+            idf: QueryIdf::Table(&idf),
+            ..ClauseLists::default()
+        };
+        let table = ScoringView {
+            norms: None,
+            params: None,
+            avgdl: Some(("body", TABLE_AVGDL)),
+        };
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let whole = ranked(
+            &eager
+                .with_scoring(&table)
+                .expect("a view at the table average"),
+            lists(),
+            f32::NEG_INFINITY,
+        )
+        .await;
+        assert_eq!(whole[0].0, RowId::new(0), "the long document ranks first");
+        let floor = whole[0].1;
+        let lazy = bucket_reader(&blob, json).await;
+        let norms = lazy
+            .candidate_norms(
+                "body",
+                &[("alpha", 1), ("beta", 1)],
+                &[],
+                &idf,
+                &table,
+                floor,
+                None,
+                None,
+            )
+            .await
+            .expect("candidate norms")
+            .expect("the candidates are read alone");
+        let view = lazy
+            .with_scoring(&ScoringView {
+                norms: Some(CandidateNorms {
+                    column: "body",
+                    norms: &norms,
+                }),
+                ..table
+            })
+            .expect("a view over the candidate norms");
+        assert_eq!(ranked(&view, lists(), floor).await, whole[..1]);
+    }
+
+    /// A lone term scores from its own documents' buckets exactly when it
+    /// has at most [`FEW_NORMS_MAX_DOCS`] postings, the count up to which
+    /// the table's fan-out skips the length-array prewarm.
+    #[tokio::test]
+    async fn few_norms_cover_a_term_of_up_to_the_short_limit() {
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let at_most = FEW_NORMS_MAX_DOCS as u32;
+        for doc in 0..=at_most {
+            let text = match doc < at_most {
+                true => "within past",
+                false => "past",
+            };
+            b.add_doc(0, doc, text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let idf: GlobalTermIdf = [("within", 1.0), ("past", 1.0)]
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect();
+        for (term, df) in [("within", at_most), ("past", at_most + 1)] {
+            let terms = [term];
+            let lists = ClauseLists {
+                shoulds: &terms,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            };
+            let lazy = bucket_reader(&blob, json).await;
+            assert_eq!(
+                ranked(&lazy, lists, f32::NEG_INFINITY).await.len(),
+                CANDIDATE_K
+            );
+            assert_eq!(
+                lazy.columns[0].norms_loaded(),
+                df as usize > FEW_NORMS_MAX_DOCS,
+                "{term}: {df} postings"
+            );
         }
     }
 }

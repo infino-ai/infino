@@ -17,7 +17,13 @@
 //! value (a missing value sorts last and is in no index). Otherwise the
 //! same sort runs as SQL, which answers alike, only slower.
 
-use std::{cmp::Ordering, collections::HashMap, slice::from_ref, sync::Arc, time::Instant};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    slice::from_ref,
+    sync::Arc,
+    time::Instant,
+};
 
 use arrow::{
     array::{Array, AsArray},
@@ -39,15 +45,17 @@ use datafusion::{
 use roaring::RoaringBitmap;
 use tracing::{Instrument, debug};
 
+#[cfg(test)]
+use crate::supertable::query::provider::walk_probe;
 use crate::{
     InfinoError,
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::timed_section,
-    superfile::{SuperfileReader, range::KeyKind},
+    superfile::{SuperfileReader, fts::tokenize::STANDARD_TOKENIZER, range::KeyKind},
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        manifest::{SuperfileEntry, SuperfileUri},
+        manifest::{SuperfileEntry, SuperfileUri, summaries::ExactLiterals},
         query::{
             SuperfileHit,
             candidate::single_range,
@@ -55,6 +63,7 @@ use crate::{
             exec::common::resolve_hits_named,
             provider::{flatten_or_eq, read_column, scalar_distinct},
             skip::ColumnTypeGuard,
+            text_match::{TextMatchMode, text_match_call},
         },
         reader_cache::disk::ForegroundQueryGuard,
         tombstones::SidecarCache,
@@ -71,12 +80,44 @@ const SQL_TABLE: &str = "supertable";
 /// One superfile's candidates: `(key, hit)` for its first rows by the key.
 type Candidates = Vec<(u64, SuperfileHit)>;
 
+/// The first `k` of the `candidates` that `keep` accepts, in a sort's order by the key,
+/// `descending` or not, and then by `_id` ascending, each hit given its `_id` first. The `_id`s
+/// come from the superfiles' id spans or id pages, so no other column is read. It reserves no
+/// memory: the walk and the range top-k reserve their candidates before they call it.
+pub(crate) async fn by_key_then_id(
+    reader: &SupertableReader,
+    candidates: Candidates,
+    descending: bool,
+    k: usize,
+    keep: impl Fn(u64, &SuperfileHit) -> bool,
+) -> Result<Candidates, QueryError> {
+    let (keys, mut hits): (Vec<u64>, Vec<SuperfileHit>) = candidates.into_iter().unzip();
+    dispatch::attach_stable_ids_to_hits(reader, &mut hits).await?;
+    let mut order: Vec<usize> = (0..hits.len())
+        .filter(|&i| keep(keys[i], &hits[i]))
+        .collect();
+    let compare = |&a: &usize, &b: &usize| {
+        let by_key = match descending {
+            false => keys[a].cmp(&keys[b]),
+            true => keys[b].cmp(&keys[a]),
+        };
+        by_key.then_with(|| hits[a].stable_id.cmp(&hits[b].stable_id))
+    };
+    // Only the first `k` are kept: pick them, then sort just those.
+    if order.len() > k {
+        order.select_nth_unstable_by(k, compare);
+        order.truncate(k);
+    }
+    order.sort_by(compare);
+    Ok(order.into_iter().map(|i| (keys[i], hits[i])).collect())
+}
+
 /// A top-k walk starts only when it expects to find its rows within 4,096, and reads no window past
 /// that after its first; past it the scan reads every row, faster for a filter that keeps so few.
 pub(crate) const MAX_WALKED_ROWS: usize = 4096;
 
 /// A window reads twice the rows the walk expects to need, so it usually holds the page at once.
-const WINDOW_MARGIN: f64 = 2.0;
+pub(crate) const WINDOW_MARGIN: f64 = 2.0;
 
 /// How much larger a window is than the last when the last kept no row.
 const WINDOW_GROWTH: usize = 4;
@@ -298,26 +339,11 @@ impl SupertableReader {
                 true => *key >= cut,
             });
         }
-        let (keys, mut hits): (Vec<u64>, Vec<SuperfileHit>) = candidates.into_iter().unzip();
-        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
-        let mut order: Vec<usize> = (0..hits.len())
-            .filter(|&i| {
-                after.is_none_or(|after| after.passed_by(keys[i], hits[i].stable_id, descending))
-            })
-            .collect();
-        order.sort_by(|&a, &b| {
-            let by_key = match descending {
-                false => keys[a].cmp(&keys[b]),
-                true => keys[b].cmp(&keys[a]),
-            };
-            by_key.then_with(|| hits[a].stable_id.cmp(&hits[b].stable_id))
-        });
         Ok(Some(
-            order
-                .into_iter()
-                .take(k)
-                .map(|i| (keys[i], hits[i]))
-                .collect(),
+            by_key_then_id(self, candidates, descending, k, |key, hit| {
+                after.is_none_or(|after| after.passed_by(key, hit.stable_id, descending))
+            })
+            .await?,
         ))
     }
 
@@ -398,13 +424,17 @@ impl SupertableReader {
     ///  - `column = literal`: the rows a file's exact value table counts for it, else one row per
     ///    distinct value, as the scan estimates for the planner.
     ///  - `IN`: one such share per value. `AND`: the product of its sides.
+    ///  - `text_match`: the rows each file's term counts allow ([`Self::text_match_share`]).
     ///  - anything else, or a column with no statistics: every row; the walk learns the share as it
     ///    reads.
-    fn expected_share(&self, condition: &Expr, files: &[Arc<SuperfileEntry>]) -> Share {
+    async fn expected_share(&self, condition: &Expr, files: &[Arc<SuperfileEntry>]) -> Share {
         let mut share = 1.0;
         let mut none = false;
         for conjunct in split_conjunction(condition) {
-            let one = self.conjunct_share(conjunct, files);
+            let one = match self.text_match_share(conjunct, files).await {
+                Some(one) => one,
+                None => self.conjunct_share(conjunct, files),
+            };
             share *= one.share;
             none |= one.none;
         }
@@ -412,6 +442,86 @@ impl SupertableReader {
             share: share.clamp(0.0, 1.0),
             none,
         }
+    }
+
+    /// The rows of each of `files` a `text_match` can keep, from the term index's count of the
+    /// rows a file holds a token in: the rarest token's count for `all`, the sum for `any`.
+    /// A file the index does not list yet, or a token it holds with no count, counts every row.
+    /// `None` when the index cannot answer: no term index, field or token, another tokenizer, or a
+    /// failed read.
+    async fn text_match_counts(
+        &self,
+        conjunct: &Expr,
+        files: &[Arc<SuperfileEntry>],
+    ) -> Option<Vec<u64>> {
+        let (column, tokens, mode) = text_match_call(conjunct)?;
+        let manifest = self.manifest();
+        if tokens.is_empty()
+            || manifest.try_fts_tokenizer_for(&column)?.name() != STANDARD_TOKENIZER
+        {
+            return None;
+        }
+        let field = manifest.field_id(&column)?;
+        // A failed index read leaves no estimate; the statement's own read then reports it.
+        let index = manifest.term_index().await.ok()??;
+        let terms: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        // The same runs the statement's own `text_match` reads, which the index then keeps.
+        let located = index.locations(field, &terms, files).await.ok()?;
+        let mut counts = Vec::with_capacity(files.len());
+        for entry in files {
+            if !index.is_indexed(&entry.superfile_id) {
+                counts.push(entry.n_docs);
+                continue;
+            }
+            let file_terms = located
+                .get(&entry.superfile_id)
+                .map_or(&[][..], Vec::as_slice);
+            // A token the file does not hold counts 0; one held with no count may be in every row.
+            let dfs = terms.iter().map(|term| {
+                match file_terms.iter().find(|(listed, _, _)| listed == term) {
+                    Some((_, 0, _)) => entry.n_docs,
+                    Some((_, df, _)) => *df,
+                    None => 0,
+                }
+            });
+            let count = match mode {
+                TextMatchMode::All => dfs.fold(u64::MAX, u64::min),
+                TextMatchMode::Any => dfs.fold(0, u64::saturating_add),
+            };
+            counts.push(count.min(entry.n_docs));
+        }
+        Some(counts)
+    }
+
+    /// The share of rows a `text_match` can keep over `files` ([`Self::text_match_counts`]).
+    async fn text_match_share(
+        &self,
+        conjunct: &Expr,
+        files: &[Arc<SuperfileEntry>],
+    ) -> Option<Share> {
+        let matched: u64 = self.text_match_counts(conjunct, files).await?.iter().sum();
+        let rows: u64 = files.iter().map(|entry| entry.n_docs).sum();
+        Some(Share {
+            share: matched as f64 / rows.max(1) as f64,
+            none: matched == 0,
+        })
+    }
+
+    /// The `files` that can hold a row `rest` keeps: a file where the term index counts no row for
+    /// one of its `text_match`es holds none, so the walk leaves it out.
+    async fn files_holding(
+        &self,
+        rest: &Expr,
+        files: &[Arc<SuperfileEntry>],
+    ) -> Vec<Arc<SuperfileEntry>> {
+        let mut holding = files.to_vec();
+        for conjunct in split_conjunction(rest) {
+            if let Some(counts) = self.text_match_counts(conjunct, &holding).await {
+                let mut counts = counts.into_iter();
+                holding.retain(|_| counts.next().is_some_and(|count| count > 0));
+            }
+        }
+        holding
     }
 
     /// [`Self::expected_share`] of one conjunct over `files`, the files the walk reads. A value
@@ -463,6 +573,15 @@ impl SupertableReader {
         let guard = ColumnTypeGuard::new(manifest, field);
         // The walk's files, not the snapshot's list, which a lazily opened table holds in part.
         let entries = files;
+        // `None` when a statement would cast the column to compare it with a literal (a string
+        // column against a number): then no table counts the literals and each file falls back.
+        let exact = ExactLiterals::new(&literals, column_type);
+        // `IN (5, 5)` asks for 5 once: counted after the cast when the literals cast, else as
+        // written.
+        let asked = exact.as_ref().map_or_else(
+            || literals.iter().collect::<HashSet<_>>().len(),
+            ExactLiterals::distinct_count,
+        );
         if entries.iter().any(|entry| guard.stats_are_stale(entry)) {
             return unknown;
         }
@@ -479,7 +598,7 @@ impl SupertableReader {
             if stats.all_null() {
                 continue;
             }
-            match stats.literal_count(&literals, column_type) {
+            match exact.as_ref().and_then(|exact| stats.literal_count(exact)) {
                 Some(held) => counted += held as f64,
                 None => {
                     uncounted +=
@@ -497,7 +616,7 @@ impl SupertableReader {
                 return unknown;
             };
             if distinct >= 1 {
-                expected += uncounted * (literals.len() as f64 / distinct as f64).min(1.0);
+                expected += uncounted * (asked as f64 / distinct as f64).min(1.0);
             }
         }
         Share {
@@ -622,16 +741,31 @@ impl SupertableReader {
         let window_for = |share: f64, rows: usize| {
             ((needed(share, rows) * WINDOW_MARGIN).ceil() as usize).max(rows)
         };
-        let Share { share, none } = self.expected_share(rest, files);
+        let holding = self.files_holding(rest, files).await;
+        let files = holding.as_slice();
+        let Share { share, none } = self.expected_share(rest, files).await;
         if none {
             // The statistics count every value the filter names, and no row holds one: it keeps
             // none.
             return Ok(Some(Vec::new()));
         }
-        if share <= 0.0 || needed(share, k) > MAX_WALKED_ROWS as f64 {
+        // No window needs more than the rows the files hold, plus one so reading them all ends it.
+        // Under a bounded filter that end answers, so a walk reads no more rows than are left, and
+        // one over a few small files starts.
+        let rows_held = files.iter().map(|entry| entry.n_docs).sum::<u64>();
+        let rows_left = |walked: usize| {
+            (rows_held as usize)
+                .saturating_sub(walked)
+                .saturating_add(1)
+        };
+        let reads = |rows: f64, walked: usize| match filter.bounded {
+            true => rows.min(rows_left(walked) as f64),
+            false => rows,
+        };
+        if share <= 0.0 || reads(needed(share, k), 0) > MAX_WALKED_ROWS as f64 {
             return Ok(None);
         }
-        let mut window = window_for(share, k);
+        let mut window = window_for(share, k).min(rows_left(0));
         let mut page = Vec::with_capacity(k);
         let mut cursor: Option<Cursor> = None;
         let mut walked = 0usize;
@@ -672,6 +806,8 @@ impl SupertableReader {
             else {
                 return Ok(None);
             };
+            #[cfg(test)]
+            walk_probe::window_read(&self.manifest().superfiles, read.len());
             let ended = read.len() < window_now;
             let hits: Vec<SuperfileHit> = read.iter().map(|(_, hit)| *hit).collect();
             let kept = match hits.is_empty() {
@@ -698,13 +834,19 @@ impl SupertableReader {
             }
             cursor = Cursor::past(cursor, &read);
             // Size the next window from the share kept so far; past the limit, the statement is
-            // faster.
+            // faster. With nothing kept yet, grow it, unless walked and grown rows pass the limit.
             let rows = k - page.len();
             window = match passed {
-                0 => window_now.saturating_mul(WINDOW_GROWTH),
+                0 => {
+                    let grown = window_now.saturating_mul(WINDOW_GROWTH);
+                    if walked as f64 + reads(grown as f64, walked) > MAX_WALKED_ROWS as f64 {
+                        return Ok(None);
+                    }
+                    grown
+                }
                 _ => {
                     let seen = passed as f64 / walked as f64;
-                    if walked as f64 + needed(seen, rows) > MAX_WALKED_ROWS as f64 {
+                    if walked as f64 + reads(needed(seen, rows), walked) > MAX_WALKED_ROWS as f64 {
                         return Ok(None);
                     }
                     window_for(seen, rows)
@@ -830,7 +972,7 @@ pub(crate) fn sorted_statement(
 }
 
 /// `name` as a quoted SQL identifier.
-fn quote(name: &str) -> String {
+pub(crate) fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -850,6 +992,7 @@ mod tests {
     use super::*;
     use crate::{
         config::OptimizeOptions,
+        memory::ConnectionMemoryBudget,
         runtime_metrics::op_stats::with_op_stats,
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
@@ -1210,6 +1353,60 @@ mod tests {
             )
             .expect("sql");
         assert_eq!(ints(&held, "seq"), ints(&want, "seq"));
+    }
+
+    /// Distinct `n` values in the repeated-literal test's file: more than its value tables keep.
+    const UNTABLED_VALUES: i64 = 20_000;
+    /// An `n` value the repeated-literal test asks for; `ASKED + 1` is another one.
+    const ASKED: i64 = 500;
+
+    #[test]
+    fn a_repeated_literal_is_counted_once() {
+        // One file whose `n` holds more distinct values than its value tables keep, so the
+        // estimate is one row per distinct value per literal.
+        //  - `n IN (a, a)` expects the rows `n = a` does, not those of `n IN (a, a + 1)`.
+        // This test pins that the walk's estimate asks for each literal once.
+        let dir = TempDir::new().expect("tempdir");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["seq".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        let values: Vec<i64> = (0..UNTABLED_VALUES).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(values.clone())),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .expect("batch");
+        let mut writer = st.writer().expect("writer");
+        writer.append(&batch).expect("append");
+        writer.commit().expect("commit");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let field = manifest.table_schema().id_of("n").expect("n");
+        let files = &manifest.superfiles;
+        assert!(
+            files.iter().all(|file| file
+                .scalar_stats
+                .column(field)
+                .is_some_and(|stats| stats.value_counts().is_none())),
+            "no file keeps a table for `n`"
+        );
+        let share = |filter: Expr| reader.conjunct_share(&filter, files).share;
+        let one = share(col("n").eq(lit(ASKED)));
+        assert!(one < 1.0, "the estimate counts rows: {one}");
+        let twice = share(col("n").in_list(vec![lit(ASKED), lit(ASKED)], false));
+        assert_eq!(twice, one);
+        assert!(share(col("n").in_list(vec![lit(ASKED), lit(ASKED + 1)], false)) > one);
     }
 
     /// The numeric-tag table has 7 `tag` values, written with a leading zero (`"00"` to `"06"`).
@@ -2080,6 +2277,70 @@ mod tests {
                     "{column}: descending {descending}, k {k}"
                 );
             }
+        }
+    }
+
+    /// Keys the candidates of [`by_key_then_id_keeps_the_first_k_and_reserves_nothing`] take, so
+    /// many share each key and the `_id` decides among them.
+    const CANDIDATE_KEYS: u32 = 7;
+    /// The candidates it keeps.
+    const KEPT: usize = 40;
+
+    /// `by_key_then_id` returns only the first `k` candidates by the key and then `_id`, either
+    /// way. It reserves no memory, so it answers with the connection's budget full: its callers
+    /// reserve the candidates, and a second reservation would count them twice.
+    #[test]
+    fn by_key_then_id_keeps_the_first_k_and_reserves_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        drop(table(&dir));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut options = SupertableOptions::new(schema(), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["key".to_string()]);
+        options.connection_memory_budget = ConnectionMemoryBudget::with_room();
+        let st = Supertable::open(options).expect("open");
+        let reader = st.reader().expect("reader");
+        let _full = reader
+            .manifest()
+            .options
+            .connection_memory_budget
+            .hold_all();
+        let candidates: Candidates = reader
+            .manifest()
+            .superfiles
+            .iter()
+            .flat_map(|entry| {
+                let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+                let keys = locals.iter().map(|local| u64::from(local % CANDIDATE_KEYS));
+                let hits = tag_hits(entry, locals.iter().map(|local| (*local, 0.0)).collect());
+                keys.zip(hits).collect::<Vec<_>>()
+            })
+            .collect();
+        for descending in [false, true] {
+            let mut want: Vec<(u64, Option<i128>)> = candidates
+                .iter()
+                .map(|(key, hit)| (*key, hit.stable_id))
+                .collect();
+            want.sort_by(|a, b| match descending {
+                false => a.cmp(b),
+                true => b.0.cmp(&a.0).then(a.1.cmp(&b.1)),
+            });
+            want.truncate(KEPT);
+            let got: Vec<(u64, Option<i128>)> = reader
+                .block_on(by_key_then_id(
+                    &reader,
+                    candidates.clone(),
+                    descending,
+                    KEPT,
+                    |_, _| true,
+                ))
+                .expect("ordered")
+                .into_iter()
+                .map(|(key, hit)| (key, hit.stable_id))
+                .collect();
+            assert_eq!(got, want, "descending: {descending}");
         }
     }
 

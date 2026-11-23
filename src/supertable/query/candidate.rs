@@ -119,19 +119,19 @@ use crate::{
         ReadError, SuperfileReader,
         fts::{
             reader::{
-                BoolMode, ContainsRows, FetchedTermMemo, LONG_S_ASCII, MatchWork, TermPattern,
+                BoolMode, ContainsRows, FetchedTermMemo, LONG_S_ASCII, MatchWork, QueryDict,
+                TermPattern,
             },
             tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER, Tokenizer},
         },
-        id_space::RowId,
+        id_space::row_bitmap,
         range::{KeyKind, float_key, signed_key, unsigned_key},
     },
     supertable::{
-        error::QueryError,
-        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri},
+        manifest::{SuperfileEntry, SuperfileUri},
         query::{
             fts::{IndexedSuperfile, PlanLocations, memos_from_plan_locations},
-            prune::{PruneLeaf, select_superfiles},
+            prune::PruneLeaf,
         },
         schema::FieldId,
     },
@@ -458,6 +458,7 @@ impl CandidatePlan {
         reader: &'a SuperfileReader,
         pool: Option<&'a ThreadPool>,
         memos: &'a TermMemos,
+        dict: &'a QueryDict,
     ) -> BoxFuture<'a, Result<(Option<RoaringBitmap>, MatchWork), ReadError>> {
         Box::pin(async move {
             match self {
@@ -475,9 +476,10 @@ impl CandidatePlan {
                             &refs,
                             BoolMode::And,
                             memo,
+                            dict,
                         )
                         .await?;
-                    Ok((Some(docs.into_iter().map(RowId::get).collect()), work))
+                    Ok((Some(row_bitmap(&docs)), work))
                 }
                 CandidatePlan::TermsAny {
                     column,
@@ -497,9 +499,10 @@ impl CandidatePlan {
                             &refs,
                             BoolMode::Or,
                             memo,
+                            dict,
                         )
                         .await?;
-                    Ok((Some(docs.into_iter().map(RowId::get).collect()), work))
+                    Ok((Some(row_bitmap(&docs)), work))
                 }
                 CandidatePlan::TermsLike {
                     column,
@@ -508,8 +511,9 @@ impl CandidatePlan {
                     fold,
                 } => {
                     let (expanded, mut work) =
-                        expand_like(reader, column, *field, tokens, *fold, true, pool).await?;
-                    let (docs, eval_work) = expanded.evaluate(reader, pool, memos).await?;
+                        expand_like(reader, column, *field, tokens, *fold, true, pool, dict)
+                            .await?;
+                    let (docs, eval_work) = expanded.evaluate(reader, pool, memos, dict).await?;
                     work.merge(eval_work);
                     Ok((docs, work))
                 }
@@ -526,7 +530,7 @@ impl CandidatePlan {
                     let mut acc: Option<RoaringBitmap> = None;
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.evaluate(reader, pool, memos).await?;
+                        let (child, child_work) = c.evaluate(reader, pool, memos, dict).await?;
                         work.merge(child_work);
                         if let Some(bm) = child {
                             acc = Some(match acc {
@@ -545,7 +549,7 @@ impl CandidatePlan {
                     let mut acc = RoaringBitmap::new();
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.evaluate(reader, pool, memos).await?;
+                        let (child, child_work) = c.evaluate(reader, pool, memos, dict).await?;
                         work.merge(child_work);
                         match child {
                             Some(bm) => acc |= bm,
@@ -612,6 +616,7 @@ impl CandidatePlan {
         pool: &ThreadPool,
         slots: &Semaphore,
         mut memos: TermMemos,
+        dict: Arc<QueryDict>,
     ) -> Result<(Option<RoaringBitmap>, MatchWork), ReadError> {
         // A `LIKE` leaf hands its dictionary walk to a pool itself, which
         // would leave that walk running on the global pool when the poll
@@ -626,11 +631,14 @@ impl CandidatePlan {
                 .map_err(|_| ReadError::TaskDropped("planning match slot"))?;
             let plan = Arc::clone(&self);
             let local = Arc::clone(&reader);
+            let local_dict = Arc::clone(&dict);
             // `memos` rides along and comes back, so the fallback below can
             // reuse it without a copy.
             let (matched, returned) =
                 run_on_pool_while_awaited(pool, "planning match", move || {
-                    let matched = plan.evaluate(&local, None, &memos).now_or_never();
+                    let matched = plan
+                        .evaluate(&local, None, &memos, &local_dict)
+                        .now_or_never();
                     (matched, memos)
                 })
                 .await
@@ -647,7 +655,7 @@ impl CandidatePlan {
             );
             memos = returned;
         }
-        self.evaluate(&reader, Some(pool), &memos).await
+        self.evaluate(&reader, Some(pool), &memos, &dict).await
     }
 
     /// Runs [`Self::resolve`] for resident superfiles on `pool`, in jobs of up to
@@ -712,7 +720,14 @@ impl CandidatePlan {
     ) -> Option<Result<Resolved, ReadError>> {
         let reader = Arc::clone(&file.reader);
         let resolved = self
-            .resolve(reader, file.superfile, locations, file.gate, None)
+            .resolve(
+                reader,
+                file.superfile,
+                locations,
+                file.gate,
+                None,
+                Arc::default(),
+            )
             .now_or_never();
         if resolved.is_none() {
             // Should be rare: the planning task redoes this superfile's work.
@@ -733,13 +748,14 @@ impl CandidatePlan {
         locations: &PlanLocations,
         gate: SelectionGate,
         pool: Option<(&ThreadPool, &Semaphore)>,
+        dict: Arc<QueryDict>,
     ) -> Result<Resolved, ReadError> {
         let located = IndexedSuperfile {
             locations,
             superfile,
         };
         let (estimate, mut work) = self
-            .estimate(&reader, pool.map(|(pool, _)| pool), Some(located))
+            .estimate(&reader, pool.map(|(pool, _)| pool), Some(located), &dict)
             .await?;
         if !gate.pays(estimate) {
             return Ok(Resolved { rows: None, work });
@@ -747,40 +763,29 @@ impl CandidatePlan {
         let memos = memos_from_plan_locations(&reader, locations, superfile).await;
         let (rows, matched) = match pool {
             Some((pool, slots)) => {
-                self.evaluate_on_pool(reader, superfile, pool, slots, memos)
+                self.evaluate_on_pool(reader, superfile, pool, slots, memos, dict)
                     .await?
             }
-            None => self.evaluate(&reader, None, &memos).await?,
+            None => self.evaluate(&reader, None, &memos, &dict).await?,
         };
         work.merge(matched);
         Ok(Resolved { rows, work })
     }
 
-    /// Manifest-only superfile survival gate for this plan: the superfile
-    /// ids that *could* match by term blooms and the term index. `None`
-    /// means no gate: the plan, or one of its `OR` branches, bounds no
-    /// superfile.
-    pub(crate) async fn surviving_superfile_ids(
-        &self,
-        manifest: &ManifestSnapshot,
-    ) -> Result<Option<HashSet<u128>>, QueryError> {
+    /// This plan's manifest-only survival gate, as prune leaves to check
+    /// beside others in one pass: the term blooms and term index of every
+    /// superfile that *could* match. Empty when there is no gate: the plan,
+    /// or one of its `OR` branches, bounds no superfile.
+    pub(crate) fn survival_leaves(&self) -> Vec<PruneLeaf> {
         let mut groups = Vec::new();
         if !self.collect_survival_or_groups(&mut groups) {
-            return Ok(None);
+            return Vec::new();
         }
         // One group is a plain conjunction; several are an `OR` of them.
-        let leaves: Vec<PruneLeaf> = match groups.len() {
-            0 => return Ok(Some(HashSet::new())),
+        match groups.len() {
             1 => groups.swap_remove(0),
             _ => PruneLeaf::any_of(groups).into_iter().collect(),
-        };
-        Ok(Some(
-            select_superfiles(manifest, &leaves)
-                .await?
-                .iter()
-                .map(|e| e.superfile_id.as_u128())
-                .collect(),
-        ))
+        }
     }
 
     /// Flatten this plan into one bloom-conjunction group per `OR` branch.
@@ -914,6 +919,7 @@ impl CandidatePlan {
         reader: &'a SuperfileReader,
         pool: Option<&'a ThreadPool>,
         located: Option<IndexedSuperfile<'a>>,
+        dict: &'a QueryDict,
     ) -> BoxFuture<'a, Result<(u64, MatchWork), ReadError>> {
         Box::pin(async move {
             let n_docs = reader.n_docs();
@@ -928,9 +934,17 @@ impl CandidatePlan {
                         return Ok((n_docs, MatchWork::default()));
                     }
                     // Intersection ≤ the rarest token's df.
-                    let (min_df, work) =
-                        fold_dfs(reader, located, column, *field, tokens, u64::MAX, u64::min)
-                            .await?;
+                    let (min_df, work) = fold_dfs(
+                        reader,
+                        located,
+                        column,
+                        *field,
+                        tokens,
+                        u64::MAX,
+                        u64::min,
+                        dict,
+                    )
+                    .await?;
                     Ok((min_df.min(n_docs), work))
                 }
                 CandidatePlan::TermsAny {
@@ -950,6 +964,7 @@ impl CandidatePlan {
                         terms,
                         0,
                         u64::saturating_add,
+                        dict,
                     )
                     .await?;
                     Ok((sum.min(n_docs), work))
@@ -962,8 +977,9 @@ impl CandidatePlan {
                 } => {
                     // The index was never asked about the expanded words.
                     let (expanded, mut work) =
-                        expand_like(reader, column, *field, tokens, *fold, true, pool).await?;
-                    let (rows, est_work) = expanded.estimate(reader, pool, None).await?;
+                        expand_like(reader, column, *field, tokens, *fold, true, pool, dict)
+                            .await?;
+                    let (rows, est_work) = expanded.estimate(reader, pool, None, dict).await?;
                     work.merge(est_work);
                     Ok((rows, work))
                 }
@@ -984,7 +1000,7 @@ impl CandidatePlan {
                     let mut m = n_docs;
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.estimate(reader, pool, located).await?;
+                        let (child, child_work) = c.estimate(reader, pool, located, dict).await?;
                         work.merge(child_work);
                         m = m.min(child);
                     }
@@ -994,7 +1010,7 @@ impl CandidatePlan {
                     let mut sum: u64 = 0;
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.estimate(reader, pool, located).await?;
+                        let (child, child_work) = c.estimate(reader, pool, located, dict).await?;
                         work.merge(child_work);
                         sum = sum.saturating_add(child);
                     }
@@ -1016,6 +1032,7 @@ async fn fold_dfs(
     terms: &[String],
     init: u64,
     fold: fn(u64, u64) -> u64,
+    dict: &QueryDict,
 ) -> Result<(u64, MatchWork), ReadError> {
     let indexed = located.and_then(|l| l.held(column)).and_then(|held| {
         terms
@@ -1027,7 +1044,7 @@ async fn fold_dfs(
     }
     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
     let (dfs, work) = reader
-        .term_dfs(reader.column_alias(field, column), &refs)
+        .term_dfs_with_dict(reader.column_alias(field, column), &refs, dict)
         .await?;
     Ok((dfs.into_iter().fold(init, fold), work))
 }
@@ -1110,6 +1127,7 @@ impl CandidatePlan {
         reader: &'a SuperfileReader,
         full_walk_pays: &'a (dyn Fn(&str) -> bool + Sync),
         pool: Option<&'a ThreadPool>,
+        dict: &'a QueryDict,
     ) -> BoxFuture<'a, Result<(CandidatePlan, MatchWork), ReadError>> {
         Box::pin(async move {
             match self {
@@ -1120,16 +1138,16 @@ impl CandidatePlan {
                     fold,
                 } => {
                     let full_walk = full_walk_pays(column);
-                    expand_like(reader, column, *field, tokens, *fold, full_walk, pool).await
+                    expand_like(reader, column, *field, tokens, *fold, full_walk, pool, dict).await
                 }
                 CandidatePlan::And(children) => {
                     let (expanded, work) =
-                        expand_children(reader, children, full_walk_pays, pool).await?;
+                        expand_children(reader, children, full_walk_pays, pool, dict).await?;
                     Ok((and_combine(expanded), work))
                 }
                 CandidatePlan::Or(children) => {
                     let (expanded, work) =
-                        expand_children(reader, children, full_walk_pays, pool).await?;
+                        expand_children(reader, children, full_walk_pays, pool, dict).await?;
                     Ok((or_combine(expanded), work))
                 }
                 leaf => Ok((leaf.clone(), MatchWork::default())),
@@ -1144,11 +1162,12 @@ async fn expand_children(
     children: &[CandidatePlan],
     full_walk_pays: &(dyn Fn(&str) -> bool + Sync),
     pool: Option<&ThreadPool>,
+    dict: &QueryDict,
 ) -> Result<(Vec<CandidatePlan>, MatchWork), ReadError> {
     let mut expanded = Vec::with_capacity(children.len());
     let mut work = MatchWork::default();
     for child in children {
-        let (plan, child_work) = child.expand(reader, full_walk_pays, pool).await?;
+        let (plan, child_work) = child.expand(reader, full_walk_pays, pool, dict).await?;
         work.merge(child_work);
         expanded.push(plan);
     }
@@ -1169,6 +1188,7 @@ async fn expand_like(
     fold: bool,
     allow_full_walk: bool,
     pool: Option<&ThreadPool>,
+    dict: &QueryDict,
 ) -> Result<(CandidatePlan, MatchWork), ReadError> {
     // One dictionary pass widens every token of the leaf.
     let patterns: Vec<TermPattern<'_>> = tokens.iter().map(LikeToken::pattern).collect();
@@ -1180,6 +1200,7 @@ async fn expand_like(
             LIKE_MAX_TERMS,
             allow_full_walk,
             pool,
+            dict,
         )
         .await?;
     let parts = expansions
@@ -3364,11 +3385,14 @@ mod tests {
             let memos = TermMemos::new();
             for (what, plan, want) in &cases {
                 let (rows, _) = pool
-                    .install(|| plan.evaluate(reader, None, &memos).now_or_never())
+                    .install(|| {
+                        plan.evaluate(reader, None, &memos, &QueryDict::default())
+                            .now_or_never()
+                    })
                     .unwrap_or_else(|| panic!("{shape}, {what}: the match waited on the pool"))
                     .expect(what);
                 let (async_rows, _) = plan
-                    .evaluate(reader, Some(&pool), &memos)
+                    .evaluate(reader, Some(&pool), &memos, &QueryDict::default())
                     .await
                     .expect(what);
                 assert_eq!(row_list(rows.clone()), *want, "{shape}, {what}");
@@ -3395,6 +3419,7 @@ mod tests {
             &pool,
             &slots,
             TermMemos::new(),
+            Arc::default(),
         ));
         assert!(
             (&mut matched).now_or_never().is_none(),
@@ -3433,6 +3458,7 @@ mod tests {
             &pool,
             &slots,
             TermMemos::new(),
+            Arc::default(),
         );
         let (rows, _) = timeout(MUST_FINISH, matched)
             .await
@@ -3459,6 +3485,7 @@ mod tests {
             &pool,
             &no_slots,
             TermMemos::new(),
+            Arc::default(),
         );
         let (rows, _) = timeout(MUST_FINISH, matched)
             .await
@@ -3484,6 +3511,7 @@ mod tests {
             &pool,
             &no_slots,
             TermMemos::new(),
+            Arc::default(),
         );
         let (rows, _) = timeout(MUST_FINISH, matched)
             .await
@@ -3553,6 +3581,7 @@ mod tests {
                 &pool,
                 &slots,
                 TermMemos::new(),
+                Arc::default(),
             ),
         )
         .await
@@ -3590,6 +3619,7 @@ mod tests {
             &busy,
             &slots,
             TermMemos::new(),
+            Arc::default(),
         ));
         assert!((&mut queued).now_or_never().is_none());
         assert_eq!(slots.available_permits(), 0, "the queued match holds it");
@@ -3603,7 +3633,14 @@ mod tests {
         let free = one_thread_pool();
         timeout(
             MUST_FINISH,
-            rust.evaluate_on_pool(reader, Uuid::nil(), &free, &slots, TermMemos::new()),
+            rust.evaluate_on_pool(
+                reader,
+                Uuid::nil(),
+                &free,
+                &slots,
+                TermMemos::new(),
+                Arc::default(),
+            ),
         )
         .await
         .expect("finishes on a free pool")
@@ -3799,6 +3836,7 @@ mod tests {
                     &locations,
                     gate,
                     Some((&pool, &slots)),
+                    Arc::default(),
                 )
                 .await
                 .expect(what);

@@ -17,6 +17,7 @@ use super::{
     core::*,
     cursor::{CursorUse, TermCursor},
     metadata::ColumnMeta,
+    options::BoolMode,
     work::MatchWork,
 };
 use crate::{
@@ -30,7 +31,7 @@ use crate::{
             posting::BLOCK_LEN,
             tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER},
         },
-        id_space::{DocMap, FtsDocId},
+        id_space::{FtsDocId, row_bitmap},
     },
     utils::terms::{make_key, value::DictEntry},
 };
@@ -439,8 +440,8 @@ impl FtsReader {
     /// Under `fold` (`ILIKE`) terms are compared with `ſ` and `K` folded to `s`
     /// and `k`, and an exact or prefix token holding an `s` joins the shared
     /// walk (its `ſ` spelling sorts elsewhere). The term dictionary is fetched
-    /// once when any pattern needs it (one planned range, like a match's
-    /// build).
+    /// through `dict` when any pattern needs it, so a later step of the
+    /// same query reads the same bytes.
     ///
     /// The dictionary fetch is I/O and stays on the calling runtime; the walk
     /// itself is CPU — up to the column's whole vocabulary — and runs on
@@ -457,6 +458,7 @@ impl FtsReader {
         max_terms: usize,
         allow_full_walk: bool,
         pool: Option<&ThreadPool>,
+        dict: &QueryDict,
     ) -> Result<(Vec<Option<Vec<String>>>, MatchWork), FtsError> {
         self.resolve_column_id(column)?;
         let walks: Vec<Walk> = patterns.iter().map(|p| p.walk(fold)).collect();
@@ -465,8 +467,8 @@ impl FtsReader {
             .iter()
             .any(|w| *w == Walk::Subtree || (*w == Walk::Full && allow_full_walk));
         let collected = if needs_dict {
-            let dict_bytes = self.dict_bytes_async().await?;
-            work.planned_ranges += 1;
+            let (dict_bytes, fetched) = self.query_dict(dict).await?;
+            work.planned_ranges += u64::from(fetched);
             let column = column.to_owned();
             let owned: Vec<OwnedPattern> = patterns.iter().map(|p| p.into_owned()).collect();
             let walks = walks.clone();
@@ -624,7 +626,8 @@ impl FtsReader {
     /// are by definition the rows that have it as a token, and the caller
     /// (the table layer's `text_match`) asks for the tokens `standard` gives
     /// a value, so each term is looked up as `standard` wrote it. One result
-    /// per term, in order; a term the column never indexed has no rows.
+    /// per term, in order; a term the column never indexed has no rows. The
+    /// dictionary, for terms the memo lacks, is read through `dict`.
     ///
     /// Errors as [`Self::contains_rows`] does: `FtsError::UnknownColumn`
     /// when `column` is not FTS-indexed here, `FtsError::ExactNeedsStandard`
@@ -634,6 +637,7 @@ impl FtsReader {
         column: &str,
         terms: &[&str],
         prefetched: Option<&crate::superfile::fts::reader::FetchedTermMemo>,
+        dict: &QueryDict,
     ) -> Result<(Vec<ContainsRows>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         let analyzer = self.columns[column_id as usize].tokenizer.name();
@@ -647,14 +651,11 @@ impl FtsReader {
         let mut out = Vec::with_capacity(terms.len());
         for term in terms {
             let (rows, term_work) = self
-                .token_match_prefetched(column, &[term], crate::BoolMode::Or, prefetched)
+                .token_match_prefetched(column, &[term], BoolMode::Or, prefetched, dict)
                 .await?;
             work.merge(term_work);
             out.push(ContainsRows {
-                proven: rows
-                    .into_iter()
-                    .map(crate::superfile::id_space::RowId::get)
-                    .collect(),
+                proven: row_bitmap(&rows),
                 doubtful: RoaringBitmap::new(),
             });
         }
@@ -665,10 +666,11 @@ impl FtsReader {
     /// (df=1) values carry their document; the rest are fetched in waves
     /// of at most [`CONTAINS_FETCH_BATCH_BYTES`] on this runtime and ORed
     /// into one document bitset on `pool`, each wave's bytes released
-    /// before the next is fetched. The bitset becomes rows through the
-    /// blob's doc map last: a merged superfile numbers its documents in an
-    /// order of its own. The bitset, and each wave while it is held, are
-    /// charged to `budget`.
+    /// before the next is fetched. The documents become rows last: a merged superfile numbers
+    /// them in an order of its own. Through the doc map on `pool` when the file holds it or keeps
+    /// it within the heap budget, else in one pass over the map's pages
+    /// ([`Self::bitmap_rows_in_pages`]). A blob in row order needs neither. The bitset and each
+    /// postings wave are charged to `budget` while held.
     async fn union_rows(
         &self,
         col: &ColumnMeta,
@@ -754,16 +756,33 @@ impl FtsReader {
             work.kernel_cpu_ns += ns;
             bits = ored?;
         }
-        // Read here, after the postings: a superfile no value matched returned
-        // above and never reads it.
-        let doc_map = self.ensure_doc_map().await?.clone();
-        let (rows, ns) = run_on_pool(pool, "contains rows", move || {
-            timed_section(|| rows_of(bits, &inline, n_docs, &doc_map))
+        // Decided after the postings, so a superfile no value matched never reads the map.
+        let map = match self.has_doc_map() {
+            true => self.kept_doc_map_within_budget().await?.cloned(),
+            false => None,
+        };
+        let through_map = map.is_some() || !self.has_doc_map();
+        let (docs, ns) = run_on_pool(pool, "contains rows", move || {
+            timed_section(|| {
+                let docs = documents_of(bits, &inline, n_docs)?;
+                Ok::<_, FtsError>(match map {
+                    Some(map) => docs
+                        .iter()
+                        .map(|d| map.row_of(FtsDocId::new(d)).get())
+                        .collect(),
+                    None => docs,
+                })
+            })
         })
         .await
         .map_err(|_| FtsError::TaskDropped("contains rows"))?;
         work.kernel_cpu_ns += ns;
-        rows
+        let docs = docs?;
+        if through_map {
+            return Ok(docs);
+        }
+        // No map kept: the documents still name blob ids.
+        self.bitmap_rows_in_pages(&docs).await
     }
 }
 
@@ -774,13 +793,11 @@ fn posting_past_documents() -> FtsError {
     ))
 }
 
-/// The Parquet rows of the documents set in `bits` or listed in `inline`,
-/// through `doc_map`.
-fn rows_of(
+/// The documents set in `bits` or listed in `inline`.
+fn documents_of(
     mut bits: Vec<u64>,
     inline: &[u32],
     n_docs: u32,
-    doc_map: &DocMap,
 ) -> Result<RoaringBitmap, FtsError> {
     for &doc in inline {
         if doc >= n_docs {
@@ -788,7 +805,7 @@ fn rows_of(
         }
         bits[(doc / u64::BITS) as usize] |= 1u64 << (doc % u64::BITS);
     }
-    let mut rows = RoaringBitmap::new();
+    let mut docs = RoaringBitmap::new();
     for (index, &word) in bits.iter().enumerate() {
         let mut rest = word;
         while rest != 0 {
@@ -799,10 +816,10 @@ fn rows_of(
                 return Err(posting_past_documents());
             }
             rest &= rest - 1;
-            rows.insert(doc_map.row_of(FtsDocId::new(doc)).get());
+            docs.insert(doc);
         }
     }
-    Ok(rows)
+    Ok(docs)
 }
 
 /// Charge `admitted` values to `charge`, when the walk carries one. `false`,
@@ -948,8 +965,16 @@ mod tests {
         max_terms: usize,
     ) -> (Vec<Option<Vec<String>>>, MatchWork) {
         let rt = Runtime::new().expect("runtime");
-        rt.block_on(r.expand_terms("body", patterns, fold, max_terms, true, None))
-            .expect("expand_terms")
+        rt.block_on(r.expand_terms(
+            "body",
+            patterns,
+            fold,
+            max_terms,
+            true,
+            None,
+            &QueryDict::default(),
+        ))
+        .expect("expand_terms")
     }
 
     fn expand(r: &FtsReader, pattern: TermPattern<'_>, max_terms: usize) -> Option<Vec<String>> {
@@ -1048,6 +1073,7 @@ mod tests {
                 MAX_TERMS,
                 false,
                 None,
+                &QueryDict::default(),
             ))
             .expect("expand_terms");
         assert_eq!(out, vec![None, None, owned(&["java"]), owned(&["rust"])]);
@@ -1061,6 +1087,7 @@ mod tests {
                 MAX_TERMS,
                 false,
                 None,
+                &QueryDict::default(),
             ))
             .expect("expand_terms");
         assert_eq!(out, vec![None]);
@@ -1588,6 +1615,7 @@ mod tests {
                 MAX_TERMS,
                 true,
                 None,
+                &QueryDict::default(),
             ))
             .expect_err("unknown column");
         assert!(matches!(err, FtsError::UnknownColumn(_)));

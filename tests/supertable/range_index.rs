@@ -29,6 +29,7 @@ use datafusion::{
 };
 use infino::{
     ColumnIndex, Connection, FieldPatch, IndexSpec, OptimizeOptions, SchemaPatch, connect,
+    runtime_metrics::op_stats::with_op_stats,
 };
 use tempfile::TempDir;
 
@@ -51,6 +52,9 @@ const FIRST_DAY: i32 = 19_000;
 const DAYS: i64 = 365;
 /// Rows the delete removes: those with `seq` below this.
 const DELETED_BELOW: i64 = 500;
+/// Rows of the second superfile a later delete removes: more than half, so
+/// their statistics are not read and that superfile is left to the scan.
+const MOST_OF_A_FILE: i64 = 2000;
 /// The physical operator a scan's rows pass through when a filter is
 /// checked on them; a count the range index answers has none.
 const FILTER_OPERATOR: &str = "FilterExec";
@@ -86,12 +90,27 @@ const QUERIES: &[&str] = &[
     BUCKETED_DAY,
     BUCKETED_WITH_TOTAL,
     "SELECT count(*) FILTER (WHERE price < 250) AS a, count(*) FILTER (WHERE price >= 250 AND price < 750.5) AS b, count(*) FILTER (WHERE price >= 750.5) AS c FROM {t}",
+    // A histogram: buckets sharing their bounds, counted in one pass.
+    "SELECT count(*) FILTER (WHERE qty >= -250 AND qty < -200) AS q0, count(*) FILTER (WHERE qty >= -200 AND qty < -150) AS q1, count(*) FILTER (WHERE qty >= -150 AND qty < -100) AS q2, count(*) FILTER (WHERE qty >= -100 AND qty < -50) AS q3, count(*) FILTER (WHERE qty >= -50 AND qty < 0) AS q4, count(*) FILTER (WHERE qty >= 0 AND qty < 50) AS q5, count(*) FILTER (WHERE qty >= 50 AND qty < 100) AS q6, count(*) FILTER (WHERE qty >= 100 AND qty < 150) AS q7, count(*) FILTER (WHERE qty >= 150 AND qty < 200) AS q8, count(*) FILTER (WHERE qty >= 200 AND qty < 250) AS q9 FROM {t}",
+    "SELECT count(*) FILTER (WHERE day >= DATE '2022-06-01' AND day < DATE '2022-06-02') AS d1, count(*) FILTER (WHERE day >= DATE '2022-06-02' AND day < DATE '2022-06-03') AS d2, count(*) FILTER (WHERE day >= DATE '2022-06-03' AND day < DATE '2022-06-04') AS d3, count(*) FILTER (WHERE day >= DATE '2022-06-04' AND day < DATE '2022-06-05') AS d4, count(*) FILTER (WHERE day >= DATE '2022-06-05' AND day < DATE '2022-06-06') AS d5 FROM {t}",
     "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE price > 500) AS b FROM {t} WHERE seq < 6000",
     "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE qty > 100 OR qty < -100) AS b FROM {t}",
     TIE_BROKEN_TOP_K,
+    ONE_FILTERED_COUNT,
+    "SELECT count(*) FILTER (WHERE seq % 7 = 0) AS n FROM {t} WHERE qty > 0",
+    "SELECT count(*) FILTER (WHERE qty > 100) AS n FROM {t} WHERE seq % 7 = 0",
     "SELECT seq, qty FROM {t} WHERE qty < -200 ORDER BY qty DESC, seq DESC LIMIT 7",
     "SELECT seq, price AS price FROM {t} WHERE price > 900 ORDER BY price ASC NULLS LAST, seq ASC NULLS LAST LIMIT 10",
     "SELECT seq, qty FROM {t} WHERE qty BETWEEN 240 AND 249 ORDER BY qty DESC, seq LIMIT 30",
+    // Counts of a column's present rows reach the aggregate rewrite: the
+    // statistics answer them, the range index when those can't.
+    "SELECT count(*) AS n FROM {t} WHERE qty IS NOT NULL",
+    "SELECT count(*) AS n FROM {t} WHERE price IS NOT NULL",
+    "SELECT count(*) AS n FROM {t} WHERE qty IS NOT NULL AND qty > 100",
+    "SELECT count(*) AS n FROM {t} WHERE qty IS NOT NULL AND qty >= -100 AND qty < 100",
+    QTY_PRESENT_AGGREGATES,
+    "SELECT seq, qty FROM {t} WHERE qty IS NOT NULL ORDER BY qty DESC NULLS LAST, seq LIMIT 7",
+    "SELECT seq, qty FROM {t} WHERE qty IS NOT NULL ORDER BY qty ASC NULLS FIRST, seq LIMIT 7",
 ];
 
 /// A top-k whose sort column ties on many rows (`qty` repeats every 500
@@ -116,9 +135,37 @@ const BUCKETED_DAY: &str = "SELECT count(*) FILTER (WHERE day < DATE '2022-04-01
 /// Buckets beside the whole table's count, under a `WHERE` that holds every
 /// row: a search request's range aggregation and its hit total together.
 const BUCKETED_WITH_TOTAL: &str = "SELECT count(*) AS total, count(*) FILTER (WHERE price < 250) AS a, count(*) FILTER (WHERE price >= 250 AND price < 500) AS b, count(*) FILTER (WHERE price >= 500) AS c FROM {t} WHERE 1=1";
+/// How a physical plan shows a count that checks no filter of its own (the
+/// output keeps the name the filtered count gave it).
+const UNFILTERED_COUNT: &str = "aggr=[count(1) as ";
+/// One count with a filter on no range-indexed column: a search's hit total.
+const ONE_FILTERED_COUNT: &str = "SELECT count(*) FILTER (WHERE seq % 7 = 0) AS n FROM {t}";
+/// The `qty` a lone filtered count over the nullable column compares
+/// against: a range the index answers.
+const NULLABLE_QTY_BOUND: i32 = 100;
+/// The divisor of a lone filtered count's predicate over the nullable
+/// column that no index answers, so its plan shows the rewrite.
+const NULLABLE_QTY_DIVISOR: i32 = 7;
+/// A `WHERE` no row passes (`seq` is never negative): a count over empty
+/// input.
+const NO_ROWS: &str = "WHERE seq < 0";
 /// How a plan shows an aggregate that checks its own filter on each row; a
 /// bucketed count the range index answers has none.
 const BUCKET_FILTER: &str = "FILTER (WHERE";
+/// Where a logical plan reads the table; a count the statistics answer has
+/// none.
+const LOGICAL_SCAN: &str = "TableScan";
+/// How a logical plan shows a count from the range index: a scan that reads
+/// no column and holds the whole filter.
+const INDEX_COUNT: &str = "projection=[], full_filters=";
+/// A count of the rows a nullable column holds a value in.
+const QTY_PRESENT: &str = "SELECT count(*) FROM {t} WHERE qty IS NOT NULL";
+/// The same beside a range on the column, which already leaves out nulls.
+const QTY_PRESENT_IN_RANGE: &str = "SELECT count(*) FROM {t} WHERE qty IS NOT NULL AND qty > 100";
+/// Aggregates the `IS NOT NULL` changes none of: each skips nulls. (A `SUM`
+/// of the `Int32` column reads as a sum of its cast, which no statistic
+/// answers, filtered or not.)
+const QTY_PRESENT_AGGREGATES: &str = "SELECT count(*) AS n, min(qty) AS lo, max(qty) AS hi, avg(qty) AS a FROM {t} WHERE qty IS NOT NULL";
 
 /// The shapes both tables answer once `qty` is renamed `amount` and a new
 /// `qty` is added: the range index follows `amount`, and the new `qty`
@@ -156,15 +203,21 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
+/// A predicate over `qty` in SQL, beside whether it holds for a row's `qty`.
+type QtyPredicate = (String, fn(Option<i32>) -> bool);
+
+/// Row `seq`'s `qty`: spread over `-250..250`, null every
+/// [`QTY_NULL_EVERY`] rows.
+fn qty_of(seq: i64) -> Option<i32> {
+    (seq % QTY_NULL_EVERY != 0).then(|| ((seq * 37) % 500 - 250) as i32)
+}
+
 /// Rows `first..first + ROWS_PER_FILE`: `qty` spread over `-250..250` with
 /// nulls, `price` over `0..1000`, `day` over a year — none of them in the
 /// order the rows arrive.
 fn rows(first: i64) -> RecordBatch {
     let seq: Vec<i64> = (first..first + ROWS_PER_FILE).collect();
-    let qty: Vec<Option<i32>> = seq
-        .iter()
-        .map(|i| (i % QTY_NULL_EVERY != 0).then(|| ((i * 37) % 500 - 250) as i32))
-        .collect();
+    let qty: Vec<Option<i32>> = seq.iter().map(|i| qty_of(*i)).collect();
     let price: Vec<f64> = seq
         .iter()
         .map(|i| ((i * 7919) % 10_000) as f64 / 10.0)
@@ -216,6 +269,25 @@ fn answer(db: &Connection, query: &str, table: &str) -> String {
     pretty_format_batches(&batches).expect("format").to_string()
 }
 
+/// The counts `query` on `table` returns, one per row it keeps.
+fn counts(db: &Connection, query: &str, table: &str) -> Vec<i64> {
+    let batches = db
+        .query_sql(&query.replace("{t}", table))
+        .unwrap_or_else(|e| panic!("{query} on {table}: {e}"));
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("an Int64 count")
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
 /// The rows the scan of an analyzed plan read (its `output_rows`, which
 /// DataFusion prints as `24` or `1.00 K`).
 fn scan_rows(plan: &str) -> f64 {
@@ -229,6 +301,18 @@ fn scan_rows(plan: &str) -> f64 {
         _ => (count, 1.0),
     };
     number.parse::<f64>().expect("a row count") * scale
+}
+
+/// Rows `count_where` reads counting `qty`'s and `price`'s present rows on
+/// `table`: none when the statistics or the range index count them.
+fn present_count_rows_read(db: &Connection, table: &str) -> u64 {
+    let (counts, stats) = with_op_stats(|| {
+        db.open_table(table)
+            .expect("open")
+            .count_where(&[col("qty").is_not_null(), col("price").is_not_null()])
+    });
+    counts.unwrap_or_else(|e| panic!("count_where on {table}: {e}"));
+    stats.rows_materialized
 }
 
 /// Every one of `queries`' answers from both tables, the same.
@@ -299,6 +383,50 @@ fn assert_same_counts(db: &Connection, when: &str) {
         assert_eq!(counts, expected, "{when}: count_where on {table}");
     }
 
+    // Only shapes the range index counts, so the counts come from it: a
+    // column's present rows (`qty` is null every few rows, `price` never),
+    // alone and beside a range on the same column.
+    let indexed = [
+        (col("qty").is_not_null(), "qty IS NOT NULL"),
+        (
+            col("qty").is_not_null().and(col("qty").gt(lit(100))),
+            "qty IS NOT NULL AND qty > 100",
+        ),
+        (col("price").is_not_null(), "price IS NOT NULL"),
+        (col("seq").lt(lit(1000i64)), "seq < 1000"),
+    ];
+    let exprs: Vec<_> = indexed.iter().map(|(expr, _)| expr.clone()).collect();
+    let sql = format!(
+        "SELECT {} FROM plain",
+        indexed
+            .iter()
+            .map(|(_, sql)| format!("count(*) FILTER (WHERE {sql})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let batches = db.query_sql(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let expected: Vec<u64> = (0..indexed.len())
+        .map(|i| {
+            let counts = batches[0]
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("an Int64 count");
+            u64::try_from(counts.value(0)).expect("a count")
+        })
+        .collect();
+    for table in ["ranged", "plain"] {
+        let counts = db
+            .open_table(table)
+            .expect("open")
+            .count_where(&exprs)
+            .unwrap_or_else(|e| panic!("{when}: count_where of present rows on {table}: {e}"));
+        assert_eq!(
+            counts, expected,
+            "{when}: count_where of present rows on {table}"
+        );
+    }
+
     // A predicate that reads another relation, which no FILTER clause can
     // hold, beside one the index counts.
     // A subquery's plan ends in the projection of its one column, as SQL
@@ -353,9 +481,13 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
     assert_same_answers(&db, QUERIES, "after load");
 
     // A count over a range-indexed column reads no row to check the range,
-    // on an integer and on a float column alike.
+    // on an integer and on a float column alike. The integer is `seq`, whose
+    // file holds a distinct value per row: `qty`'s 500 values fit the exact
+    // value table, so the plain table counts a range of them from its
+    // statistics too, and only a column past that table shows the scan the
+    // index saves.
     for query in [
-        "EXPLAIN SELECT count(*) FROM {t} WHERE qty >= -10 AND qty < 10",
+        "EXPLAIN SELECT count(*) FROM {t} WHERE seq >= 100 AND seq < 2000",
         "EXPLAIN SELECT count(*) FROM {t} WHERE price > 990.5",
     ] {
         assert!(
@@ -367,6 +499,26 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
             "{query}"
         );
     }
+    // A count of a column's present rows is that column's count, answered
+    // from each superfile's null count on either table: with no delete yet,
+    // no row is read at all. Beside a range on the column, the `IS NOT NULL`
+    // narrows nothing, and the range is counted without checking a row.
+    for table in ["plain", "ranged"] {
+        for query in [QTY_PRESENT, QTY_PRESENT_AGGREGATES] {
+            let plan = answer(&db, &format!("EXPLAIN {query}"), table);
+            assert!(
+                !plan.contains(FILTER_OPERATOR) && !plan.contains(LOGICAL_SCAN),
+                "{table}: {plan}"
+            );
+        }
+        assert_eq!(
+            present_count_rows_read(&db, table),
+            0,
+            "after load: {table}"
+        );
+    }
+    let plan = answer(&db, &format!("EXPLAIN {QTY_PRESENT_IN_RANGE}"), "ranged");
+    assert!(!plan.contains(FILTER_OPERATOR), "{plan}");
     // Nor does a bucketed one check any bucket's range on a row.
     for bucketed in [BUCKETED_QTY, BUCKETED_DAY, BUCKETED_WITH_TOTAL] {
         let query = format!("EXPLAIN {bucketed}");
@@ -379,6 +531,29 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
             !ranged.contains(BUCKET_FILTER) && !ranged.contains(FILTER_OPERATOR),
             "{query}: {ranged}"
         );
+    }
+    // A lone filtered count is a count over a filter the scan takes, on
+    // either table: the aggregate checks no filter of its own on each row.
+    // It counts what the same filter in the `WHERE` counts.
+    for table in ["plain", "ranged"] {
+        let plan = answer(&db, &format!("EXPLAIN {ONE_FILTERED_COUNT}"), table);
+        assert!(plan.contains(UNFILTERED_COUNT), "{table}: {plan}");
+        for (filtered, plain) in [
+            (
+                ONE_FILTERED_COUNT,
+                "SELECT count(*) AS n FROM {t} WHERE seq % 7 = 0",
+            ),
+            (
+                "SELECT count(*) FILTER (WHERE seq % 7 = 0) AS n FROM {t} WHERE qty > 0",
+                "SELECT count(*) AS n FROM {t} WHERE qty > 0 AND seq % 7 = 0",
+            ),
+        ] {
+            assert_eq!(
+                answer(&db, filtered, table),
+                answer(&db, plain, table),
+                "{table}: {filtered}"
+            );
+        }
     }
     // A top-k broken by a later key reads the rows up to the cutoff from the
     // range index, ties included, not every row of the range.
@@ -401,6 +576,46 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
             .expect("delete");
     }
     assert_same_answers(&db, QUERIES, "after a delete");
+    // The deleted rows' statistics correct the null counts: still no scan.
+    for table in ["plain", "ranged"] {
+        let plan = answer(&db, &format!("EXPLAIN {QTY_PRESENT}"), table);
+        assert!(!plan.contains(LOGICAL_SCAN), "{table}: {plan}");
+        assert_eq!(
+            present_count_rows_read(&db, table),
+            0,
+            "after a delete: {table}"
+        );
+    }
+
+    // Past half a superfile, its deleted rows' statistics are not read: the
+    // range index counts that superfile's present rows, the statistics the
+    // rest, and the plain table scans it.
+    for table in ["plain", "ranged"] {
+        db.open_table(table)
+            .expect("open")
+            .delete(
+                col("seq")
+                    .gt_eq(lit(ROWS_PER_FILE))
+                    .and(col("seq").lt(lit(ROWS_PER_FILE + MOST_OF_A_FILE))),
+            )
+            .expect("delete");
+    }
+    for query in [QTY_PRESENT, QTY_PRESENT_AGGREGATES] {
+        assert_eq!(
+            answer(&db, query, "ranged"),
+            answer(&db, query, "plain"),
+            "{query}"
+        );
+    }
+    let plan = answer(&db, &format!("EXPLAIN {QTY_PRESENT}"), "ranged");
+    assert!(
+        plan.contains(INDEX_COUNT) && !plan.contains(FILTER_OPERATOR),
+        "{plan}"
+    );
+    assert_eq!(present_count_rows_read(&db, "ranged"), 0, "ranged");
+    // The plain table has no index to count from: the count scans, and the
+    // op stats see it.
+    assert!(present_count_rows_read(&db, "plain") > 0, "plain");
 
     for table in ["plain", "ranged"] {
         db.open_table(table)
@@ -413,6 +628,59 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
     drop(db);
     let reopened = connect(path).expect("reconnect");
     assert_same_answers(&reopened, QUERIES, "after a reopen");
+}
+
+/// A lone filtered count over a nullable column, under a `HAVING` over the
+/// count, counts the rows its predicate holds for — a null `qty` in none of
+/// them, unless the predicate asks for nulls — whether the count is a range
+/// the index answers or a filter the scan checks, and over empty input
+/// counts zero: the `HAVING` keeps the one row at its count and drops it
+/// above.
+#[test]
+fn a_lone_filtered_count_over_a_nullable_column_under_a_having_counts_the_rows_it_holds_for() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    create(&db);
+    let predicates: [QtyPredicate; 4] = [
+        (format!("qty > {NULLABLE_QTY_BOUND}"), |qty| {
+            qty.is_some_and(|value| value > NULLABLE_QTY_BOUND)
+        }),
+        (format!("NOT (qty > {NULLABLE_QTY_BOUND})"), |qty| {
+            qty.is_some_and(|value| value <= NULLABLE_QTY_BOUND)
+        }),
+        (format!("qty % {NULLABLE_QTY_DIVISOR} = 0"), |qty| {
+            qty.is_some_and(|value| value % NULLABLE_QTY_DIVISOR == 0)
+        }),
+        ("qty IS NULL".to_string(), |qty| qty.is_none()),
+    ];
+    for (predicate, holds) in &predicates {
+        let held = (0..FILES * ROWS_PER_FILE)
+            .filter(|seq| holds(qty_of(*seq)))
+            .count();
+        let held = i64::try_from(held).expect("a count");
+        assert!(held > 0, "{predicate} holds for no row");
+        let count = format!("count(*) FILTER (WHERE {predicate})");
+        for table in ["plain", "ranged"] {
+            for (input, expected) in [("", held), (NO_ROWS, 0)] {
+                let select = format!("SELECT {count} AS n FROM {{t}} {input}");
+                let kept = format!("{select} HAVING {count} >= {expected}");
+                assert_eq!(counts(&db, &kept, table), [expected], "{table}: {kept}");
+                let dropped = format!("{select} HAVING {count} > {expected}");
+                assert!(
+                    counts(&db, &dropped, table).is_empty(),
+                    "{table}: {dropped}"
+                );
+            }
+        }
+    }
+    // The `HAVING` leaves the count for the rewrite: under it, a predicate
+    // no index answers is a filter the scan takes, not the aggregate's own.
+    let count = format!("count(*) FILTER (WHERE qty % {NULLABLE_QTY_DIVISOR} = 0)");
+    let query = format!("EXPLAIN SELECT {count} AS n FROM {{t}} HAVING {count} > 0");
+    for table in ["plain", "ranged"] {
+        let plan = answer(&db, &query, table);
+        assert!(plan.contains(UNFILTERED_COUNT), "{table}: {plan}");
+    }
 }
 
 #[test]
@@ -732,4 +1000,131 @@ fn a_range_beside_an_exact_text_filter_answers_as_a_scan_does() {
     );
     let physical = &plan[plan.find("physical_plan").expect("a physical plan")..];
     assert!(!physical.contains(FILTER_OPERATOR), "{physical}");
+}
+
+/// Present values in the edge-case table's columns: `f` holds a value in 9
+/// rows (NaN, -NaN and the infinities are values), `late` in 2 (it was added
+/// after the first append, so earlier rows hold none), `e` in none.
+const F_PRESENT: i64 = 9;
+const LATE_PRESENT: i64 = 2;
+const E_PRESENT: i64 = 0;
+/// Rows in the edge-case table.
+const EDGE_ROWS: i64 = 12;
+
+/// `COUNT(*) WHERE column IS NOT NULL`, in SQL and through `count_where`,
+/// counts the rows holding a value: NaN and the infinities count, a column
+/// added later counts none in the rows written before it, a column of nulls
+/// counts none, and an empty table counts zero. With and without a range
+/// index on the column.
+#[test]
+fn a_count_of_present_rows_counts_values_not_nulls() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("seq", DataType::Int64, false),
+        Field::new("f", DataType::Float64, true),
+        Field::new("e", DataType::Int64, true),
+    ]));
+    let first = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from((0..8).collect::<Vec<i64>>())),
+            Arc::new(Float64Array::from(vec![
+                Some(1.0),
+                Some(f64::NAN),
+                Some(-f64::NAN),
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+                None,
+                Some(2.0),
+                None,
+            ])),
+            Arc::new(Int64Array::from(vec![None::<i64>; 8])),
+        ],
+    )
+    .expect("first batch");
+    let second_schema = Arc::new(Schema::new(vec![
+        Field::new("seq", DataType::Int64, false),
+        Field::new("f", DataType::Float64, true),
+        Field::new("e", DataType::Int64, true),
+        Field::new("late", DataType::Int64, true),
+    ]));
+    let second = RecordBatch::try_new(
+        second_schema,
+        vec![
+            Arc::new(Int64Array::from((8..12).collect::<Vec<i64>>())),
+            Arc::new(Float64Array::from(vec![
+                Some(3.0),
+                None,
+                Some(f64::NAN),
+                Some(4.0),
+            ])),
+            Arc::new(Int64Array::from(vec![None::<i64>; 4])),
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3), None])),
+        ],
+    )
+    .expect("second batch");
+    let tables = [
+        ("edges", IndexSpec::new(), false),
+        (
+            "edges_ranged",
+            IndexSpec::new().range("f").range("e"),
+            false,
+        ),
+        ("edges_empty", IndexSpec::new(), true),
+    ];
+    for (table, spec, empty) in tables.clone() {
+        db.create_table(table, Arc::clone(&schema), spec)
+            .expect("create");
+        let mut late = FieldPatch::named("late").with_type(DataType::Int64);
+        if table == "edges_ranged" {
+            late = late.with_index(ColumnIndex::Range);
+        }
+        if !empty {
+            db.open_table(table)
+                .expect("open")
+                .append(&first, None)
+                .expect("append");
+        }
+        db.apply_schema(table, &SchemaPatch::new(vec![late]), None)
+            .expect("add late");
+        if !empty {
+            db.open_table(table)
+                .expect("open")
+                .append(&second, None)
+                .expect("append");
+        }
+    }
+    for (table, _, empty) in tables {
+        let expected = |n: i64| if empty { 0 } else { n };
+        for (column, present) in [("f", F_PRESENT), ("late", LATE_PRESENT), ("e", E_PRESENT)] {
+            let query = format!("SELECT count(*) AS n FROM {{t}} WHERE {column} IS NOT NULL");
+            assert_eq!(
+                counts(&db, &query, table),
+                [expected(present)],
+                "{table}.{column}"
+            );
+        }
+        let counted = db
+            .open_table(table)
+            .expect("open")
+            .count_where(&[
+                lit(true),
+                col("f").is_not_null(),
+                col("late").is_not_null(),
+                col("e").is_not_null(),
+            ])
+            .expect("count_where");
+        let as_u64 = |n: i64| u64::try_from(expected(n)).expect("a count");
+        assert_eq!(
+            counted,
+            [
+                as_u64(EDGE_ROWS),
+                as_u64(F_PRESENT),
+                as_u64(LATE_PRESENT),
+                as_u64(E_PRESENT)
+            ],
+            "{table}: count_where"
+        );
+    }
 }

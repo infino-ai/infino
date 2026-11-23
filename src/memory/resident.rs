@@ -29,7 +29,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread::{self, Thread},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use datafusion::error::DataFusionError;
@@ -196,6 +196,34 @@ fn start_sampler() -> Option<Sampler> {
     }
 }
 
+/// The last reading [`recent_anon_rss_bytes`] took, and when.
+static RECENT: Mutex<Option<(Instant, Option<u64>)>> = Mutex::new(None);
+
+/// The process's anonymous resident bytes, read again only once the last reading is
+/// [`SAMPLE_EVERY`] old: for callers that ask far more often than memory moves, as a full-text
+/// query does once per file it opens. Reads even while no statement watches the sampler.
+pub(crate) fn recent_anon_rss_bytes() -> Option<u64> {
+    reading_within(&RECENT, Instant::now(), status_anon_rss_bytes)
+}
+
+/// The reading in `last` while it is younger than [`SAMPLE_EVERY`] at `now`, else a new one from
+/// `read`, kept in `last`.
+fn reading_within(
+    last: &Mutex<Option<(Instant, Option<u64>)>>,
+    now: Instant,
+    read: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((taken, bytes)) = *last
+        && now.saturating_duration_since(taken) < SAMPLE_EVERY
+    {
+        return bytes;
+    }
+    let bytes = read();
+    *last = Some((now, bytes));
+    bytes
+}
+
 /// The process's anonymous resident bytes, if they are over `limit` now: one
 /// read, no sampler. `None` when they are not, or cannot be read.
 pub(crate) fn process_over_limit(limit: u64) -> Option<u64> {
@@ -235,7 +263,10 @@ pub(crate) fn over_process_limit(anon: u64, limit: u64) -> DataFusionError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Barrier, atomic::AtomicUsize};
+    use std::{
+        cell::Cell,
+        sync::{Barrier, atomic::AtomicUsize},
+    };
 
     use tokio::{runtime::Runtime, time::timeout};
 
@@ -255,6 +286,11 @@ mod tests {
     const WORKER_HIGH: u64 = 7_516_192_768;
     /// A limit that is not a whole number of hundreds, so the remainder counts.
     const NOT_WHOLE_HUNDREDS: u64 = 199;
+    /// Anonymous memory the first and a later reading report.
+    const FIRST_ANON: u64 = 1 << 30;
+    const LATER_ANON: u64 = 2 << 30;
+    /// Less than a sample's interval, to ask just before a reading is old.
+    const JUST_UNDER: Duration = Duration::from_millis(1);
 
     /// The share computed in 128 bits, where nothing can overflow: the
     /// reference the 64-bit split is checked against.
@@ -333,6 +369,46 @@ mod tests {
         let waited =
             runtime.block_on(async { timeout(SETTLE, process_limit_exceeded(u64::MAX)).await });
         assert!(waited.is_err(), "no reading passes u64::MAX: {waited:?}");
+    }
+
+    #[test]
+    fn a_memory_reading_answers_until_it_is_a_sample_old() {
+        // One reading, asked again just before and at one interval, then past two.
+        //  - Within the interval the first reading answers and nothing is read.
+        //  - At the interval a new reading is taken; one that cannot be read answers as none.
+        // This test pins that a recent reading reads `/proc` at most once per interval.
+        let last = Mutex::new(None);
+        let start = Instant::now();
+        let reads = Cell::new(0);
+        let read = |bytes: Option<u64>| {
+            reads.set(reads.get() + 1);
+            bytes
+        };
+        let asks = [
+            (start, Some(FIRST_ANON), Some(FIRST_ANON), 1),
+            (
+                start + SAMPLE_EVERY - JUST_UNDER,
+                Some(LATER_ANON),
+                Some(FIRST_ANON),
+                1,
+            ),
+            (start + SAMPLE_EVERY, Some(LATER_ANON), Some(LATER_ANON), 2),
+            (start + SAMPLE_EVERY * 2, None, None, 3),
+            (
+                start + SAMPLE_EVERY * 2 + JUST_UNDER,
+                Some(LATER_ANON),
+                None,
+                3,
+            ),
+        ];
+        for (i, (now, reading, want, read_count)) in asks.into_iter().enumerate() {
+            assert_eq!(
+                reading_within(&last, now, || read(reading)),
+                want,
+                "ask {i}"
+            );
+            assert_eq!(reads.get(), read_count, "reads by ask {i}");
+        }
     }
 
     #[test]

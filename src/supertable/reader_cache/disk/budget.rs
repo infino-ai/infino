@@ -1156,12 +1156,16 @@ mod tests {
             cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
             cfg.mmap_cold_threshold_secs = 0;
             cfg.promotion_defer_timeout = Duration::MAX;
+            cfg.prefetch_concurrency = 1;
         });
         let warm = SuperfileUri::new_v4();
         let stream = SuperfileUri::new_v4();
         for uri in [&warm, &stream] {
             put_superfile(&store, uri, tiny_superfile_bytes()).await;
         }
+        // Hold the only download slot until the sweep: a download past its slot keeps its file's
+        // entry, and on a slow run the Warm open's download gets there before the sweep.
+        let slot = hold_fill_slot(&store).await;
         store.reader(&warm).await.expect("warm lazy open");
         store
             .open_for_query(
@@ -1192,6 +1196,7 @@ mod tests {
             "nothing is charged once both entries are gone"
         );
 
+        drop(slot);
         store
             .wait_until_fills_settled(PROMOTE_TIMEOUT)
             .await

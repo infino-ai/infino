@@ -19,7 +19,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, hash_map::Entry},
     hash::{Hash, Hasher},
-    slice,
+    mem, slice,
     sync::Arc,
 };
 
@@ -123,10 +123,11 @@ const FORMAT_MAJOR_INLINE: &str = "2";
 /// at this major key their aggregates by column name, which
 /// [`decode`] resolves through the table's [`LegacyNames`].
 const FORMAT_MAJOR_NAMED: &str = "1";
-/// Maximum distinct values retained as an exact per-column frequency table.
-/// Columns crossing the cap carry no table, so high-cardinality data has
-/// bounded manifest cost.
-pub(crate) const MAX_EXACT_VALUE_COUNTS: usize = 256;
+/// A first guess at a column's distinct values when counting them, so the
+/// count of a column with a few hundred never grows its map. An allocation
+/// hint only: what a superfile keeps is decided by bytes
+/// ([`VALUE_TABLES_BUDGET_BYTES`]).
+const COUNT_MAP_INITIAL_CAPACITY: usize = 1024;
 
 /// Cells probed per query — exactly one, the grid-nearest. The p=1 read
 /// shape is the design point (one cell fetch, ~fine_nprobe × 2 MiB runs).
@@ -806,15 +807,83 @@ pub struct ScalarStatsAgg {
     /// Merged HLL distinct sketch (raw registers); `None` when any
     /// segment lacks one.
     pub hll: Option<Vec<u8>>,
-    /// Exact non-null value frequencies when the column has at most
-    /// [`MAX_EXACT_VALUE_COUNTS`] distinct values.
+    /// Exact non-null value frequencies, when the column's table fits a
+    /// superfile's budget ([`VALUE_TABLES_BUDGET_BYTES`]).
     pub(crate) value_counts: Option<ScalarValueCounts>,
+}
+
+/// The order a value table's entries and an `=` or `IN`'s literals are sorted in. Values of one
+/// counted type always compare; `Equal` for two that don't keeps a sort from panicking.
+pub(crate) fn value_order(left: &ScalarValue, right: &ScalarValue) -> Ordering {
+    left.partial_cmp(right).unwrap_or(Ordering::Equal)
+}
+
+/// The rows a value table holds for asked values, the table's `entries` and the `asked` values each
+/// distinct and sorted in one order: `order(entry, value)` compares an entry with an asked value by
+/// index, and `rows(entry)` is the entry's count. `None` when the sum passes u64.
+pub(crate) fn held_rows(
+    entries: usize,
+    asked: usize,
+    order: impl Fn(usize, usize) -> Ordering,
+    rows: impl Fn(usize) -> u64,
+) -> Option<u64> {
+    let (short, long) = (asked.min(entries), asked.max(entries));
+    if short == 0 {
+        return Some(0);
+    }
+    let mut held: u64 = 0;
+    // Both sides are sorted. Searching the longer side for each value of the shorter costs about
+    // `short * log2(long)` comparisons, walking the two side by side `short + long`: the cheaper
+    // is taken.
+    if short * long.ilog2() as usize >= short + long {
+        let (mut entry, mut value) = (0, 0);
+        while entry < entries && value < asked {
+            match order(entry, value) {
+                Ordering::Less => entry += 1,
+                Ordering::Greater => value += 1,
+                Ordering::Equal => {
+                    held = held.checked_add(rows(entry))?;
+                    entry += 1;
+                    value += 1;
+                }
+            }
+        }
+    } else if asked <= entries {
+        for value in 0..asked {
+            if let Some(entry) = sorted_position(entries, |entry| order(entry, value)) {
+                held = held.checked_add(rows(entry))?;
+            }
+        }
+    } else {
+        for entry in 0..entries {
+            if sorted_position(asked, |value| order(entry, value).reverse()).is_some() {
+                held = held.checked_add(rows(entry))?;
+            }
+        }
+    }
+    Some(held)
+}
+
+/// The index in `0..len` of the item looked for, the items sorted: `order(at)` compares the item at
+/// `at` with the one looked for.
+fn sorted_position(len: usize, order: impl Fn(usize) -> Ordering) -> Option<usize> {
+    let (mut low, mut high) = (0, len);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match order(middle) {
+            Ordering::Less => low = middle + 1,
+            Ordering::Greater => high = middle,
+            Ordering::Equal => return Some(middle),
+        }
+    }
+    None
 }
 
 /// A column's exact value table. The entries are shared: a table is never
 /// changed once built, and a superfile's stats are copied whole as an entry
 /// moves into a part and its summaries, so a copy of a table is a count, not
-/// the up to [`MAX_EXACT_VALUE_COUNTS`] values it holds.
+/// the values it holds. Its entries are distinct, sorted by value, of one counted type and
+/// comparable pairwise, with no null value or zero count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScalarValueCounts {
     entries: Arc<[(ScalarValue, u64)]>,
@@ -822,20 +891,24 @@ pub(crate) struct ScalarValueCounts {
 
 impl ScalarValueCounts {
     /// Exact non-null value counts for one column, split into `pieces`. `None`
-    /// when the type has no counts or the column holds more than
-    /// [`MAX_EXACT_VALUE_COUNTS`] distinct values.
-    fn from_pieces(pieces: &[ArrayRef]) -> Option<Self> {
-        counter(pieces.first()?.data_type())?(pieces)
+    /// when the type has no counts or the table would take more than `limit`
+    /// bytes stored, at most [`VALUE_TABLES_BUDGET_BYTES`], more than a
+    /// superfile keeps.
+    fn from_pieces(pieces: &[ArrayRef], limit: usize) -> Option<Self> {
+        counter(pieces.first()?.data_type())?(pieces, limit)
     }
 
     /// [`ScalarValueCounts::count`] for a primitive column of type `T`.
-    fn primitive<T: ArrowPrimitiveType>(pieces: &[ArrayRef]) -> Option<Self>
+    fn primitive<T: ArrowPrimitiveType>(pieces: &[ArrayRef], limit: usize) -> Option<Self>
     where
         T::Native: Hash + Eq,
     {
-        Self::count(pieces, |piece| {
-            Some(non_null(piece.as_primitive_opt::<T>()?.iter()))
-        })
+        Self::count(
+            pieces,
+            |piece| Some(non_null(piece.as_primitive_opt::<T>()?.iter())),
+            |_| size_of::<T::Native>(),
+            limit,
+        )
     }
 
     /// Counts each piece's `(row, value)` pairs by value, then turns each
@@ -843,27 +916,38 @@ impl ScalarValueCounts {
     ///
     /// Counting on the plain value matters: a `ScalarValue` per row, hashed
     /// into a map, cost more than every other column stat put together.
+    ///
+    /// `stored` is the bytes a value takes stored, as [`stored_value_bytes`]
+    /// measures its `ScalarValue`. Counting stops once the table's entries
+    /// take more than `limit`, at most [`VALUE_TABLES_BUDGET_BYTES`]: no
+    /// superfile keeps a table that large, so a high-cardinality column
+    /// costs at most the rows it takes to fill the budget. A superfile's
+    /// build passes less, the most its budget can still keep of the column
+    /// ([`ValueTableBudget::keepable_bytes`]).
     fn count<'a, V: Hash + Eq, I: Iterator<Item = (usize, V)>>(
         pieces: &'a [ArrayRef],
         values: impl Fn(&'a ArrayRef) -> Option<I>,
+        stored: impl Fn(&V) -> usize,
+        limit: usize,
     ) -> Option<Self> {
         // value -> (count, the piece and row it first showed up in)
-        // Sized for the cap at most, so a column under it never rehashes.
         let rows: usize = pieces.iter().map(|piece| piece.len()).sum();
         let mut counts: FxHashMap<V, (u64, usize, usize)> = FxHashMap::with_capacity_and_hasher(
-            rows.min(MAX_EXACT_VALUE_COUNTS + 1),
+            rows.min(COUNT_MAP_INITIAL_CAPACITY),
             Default::default(),
         );
+        // What the table's entries take stored, as `value_bytes` adds them up.
+        let mut bytes = 0usize;
         for (at, piece) in pieces.iter().enumerate() {
             for (row, value) in values(piece)? {
-                let distinct = counts.len();
                 match counts.entry(value) {
                     Entry::Occupied(mut seen) => {
                         let count = &mut seen.get_mut().0;
                         *count = count.checked_add(1)?;
                     }
                     Entry::Vacant(new) => {
-                        if distinct >= MAX_EXACT_VALUE_COUNTS {
+                        bytes += stored(new.key()) + size_of::<u64>();
+                        if bytes > limit {
                             return None;
                         }
                         new.insert((1, at, row));
@@ -882,11 +966,10 @@ impl ScalarValueCounts {
 
     /// The table of entries whose values are already distinct, as
     /// [`Self::count`] and [`Self::from_entries`] leave them. `None` when there
-    /// are none or more than the cap, when a value is null or a count zero,
-    /// when the values are not all of one counted type, or when two of them
-    /// do not compare.
+    /// are none, when a value is null or a count zero, when the values are not
+    /// all of one counted type, or when two of them do not compare.
     fn from_distinct_entries(mut entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
-        if entries.is_empty() || entries.len() > MAX_EXACT_VALUE_COUNTS {
+        if entries.is_empty() {
             return None;
         }
         if !exact_value_counts_type(&entries[0].0.data_type()) {
@@ -904,7 +987,7 @@ impl ScalarValueCounts {
         {
             return None;
         }
-        entries.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+        entries.sort_by(|left, right| value_order(&left.0, &right.0));
         if entries
             .windows(2)
             .any(|pair| pair[0].0.partial_cmp(&pair[1].0).is_none())
@@ -918,13 +1001,10 @@ impl ScalarValueCounts {
 
     /// The table of `entries`, with the counts of a value that shows up more
     /// than once added together. `None` when the entries cannot make a table:
-    /// see [`Self::from_distinct_entries`].
+    /// see [`Self::from_distinct_entries`]. Any number of entries makes one:
+    /// what bounds a table is who builds it, a superfile by its budget and a
+    /// table-wide sum by its own limit.
     pub(crate) fn from_entries(entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
-        // More entries than the cap is refused before folding, so the map
-        // below stays bounded however the values repeat.
-        if entries.len() > MAX_EXACT_VALUE_COUNTS {
-            return None;
-        }
         let mut merged: HashMap<ScalarValue, u64> = HashMap::with_capacity(entries.len());
         for (value, count) in entries {
             // A zero count folded into a nonzero one for the same value
@@ -938,14 +1018,102 @@ impl ScalarValueCounts {
         Self::from_distinct_entries(merged.into_iter().collect())
     }
 
-    pub(crate) fn merged_with(&self, other: &Self) -> Option<Self> {
-        Self::from_entries(
-            self.entries
-                .iter()
-                .chain(other.entries.iter())
-                .cloned()
-                .collect(),
-        )
+    /// Fold `other`'s rows into this table, as one superfile holding both
+    /// would count them, and say whether it did. The table is left as it was
+    /// when the two would make no table: past [`VALUE_TABLES_BUDGET_BYTES`],
+    /// which no superfile keeps, or where [`Self::from_entries`] would refuse
+    /// their entries together (values of two types, a count past `u64`).
+    ///
+    /// Both tables are sorted and distinct, so they merge in one pass over
+    /// each, with no hashing and no sort. A merge folds a table into its
+    /// output's once per batch, so the first pass only checks the result
+    /// and stops as soon as it passes the budget, and the second moves this
+    /// table's values into the result rather than copying them, unless
+    /// another copy of the table is held.
+    pub(crate) fn merge_from(&mut self, other: &Self) -> bool {
+        let Some(distinct) = self.merged_len(other) else {
+            return false;
+        };
+        let left = Arc::make_mut(&mut self.entries);
+        let right = other.entries();
+        let mut merged = Vec::with_capacity(distinct);
+        let (mut l, mut r) = (0, 0);
+        while l < left.len() || r < right.len() {
+            // `merged_len` has compared every pair compared here, and added
+            // every pair of counts added here, so neither fails.
+            let order = match (left.get(l), right.get(r)) {
+                (Some((lv, _)), Some((rv, _))) => lv.partial_cmp(rv).unwrap_or(Ordering::Less),
+                (Some(_), None) => Ordering::Less,
+                _ => Ordering::Greater,
+            };
+            match order {
+                Ordering::Less => {
+                    merged.push(take_entry(&mut left[l]));
+                    l += 1;
+                }
+                Ordering::Greater => {
+                    merged.push(right[r].clone());
+                    r += 1;
+                }
+                Ordering::Equal => {
+                    let (value, count) = take_entry(&mut left[l]);
+                    merged.push((value, count.saturating_add(right[r].1)));
+                    l += 1;
+                    r += 1;
+                }
+            }
+        }
+        self.entries = merged.into();
+        true
+    }
+
+    /// How many distinct values this table and `other` hold together, when
+    /// they make one table within [`VALUE_TABLES_BUDGET_BYTES`]: the checks
+    /// of [`Self::merge_from`], which [`Self::from_entries`] makes on their
+    /// entries together, in one pass that stops at the budget.
+    fn merged_len(&self, other: &Self) -> Option<usize> {
+        let (left, right) = (self.entries(), other.entries());
+        if let (Some((lv, _)), Some((rv, _))) = (left.first(), right.first())
+            && lv.data_type() != rv.data_type()
+        {
+            return None;
+        }
+        let (mut l, mut r, mut distinct, mut bytes) = (0, 0, 0usize, 0usize);
+        while l < left.len() || r < right.len() {
+            let value = match (left.get(l), right.get(r)) {
+                (Some((lv, lc)), Some((rv, rc))) => match lv.partial_cmp(rv)? {
+                    Ordering::Less => {
+                        l += 1;
+                        lv
+                    }
+                    Ordering::Greater => {
+                        r += 1;
+                        rv
+                    }
+                    Ordering::Equal => {
+                        lc.checked_add(*rc)?;
+                        l += 1;
+                        r += 1;
+                        lv
+                    }
+                },
+                (Some((lv, _)), None) => {
+                    l += 1;
+                    lv
+                }
+                (None, Some((rv, _))) => {
+                    r += 1;
+                    rv
+                }
+                (None, None) => break,
+            };
+            distinct += 1;
+            bytes += stored_value_bytes(value) + size_of::<u64>();
+            if bytes > VALUE_TABLES_BUDGET_BYTES {
+                return None;
+            }
+        }
+        (distinct > 0).then_some(distinct)
     }
 
     /// The counts of a column that holds no value at all: every row null, or
@@ -961,6 +1129,28 @@ impl ScalarValueCounts {
         &self.entries
     }
 
+    /// The rows the table holds for `values`: distinct, in [`value_order`], of one type. `None`
+    /// when that type is not the table's, so the values don't compare, or the sum passes u64.
+    pub(crate) fn rows_holding(&self, values: &[ScalarValue]) -> Option<u64> {
+        let (first, _) = self.entries.first()?;
+        if values.first()?.data_type() != first.data_type() {
+            return None;
+        }
+        debug_assert!(
+            values
+                .windows(2)
+                .all(|pair| value_order(&pair[0], &pair[1]) == Ordering::Less
+                    && pair[1].data_type() == first.data_type()),
+            "asked values are distinct, sorted and of one type"
+        );
+        held_rows(
+            self.entries.len(),
+            values.len(),
+            |entry, value| value_order(&self.entries[entry].0, &values[value]),
+            |entry| self.entries[entry].1,
+        )
+    }
+
     /// About the bytes the table's entries take stored: each value's own
     /// bytes and its count.
     pub(crate) fn value_bytes(&self) -> usize {
@@ -973,10 +1163,12 @@ impl ScalarValueCounts {
 
 /// The most bytes a superfile's exact value tables may take stored, all
 /// together, not counting tables no larger than the distinct sketch (see
-/// [`ValueTableBudget`]).
+/// [`ValueTableBudget`]). It is the only bound on a superfile's tables: a
+/// column is counted exactly whatever its number of distinct values, while
+/// its table fits, so the bound is what a table costs, its bytes.
 ///
 /// A table copies the values it counts, so on a table of thousands of
-/// sparse columns, whose few values in a superfile all fit the cap, the
+/// sparse columns, whose few values in a superfile are all counted, the
 /// tables were most of what a commit added to the manifest: about the bytes
 /// it wrote. A budget per superfile bounds that by the superfile, whatever
 /// its width, while a superfile of a few columns, a small commit's, keeps
@@ -991,7 +1183,7 @@ pub(crate) const VALUE_TABLES_BUDGET_BYTES: usize = 128 * 1024;
 /// sketch. The larger ones are kept smallest first while they fit
 /// [`VALUE_TABLES_BUDGET_BYTES`] together, so the budget keeps as many
 /// columns counted exactly as it can; the rest carry the sketch instead,
-/// as a column past the cap of distinct values does. Ties go to the lower
+/// as a column whose table alone passes the budget does. Ties go to the lower
 /// column id. Which tables are kept does not depend on the order they are
 /// admitted in, so a build that counts its columns one at a time holds at
 /// most the budget and one table, not every column's.
@@ -1002,6 +1194,8 @@ struct ValueTableBudget {
     kept: BinaryHeap<(usize, FieldId)>,
     /// What the tables in `kept` take.
     bytes: usize,
+    /// The smallest table dropped so far, as `(bytes, column)`.
+    first_dropped: Option<(usize, FieldId)>,
 }
 
 impl ValueTableBudget {
@@ -1018,8 +1212,60 @@ impl ValueTableBudget {
                 break;
             };
             self.bytes -= largest;
+            let dropped = (largest, column);
+            self.first_dropped = Some(
+                self.first_dropped
+                    .map_or(dropped, |first| first.min(dropped)),
+            );
             drop(column);
         }
+    }
+
+    /// The most bytes `column`'s table, not yet admitted, can take and still
+    /// be kept. A larger table would be dropped as it is admitted, and stay
+    /// dropped, so counting `column` can stop past it. Never less than the
+    /// sketch, as such a table is always kept.
+    ///
+    /// The kept tables are the longest run of the admitted ones, in
+    /// `(bytes, column)` order, that fits the budget, so a table is kept
+    /// while it and every admitted table before it fit together. Admitting
+    /// more tables only adds to what comes before it. A table after one
+    /// already dropped is dropped, as the tables up to that one already
+    /// pass the budget. Before it, the tables before it are the kept ones,
+    /// so the table is kept when it and those fit the budget; the larger the
+    /// table, the more come before it, so the tables that are kept are those
+    /// up to the bytes returned.
+    fn keepable_bytes(&self, column: FieldId) -> usize {
+        let mut kept: Vec<(usize, FieldId)> = self.kept.iter().copied().collect();
+        kept.sort_unstable();
+        // The most bytes that still put `(bytes, column)` before `next`.
+        let below = |(bytes, id): (usize, FieldId)| match column < id {
+            true => bytes,
+            false => bytes - 1,
+        };
+        let ceiling = self.first_dropped.map_or(VALUE_TABLES_BUDGET_BYTES, below);
+        // Try `column` after each prefix of the kept tables, the largest
+        // table that fits there, after the longest prefix it can follow.
+        let mut keepable = HLL_REGISTERS;
+        let mut before = 0usize;
+        for at in 0..=kept.len() {
+            let after = match at {
+                0 => 0,
+                _ => below(kept[at - 1]) + 1,
+            };
+            let most = kept
+                .get(at)
+                .map_or(usize::MAX, |&next| below(next))
+                .min(ceiling)
+                .min(VALUE_TABLES_BUDGET_BYTES.saturating_sub(before));
+            if most >= after {
+                keepable = keepable.max(most);
+            }
+            if let Some(&(bytes, _)) = kept.get(at) {
+                before += bytes;
+            }
+        }
+        keepable
     }
 }
 
@@ -1038,6 +1284,12 @@ fn stored_value_bytes(value: &ScalarValue) -> usize {
             .primitive_width()
             .unwrap_or(size_of::<u64>()),
     }
+}
+
+/// A table entry moved out of a table being merged away, a null left in
+/// its place.
+fn take_entry(entry: &mut (ScalarValue, u64)) -> (ScalarValue, u64) {
+    (mem::replace(&mut entry.0, ScalarValue::Null), entry.1)
 }
 
 /// `(row, value)` for each non-null value of an Arrow array iterator.
@@ -1105,16 +1357,19 @@ impl Hash for CountedStr<'_> {
 }
 
 /// Counts one column's values, for [`ScalarValueCounts::from_pieces`].
-type Counter = fn(&[ArrayRef]) -> Option<ScalarValueCounts>;
+type Counter = fn(&[ArrayRef], usize) -> Option<ScalarValueCounts>;
 
 /// The counter for a column type, or `None` when the type carries no exact
 /// value counts. This is the one list of counted types.
 fn counter(data_type: &DataType) -> Option<Counter> {
     let counter: Counter = match data_type {
-        DataType::Boolean => |pieces| {
-            ScalarValueCounts::count(pieces, |piece| {
-                Some(non_null(piece.as_boolean_opt()?.iter()))
-            })
+        DataType::Boolean => |pieces, limit| {
+            ScalarValueCounts::count(
+                pieces,
+                |piece| Some(non_null(piece.as_boolean_opt()?.iter())),
+                |_| size_of::<u64>(),
+                limit,
+            )
         },
         DataType::Int8 => ScalarValueCounts::primitive::<Int8Type>,
         DataType::Int16 => ScalarValueCounts::primitive::<Int16Type>,
@@ -1125,15 +1380,25 @@ fn counter(data_type: &DataType) -> Option<Counter> {
         DataType::UInt32 => ScalarValueCounts::primitive::<UInt32Type>,
         DataType::UInt64 => ScalarValueCounts::primitive::<UInt64Type>,
         DataType::Decimal128(_, _) => ScalarValueCounts::primitive::<Decimal128Type>,
-        DataType::Utf8 => |pieces| {
-            ScalarValueCounts::count(pieces, |piece| {
-                Some(non_null(piece.as_string_opt::<i32>()?.iter()).map(CountedStr::of_row))
-            })
+        DataType::Utf8 => |pieces, limit| {
+            ScalarValueCounts::count(
+                pieces,
+                |piece| {
+                    Some(non_null(piece.as_string_opt::<i32>()?.iter()).map(CountedStr::of_row))
+                },
+                |value: &CountedStr<'_>| value.len,
+                limit,
+            )
         },
-        DataType::LargeUtf8 => |pieces| {
-            ScalarValueCounts::count(pieces, |piece| {
-                Some(non_null(piece.as_string_opt::<i64>()?.iter()).map(CountedStr::of_row))
-            })
+        DataType::LargeUtf8 => |pieces, limit| {
+            ScalarValueCounts::count(
+                pieces,
+                |piece| {
+                    Some(non_null(piece.as_string_opt::<i64>()?.iter()).map(CountedStr::of_row))
+                },
+                |value: &CountedStr<'_>| value.len,
+                limit,
+            )
         },
         _ => return None,
     };
@@ -1183,8 +1448,8 @@ impl ScalarStatsAgg {
     /// supported type still returns an aggregate: null min/max plus the
     /// null count, so `IS [NOT] NULL` can prune on it. When present, every
     /// companion stat (null count, exact sum, HLL sketch) is computed in the
-    /// same pass; sum/HLL/value counts stay `None` for unsupported types or
-    /// when the exact-value cardinality cap is exceeded.
+    /// same pass; sum/HLL/value counts stay `None` for unsupported types, and
+    /// value counts when the column's table would pass the budget.
     pub fn from_column(column: &ArrayRef) -> Option<ScalarStatsAgg> {
         Self::from_pieces(slice::from_ref(column))
     }
@@ -1192,6 +1457,12 @@ impl ScalarStatsAgg {
     /// [`ScalarStatsAgg::from_column`] for one column split into `pieces`, the
     /// same stats as on their concat without copying them into one array.
     fn from_pieces(pieces: &[ArrayRef]) -> Option<ScalarStatsAgg> {
+        Self::from_pieces_within(pieces, VALUE_TABLES_BUDGET_BYTES)
+    }
+
+    /// [`ScalarStatsAgg::from_pieces`] with no value table past `limit`
+    /// bytes, the column's sketch in its place.
+    fn from_pieces_within(pieces: &[ArrayRef], limit: usize) -> Option<ScalarStatsAgg> {
         // The min of the pieces' mins, and the max of their maxes, through the
         // same Arrow min/max, so nulls and NaN are ordered as on the concat.
         let bounds = pieces
@@ -1220,14 +1491,14 @@ impl ScalarStatsAgg {
         // column.
         //
         // A table larger than the whole budget for a superfile's tables is
-        // never kept; the rest are kept or not by the superfile's budget
-        // (see [`ValueTableBudget`]).
+        // never kept, and counting stops there, or at `limit` when the
+        // superfile's budget can keep less of the column; the rest are kept
+        // or not by the superfile's budget (see [`ValueTableBudget`]).
         let non_null: usize = pieces
             .iter()
             .map(|piece| piece.len() - piece.null_count())
             .sum();
-        let value_counts = ScalarValueCounts::from_pieces(pieces)
-            .filter(|table| table.value_bytes() <= VALUE_TABLES_BUDGET_BYTES);
+        let value_counts = ScalarValueCounts::from_pieces(pieces, limit);
         let hll = if value_counts.is_some() || non_null == 0 {
             None
         } else {
@@ -1259,11 +1530,19 @@ impl ScalarStatsAgg {
             return HashMap::new();
         }
         // The batches are one superfile's rows, so its tables share one
-        // budget, applied as each column is counted.
+        // budget, applied as each column is counted. A column is counted
+        // only as far as the budget can still keep its table: once the
+        // budget is full, a wide table's later columns stop where their
+        // tables would be dropped, and carry the sketch they would have
+        // been given.
         let mut stats = HashMap::new();
         let mut budget = ValueTableBudget::default();
         for field in scalar_schema.fields() {
-            let Some((id, agg)) = ScalarStatsAgg::for_field(field, batches) else {
+            let Some(id) = field_id_of(field) else {
+                continue;
+            };
+            let limit = budget.keepable_bytes(id);
+            let Some((id, agg)) = ScalarStatsAgg::for_field(field, batches, limit) else {
                 continue;
             };
             let bytes = agg.value_table_bytes();
@@ -1277,6 +1556,28 @@ impl ScalarStatsAgg {
             }
         }
         stats
+    }
+
+    /// [`ScalarStatsAgg::from_batches`] for some of one superfile's rows,
+    /// with its value tables not held to the superfile's budget: which
+    /// tables a superfile keeps depends on all of its rows, so whoever folds
+    /// these stats fits the folded tables once
+    /// ([`ScalarStatsAgg::fit_value_tables`]). A table past the budget alone
+    /// is still dropped, as it would be from the whole.
+    pub(crate) fn from_batches_unbudgeted(
+        scalar_schema: &Schema,
+        batches: &[&RecordBatch],
+    ) -> HashMap<FieldId, ScalarStatsAgg> {
+        if batches.is_empty() {
+            return HashMap::new();
+        }
+        scalar_schema
+            .fields()
+            .iter()
+            .filter_map(|field| {
+                ScalarStatsAgg::for_field(field, batches, VALUE_TABLES_BUDGET_BYTES)
+            })
+            .collect()
     }
 
     /// [`ScalarStatsAgg::from_batches`] with one column per task on the current
@@ -1294,7 +1595,9 @@ impl ScalarStatsAgg {
         let mut stats = scalar_schema
             .fields()
             .par_iter()
-            .filter_map(|field| ScalarStatsAgg::for_field(field, batches))
+            .filter_map(|field| {
+                ScalarStatsAgg::for_field(field, batches, VALUE_TABLES_BUDGET_BYTES)
+            })
             .collect();
         Self::fit_value_tables(&mut stats);
         stats
@@ -1335,10 +1638,14 @@ impl ScalarStatsAgg {
         }
     }
 
-    /// One column's stats across `batches`, keyed by its field id. `None` when
-    /// the field has no id, a batch doesn't have the column, or the column's
-    /// type has no stats.
-    fn for_field(field: &Field, batches: &[&RecordBatch]) -> Option<(FieldId, ScalarStatsAgg)> {
+    /// One column's stats across `batches`, keyed by its field id, with no
+    /// value table past `limit` bytes. `None` when the field has no id, a
+    /// batch doesn't have the column, or the column's type has no stats.
+    fn for_field(
+        field: &Field,
+        batches: &[&RecordBatch],
+        limit: usize,
+    ) -> Option<(FieldId, ScalarStatsAgg)> {
         // Stats are keyed by the field id stamped on the stored schema;
         // a field without one is not a column the table tracks.
         let id = field_id_of(field)?;
@@ -1351,7 +1658,7 @@ impl ScalarStatsAgg {
             .iter()
             .map(|b| b.column_by_name(field.name()).cloned())
             .collect::<Option<Vec<ArrayRef>>>()?;
-        Some((id, ScalarStatsAgg::from_pieces(&pieces)?))
+        Some((id, ScalarStatsAgg::from_pieces_within(&pieces, limit)?))
     }
 
     /// Merge `other` into `self` for the same column.
@@ -1393,15 +1700,25 @@ impl ScalarStatsAgg {
         };
         // A side with no non-null values has no counts to give, and adds
         // nothing to the other side's.
-        let merged_table = match (&self.value_counts, &other.value_counts) {
-            (Some(left), Some(right)) => left.merged_with(right),
-            (counts, None) if !other_has_values => counts.clone(),
+        // A table that does not survive is put back, for the sketch below.
+        let merged_table = match (self.value_counts.take(), &other.value_counts) {
+            (Some(mut left), Some(right)) => match left.merge_from(right) {
+                true => Some(left),
+                false => {
+                    self.value_counts = Some(left);
+                    None
+                }
+            },
+            (counts, None) if !other_has_values => counts,
             (None, counts) if !self_has_values => counts.clone(),
-            _ => None,
+            (counts, _) => {
+                self.value_counts = counts;
+                None
+            }
         };
         // Where no table survives, the sketch stands in: each side's own,
         // or its table's values sketched as the column sketch hashes them,
-        // so two tables whose union passes the cap, or a table beside a
+        // so two tables whose union passes the budget, or a table beside a
         // sketch, still give a distinct estimate. A side with no values
         // adds nothing; a side with values and neither sketch nor table
         // leaves the estimate unknown.
@@ -2755,7 +3072,7 @@ mod tests {
     //! decodes to bit-equal entries; top-level JSON keys are
     //! jq-friendly.
     use std::{
-        collections::{BTreeMap, HashMap},
+        collections::{BTreeMap, HashMap, HashSet},
         slice::from_ref,
         str::from_utf8,
         sync::Arc,
@@ -2786,7 +3103,7 @@ mod tests {
 
     /// Rows in each column the value-count tests build.
     const COUNTED_ROWS: usize = 1_000;
-    /// Distinct values in those columns, well under the counts cap.
+    /// Distinct values in those columns, a table well under the budget.
     const COUNTED_DISTINCT: usize = 13;
     /// Decimal precision and scale for the value-count tests.
     const DECIMAL_PRECISION: u8 = 18;
@@ -2797,8 +3114,9 @@ mod tests {
         (i * 7 % COUNTED_DISTINCT) as i64
     }
 
-    /// Exact value counts built the slow way, one `ScalarValue` per row: the
-    /// reference the native-type counting must match.
+    /// Exact value counts built the slow way, one `ScalarValue` per row, and
+    /// kept while the table fits the budget: the reference the native-type
+    /// counting must match.
     fn counts_per_row(column: &ArrayRef) -> Option<ScalarValueCounts> {
         if !exact_value_counts_type(column.data_type()) {
             return None;
@@ -2806,13 +3124,20 @@ mod tests {
         let mut counts: HashMap<ScalarValue, u64> = HashMap::new();
         for row in (0..column.len()).filter(|&row| column.is_valid(row)) {
             let value = ScalarValue::try_from_array(column, row).ok()?;
-            if !counts.contains_key(&value) && counts.len() >= MAX_EXACT_VALUE_COUNTS {
-                return None;
-            }
             *counts.entry(value).or_default() += 1;
         }
         ScalarValueCounts::from_entries(counts.into_iter().collect())
+            .filter(|table| table.value_bytes() <= VALUE_TABLES_BUDGET_BYTES)
     }
+
+    /// The most distinct values of `width` bytes one table holds within the
+    /// budget: each entry stores its value and its 8-byte count.
+    fn most_distinct(width: usize) -> usize {
+        VALUE_TABLES_BUDGET_BYTES / (width + size_of::<u64>())
+    }
+
+    /// The most distinct `i64` values one table holds within the budget.
+    const MOST_DISTINCT_I64: usize = VALUE_TABLES_BUDGET_BYTES / (2 * size_of::<u64>());
 
     /// Build a per-column aggregate from a plain `i64` array (no nulls).
     fn agg_i64(vals: Vec<i64>) -> ScalarStatsAgg {
@@ -2963,10 +3288,12 @@ mod tests {
         assert_eq!(counts.entries(), expected.as_slice());
         // Split into pieces, the same table.
         let pieces = [column.slice(0, 7), column.slice(7, values.len() - 7)];
-        let split = ScalarValueCounts::from_pieces(&pieces).expect("under cap");
+        let split =
+            ScalarValueCounts::from_pieces(&pieces, VALUE_TABLES_BUDGET_BYTES).expect("under cap");
         assert_eq!(split.entries(), expected.as_slice());
         let large: ArrayRef = Arc::new(LargeStringArray::from(values.clone()));
-        let large = ScalarValueCounts::from_pieces(&[large]).expect("under cap");
+        let large =
+            ScalarValueCounts::from_pieces(&[large], VALUE_TABLES_BUDGET_BYTES).expect("under cap");
         assert_eq!(large.entries().len(), expected.len());
         for ((value, count), (want, want_count)) in large.entries().iter().zip(&expected) {
             assert_eq!(value.to_string(), want.to_string());
@@ -2975,7 +3302,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_value_counts_are_exact_and_capped() {
+    fn scalar_value_counts_are_exact_and_within_the_budget() {
         let repeated: ArrayRef = Arc::new(StringArray::from(vec![
             Some("rust"),
             Some("go"),
@@ -2994,30 +3321,28 @@ mod tests {
             ]
         );
 
-        let at_the_cap: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            0..MAX_EXACT_VALUE_COUNTS as i64,
-        ));
-        let at_the_cap = ScalarStatsAgg::from_column(&at_the_cap).expect("int stats");
-        assert_eq!(
-            at_the_cap
-                .value_counts
-                .as_ref()
-                .expect("exactly the cap's distinct values keep the table")
-                .entries()
-                .len(),
-            MAX_EXACT_VALUE_COUNTS
-        );
-        assert!(at_the_cap.hll.is_none(), "counted exactly, so no sketch");
+        let at_the_budget: ArrayRef =
+            Arc::new(Int64Array::from_iter_values(0..MOST_DISTINCT_I64 as i64));
+        let at_the_budget = ScalarStatsAgg::from_column(&at_the_budget).expect("int stats");
+        let table = at_the_budget
+            .value_counts
+            .as_ref()
+            .expect("a table of exactly the budget is kept");
+        assert_eq!(table.entries().len(), MOST_DISTINCT_I64);
+        assert_eq!(table.value_bytes(), VALUE_TABLES_BUDGET_BYTES);
+        assert!(at_the_budget.hll.is_none(), "counted exactly, so no sketch");
 
-        let high_cardinality: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            0..=MAX_EXACT_VALUE_COUNTS as i64,
-        ));
-        let past_the_cap = ScalarStatsAgg::from_column(&high_cardinality).expect("int stats");
+        let high_cardinality: ArrayRef =
+            Arc::new(Int64Array::from_iter_values(0..=MOST_DISTINCT_I64 as i64));
+        let past_the_budget = ScalarStatsAgg::from_column(&high_cardinality).expect("int stats");
         assert!(
-            past_the_cap.value_counts.is_none(),
-            "the 257th distinct value must drop the exact table"
+            past_the_budget.value_counts.is_none(),
+            "one more distinct value takes the table past the budget"
         );
-        assert!(past_the_cap.hll.is_some(), "and the sketch takes its place");
+        assert!(
+            past_the_budget.hll.is_some(),
+            "and the sketch takes its place"
+        );
     }
 
     #[test]
@@ -3090,21 +3415,19 @@ mod tests {
         );
     }
 
-    /// Two tables whose union passes the cap drop the table, and the
+    /// Two tables whose union passes the budget drop the table, and the
     /// sketch of their values takes its place: the sketch the whole
     /// column would have had, register for register. A table beside a
     /// sketch merges the same way.
     #[test]
-    fn scalar_agg_merge_drops_value_counts_above_cap() {
+    fn scalar_agg_merge_drops_value_counts_past_the_budget() {
         let left: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            0..=(MAX_EXACT_VALUE_COUNTS / 2) as i64,
+            0..=(MOST_DISTINCT_I64 / 2) as i64,
         ));
         let right: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            (MAX_EXACT_VALUE_COUNTS / 2 + 1) as i64..=MAX_EXACT_VALUE_COUNTS as i64,
+            (MOST_DISTINCT_I64 / 2 + 1) as i64..=MOST_DISTINCT_I64 as i64,
         ));
-        let whole: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            0..=MAX_EXACT_VALUE_COUNTS as i64,
-        ));
+        let whole: ArrayRef = Arc::new(Int64Array::from_iter_values(0..=MOST_DISTINCT_I64 as i64));
         let want = column_hll(from_ref(&whole)).expect("sketchable");
         let mut merged = ScalarStatsAgg::from_column(&left).expect("left stats");
         let right = ScalarStatsAgg::from_column(&right).expect("right stats");
@@ -3120,17 +3443,278 @@ mod tests {
         let mut sketched = ScalarStatsAgg::from_column(&whole).expect("whole stats");
         assert!(sketched.hll.is_some() && sketched.value_counts.is_none());
         let doubled: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            0..=(2 * MAX_EXACT_VALUE_COUNTS) as i64,
+            0..=(2 * MOST_DISTINCT_I64) as i64,
         ));
         let want = column_hll(from_ref(&doubled)).expect("sketchable");
         let upper: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            (MAX_EXACT_VALUE_COUNTS + 1) as i64..=(2 * MAX_EXACT_VALUE_COUNTS) as i64,
+            (MOST_DISTINCT_I64 + 1) as i64..=(2 * MOST_DISTINCT_I64) as i64,
         ));
         let upper = ScalarStatsAgg::from_column(&upper).expect("upper stats");
         assert!(upper.value_counts.is_some());
         sketched.merge_with(&upper).expect("same type");
         assert_eq!(sketched.hll.as_deref(), Some(want.as_bytes()));
         assert!(sketched.value_counts.is_none());
+    }
+
+    /// The table of `left`'s and `right`'s entries together, built the slow
+    /// way: every entry hashed into one map, then sorted, and kept while it
+    /// fits the budget. The reference [`ScalarValueCounts::merge_from`] must
+    /// match.
+    fn merged_per_entry(
+        left: &ScalarValueCounts,
+        right: &ScalarValueCounts,
+    ) -> Option<ScalarValueCounts> {
+        ScalarValueCounts::from_entries(
+            left.entries()
+                .iter()
+                .chain(right.entries())
+                .cloned()
+                .collect(),
+        )
+        .filter(|table| table.value_bytes() <= VALUE_TABLES_BUDGET_BYTES)
+    }
+
+    /// Fold `right` into a copy of `left` and check it against
+    /// [`merged_per_entry`]: the same table, counts included, when there is
+    /// one, and the copy as it was when there is none. `left` itself shares
+    /// its entries with the copy, and must be left as it was either way.
+    /// Returns the merged table, if any.
+    fn assert_merges_like_counting_both(
+        left: &ScalarValueCounts,
+        right: &ScalarValueCounts,
+    ) -> Option<ScalarValueCounts> {
+        let before = left.entries().to_vec();
+        let want = merged_per_entry(left, right);
+        let mut merged = left.clone();
+        assert_eq!(merged.merge_from(right), want.is_some());
+        match &want {
+            Some(want) => assert_eq!(&merged, want),
+            None => assert_eq!(&merged, left),
+        }
+        assert_eq!(left.entries(), &before[..]);
+        want
+    }
+
+    /// An `Int64` table of `(value, count)` entries.
+    fn i64_table(entries: impl IntoIterator<Item = (i64, u64)>) -> ScalarValueCounts {
+        ScalarValueCounts::from_entries(
+            entries
+                .into_iter()
+                .map(|(value, count)| (ScalarValue::Int64(Some(value)), count))
+                .collect(),
+        )
+        .expect("a table")
+    }
+
+    /// A `Utf8` table of `(value, count)` entries.
+    fn utf8_table<'a>(entries: impl IntoIterator<Item = (&'a str, u64)>) -> ScalarValueCounts {
+        ScalarValueCounts::from_entries(
+            entries
+                .into_iter()
+                .map(|(value, count)| (ScalarValue::Utf8(Some(value.to_string())), count))
+                .collect(),
+        )
+        .expect("a table")
+    }
+
+    /// Two sorted tables merged in one pass make the table their entries
+    /// make counted together, counts included: overlapping, disjoint,
+    /// interleaved and equal tables of every shape of counted value.
+    #[test]
+    fn merge_from_matches_counting_both_tables_together() {
+        let counted = |range: std::ops::Range<i64>, scale: u64| {
+            i64_table(range.map(move |value| (value, value.unsigned_abs() * scale + 1)))
+        };
+        let pairs = [
+            // Overlapping, each side holding values the other does not.
+            (counted(0..100, 1), counted(50..150, 3)),
+            // Disjoint, either side first.
+            (counted(0..10, 1), counted(10..20, 2)),
+            (counted(10..20, 2), counted(0..10, 1)),
+            // Interleaved, every other value from each side.
+            (
+                i64_table((0..50).map(|v| (2 * v, 1))),
+                i64_table((0..50).map(|v| (2 * v + 1, 2))),
+            ),
+            // The same values on both sides.
+            (counted(-30..30, 1), counted(-30..30, 5)),
+            // One side inside the other.
+            (counted(0..200, 1), counted(90..110, 7)),
+            (counted(90..110, 7), counted(0..200, 1)),
+            // A single value against many.
+            (i64_table([(i64::MIN, 4)]), counted(-5..5, 1)),
+            (counted(-5..5, 1), i64_table([(i64::MAX, 4)])),
+        ];
+        for (left, right) in &pairs {
+            let merged = assert_merges_like_counting_both(left, right).expect("within the budget");
+            let total =
+                |table: &ScalarValueCounts| table.entries().iter().map(|e| e.1).sum::<u64>();
+            assert_eq!(total(&merged), total(left) + total(right));
+        }
+
+        // Strings of several lengths, the empty one among them.
+        let left = utf8_table([("", 1), ("go", 2), ("rust", 3), ("zig", 1)]);
+        let right = utf8_table([("a", 4), ("go", 1), ("python", 2), ("zig", 6)]);
+        assert_merges_like_counting_both(&left, &right).expect("within the budget");
+        let wide = ScalarValueCounts::from_entries(
+            (0..40)
+                .map(|i| (ScalarValue::LargeUtf8(Some("x".repeat(i))), i as u64 + 1))
+                .collect(),
+        )
+        .expect("a table");
+        let narrow = ScalarValueCounts::from_entries(
+            (20..60)
+                .map(|i| (ScalarValue::LargeUtf8(Some("x".repeat(i))), 2))
+                .collect(),
+        )
+        .expect("a table");
+        assert_merges_like_counting_both(&wide, &narrow).expect("within the budget");
+
+        // Booleans, and decimals of one precision and scale.
+        let flags = |entries: &[(bool, u64)]| {
+            ScalarValueCounts::from_entries(
+                entries
+                    .iter()
+                    .map(|&(value, count)| (ScalarValue::Boolean(Some(value)), count))
+                    .collect(),
+            )
+            .expect("a table")
+        };
+        assert_merges_like_counting_both(&flags(&[(true, 3)]), &flags(&[(false, 1), (true, 2)]))
+            .expect("within the budget");
+        let decimals = |values: std::ops::Range<i128>| {
+            ScalarValueCounts::from_entries(
+                values
+                    .map(|v| {
+                        (
+                            ScalarValue::Decimal128(
+                                Some(v * 125),
+                                DECIMAL_PRECISION,
+                                DECIMAL_SCALE,
+                            ),
+                            1,
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("a table")
+        };
+        assert_merges_like_counting_both(&decimals(-10..10), &decimals(0..30))
+            .expect("within the budget");
+
+        // Pairs of every overlap and size, from a fixed seed.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        for _ in 0..200 {
+            let side = |next: &mut dyn FnMut(u64) -> u64| {
+                let start = next(400) as i64;
+                let len = next(300) as i64 + 1;
+                let step = next(3) as i64 + 1;
+                i64_table((0..len).map(|i| (start + i * step, next(1_000) + 1)))
+            };
+            let left = side(&mut next);
+            let right = side(&mut next);
+            assert_merges_like_counting_both(&left, &right).expect("within the budget");
+        }
+    }
+
+    /// A merge makes no table where counting both tables' entries together
+    /// makes none, and leaves the table it would fold into as it was: past
+    /// the budget, across two types, or past a `u64` count. Up to the budget
+    /// it makes the table, an empty side adding nothing.
+    #[test]
+    fn merge_from_refuses_what_counting_both_tables_together_refuses() {
+        let below = |end: usize| i64_table((0..end as i64).map(|value| (value, 1)));
+        let above = |start: usize| {
+            i64_table((start as i64..MOST_DISTINCT_I64 as i64).map(|value| (value, 1)))
+        };
+        // Exactly the budget between them, overlapping or not, then one past.
+        let fits = assert_merges_like_counting_both(&below(5_000), &above(3_000)).expect("fits");
+        assert_eq!(fits.value_bytes(), VALUE_TABLES_BUDGET_BYTES);
+        assert_merges_like_counting_both(
+            &below(MOST_DISTINCT_I64 / 2),
+            &above(MOST_DISTINCT_I64 / 2),
+        )
+        .expect("fits");
+        let past = i64_table([(MOST_DISTINCT_I64 as i64, 1)]);
+        assert!(assert_merges_like_counting_both(&below(MOST_DISTINCT_I64), &past).is_none());
+        assert!(assert_merges_like_counting_both(&past, &below(MOST_DISTINCT_I64)).is_none());
+        // Two tables each at the budget pass it together, as does one of
+        // them and a single value more.
+        let half = i64_table((0..MOST_DISTINCT_I64 as i64).map(|value| (2 * value, 1)));
+        let odd = i64_table((0..MOST_DISTINCT_I64 as i64).map(|value| (2 * value + 1, 1)));
+        assert!(assert_merges_like_counting_both(&half, &odd).is_none());
+        assert!(assert_merges_like_counting_both(&half, &i64_table([(-1, 1)])).is_none());
+
+        // Two types: a table of `Int32` values beside one of `Int64` values.
+        let int32 = ScalarValueCounts::from_entries(vec![(ScalarValue::Int32(Some(1)), 1)])
+            .expect("a table");
+        assert!(assert_merges_like_counting_both(&i64_table([(1, 1)]), &int32).is_none());
+        assert!(assert_merges_like_counting_both(&int32, &i64_table([(1, 1)])).is_none());
+
+        // A count past `u64`, and one that just reaches it.
+        let full = i64_table([(1, u64::MAX - 1), (2, 1)]);
+        assert!(assert_merges_like_counting_both(&full, &i64_table([(1, 2)])).is_none());
+        let topped = assert_merges_like_counting_both(&full, &i64_table([(1, 1), (3, 1)]))
+            .expect("a count of u64::MAX fits");
+        assert_eq!(topped.entries()[0].1, u64::MAX);
+
+        // An empty table adds nothing, and two make no table.
+        let some = i64_table([(4, 2), (9, 1)]);
+        let empty = ScalarValueCounts::empty();
+        assert_eq!(
+            assert_merges_like_counting_both(&empty, &some),
+            Some(some.clone())
+        );
+        assert_eq!(
+            assert_merges_like_counting_both(&some, &empty),
+            Some(some.clone())
+        );
+        assert!(assert_merges_like_counting_both(&empty, &empty).is_none());
+    }
+
+    /// A column's stats folded batch by batch keep the table of the whole
+    /// column, counted at once, and drop it at the batch that takes it past
+    /// the budget.
+    #[test]
+    fn scalar_agg_merge_folds_batches_into_the_whole_columns_table() {
+        for (rows, distinct) in [
+            (10_000, 1_200),
+            (20_000, MOST_DISTINCT_I64),
+            (20_000, MOST_DISTINCT_I64 + 1),
+        ] {
+            let whole: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                (0..rows).map(|row| (row * 7_919 % distinct) as i64),
+            ));
+            let mut folded: Option<ScalarStatsAgg> = None;
+            for start in (0..rows).step_by(1_337) {
+                let batch = whole.slice(start, 1_337.min(rows - start));
+                let batch = ScalarStatsAgg::from_column(&batch).expect("batch stats");
+                match folded.as_mut() {
+                    Some(folded) => folded.merge_with(&batch).expect("same type"),
+                    None => folded = Some(batch),
+                }
+            }
+            let folded = folded.expect("rows");
+            assert_eq!(
+                folded.value_counts,
+                counts_per_row(&whole),
+                "{distinct} distinct"
+            );
+            let want_hll = folded
+                .value_counts
+                .is_none()
+                .then(|| column_hll(from_ref(&whole)).expect("sketchable"));
+            assert_eq!(
+                folded.hll.as_deref(),
+                want_hll.as_ref().map(|hll| hll.as_bytes())
+            );
+        }
     }
 
     #[test]
@@ -3151,6 +3735,56 @@ mod tests {
         assert!(a.null_count.is_none());
         assert!(a.hll.is_none());
         assert!(a.value_counts.is_none());
+    }
+
+    /// The table of `entries`, which must make one.
+    fn table_of(entries: Vec<(ScalarValue, u64)>) -> ScalarValueCounts {
+        ScalarValueCounts::from_entries(entries).expect("a table")
+    }
+
+    #[test]
+    fn a_table_counts_asked_values() {
+        // Tables of strings, decimals, booleans and integers, asked for fewer values than they hold
+        // (each asked value is searched in the table), for more (each table value is searched),
+        // and for about as many (both are walked side by side).
+        //  - Held values add their rows; absent ones add nothing.
+        //  - Values of another type, or counts whose sum passes u64, give no count.
+        // This test pins all three ways the in-memory table is searched.
+        let s = |v: &str| ScalarValue::Utf8(Some(v.to_string()));
+        let strings = table_of(vec![(s("a"), 2), (s("c"), 3), (s("e"), 4)]);
+        assert_eq!(strings.rows_holding(&[s("c")]), Some(3));
+        assert_eq!(strings.rows_holding(&[s("b"), s("e")]), Some(4));
+        assert_eq!(
+            strings.rows_holding(&[s("a"), s("b"), s("c"), s("d"), s("e")]),
+            Some(9)
+        );
+        assert_eq!(
+            strings.rows_holding(&[s("b"), s("d"), s("f"), s("g")]),
+            Some(0)
+        );
+        let d = |v: i128| ScalarValue::Decimal128(Some(v), 10, 2);
+        let decimals = table_of(vec![(d(150), 5), (d(200), 6)]);
+        assert_eq!(decimals.rows_holding(&[d(150)]), Some(5));
+        assert_eq!(
+            decimals.rows_holding(&[d(100), d(150), d(175), d(200)]),
+            Some(11)
+        );
+        let b = |v: bool| ScalarValue::Boolean(Some(v));
+        let flags = table_of(vec![(b(true), 7)]);
+        assert_eq!(flags.rows_holding(&[b(true)]), Some(7));
+        assert_eq!(flags.rows_holding(&[b(false), b(true)]), Some(7));
+        assert_eq!(flags.rows_holding(&[b(false)]), Some(0));
+        let i = |v: i64| ScalarValue::Int64(Some(v));
+        let one = table_of(vec![(i(1), 1)]);
+        assert_eq!(one.rows_holding(&[ScalarValue::Int32(Some(1))]), None);
+        let full = table_of(vec![(i(1), u64::MAX), (i(2), 1)]);
+        assert_eq!(full.rows_holding(&[i(1), i(2)]), None);
+        assert_eq!(full.rows_holding(&[i(0), i(1), i(2)]), None);
+        let walked = table_of(vec![(i(1), 2), (i(3), 3), (i(5), 4), (i(7), 5)]);
+        assert_eq!(walked.rows_holding(&[i(0), i(3), i(5), i(8)]), Some(7));
+        assert_eq!(walked.rows_holding(&[i(0), i(2), i(4), i(6)]), Some(0));
+        let walked_full = table_of(vec![(i(1), u64::MAX), (i(2), 1), (i(3), 1), (i(4), 1)]);
+        assert_eq!(walked_full.rows_holding(&[i(1), i(2), i(3), i(4)]), None);
     }
 
     /// A side with no non-null values (an all-null batch of the column)
@@ -3207,8 +3841,9 @@ mod tests {
     #[test]
     fn scalar_agg_from_column_utf8_has_minmax_and_hll_but_no_sum() {
         // Utf8 is orderable (min/max) and hashable (HLL) but not summable.
-        // Over the value-table cap the column is sketched, not counted.
-        let values: Vec<String> = (0..=MAX_EXACT_VALUE_COUNTS)
+        // Past the value-table budget the column is sketched, not counted:
+        // every value takes at least 9 bytes and its count 8.
+        let values: Vec<String> = (0..=most_distinct(9))
             .map(|i| format!("value{i:04}"))
             .collect();
         let arr: ArrayRef = Arc::new(StringArray::from(values));
@@ -3217,7 +3852,7 @@ mod tests {
         assert_eq!(agg.max.len(), 1);
         assert!(agg.sum.is_none(), "utf8 is not summable");
         assert!(agg.hll.is_some(), "utf8 supports HLL");
-        assert!(agg.value_counts.is_none(), "over the cap");
+        assert!(agg.value_counts.is_none(), "past the budget");
         assert_eq!(agg.null_count, Some(0));
     }
 
@@ -3232,13 +3867,13 @@ mod tests {
     }
 
     #[test]
-    fn scalar_agg_from_column_under_the_cap_is_counted_not_sketched() {
+    fn scalar_agg_from_column_under_the_budget_is_counted_not_sketched() {
         let arr: ArrayRef = Arc::new(StringArray::from(vec!["alpha", "delta", "bravo"]));
         let agg = ScalarStatsAgg::from_column(&arr).expect("utf8 is orderable");
         assert_eq!(
             agg.value_counts
                 .as_ref()
-                .expect("under the cap")
+                .expect("under the budget")
                 .entries()
                 .len(),
             3
@@ -3336,6 +3971,174 @@ mod tests {
         let alone = ScalarStatsAgg::from_column(&column(0, 0..DISTINCT)).expect("int stats");
         assert!(alone.value_counts.is_some());
         assert!(alone.hll.is_none());
+    }
+
+    /// The tables a budget keeps of `admitted`, admitted in that order, with
+    /// `column`'s table of `bytes` admitted after them.
+    fn keeps_after(admitted: &[(usize, FieldId)], (bytes, column): (usize, FieldId)) -> bool {
+        let mut budget = ValueTableBudget::default();
+        let mut dropped = HashSet::new();
+        for &(bytes, id) in admitted.iter().chain([&(bytes, column)]) {
+            budget.admit(id, bytes, |id| {
+                dropped.insert(id);
+            });
+        }
+        !dropped.contains(&column)
+    }
+
+    /// A column's table is kept exactly when it takes no more than the
+    /// bytes the budget says it can still keep, so a build that stops
+    /// counting a column there drops no table the budget would keep. A
+    /// table past them stays dropped whatever is admitted after it.
+    #[test]
+    fn a_budget_keeps_a_table_exactly_up_to_the_bytes_it_can_still_keep() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        for _ in 0..500 {
+            // Tables around the sketch's size and up to past the budget,
+            // some of equal size, so ties fall to the column id.
+            let mut tables: Vec<(usize, FieldId)> = (1..=next(30) as u32 + 2)
+                .map(|id| {
+                    let bytes = match next(4) {
+                        0 => HLL_REGISTERS - 64 + next(128) as usize,
+                        1 => 16_000 + 16 * next(3) as usize,
+                        2 => HLL_REGISTERS + next(VALUE_TABLES_BUDGET_BYTES as u64 / 2) as usize,
+                        _ => VALUE_TABLES_BUDGET_BYTES - 64 + next(128) as usize,
+                    };
+                    (bytes, FieldId(id))
+                })
+                .collect();
+            for at in (1..tables.len()).rev() {
+                tables.swap(at, next(at as u64 + 1) as usize);
+            }
+            let column = tables.pop().expect("at least two tables").1;
+            let (admitted, later) = tables.split_at(next(tables.len() as u64 + 1) as usize);
+
+            let mut budget = ValueTableBudget::default();
+            for &(bytes, id) in admitted {
+                budget.admit(id, bytes, |_| {});
+            }
+            let keepable = budget.keepable_bytes(column);
+            assert!(keepable >= HLL_REGISTERS);
+            assert!(keepable <= VALUE_TABLES_BUDGET_BYTES);
+            assert!(keeps_after(admitted, (keepable, column)), "{admitted:?}");
+            assert!(
+                !keeps_after(admitted, (keepable + 1, column)),
+                "{admitted:?}"
+            );
+            for _ in 0..20 {
+                let bytes = next(VALUE_TABLES_BUDGET_BYTES as u64 + 2) as usize;
+                assert_eq!(
+                    keeps_after(admitted, (bytes, column)),
+                    bytes <= keepable,
+                    "{bytes} bytes after {admitted:?}"
+                );
+            }
+
+            // Dropped as it is admitted, the table stays dropped.
+            let mut budget = ValueTableBudget::default();
+            let mut dropped = HashSet::new();
+            for &(bytes, id) in admitted
+                .iter()
+                .chain([&(keepable + 1, column)])
+                .chain(later)
+            {
+                budget.admit(id, bytes, |id| {
+                    dropped.insert(id);
+                });
+            }
+            assert!(dropped.contains(&column), "{admitted:?} then {later:?}");
+        }
+    }
+
+    /// A superfile's build counts each column only as far as its budget can
+    /// still keep the column's table, and keeps the same tables, and the
+    /// same sketches in place of the rest, as counting every column whole
+    /// and fitting the tables after. Wide tables of columns whose tables
+    /// pass the budget together, of integers and of text, some past the
+    /// budget alone, split over batches.
+    #[test]
+    fn a_superfile_build_keeps_the_tables_counting_every_column_whole_keeps() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        const ROWS: i64 = 9_000;
+        // The widths the build was slow on, 1,000 to 1,440 values a column,
+        // then columns of every size.
+        let cycling: Vec<u64> = (0..24).map(|c| 1_000 + (c * 61) % 441).collect();
+        let shapes = [cycling]
+            .into_iter()
+            .chain((0..6).map(|_| {
+                (0..next(24) + 8)
+                    .map(|_| match next(5) {
+                        0 => next(60) + 1,
+                        1 => next(1_000) + 60,
+                        2 => next(3_000) + 1_000,
+                        3 => 8_190 + next(4),
+                        _ => 1_000 + next(441),
+                    })
+                    .collect()
+            }))
+            .collect::<Vec<Vec<u64>>>();
+        for (shape, distinct) in shapes.into_iter().enumerate() {
+            let text: Vec<bool> = distinct.iter().map(|_| next(3) == 0).collect();
+            let user = Schema::new(
+                (0..distinct.len())
+                    .map(|c| {
+                        let data_type = match text[c] {
+                            true => DataType::Utf8,
+                            false => DataType::Int64,
+                        };
+                        Field::new(format!("c{c:03}"), data_type, true)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let schema = TableSchema::from_user_schema(&user).stamp_field_ids(&user, "_id");
+            let batch = |rows: std::ops::Range<i64>| {
+                let columns = (0..distinct.len())
+                    .map(|c| -> ArrayRef {
+                        let values = rows
+                            .clone()
+                            .map(|row| (row * 7_919 + c as i64) % distinct[c] as i64);
+                        match text[c] {
+                            true => Arc::new(StringArray::from_iter_values(
+                                values.map(|value| format!("v{value}")),
+                            )),
+                            false => Arc::new(Int64Array::from_iter_values(values)),
+                        }
+                    })
+                    .collect();
+                RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch")
+            };
+            let split = next(ROWS as u64 - 1) as i64 + 1;
+            let (first, second) = (batch(0..split), batch(split..ROWS));
+            let batches = [&first, &second];
+
+            let mut whole = ScalarStatsAgg::from_batches_unbudgeted(&schema, &batches);
+            ScalarStatsAgg::fit_value_tables(&mut whole);
+            let built = ScalarStatsAgg::from_batches(&schema, &batches);
+            assert_eq!(built, whole, "{distinct:?}");
+            assert_eq!(ScalarStatsAgg::from_batches_par(&schema, &batches), whole);
+            if shape == 0 {
+                let kept = whole
+                    .values()
+                    .filter(|agg| agg.value_counts.is_some())
+                    .count();
+                assert!(
+                    kept > 0 && kept < distinct.len(),
+                    "the budget keeps some of these tables and drops the rest"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3462,10 +4265,10 @@ mod tests {
 
     #[test]
     fn scalar_agg_merge_invalid_hll_bytes_drops_hll() {
-        // Columns over the value-table cap, so both sides carry a sketch.
-        let over_the_cap = |from: i64| (from..from + MAX_EXACT_VALUE_COUNTS as i64 + 1).collect();
-        let mut a = agg_i64(over_the_cap(0)); // valid HLL
-        let mut b = agg_i64(over_the_cap(1_000));
+        // Columns past the value-table budget, so both sides carry a sketch.
+        let past_the_budget = |from: i64| (from..from + MOST_DISTINCT_I64 as i64 + 1).collect();
+        let mut a = agg_i64(past_the_budget(0)); // valid HLL
+        let mut b = agg_i64(past_the_budget(1_000));
         assert!(a.hll.is_some() && b.hll.is_some(), "sketched, not counted");
         b.hll = Some(vec![1, 2, 3]); // not a valid sketch
         a.merge_with(&b).expect("same type merges");
@@ -5491,7 +6294,8 @@ mod tests {
     ///   - every type that carries counts, plus a float column that doesn't;
     ///   - nulls, an all-null column, and every column sliced, so the rows
     ///     counted don't start at zero;
-    ///   - exactly [`MAX_EXACT_VALUE_COUNTS`] distinct values, and one more.
+    ///   - exactly as many distinct values as a table holds within the budget,
+    ///     and one more.
     /// This test pins that counting on the native type gives the same counts,
     /// each built from a row that holds its value.
     #[test]
@@ -5546,7 +6350,10 @@ mod tests {
             let sliced = column.slice(1, column.len() - 2);
             for column in [column, &sliced] {
                 assert_eq!(
-                    ScalarValueCounts::from_pieces(slice::from_ref(column)),
+                    ScalarValueCounts::from_pieces(
+                        slice::from_ref(column),
+                        VALUE_TABLES_BUDGET_BYTES
+                    ),
                     counts_per_row(column),
                     "{} rows of {}",
                     column.len(),
@@ -5555,18 +6362,21 @@ mod tests {
             }
         }
 
-        let at_cap: ArrayRef = Arc::new(Int32Array::from_iter_values(
-            0..MAX_EXACT_VALUE_COUNTS as i32,
-        ));
-        let past_cap: ArrayRef = Arc::new(Int32Array::from_iter_values(
-            0..=MAX_EXACT_VALUE_COUNTS as i32,
-        ));
+        let most = most_distinct(size_of::<i32>()) as i32;
+        let at_cap: ArrayRef = Arc::new(Int32Array::from_iter_values(0..most));
+        let past_cap: ArrayRef = Arc::new(Int32Array::from_iter_values(0..=most));
         assert_eq!(
-            ScalarValueCounts::from_pieces(slice::from_ref(&at_cap)),
+            ScalarValueCounts::from_pieces(slice::from_ref(&at_cap), VALUE_TABLES_BUDGET_BYTES),
             counts_per_row(&at_cap)
         );
-        assert!(ScalarValueCounts::from_pieces(slice::from_ref(&at_cap)).is_some());
-        assert!(ScalarValueCounts::from_pieces(slice::from_ref(&past_cap)).is_none());
+        assert!(
+            ScalarValueCounts::from_pieces(slice::from_ref(&at_cap), VALUE_TABLES_BUDGET_BYTES)
+                .is_some()
+        );
+        assert!(
+            ScalarValueCounts::from_pieces(slice::from_ref(&past_cap), VALUE_TABLES_BUDGET_BYTES)
+                .is_none()
+        );
     }
 
     #[test]
@@ -5576,10 +6386,10 @@ mod tests {
         //  - Int64 with nulls, an all-null piece and an empty piece.
         //  - Float64 with a NaN in one piece only.
         //  - Utf8, Decimal128, Boolean, a zoned Timestamp, and Binary (no stats).
-        //  - Int32 with exactly the value-count cap of distinct values, and one
-        //    past it, each piece under the cap.
+        //  - Int32 with exactly as many distinct values as a table holds within
+        //    the budget, and one more, each piece under it.
         // This test pins that skipping the concat changes no stat.
-        let half = MAX_EXACT_VALUE_COUNTS as i32 / 2;
+        let half = most_distinct(size_of::<i32>()) as i32 / 2;
         let decimal = |values: Vec<Option<i128>>| -> ArrayRef {
             Arc::new(
                 Decimal128Array::from(values)

@@ -137,6 +137,13 @@ pub enum InfinoError {
     /// [`QueryCancel`]: crate::QueryCancel
     #[error("cancelled: {0}")]
     Cancelled(String),
+
+    /// The hosted service could not be reached or did not answer in time: a
+    /// connection that failed or broke, a timeout, or a 502, 503 or 504.
+    /// It says nothing about the request itself, so the same request may
+    /// succeed later. A write that timed out may still have been committed.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
 }
 
 impl InfinoError {
@@ -171,6 +178,7 @@ impl InfinoError {
             Self::Config(m) => Self::Config(format!("{prefix}: {m}")),
             Self::Unsupported(m) => Self::Unsupported(format!("{prefix}: {m}")),
             Self::Cancelled(m) => Self::Cancelled(format!("{prefix}: {m}")),
+            Self::Unavailable(m) => Self::Unavailable(format!("{prefix}: {m}")),
         }
     }
 
