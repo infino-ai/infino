@@ -58,6 +58,7 @@ use parquet::{
         ProjectionMask,
         arrow_reader::{
             ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+            RowSelectionPolicy,
         },
         async_reader::{AsyncFileReader, ParquetObjectReader, ParquetRecordBatchStreamBuilder},
     },
@@ -2327,6 +2328,29 @@ where
     finish_take(&plan, batches, local_doc_ids, names)
 }
 
+/// The row groups `sorted` (ascending, distinct rows) falls in, and its rows
+/// numbered as if only those row groups were in the file.
+fn hit_row_groups(metadata: &ParquetMetaData, sorted: &[u32]) -> (Vec<usize>, Vec<u32>) {
+    let mut groups = Vec::new();
+    let mut rows = Vec::with_capacity(sorted.len());
+    let (mut first_row, mut kept_rows, mut next) = (0u64, 0u64, 0usize);
+    for (index, rg) in metadata.row_groups().iter().enumerate() {
+        let end_row = first_row + rg.num_rows() as u64;
+        let before = next;
+        while next < sorted.len() && u64::from(sorted[next]) < end_row {
+            // At most the row's own number, so it fits in a u32.
+            rows.push((kept_rows + u64::from(sorted[next]) - first_row) as u32);
+            next += 1;
+        }
+        if next > before {
+            groups.push(index);
+            kept_rows += end_row - first_row;
+        }
+        first_row = end_row;
+    }
+    (groups, rows)
+}
+
 /// [`take_rows_async`] decoding from `chunks`, synchronously: the reader-pool
 /// half of a prefetched take.
 fn take_rows_prefetched(
@@ -2341,13 +2365,21 @@ fn take_rows_prefetched(
         Ok(plan) => plan,
         Err(done) => return Ok(done),
     };
+    // Only the row groups with a hit: a row group with none would still read
+    // its dictionary page, which the prefetch leaves out.
+    let (row_groups, rows) = hit_row_groups(&metadata, &plan.sorted);
+    let (_, selection) = row_selection_for_ids(&rows);
     let metadata = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
         .map_err(QueryError::store)?;
     let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(chunks, metadata);
     let mask = ProjectionMask::roots(builder.parquet_schema(), plan.col_indices.iter().copied());
     let batches: Vec<RecordBatch> = builder
         .with_projection(mask)
-        .with_row_selection(plan.selection.clone())
+        .with_row_groups(row_groups)
+        .with_row_selection(selection)
+        // A mask reads every page between two hits, also the pages the
+        // prefetch skipped; selectors skip them.
+        .with_row_selection_policy(RowSelectionPolicy::Selectors)
         .build()
         .map_err(QueryError::store)?
         .collect::<Result<_, _>>()
@@ -2885,6 +2917,118 @@ mod tests {
             covered(chunk_start, first_page - chunk_start),
             "the dictionary page"
         );
+    }
+
+    /// A dense take that skips a page between two hit pages decodes from its
+    /// prefetch alone: the decode must not read the skipped page.
+    #[test]
+    fn dense_take_decodes_from_its_prefetch_alone() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let values = Arc::new(Int64Array::from_iter_values(0..1000)) as ArrayRef;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values]).expect("batch");
+        let mut bytes = Vec::new();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .set_data_page_row_count_limit(10)
+            .set_write_batch_size(10)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let bytes = Bytes::from(bytes);
+        let metadata = Arc::new(
+            ParquetMetaDataReader::new()
+                .with_page_index_policy(PageIndexPolicy::Required)
+                .parse_and_finish(&bytes)
+                .expect("metadata"),
+        );
+        // Every other row of pages 0 and 2: short runs, page 1 has no hit.
+        let rows: Vec<u32> = (0..10).chain(20..30).step_by(2).collect();
+        let spans =
+            take_prefetch_spans(&metadata, &rows, &[0], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
+        let chunks = PrefetchedChunks {
+            len: bytes.len() as u64,
+            spans: spans
+                .into_iter()
+                .map(|s| (s.clone(), bytes.slice(s.start as usize..s.end as usize)))
+                .collect(),
+        };
+        let got = take_rows_prefetched(chunks, metadata, &schema, 1000, &rows, &["a"])
+            .expect("decodes from the prefetch alone");
+        let want: Vec<i64> = rows.iter().map(|&r| i64::from(r)).collect();
+        assert_eq!(
+            got.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64")
+                .values(),
+            want.as_slice()
+        );
+    }
+
+    /// A take whose rows skip a whole row group decodes from its prefetch
+    /// alone: the row group with no hit must not read its dictionary page,
+    /// which the prefetch leaves out.
+    #[test]
+    fn take_skipping_a_row_group_decodes_from_its_prefetch_alone() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "lang",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        const LANGS: [&str; 3] = ["en", "fr", "de"];
+        let values = LargeStringArray::from_iter_values((0..300).map(|i| LANGS[i % 3]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values) as ArrayRef])
+            .expect("batch");
+        let mut bytes = Vec::new();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .set_data_page_row_count_limit(10)
+            .set_write_batch_size(10)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let bytes = Bytes::from(bytes);
+        let metadata = Arc::new(
+            ParquetMetaDataReader::new()
+                .with_page_index_policy(PageIndexPolicy::Required)
+                .parse_and_finish(&bytes)
+                .expect("metadata"),
+        );
+        assert!(
+            metadata
+                .row_group(1)
+                .column(0)
+                .dictionary_page_offset()
+                .is_some(),
+            "the column is dictionary encoded"
+        );
+        // Hits in row groups 0 and 2; row group 1 has none.
+        let rows: Vec<u32> = vec![3, 41, 205, 299];
+        let spans =
+            take_prefetch_spans(&metadata, &rows, &[0], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
+        let chunks = PrefetchedChunks {
+            len: bytes.len() as u64,
+            spans: spans
+                .into_iter()
+                .map(|s| (s.clone(), bytes.slice(s.start as usize..s.end as usize)))
+                .collect(),
+        };
+        let got = take_rows_prefetched(chunks, metadata, &schema, 300, &rows, &["lang"])
+            .expect("decodes from the prefetch alone");
+        let got: Vec<&str> = got
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("large utf8")
+            .iter()
+            .map(|v| v.expect("not null"))
+            .collect();
+        let want: Vec<&str> = rows.iter().map(|&r| LANGS[r as usize % 3]).collect();
+        assert_eq!(got, want);
     }
 
     /// A batch of ranges the prefetch holds only some of fetches just the
