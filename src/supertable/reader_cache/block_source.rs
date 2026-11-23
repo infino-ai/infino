@@ -196,6 +196,11 @@ const ALIGNED_GET_BYTES: u64 = 512 * 1024;
 /// [`ALIGNED_GET_BYTES`] in blocks.
 const ALIGNED_GET_BLOCKS: u32 = (ALIGNED_GET_BYTES / CACHE_BLOCK_BYTES) as u32;
 
+/// Largest read served by `pread` rather than from a mapping of the block
+/// file, outside the vector and FTS sections: column pages, page headers and
+/// page indexes.
+const PREAD_MAX_BYTES: u64 = 1024 * 1024;
+
 /// A read smaller than this gets a copy of its bytes rather than a slice of the
 /// run it came from: a caller may keep it as long as its reader lives (a vector
 /// reader keeps its headers), and a slice would keep the whole run in memory.
@@ -1293,6 +1298,17 @@ impl BlockCachedSource {
         Some((first, last))
     }
 
+    /// Whether `[start, start+len)` overlaps the vector or the FTS section,
+    /// whose readers read a range and touch only part of it: cluster spans,
+    /// a term dictionary they search. A slice of the mapping reads only the
+    /// pages they touch; a copy would read them all.
+    fn read_touches_part(&self, start: u64, len: u64) -> bool {
+        let overlaps = |section: Option<(u64, u64)>| {
+            section.is_some_and(|(off, n)| start < off.saturating_add(n) && start + len > off)
+        };
+        overlaps(self.layout.aligned_region) || overlaps(self.layout.fts_hole)
+    }
+
     /// The block holding the aligned region's first byte.
     fn first_region_block(&self) -> Option<u32> {
         let (off, _) = self.layout.aligned_region?;
@@ -1595,7 +1611,8 @@ impl BlockCachedSource {
             let s = (u64::from(first) * CACHE_BLOCK_BYTES).max(start);
             let e = ((u64::from(last) + 1) * CACHE_BLOCK_BYTES).min(end);
             pieces.push(match segment {
-                Segment::Filled { .. } => self.read_local(bf, s, e - s)?,
+                // Copied below, so a slice: a `pread` would copy twice.
+                Segment::Filled { .. } => self.read_mapped(bf, s, e - s)?,
                 Segment::InMemory {
                     run_first, bytes, ..
                 } => {
@@ -2030,6 +2047,22 @@ impl BlockCachedSource {
     /// Serve `[start, start+len)` from the sparse file. `None` on a read
     /// error (caller degrades to passthrough).
     fn read_local(&self, bf: &BlockFile, start: u64, len: u64) -> Option<Bytes> {
+        // A small read outside the vector and FTS sections is copied out with
+        // one `pread`. A slice of the mapping takes its page faults later, in
+        // the decoder: each takes the process's memory-map lock and reads
+        // ahead pages nobody asked for, and with thousands of files read per
+        // query that cost more than the copy.
+        if len <= PREAD_MAX_BYTES && !self.read_touches_part(start, len) {
+            let mut out = vec![0u8; len as usize];
+            bf.file.read_exact_at(&mut out, start).ok()?;
+            return Some(Bytes::from(out));
+        }
+        self.read_mapped(bf, start, len)
+    }
+
+    /// `[start, start+len)` of the sparse file as a slice of its mapping.
+    /// `None` on a read error (caller degrades to passthrough).
+    fn read_mapped(&self, bf: &BlockFile, start: u64, len: u64) -> Option<Bytes> {
         // Zero-copy hit service: filled ranges are handed out as slices of
         // one shared read-only mapping instead of alloc+pread per range. At
         // law width a warm vector query reads ~20 MB through here; the
@@ -3384,6 +3417,95 @@ mod tests {
 
     /// Bytes in one aligned group.
     const GROUP: u64 = ALIGNED_GET_BYTES;
+
+    /// Whether `src` has mapped its block file.
+    fn mapped(src: &BlockCachedSource) -> bool {
+        src.block_file()
+            .and_then(|bf| bf.mmap.get())
+            .is_some_and(Option::is_some)
+    }
+
+    /// Bytes of the blob behind [`filled_source`].
+    const FILLED_BYTES: u64 = 8 * GROUP;
+
+    /// The layout of [`filled_source`]: the FTS section is its fifth group, the
+    /// vector section its seventh, and its first four groups are neither.
+    const FILLED_LAYOUT: SourceLayout = SourceLayout {
+        fts_hole: Some((4 * GROUP, GROUP)),
+        aligned_region: Some((6 * GROUP, GROUP)),
+    };
+
+    /// A source over a [`FILLED_BYTES`]-byte blob with `layout`, every block
+    /// filled and nothing read from its blocks yet.
+    async fn filled_source(
+        dir: &Path,
+        store: &Arc<DiskCacheStore>,
+        layout: SourceLayout,
+    ) -> (SuperfileUri, Arc<CountingSource>, Arc<BlockCachedSource>) {
+        let inner = Arc::new(CountingSource::new(FILLED_BYTES as usize));
+        let uri = SuperfileUri::new_v4();
+        let src = BlockCachedSource::new_with_accounting(
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(store),
+            uri,
+            dir.join("filled.blocks"),
+            true,
+            layout,
+        );
+        store.install_block_entry_for_test(uri, Arc::clone(&src));
+        // A prefetch also fills the FTS section, which reads leave out.
+        src.prefetch(0, FILLED_BYTES, GROUP, 2)
+            .await
+            .expect("prefetch");
+        store.block_writes_settled().await;
+        assert!(src.all_filled(0, (FILLED_BYTES / CACHE_BLOCK_BYTES) as u32 - 1));
+        assert!(!mapped(&src), "filling does not map the file");
+        (uri, inner, src)
+    }
+
+    /// Read `len` bytes at `at` from `src` and check them against `inner`.
+    async fn read_checked(src: &BlockCachedSource, inner: &CountingSource, at: u64, len: u64) {
+        let got = src.range(at, len).await.expect("read");
+        assert_eq!(got, inner.blob.slice(at as usize..(at + len) as usize));
+    }
+
+    /// A read of up to `PREAD_MAX_BYTES` outside the vector and FTS sections
+    /// is copied out with `pread`, so the block file is not mapped; one byte
+    /// more is a slice of the mapping. The bytes are the same either way.
+    #[tokio::test]
+    async fn a_small_read_outside_the_sections_does_not_map_the_file() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = filled_source(dir.path(), &store, FILLED_LAYOUT).await;
+
+        read_checked(&src, &inner, GROUP - 100, 50).await;
+        assert!(!mapped(&src), "a small read");
+        read_checked(&src, &inner, 100, PREAD_MAX_BYTES).await;
+        assert!(!mapped(&src), "a read of exactly PREAD_MAX_BYTES");
+        read_checked(&src, &inner, 100, PREAD_MAX_BYTES + 1).await;
+        assert!(mapped(&src), "a read past PREAD_MAX_BYTES");
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A small read in the vector section, or in the FTS section, keeps the
+    /// zero-copy slice of the mapping: their readers touch only part of what
+    /// they read. So does any read of a source whose layout is unknown.
+    #[tokio::test]
+    async fn a_small_read_in_a_section_is_a_slice_of_the_mapping() {
+        for (name, layout, at) in [
+            ("vector", FILLED_LAYOUT, 6 * GROUP + 100),
+            ("FTS", FILLED_LAYOUT, 4 * GROUP + 100),
+            ("straddling FTS", FILLED_LAYOUT, 4 * GROUP - 20),
+            ("unknown layout", SourceLayout::ALL_ALIGNED, GROUP - 100),
+        ] {
+            let dir = tempdir().expect("tempdir");
+            let store = test_store(dir.path(), u64::MAX);
+            let (uri, inner, src) = filled_source(dir.path(), &store, layout).await;
+            read_checked(&src, &inner, at, 50).await;
+            assert!(mapped(&src), "a read in the {name} section maps the file");
+            store.remove_block_entry_for_test(&uri);
+        }
+    }
 
     /// Outside the aligned region a GET for a missing run at least as long as
     /// `MIN_GET_BYTES` covers only the blocks the run touches.
