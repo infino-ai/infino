@@ -366,7 +366,7 @@ impl DiskCacheStore {
         candidates.sort_by_key(|(_, _, mtime_us)| *mtime_us);
 
         let mut freed: u64 = 0;
-        for (uri, size, _) in candidates {
+        for (uri, size, mtime_us) in candidates {
             if freed >= bytes_needed {
                 break;
             }
@@ -374,7 +374,14 @@ impl DiskCacheStore {
             // Only the winner of the remove deletes and subtracts, so two concurrent evictions
             // cannot double-count.
             if self.unindexed.remove(&uri).is_some() {
-                tracing::info!(target: "infino::cache", uri = %uri.0, size, "evict: whole .sf.parquet (budget)");
+                tracing::info!(
+                    target: "infino::cache",
+                    uri = %uri.0,
+                    size,
+                    cached_at_us = self.cached_at_us(&uri),
+                    mtime_us,
+                    "evict: whole .sf.parquet (budget)"
+                );
                 self.remove_local_copy(&uri);
                 self.drop_block_file(&uri);
                 self.current_bytes.fetch_sub(size, Ordering::Release);
@@ -401,13 +408,20 @@ impl DiskCacheStore {
         candidates.sort_by_key(|(_, _, mtime_us)| *mtime_us);
 
         let mut freed: u64 = 0;
-        for (uri, size, _) in candidates {
+        for (uri, size, mtime_us) in candidates {
             if freed >= bytes_needed {
                 break;
             }
 
             if self.block_files.remove(&uri).is_some() {
-                tracing::info!(target: "infino::cache", uri = %uri.0, size, "evict: .blocks (budget)");
+                tracing::info!(
+                    target: "infino::cache",
+                    uri = %uri.0,
+                    size,
+                    cached_at_us = created_at_us(&self.blocks_path(&uri)),
+                    mtime_us,
+                    "evict: .blocks (budget)"
+                );
                 let _ = fs::remove_file(self.blocks_path(&uri));
                 let _ = fs::remove_file(self.blocks_idx_path(&uri));
                 self.current_bytes.fetch_sub(size, Ordering::Release);
@@ -777,7 +791,13 @@ impl DiskCacheStore {
             // double-decrement current_bytes. The removal
             // also cancels the file's download.
             if let Some(entry) = self.remove_entry_cancelling_fill(&uri, |_| true) {
-                tracing::info!(target: "infino::cache", uri = %uri.0, "evict: live cached entry (budget pressure)");
+                tracing::info!(
+                    target: "infino::cache",
+                    uri = %uri.0,
+                    cached_at_us = self.cached_at_us(&uri),
+                    last_used_us = unix_us(self.store_time(entry.last_access_us.load(Ordering::Acquire))),
+                    "evict: live cached entry (budget pressure)"
+                );
 
                 // A leftover coordinator would keep the evicted entry, and its budget, alive.
                 self.coordinators.remove(&uri);
@@ -1071,9 +1091,26 @@ impl<'a> Drop for Reservation<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        collections::HashMap,
+        fmt::Debug,
+        fs::{self, OpenOptions},
+        io::Write,
+        path::Path,
+        sync::{Arc, Mutex},
+        thread,
+        time::{Duration, SystemTime},
+    };
 
     use bytes::Bytes;
+    use tempfile::tempdir;
+    use tracing::{
+        Event, Subscriber,
+        callsite::rebuild_interest_cache,
+        field::{Field, Visit},
+        subscriber::{set_default, set_global_default},
+    };
+    use tracing_subscriber::{Layer, layer::Context, prelude::*, registry};
 
     use crate::{
         superfile::LazyByteSource,
@@ -1082,10 +1119,200 @@ mod tests {
             reader_cache::{
                 block_source::CACHE_BLOCK_BYTES,
                 config::ColdFetchMode,
-                disk::{budget::*, test_support::*},
+                disk::{budget::*, created_at_us, file_mtime_us, test_support::*, unix_us},
             },
         },
     };
+
+    /// How far a store-clock time turned into a wall-clock time may land from the moment it names:
+    /// a little late by a pause between the store's two clock reads, either way by a wall clock
+    /// slewed since.
+    const CLOCK_SLACK_US: u64 = 1_000;
+
+    /// Long enough for a later write to move a file's mtime past its creation time.
+    const MTIME_STEP: Duration = Duration::from_millis(20);
+
+    /// The `evict:` lines logged, each as its message and its integer fields by name.
+    #[derive(Clone, Default)]
+    struct EvictionLog(Arc<Mutex<Vec<(String, HashMap<&'static str, u64>)>>>);
+
+    impl EvictionLog {
+        /// The integer fields of the one line logged with `message`.
+        fn fields(&self, message: &str) -> HashMap<&'static str, u64> {
+            let lines = self.0.lock().expect("eviction log lock");
+            let mut matching = lines.iter().filter(|(logged, _)| logged == message);
+            let (_, fields) = matching
+                .next()
+                .unwrap_or_else(|| panic!("no {message:?} line"));
+            assert!(matching.next().is_none(), "one {message:?} line");
+            fields.clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct LineFields {
+        message: String,
+        numbers: HashMap<&'static str, u64>,
+    }
+
+    impl Visit for LineFields {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.numbers.insert(field.name(), value);
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for EvictionLog {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut line = LineFields::default();
+            event.record(&mut line);
+            if line.message.starts_with("evict:") {
+                self.0
+                    .lock()
+                    .expect("eviction log lock")
+                    .push((line.message, line.numbers));
+            }
+        }
+    }
+
+    fn mtime_us(path: &Path) -> u64 {
+        file_mtime_us(&fs::metadata(path).expect("file on disk"))
+    }
+
+    /// A file's created time stays put when it is written again and renamed, as a cache file's is
+    /// when a download lands. Without a birth time there is none, rather than another time.
+    #[test]
+    fn a_file_keeps_its_created_time_through_a_later_write_and_a_rename() {
+        let dir = tempdir().expect("tempdir");
+        let (tmp, kept) = (dir.path().join("copy.tmp"), dir.path().join("copy"));
+        fs::write(&tmp, b"first").expect("create");
+        let created = created_at_us(&tmp);
+
+        thread::sleep(MTIME_STEP);
+        OpenOptions::new()
+            .append(true)
+            .open(&tmp)
+            .and_then(|mut file| file.write_all(b" second"))
+            .expect("write again");
+        fs::rename(&tmp, &kept).expect("rename");
+
+        if fs::metadata(&kept).expect("kept").created().is_ok() {
+            let created = created.expect("a birth time");
+            assert_eq!(
+                created_at_us(&kept),
+                Some(created),
+                "the birth time survives"
+            );
+            assert!(
+                created < mtime_us(&kept),
+                "the later write moved only the mtime"
+            );
+        } else {
+            assert_eq!(created_at_us(&kept), None, "no other time stands in");
+        }
+    }
+
+    /// Each budget eviction logs when its file was cached and when it was last used: a file never
+    /// opened, a `.blocks` record, and a live entry adopted from disk after a restart, whose cached
+    /// time is still the one its file was written at.
+    #[tokio::test]
+    async fn budget_evictions_log_when_each_file_was_cached_and_last_used() {
+        // A process-wide registry keeps the eviction lines enabled whichever test thread meets
+        // them first. Another test may have installed it already.
+        let _ = set_global_default(registry());
+        let log = EvictionLog::default();
+        let _logging = set_default(registry().with(log.clone()));
+        rebuild_interest_cache();
+
+        let (_dir, store) = test_store();
+        let bytes = tiny_superfile_bytes();
+        let (unopened, adopted, blocks) = (
+            SuperfileUri::new_v4(),
+            SuperfileUri::new_v4(),
+            SuperfileUri::new_v4(),
+        );
+        seed_cache_file(&store, &unopened, &bytes);
+        seed_cache_file(&store, &adopted, &bytes);
+        seed_valid_block_file(&store, &blocks, 3 * CACHE_BLOCK_BYTES, &[0, 1, 2]);
+        // A later write moves the mtime, so each line's two times differ wherever the filesystem
+        // keeps a birth time.
+        for path in [
+            store.cache_path(&unopened),
+            store.cache_path(&adopted),
+            store.blocks_path(&blocks),
+        ] {
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(SystemTime::now() + MTIME_STEP))
+                .expect("move the mtime");
+        }
+        // Read before eviction deletes the files.
+        let times = |path: &Path| (created_at_us(path), mtime_us(path));
+        let unopened_times = times(&store.cache_path(&unopened));
+        let blocks_times = times(&store.blocks_path(&blocks));
+        let adopted_created = created_at_us(&store.cache_path(&adopted));
+
+        // A restart: the records and the entry below all come from the files on disk.
+        let reopened = reopen_store(&store, |_| {});
+        let before_open = unix_us(SystemTime::now());
+        reopened
+            .reader(&adopted)
+            .await
+            .expect("adopt the whole copy");
+
+        reopened.evict_unindexed(u64::MAX, None);
+        reopened.evict_block_files(u64::MAX, None);
+        reopened
+            .evict_at_least(bytes.len() as u64)
+            .await
+            .expect("evict the live entry");
+
+        let whole = log.fields("evict: whole .sf.parquet (budget)");
+        assert_eq!(whole.get("cached_at_us").copied(), unopened_times.0);
+        assert_eq!(whole.get("mtime_us"), Some(&unopened_times.1));
+
+        let block_file = log.fields("evict: .blocks (budget)");
+        assert_eq!(block_file.get("cached_at_us").copied(), blocks_times.0);
+        assert_eq!(block_file.get("mtime_us"), Some(&blocks_times.1));
+
+        let live = log.fields("evict: live cached entry (budget pressure)");
+        assert_eq!(
+            live.get("cached_at_us").copied(),
+            adopted_created,
+            "adopting the file after a restart keeps when it was cached"
+        );
+        let last_used = live["last_used_us"];
+        let evicted = unix_us(SystemTime::now());
+        assert!(
+            (before_open - CLOCK_SLACK_US..=evicted + CLOCK_SLACK_US).contains(&last_used),
+            "last used at the open: {last_used} not within {before_open}..={evicted}"
+        );
+    }
+
+    /// A file with more than one local copy was cached when its oldest copy was created, since the
+    /// eviction that logs it deletes them all.
+    #[tokio::test]
+    async fn a_file_was_cached_when_its_oldest_copy_was_created() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        seed_valid_block_file(&store, &uri, CACHE_BLOCK_BYTES, &[0]);
+        thread::sleep(MTIME_STEP);
+        seed_cache_file(&store, &uri, &tiny_superfile_bytes());
+
+        let oldest = created_at_us(&store.blocks_path(&uri));
+        assert_eq!(store.cached_at_us(&uri), oldest);
+        if oldest.is_some() {
+            assert!(
+                oldest < created_at_us(&store.cache_path(&uri)),
+                "two distinct copies"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn downloads_ahead_of_reads_get_half_the_unwritten_runs_cap() {

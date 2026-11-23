@@ -10,14 +10,14 @@
 use std::{
     collections::HashSet,
     fmt, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dashmap::DashMap;
@@ -129,13 +129,23 @@ impl Drop for ForegroundQueryGuard {
     }
 }
 
+/// `time` in microseconds since the unix epoch, 0 for a time before it.
+fn unix_us(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64)
+}
+
 /// File mtime in microseconds since the unix epoch, 0 if the filesystem has none.
 fn file_mtime_us(meta: &fs::Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
+    meta.modified().map_or(0, unix_us)
+}
+
+/// When the file at `path` was created (its birth time) in microseconds since the unix epoch,
+/// `None` with no file or on a filesystem that keeps no birth time. Renaming keeps it, so a
+/// downloaded copy keeps its download's start across reopens and restarts; a copy admitted as a
+/// hard link keeps when the build created it.
+fn created_at_us(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok()?.created().ok().map(unix_us)
 }
 
 /// Errors surfaced by [`DiskCacheStore::open_for_query`] and its sibling reader entry points.
@@ -751,6 +761,27 @@ impl DiskCacheStore {
 
     pub(crate) fn now_us(&self) -> u64 {
         self.started_at.elapsed().as_micros() as u64
+    }
+
+    /// `store_us`, a time on this store's clock ([`Self::now_us`]), as a wall-clock time, so it
+    /// sorts beside a file's times. Counted back from now, so a clock step or a suspend before
+    /// `store_us` does not shift it; the store clock is read first, so it can only land late.
+    fn store_time(&self, store_us: u64) -> SystemTime {
+        let since = Duration::from_micros(self.now_us().saturating_sub(store_us));
+        SystemTime::now().checked_sub(since).unwrap_or(UNIX_EPOCH)
+    }
+
+    /// When the oldest local copy of `uri` was created, for an eviction log that deletes them all.
+    /// `None` when none is on disk under its cache name, as before a download lands.
+    fn cached_at_us(&self, uri: &SuperfileUri) -> Option<u64> {
+        [
+            self.cache_path(uri),
+            self.hole_path(uri),
+            self.blocks_path(uri),
+        ]
+        .iter()
+        .filter_map(|path| created_at_us(path))
+        .min()
     }
 
     /// Build a per-URI cache file path under `cache_root`.
