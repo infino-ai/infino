@@ -2200,14 +2200,20 @@ pub(crate) async fn take_rows_byte_source(
 
 /// Per row group, whether every row of `name` holds one value the footer
 /// records exactly (min == max, both exact, no nulls), with the row groups'
-/// minimums. `None` for a float or nested column or unreadable statistics.
+/// minimums. `None` for a float, nested or dictionary column or unreadable
+/// statistics: Parquet's converter reads a dictionary's statistics as its
+/// values' without the checks [`decimal_statistics_fit`] makes, and their
+/// minimums would not have the column's type anyway.
 fn constant_row_groups(
     metadata: &ParquetMetaData,
     schema: &Schema,
     name: &str,
 ) -> Option<(ArrayRef, Vec<bool>)> {
     let field = schema.field_with_name(name).ok()?;
-    if field.data_type().is_floating() || field.data_type().is_nested() {
+    if field.data_type().is_floating()
+        || field.data_type().is_nested()
+        || matches!(field.data_type(), DataType::Dictionary(..))
+    {
         return None;
     }
     let converter =
@@ -2379,6 +2385,11 @@ async fn take_with_constant_chunks(
     let mut fields = Vec::with_capacity(names.len());
     let mut columns = Vec::with_capacity(names.len());
     for ((name, c), slot) in names.iter().zip(constants).zip(slots) {
+        // A column constant in none of the hit row groups is its read as is.
+        let c = match doc_rgs.iter().any(|&rg| constant_in(&c, rg)) {
+            true => c,
+            false => None,
+        };
         fields.push(
             schema
                 .field_with_name(name)
@@ -4238,17 +4249,19 @@ mod tests {
         );
     }
 
+    /// The row of `rating` that holds its only null.
+    const RATING_NULL_ROW: i64 = 1;
+
     /// A take reads a column only in the row groups where it varies: in the
     /// others the footer's exact min == max is every row's value. The rows,
     /// in request order and with repeats, match the column's own.
     #[tokio::test]
     async fn a_take_serves_constant_row_groups_from_statistics() {
-        use arrow_array::Int64Array;
-
         let schema: Arc<Schema> = Arc::new(Schema::new(vec![
             decimal128_id_field("doc_id"),
             Field::new("day", DataType::Int64, false),
             Field::new("views", DataType::Int64, false),
+            Field::new("rating", DataType::Int64, true),
         ]));
         let mut opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
         opts.row_group_size = 1000;
@@ -4265,6 +4278,11 @@ mod tests {
                 Arc::new(decimal128_ids(0..3000)),
                 Arc::new(Int64Array::from_iter_values((0..3000).map(day))),
                 Arc::new(Int64Array::from_iter_values((0..3000).map(|i| i * 10))),
+                // Equal minimum and maximum everywhere, with a null in the
+                // first row group.
+                Arc::new(Int64Array::from_iter(
+                    (0..3000).map(|i| (i != RATING_NULL_ROW).then_some(7)),
+                )),
             ],
         )
         .expect("build batch");
@@ -4361,6 +4379,36 @@ mod tests {
         let together = ranges_of(&["views", "doc_id"]).await;
         assert!(!together.is_empty());
         assert_eq!(ranges_of(&["day", "views", "doc_id"]).await, together);
+
+        // A row group holding a null is not constant though its minimum
+        // and maximum agree: its null row stays null, read from the column.
+        let rating = |ids: &[u32]| {
+            let open = &open;
+            let ids = ids.to_vec();
+            async move {
+                let (source, reader, _, read) = open().await;
+                let batch = take_rows_byte_source(&reader, &ids, &["rating"], None, None)
+                    .await
+                    .expect("take");
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64")
+                    .iter()
+                    .collect::<Vec<_>>();
+                (column, source.ranges().len() - read)
+            }
+        };
+        let (null_row, reads) = rating(&[RATING_NULL_ROW as u32]).await;
+        assert_eq!(null_row, vec![None]);
+        assert!(reads > 0, "the null row's row group is read");
+        let (constant_row, reads) = rating(&[1500]).await;
+        assert_eq!(constant_row, vec![Some(7)]);
+        assert_eq!(
+            reads, 0,
+            "a row group without nulls is served from statistics"
+        );
     }
 
     /// The bytes of a `Decimal128` value.
@@ -4368,11 +4416,20 @@ mod tests {
 
     /// A footer whose decimal minimum or maximum is empty, or wider than the
     /// decimal, leaves the column without constant row groups rather than
-    /// panicking in Parquet's statistics converter; one of the decimal's
-    /// width still reads.
+    /// panicking in Parquet's statistics converter, as a column that reads
+    /// it as a dictionary of decimals does; one of the decimal's width still
+    /// reads.
     #[test]
     fn malformed_decimal_statistics_are_not_constant() {
         let schema = Schema::new(vec![decimal128_id_field("doc_id")]);
+        let dictionary = Schema::new(vec![Field::new(
+            "doc_id",
+            DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Decimal128(38, 0)),
+            ),
+            false,
+        )]);
         let descr = Arc::new(
             ArrowSchemaConverter::new()
                 .convert(&schema)
@@ -4402,9 +4459,14 @@ mod tests {
         };
         for min in [Vec::new(), vec![0u8; DECIMAL128_BYTES + 1]] {
             let len = min.len();
+            let metadata = metadata(min);
             assert!(
-                constant_row_groups(&metadata(min), &schema, "doc_id").is_none(),
+                constant_row_groups(&metadata, &schema, "doc_id").is_none(),
                 "a {len}-byte minimum"
+            );
+            assert!(
+                constant_row_groups(&metadata, &dictionary, "doc_id").is_none(),
+                "a {len}-byte minimum of a dictionary"
             );
         }
         let (_, constant) =

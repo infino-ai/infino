@@ -2996,6 +2996,16 @@ impl TermIndex {
         for term in terms {
             *bare.entry(term).or_insert(0.0) += 1.0;
         }
+        // A superfile the root lists more than once sums under its first
+        // ordinal, so a posting at any of its listings reaches its ceiling.
+        let mut ordinal: HashMap<Uuid, usize> = HashMap::with_capacity(self.root.superfiles.len());
+        let canonical: Vec<usize> = self
+            .root
+            .superfiles
+            .iter()
+            .enumerate()
+            .map(|(i, id)| *ordinal.entry(*id).or_insert(i))
+            .collect();
         // Bare terms sum straight into a per-ordinal ceiling, so the work is
         // one pass over their postings rather than a lookup per term per
         // superfile, which a prefix's thousands of expansions make large.
@@ -3018,8 +3028,9 @@ impl TermIndex {
                         false => p.bound,
                     };
                     if let Some(idf) = idf {
-                        let o = p.superfile as usize;
-                        // A later layer's posting replaces an earlier one's.
+                        let o = canonical[p.superfile as usize];
+                        // A later posting for the superfile replaces an
+                        // earlier one's.
                         if last_term[o] != ti {
                             last_term[o] = ti;
                             before[o] = term_ceiling[o];
@@ -3035,13 +3046,6 @@ impl TermIndex {
                 per_term.insert(term, by_sf);
             }
         }
-        let ordinal: HashMap<Uuid, usize> = self
-            .root
-            .superfiles
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (*id, i))
-            .collect();
         let mut out: HashMap<Uuid, f32> = HashMap::with_capacity(entries.len());
         for e in entries {
             let id = e.superfile_id;
@@ -4886,6 +4890,64 @@ mod tests {
             .expect("runs")
             .remove(0);
         assert!(runs.len() == 1 && runs[0].run.legacy_bound && runs[0].tier_object.is_none());
+    }
+
+    /// A superfile the root lists twice keeps the bound posted at either
+    /// listing: one posted only at its first ordinal is not lost to the
+    /// second, which holds none.
+    #[test]
+    fn a_superfile_listed_twice_keeps_the_ceiling_of_its_first_listing() {
+        let (_dir, storage, st) = fresh_table();
+        commit_layer(&st, 0);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let reader = st.reader().expect("reader");
+        let entries: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        let key = title_id().term_key("shared");
+        let (df, bound) = (5u64, 2.5f32);
+        let slice =
+            format::encode_legacy_slice(&[(key.clone(), vec![(0, df, bound, Location::None)])]);
+        let hash = ContentHash::of(&slice);
+        rt.block_on(put_content_addressed(
+            storage.as_ref(),
+            "slice",
+            slice.clone(),
+        ))
+        .expect("slice stored");
+        let root = Root {
+            superfiles: vec![e.superfile_id, e.superfile_id],
+            id_mins: vec![e.id_min, e.id_min],
+            layers: vec![Layer {
+                base: 0,
+                ordinals: None,
+                slices: vec![format::SliceRef {
+                    first_key: key.clone(),
+                    last_key: key.clone(),
+                    content_hash: hash,
+                    tier: None,
+                    len: 0,
+                }],
+            }],
+        };
+        let root = Root::decode(&format::encode_legacy_root(&root, &[slice.len() as u64]))
+            .expect("a legacy root decodes");
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let idf_used = |_: &str| 1.7f32;
+        let ceilings = rt
+            .block_on(index.query_ceilings(title_id(), &["shared"], &[], &entries, &idf_used))
+            .expect("ceilings");
+        let n = e
+            .fts_summary
+            .get(&title_id())
+            .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
+            .unwrap_or(e.n_docs);
+        let expected = bound / bm25::idf(n, df.min(n)) * 1.7 * CEILING_SLACK;
+        let got = ceilings[&e.superfile_id];
+        assert!(
+            (got - expected).abs() <= expected * 1e-5,
+            "ceiling {got}, expected {expected}"
+        );
     }
 
     /// A merge cursor's decoded batch stays within the memory a fold plans
