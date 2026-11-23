@@ -117,7 +117,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError, config,
-    memory::ConnectionMemoryBudget,
+    memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::run_on_pool_unless_blocking,
     runtime_metrics::op_stats,
     superfile::{
@@ -3151,13 +3151,23 @@ impl SupertableReader {
     /// Every term of `column` with the documents holding it, summed over
     /// `files`, deleted rows included: from the term index for the
     /// superfiles it covers, from the dictionaries of the rest.
+    ///
+    /// The map holds every distinct value of the column, and each file
+    /// outside the index hands back its whole term list, so both are charged
+    /// to the connection memory budget as they are built. `None` when a
+    /// charge is refused: the caller then counts another way, budgeted and
+    /// able to spill. What was charged is released when the returned
+    /// [`TermCounts`] is dropped.
     pub(crate) async fn term_doc_counts(
         &self,
         column: &str,
         files: Vec<Arc<SuperfileEntry>>,
-    ) -> Result<HashMap<Vec<u8>, u64>, QueryError> {
+    ) -> Result<Option<TermCounts>, QueryError> {
         let field = self.manifest().field_id(column);
-        let mut counts: HashMap<Vec<u8>, u64> = HashMap::new();
+        let budget = Arc::clone(&self.manifest().options.connection_memory_budget);
+        let Some(mut counts) = TermCounts::new(&budget) else {
+            return Ok(None);
+        };
         let index = self
             .manifest()
             .term_index()
@@ -3176,6 +3186,7 @@ impl SupertableReader {
                     let live_ordinals: Vec<bool> = (0..index.root().superfiles.len() as u32)
                         .map(|o| index.superfile_id(o).is_some_and(|id| live.contains(&id)))
                         .collect();
+                    let mut fits = true;
                     index
                         .for_each_prefix(field, "", |key, run| {
                             let held: u64 = run
@@ -3183,13 +3194,14 @@ impl SupertableReader {
                                 .filter(|p| live_ordinals.get(p.superfile as usize) == Some(&true))
                                 .map(|p| p.df)
                                 .sum();
-                            if held > 0 {
-                                *counts.entry(key[head..].to_vec()).or_default() += held;
-                            }
-                            true
+                            fits = held == 0 || counts.add(&key[head..], held);
+                            fits
                         })
                         .await
                         .map_err(QueryError::from)?;
+                    if !fits {
+                        return Ok(None);
+                    }
                 }
                 rest
             }
@@ -3198,7 +3210,7 @@ impl SupertableReader {
         let column_arc: Arc<str> = Arc::from(column);
         let pool = Arc::clone(&self.manifest().options.reader_pool);
         let units = rest.into_iter().map(|entry| (entry, ())).collect();
-        let per_superfile: Vec<Vec<(Vec<u8>, u64)>> = dispatch::fanout_with(
+        let per_superfile: Vec<Option<(Vec<(Vec<u8>, u64)>, Reservation)>> = dispatch::fanout_with(
             self,
             units,
             false,
@@ -3206,27 +3218,46 @@ impl SupertableReader {
             move |r, _entry, _sidecars, _now, ()| {
                 let column_arc = Arc::clone(&column_arc);
                 let pool = Arc::clone(&pool);
+                let budget = Arc::clone(&budget);
                 async move {
                     let fts = r
                         .fts()
                         .ok_or_else(|| QueryError::Internal("superfile has no FTS index".into()))?;
                     let column = r.column_alias(field, &column_arc);
                     let terms = fts.terms_with_prefix(column, b"", Some(&pool)).await?;
+                    // The file's list is held until the merge below takes
+                    // it, beside every other file's.
+                    let bytes = terms.iter().map(|t| term_entry_bytes(t.len())).sum();
+                    let Ok(held) = budget.try_reserve(bytes) else {
+                        return Ok(None);
+                    };
                     let texts = terms
                         .iter()
                         .map(|t| str::from_utf8(t))
                         .collect::<Result<Vec<&str>, _>>()
                         .map_err(|_| QueryError::Internal("a term is not UTF-8".into()))?;
                     let (dfs, _) = fts.term_dfs(column, &texts).await?;
-                    Ok(terms.into_iter().zip(dfs).collect())
+                    Ok(Some((terms.into_iter().zip(dfs).collect(), held)))
                 }
             },
         )
         .await?;
-        for (term, df) in per_superfile.into_iter().flatten() {
-            *counts.entry(term).or_default() += df;
+        let mut lists = Vec::with_capacity(per_superfile.len());
+        for list in per_superfile {
+            let Some(list) = list else {
+                return Ok(None);
+            };
+            lists.push(list);
         }
-        Ok(counts)
+        for (terms, held) in lists {
+            for (term, df) in terms {
+                if df > 0 && !counts.add(&term, df) {
+                    return Ok(None);
+                }
+            }
+            drop(held);
+        }
+        Ok(Some(counts))
     }
 
     /// Parse `query` into positive and negated tokens, then select the
@@ -5010,6 +5041,76 @@ impl Supertable {
             );
         };
         Ok(tokenizer.tokenize(text).collect())
+    }
+}
+
+/// Bytes a term held as a map key or a list entry is charged: its own bytes,
+/// the `Vec` that owns them, its count, and the map's slot around the pair.
+fn term_entry_bytes(term_len: usize) -> usize {
+    term_len + size_of::<Vec<u8>>() + size_of::<u64>() + TERM_SLOT_OVERHEAD
+}
+
+/// A hash map slot's share beyond its pair: the control byte and the empty
+/// slots its load factor keeps, rounded up.
+const TERM_SLOT_OVERHEAD: usize = 16;
+
+/// The bytes [`TermCounts`] charges the budget at a time, so a column of many
+/// small terms does not charge once per term.
+const TERM_COUNTS_CHARGE: usize = 64 << 10;
+
+/// Each term of a column with the documents holding it, the bytes it holds
+/// charged to the connection memory budget as it grows and released when it
+/// is dropped.
+#[derive(Debug)]
+pub(crate) struct TermCounts {
+    counts: HashMap<Vec<u8>, u64>,
+    /// Bytes the map holds by [`term_entry_bytes`]; the reservation stays at
+    /// or above it.
+    held: usize,
+    reservation: Reservation,
+}
+
+impl TermCounts {
+    /// An empty map, or `None` when the budget has no room left at all.
+    fn new(budget: &Arc<ConnectionMemoryBudget>) -> Option<Self> {
+        Some(Self {
+            counts: HashMap::new(),
+            held: 0,
+            reservation: budget.try_reserve(0).ok()?,
+        })
+    }
+
+    /// Add `n` documents to `term`. `false` when a new term does not fit the
+    /// budget; the map is then left without it.
+    fn add(&mut self, term: &[u8], n: u64) -> bool {
+        if let Some(count) = self.counts.get_mut(term) {
+            *count += n;
+            return true;
+        }
+        let bytes = term_entry_bytes(term.len());
+        let short = (self.held + bytes).saturating_sub(self.reservation.size());
+        let fits = short == 0
+            || self
+                .reservation
+                .try_grow(short.max(TERM_COUNTS_CHARGE))
+                .is_ok()
+            || self.reservation.try_grow(short).is_ok();
+        if !fits {
+            return false;
+        }
+        self.held += bytes;
+        self.counts.insert(term.to_vec(), n);
+        true
+    }
+
+    /// The count of `term`, to adjust in place.
+    pub(crate) fn get_mut(&mut self, term: &[u8]) -> Option<&mut u64> {
+        self.counts.get_mut(term)
+    }
+
+    /// The terms and their counts.
+    pub(crate) fn counts(&self) -> &HashMap<Vec<u8>, u64> {
+        &self.counts
     }
 }
 

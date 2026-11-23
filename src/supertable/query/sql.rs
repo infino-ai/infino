@@ -884,9 +884,10 @@ impl SupertableReader {
     /// there each term is one whole value, so a term's document count in a
     /// superfile is the rows holding that value. The deleted rows' values
     /// are taken off and the nulls added, both from the statistics. `None`
-    /// on another analyzer, or when those statistics are not exact (see
-    /// [`term_count_inputs`]).
-    fn value_counts_from_terms(
+    /// on another analyzer, when those statistics are not exact (see
+    /// [`term_count_inputs`]), or when the terms do not fit the connection
+    /// memory budget (see [`Self::term_doc_counts`]).
+    pub(crate) fn value_counts_from_terms(
         &self,
         column: &str,
         schema: &SchemaRef,
@@ -903,7 +904,9 @@ impl SupertableReader {
         let Some(inputs) = self.block_on(term_count_inputs(&provider, &state, column)) else {
             return Ok(None);
         };
-        let mut counts = self.block_on(self.term_doc_counts(column, inputs.files))?;
+        let Some(mut counts) = self.block_on(self.term_doc_counts(column, inputs.files))? else {
+            return Ok(None);
+        };
         for (value, deleted) in inputs.deleted {
             let held = value.try_as_str().flatten();
             let Some(count) = held.and_then(|text| counts.get_mut(text.as_bytes())) else {
@@ -914,7 +917,8 @@ impl SupertableReader {
             };
             *count = live;
         }
-        term_counts_batch(schema, &counts, inputs.nulls)
+        // `counts` stays charged to the budget until the rows are built.
+        term_counts_batch(schema, counts.counts(), inputs.nulls)
     }
 
     /// The live rows each of `predicates` holds, in order, exactly as
