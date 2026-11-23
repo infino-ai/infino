@@ -126,7 +126,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -145,7 +145,7 @@ use tokio::{
 };
 use tracing::Instrument;
 
-use super::disk::{ArcMmapOwner, DiskCacheStore, Reservation};
+use super::disk::{ArcMmapOwner, DiskCacheStore, Reservation, unix_us};
 use crate::{
     runtime_bridge::shared_io_runtime,
     storage::{StorageError, stuck_after},
@@ -185,6 +185,11 @@ const FETCH_THROUGH_BLOCKS: u32 = 2;
 /// forward miss taken for a jump back: its window then also covers blocks behind
 /// it.
 const READ_ENDS: usize = 16;
+
+/// How far a read must be past the source's recorded last read before it is recorded again, in
+/// microseconds: eviction ranks files far coarser than this, and readers sharing a source then
+/// rarely write the same cache line.
+const LAST_READ_STEP_US: u64 = 1_000;
 
 /// Near the aligned region (see [`SourceLayout::aligned_region`]) a GET covers
 /// whole groups of this many bytes, aligned to file offset 0. Vector reads are
@@ -285,6 +290,9 @@ pub(crate) struct BlockCachedSource {
     /// past any of them.
     read_ends: [AtomicU64; READ_ENDS],
     next_read_end: AtomicUsize,
+    /// When a query last read through this source, in microseconds since the unix epoch, 0 before
+    /// any read.
+    last_read_us: AtomicU64,
     state: OnceLock<Option<BlockFile>>,
     /// Filled-block set. Guarded by a sync mutex; never held across await.
     filled: Mutex<RoaringBitmap>,
@@ -790,6 +798,7 @@ impl BlockCachedSource {
             },
             read_ends: array::from_fn(|_| AtomicU64::new(u64::MAX)),
             next_read_end: AtomicUsize::new(0),
+            last_read_us: AtomicU64::new(0),
             state: OnceLock::new(),
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
@@ -932,6 +941,19 @@ impl BlockCachedSource {
     /// `size_bytes` so accounting and eviction see live growth.
     pub(crate) fn filled_bytes_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.filled_bytes)
+    }
+
+    /// The block file this source opened or adopted, `None` before its first read. Never opens one.
+    pub(crate) fn opened_file(&self) -> Option<&fs::File> {
+        self.created_block_file().map(|block| &block.file)
+    }
+
+    /// When a query last read through this source, `None` before any read.
+    pub(crate) fn last_read(&self) -> Option<SystemTime> {
+        match self.last_read_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(UNIX_EPOCH + Duration::from_micros(us)),
+        }
     }
 
     /// The sparse file, created on first use once the object size is known.
@@ -2287,6 +2309,11 @@ impl LazyByteSource for BlockCachedSource {
     fn note_read(&self, start: u64, len: u64) {
         if len > 0 {
             self.note_read_end(start.saturating_add(len));
+            let now = unix_us(SystemTime::now());
+            // A move either way counts, so reads still record after the wall clock steps back.
+            if now.abs_diff(self.last_read_us.load(Ordering::Relaxed)) >= LAST_READ_STEP_US {
+                self.last_read_us.store(now, Ordering::Relaxed);
+            }
         }
     }
 
@@ -4708,7 +4735,7 @@ mod tests {
         fs::remove_file(&path).expect("unlink blocks");
         fs::File::create(&path).expect("newer file");
 
-        store.retain_block_file(&uri, &older, 0);
+        store.retain_block_file(&uri, &older, None);
         drop(older);
         assert_eq!(
             store.stats().current_bytes,
@@ -4745,7 +4772,7 @@ mod tests {
         let _ = older.range(0, 100).await.expect("fill block 0");
         store.block_writes_settled().await;
         store.remove_block_entry_for_test(&uri);
-        store.retain_block_file(&uri, &older, 0);
+        store.retain_block_file(&uri, &older, None);
         drop(older);
         assert!(store.stats().current_bytes > 0, "the kept file is charged");
 

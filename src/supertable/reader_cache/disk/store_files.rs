@@ -456,26 +456,39 @@ impl DiskCacheStore {
     /// replaced it, and a record for the old one would later unlink the newer); the source then
     /// gives its bytes back when it drops. A released source may wait on the freeing thread with
     /// the file open, so if the record is evicted meanwhile, its disk space comes back only then.
+    /// `last_used` is when a query last opened or read the file, `None` if no admitted reader had
+    /// it. The record takes the later of that and the last block write; the mtime moves up to it.
     pub(crate) fn retain_block_file(
         &self,
         uri: &SuperfileUri,
         source: &BlockCachedSource,
-        now_us: u64,
+        last_used: Option<SystemTime>,
     ) {
         let filled = source.filled_bytes_handle().load(Ordering::Acquire);
         if filled == 0 || !source.path_names_its_file() {
             return;
+        }
+        let Some(file) = source.opened_file() else {
+            return;
+        };
+        let written = file.metadata().and_then(|meta| meta.modified()).ok();
+        let last_used = written.max(last_used);
+        if let Some(time) = last_used
+            && last_used != written
+        {
+            // On failure the mtime stays at the last write; only a restart reads it.
+            let _ = file.set_modified(time);
         }
         // From here the record counts the bytes and the source no longer writes the index, so both
         // happen once however long the source outlives its entry on the freeing thread.
         if !source.retire(filled) {
             self.current_bytes.fetch_add(filled, Ordering::Release);
         }
-        let file = UnindexedFile {
+        let record = UnindexedFile {
             size_bytes: filled,
-            mtime_us: now_us,
+            mtime_us: last_used.map_or(0, unix_us),
         };
-        if let Some(prior) = self.block_files.insert(*uri, file) {
+        if let Some(prior) = self.block_files.insert(*uri, record) {
             self.current_bytes
                 .fetch_sub(prior.size_bytes, Ordering::Release);
         }
@@ -530,8 +543,8 @@ impl DiskCacheStore {
 
     /// [`Self::retain_block_file`] for a block source dropped before its entry was admitted (an
     /// open that failed, was cancelled, or lost its slot to a whole file). Such a source writes no
-    /// blocks, so what it holds is a file it adopted, whose record it took over. Skipped when a
-    /// lazy entry holds `uri`, whose own source owns the path.
+    /// blocks, so what it holds is a file it adopted, whose record it took over, at the file's
+    /// mtime. Skipped when a lazy entry holds `uri`, whose own source owns the path.
     pub(crate) fn retain_unadmitted_block_file(
         &self,
         uri: &SuperfileUri,
@@ -542,7 +555,7 @@ impl DiskCacheStore {
             .get(uri)
             .is_some_and(|entry| entry.block_source().is_some());
         if !lazy_entry_owns_path {
-            self.retain_block_file(uri, source, self.now_us());
+            self.retain_block_file(uri, source, None);
         }
     }
 

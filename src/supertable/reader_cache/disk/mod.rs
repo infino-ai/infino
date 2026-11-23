@@ -130,7 +130,7 @@ impl Drop for ForegroundQueryGuard {
 }
 
 /// `time` in microseconds since the unix epoch, 0 for a time before it.
-fn unix_us(time: SystemTime) -> u64 {
+pub(crate) fn unix_us(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_micros() as u64)
 }
@@ -423,7 +423,8 @@ struct UnindexedFile {
     size_bytes: u64,
     /// File mtime in microseconds since the unix epoch; eviction drops the oldest first. mtime and
     /// not atime: relatime/noatime mounts make atime undependable, and for a file no read has
-    /// opened the two match anyway, so oldest-mtime is oldest-copy, the likeliest dead one.
+    /// opened the two match anyway, so oldest-mtime is oldest-copy, the likeliest dead one. A
+    /// release moves a `.blocks` file's mtime up to its last use, so a restart ranks it the same.
     mtime_us: u64,
 }
 
@@ -761,9 +762,9 @@ impl DiskCacheStore {
         self.started_at.elapsed().as_micros() as u64
     }
 
-    /// `store_us`, a time on this store's clock ([`Self::now_us`]), as a wall-clock time, so it
-    /// sorts beside a file's times. Counted back from now, so a clock step or a suspend before
-    /// `store_us` does not shift it; the store clock is read first, so it can only land late.
+    /// A time on this store's clock ([`Self::now_us`]) as wall-clock time, so it sorts with file
+    /// mtimes. Counted back from now: a suspend between that time and now makes it later by the
+    /// suspend, since the store clock stops while suspended.
     fn store_time(&self, store_us: u64) -> SystemTime {
         let since = Duration::from_micros(self.now_us().saturating_sub(store_us));
         SystemTime::now().checked_sub(since).unwrap_or(UNIX_EPOCH)
