@@ -2548,10 +2548,10 @@ mod tests {
     }
 
     /// A sort column whose range spans the same values in every superfile:
-    /// no superfile can be passed, so no order is attached and the match
-    /// takes the plan it takes without one, with the same answer.
+    /// no superfile can be passed, but the walk still runs, keeping only the
+    /// rows that can place, with the same answer as the plan without it.
     #[test]
-    fn order_by_a_column_overlapping_in_every_superfile_does_not_walk() {
+    fn order_by_a_column_overlapping_in_every_superfile_walks() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("title", DataType::LargeUtf8, false),
             Field::new("hour", DataType::Int64, false),
@@ -2574,7 +2574,7 @@ mod tests {
             IndexSpec::new().fts("title"),
             &commits,
         );
-        assert!(!walks_by_hour(&conn), "overlapping ranges must not walk");
+        assert!(walks_by_hour(&conn), "overlapping ranges walk too");
         walked(&conn, "zyzzyva", "", "hour DESC", "LIMIT 3", "hour");
         assert!(
             walks_by_hour(&hourly_conn()),

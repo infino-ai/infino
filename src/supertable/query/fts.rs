@@ -3353,7 +3353,7 @@ impl SupertableReader {
         dispatch::fanout_with_ordered(
             self,
             units,
-            |answered| MatchOrder::window(answered, widest),
+            |answered| order.walk_window(answered, widest),
             |(best, _): &(u64, P)| order.passed(*best),
             ordered,
             |_| {},

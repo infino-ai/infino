@@ -24,7 +24,11 @@
 //!
 //! The sort and the filter stay where they are, so the answer is the one
 //! they give over the rows the walk returns; the walk only leaves out
-//! superfiles that cannot place a row. It applies to a single sort column
+//! superfiles and rows that cannot place. Each superfile returns only the
+//! rows whose key is at least the `n`-th best found so far, so a column whose
+//! ranges overlap in every superfile (a count, a size) still materializes a
+//! few rows per superfile rather than every match; such a walk opens every
+//! superfile at the fan-out's width, since none can be passed early. It applies to a single sort column
 //! of integer, date or timestamp type that every candidate superfile holds
 //! current statistics for and no nulls in (a null sorts first under a
 //! descending sort, outside every range), under a `WHERE` it can evaluate
@@ -87,6 +91,10 @@ pub(crate) struct MatchOrder {
     check: Option<RowCheck>,
     key_schema: SchemaRef,
     op_stats: Option<Arc<OpStatsCollector>>,
+    /// Whether superfiles adjacent in the walk's order hold ranges apart
+    /// often enough for the walk to pass superfiles early (see
+    /// [`Self::ranges_separate`]).
+    stops_early: bool,
     /// The ranks of the `fetch` best keys found so far, the worst on top.
     found: Mutex<BinaryHeap<Reverse<u64>>>,
 }
@@ -115,12 +123,7 @@ impl MatchOrder {
     /// under `filters`, the `WHERE` pushed to the match. `None` when the
     /// walk cannot honour it: the column is not one [`Self::sort_key`]
     /// takes, or the `WHERE` is one the walk cannot evaluate from stored
-    /// columns, so it could not tell which rows count. `None` too when the
-    /// table's superfiles hold overlapping ranges of the column: the walk
-    /// passes a superfile only once the rows in hand beat its best key,
-    /// which a range overlapping its neighbours' rarely allows, so it would
-    /// read every superfile's key column for nothing, and the match is left
-    /// to the fan-out it takes without an order.
+    /// columns, so it could not tell which rows count.
     pub(crate) fn new(
         reader: &SupertableReader,
         column: &str,
@@ -153,7 +156,7 @@ impl MatchOrder {
             data_type.clone(),
             true,
         )]));
-        let order = Self {
+        let mut order = Self {
             guard: ColumnTypeGuard::new(&manifest, field),
             manifest,
             column: column.to_owned(),
@@ -165,9 +168,11 @@ impl MatchOrder {
             check,
             key_schema,
             op_stats: reader.op_stats.clone(),
+            stops_early: false,
             found: Mutex::new(BinaryHeap::new()),
         };
-        Ok(order.ranges_separate().then_some(order))
+        order.stops_early = order.ranges_separate();
+        Ok(Some(order))
     }
 
     /// Whether at least one in [`SEPARATED_SHARE_DENOMINATOR`] pairs of
@@ -244,8 +249,18 @@ impl MatchOrder {
         answered.clamp(ORDERED_WINDOW, widest.max(ORDERED_WINDOW))
     }
 
+    /// [`Self::window`] for this walk: the fan-out's width from the start
+    /// when the ranges overlap too often for any superfile to be passed.
+    pub(crate) fn walk_window(&self, answered: usize, widest: usize) -> usize {
+        match self.stops_early {
+            true => Self::window(answered, widest),
+            false => widest.max(ORDERED_WINDOW),
+        }
+    }
+
     /// Of `hits`, the matches of one superfile read through `r`, those the
-    /// `WHERE` keeps, with their keys folded into the walk's best.
+    /// `WHERE` keeps and whose key is at least the walk's `fetch`-th best
+    /// once theirs are folded in: a row below it can never place.
     pub(crate) async fn keep(
         &self,
         r: &Arc<SuperfileReader>,
@@ -271,6 +286,7 @@ impl MatchOrder {
         // pool: a chunk's best `fetch` ranks are all the walk's best can
         // take from it, so only those reach the lock.
         let budget = &self.manifest.options.connection_memory_budget;
+        let mut placing = RoaringBitmap::new();
         let mut remaining = kept.iter();
         loop {
             let chunk: Vec<u32> = remaining.by_ref().take(EXACT_SCOPE_TAKE_ROWS).collect();
@@ -280,7 +296,7 @@ impl MatchOrder {
             let batch = take_file_columns(
                 &self.manifest,
                 r,
-                chunk,
+                chunk.clone(),
                 &[self.column.as_str()],
                 &self.key_schema,
                 &self.op_stats,
@@ -293,19 +309,36 @@ impl MatchOrder {
                     QueryError::OverBudget(format!("during an ordered match walk, {over}"))
                 })?;
             let (kind, descending, fetch) = (self.kind, self.descending, self.fetch);
-            let best = run_on_pool(
+            let (ranks, best) = run_on_pool(
                 Some(&self.manifest.options.reader_pool),
                 "ordered match keys",
-                move || best_of_chunk(&batch, kind, descending, fetch),
+                move || ranks_of_chunk(&batch, kind, descending, fetch),
             )
             .await
             .map_err(QueryError::internal)??;
-            let mut found = self.found.lock().expect("match order mutex poisoned");
-            for rank in best {
-                keep_best(&mut found, self.fetch, rank);
-            }
+            let worst = {
+                let mut found = self.found.lock().expect("match order mutex poisoned");
+                for rank in best {
+                    keep_best(&mut found, self.fetch, rank);
+                }
+                match found.len() >= self.fetch {
+                    true => found.peek().map(|Reverse(worst)| *worst),
+                    false => None,
+                }
+            };
+            // A tie with the `fetch`-th best is kept: the sort above breaks it.
+            placing.extend(
+                chunk
+                    .iter()
+                    .zip(&ranks)
+                    .filter(|(_, rank)| worst.is_none_or(|worst| **rank >= worst))
+                    .map(|(row, _)| *row),
+            );
         }
-        Ok(hits)
+        Ok(hits
+            .into_iter()
+            .filter(|h| placing.contains(h.local_doc_id))
+            .collect())
     }
 }
 
@@ -318,20 +351,24 @@ fn rank_of(key: u64, descending: bool) -> u64 {
     }
 }
 
-/// The best `fetch` ranks among the keys in `batch`'s first column.
-fn best_of_chunk(
+/// Each row's rank in `batch`'s first column, and the best `fetch` of them. A
+/// row without a key ranks best, so it is never left out.
+fn ranks_of_chunk(
     batch: &RecordBatch,
     kind: KeyKind,
     descending: bool,
     fetch: usize,
-) -> Result<Vec<u64>, QueryError> {
+) -> Result<(Vec<u64>, Vec<u64>), QueryError> {
+    let mut ranks = vec![u64::MAX; batch.num_rows()];
     let mut best: BinaryHeap<Reverse<u64>> = BinaryHeap::with_capacity(fetch.min(batch.num_rows()));
-    push_keys(batch.column(0).as_ref(), kind, 0, |key, _| {
-        keep_best(&mut best, fetch, rank_of(key, descending));
+    push_keys(batch.column(0).as_ref(), kind, 0, |key, row| {
+        let rank = rank_of(key, descending);
+        ranks[row as usize] = rank;
+        keep_best(&mut best, fetch, rank);
         Ok(())
     })
     .map_err(QueryError::internal)?;
-    Ok(best.into_iter().map(|Reverse(rank)| rank).collect())
+    Ok((ranks, best.into_iter().map(|Reverse(rank)| rank).collect()))
 }
 
 /// Take `rank` into `best`, the `fetch` best ranks so far with the worst on
