@@ -145,6 +145,7 @@ use crate::{
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
             superfile_reader::OpenTierCounts,
+            widening::next_want,
         },
         reader_cache::ReadIntent,
         schema::FieldId,
@@ -173,9 +174,6 @@ const LAW_WIDTH_WITHIN_DEFAULT: usize = 1;
 /// headroom still only 0.9865. 4x holds the bar while keeping the total
 /// survivor budget well below the undivided width sweep.
 const WIDTH_BUDGET_OVERSAMPLE: usize = 4;
-
-/// Candidate growth when a deleted row occupies a current top-k slot.
-const DELETE_REFILL_GROWTH_FACTOR: usize = 2;
 
 /// A filtered search on the hidden index reads the cells that hold matching
 /// rows, instead of the cells near the query, when those cells hold at most
@@ -8556,18 +8554,11 @@ impl SupertableReader {
                 return Ok(combined);
             }
 
-            let next = requested
-                .saturating_mul(DELETE_REFILL_GROWTH_FACTOR)
-                .min(refill_cap);
-            if next == requested {
-                combined.retain(|hit| {
-                    hit.stable_id
-                        .is_some_and(|id| deleted.binary_search(&id).is_err())
-                });
-                combined.truncate(k);
-                return Ok(combined);
-            }
-            requested = next;
+            // Each refill reruns the fan-out over every superfile, so size it
+            // from how many of the last round's hits were live: a top-k
+            // buried under deletes refills in a round or two. It always
+            // grows, so the loop reaches the cap.
+            requested = next_want(k, requested, live, refill_cap);
             let hidden_retry = async {
                 if hidden_entries.is_empty() {
                     Ok(Vec::new())
@@ -9148,6 +9139,7 @@ mod tests {
         borrow::Cow,
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
         fs,
+        ops::Range,
         path::Path,
         sync::{
             Arc, Mutex as StdMutex,
@@ -9158,6 +9150,7 @@ mod tests {
     use arrow::array::Array;
     use async_trait::async_trait;
     use bytes::Bytes;
+    use datafusion::prelude::{col, lit};
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use roaring::RoaringBitmap;
 
@@ -15775,6 +15768,95 @@ mod tests {
             hits_before.len() - 1,
             "the deleted doc must drop out of the results"
         );
+    }
+
+    /// Rows in the delete-refill fixture: one superfile, drained to the hidden
+    /// index, every row one-hot so the query's nearest rows are known.
+    const REFILL_ROWS: usize = 64;
+
+    /// The `k` the delete-refill test asks for.
+    const REFILL_K: usize = 10;
+
+    /// Rows the delete-refill test deletes first: enough that most of the
+    /// first round's hits are deleted and the search has to refill, while
+    /// more than [`REFILL_K`] rows stay live.
+    const REFILL_FIRST_DELETES: usize = 40;
+
+    /// Live rows left after the second delete, fewer than [`REFILL_K`], so
+    /// the refill runs to its cap of `k` plus the deleted count.
+    const REFILL_LAST_LIVE: usize = 4;
+
+    /// When deleted rows crowd a vector search's top `k`, the search refills
+    /// with more hits until `k` live rows stand or it has asked for `k` plus
+    /// every deleted row. Sized from the live rate, a refill must still end:
+    /// with enough live rows it returns `k` of them, and with too few it runs
+    /// to the cap and returns every live row.
+    #[test]
+    fn a_refill_past_deletes_returns_k_live_rows_or_every_live_row() {
+        let dim = 16;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(options_one_superfile_per_commit(dim).with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, REFILL_ROWS, dim, schema))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w); // release the writer so the deletes can take one
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let search = |k: usize| {
+            st.reader()
+                .expect("reader")
+                .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
+                .expect("search")
+        };
+        let ids = |hits: &[SuperfileHit]| -> HashSet<i128> {
+            hits.iter()
+                .map(|hit| hit.stable_id.expect("stable _id"))
+                .collect()
+        };
+        assert_eq!(search(REFILL_ROWS).len(), REFILL_ROWS, "every row found");
+        let delete_rows = |rows: Range<usize>| {
+            let titles = rows.map(|i| lit(format!("doc {i}"))).collect();
+            st.delete(col("title").in_list(titles, false))
+                .expect("delete")
+        };
+
+        let stats = delete_rows(0..REFILL_FIRST_DELETES);
+        assert_eq!(stats.n_tombstoned(), REFILL_FIRST_DELETES);
+        let every_live = search(REFILL_ROWS);
+        let live = ids(&every_live);
+        assert_eq!(live.len(), REFILL_ROWS - REFILL_FIRST_DELETES);
+        let top_k = search(REFILL_K);
+        assert_eq!(top_k.len(), REFILL_K, "k live rows exist, so k come back");
+        assert!(
+            ids(&top_k).is_subset(&live),
+            "a deleted row came back from the refill"
+        );
+        // One live row is the query's exact match; the others tie far away.
+        let nearest_live = every_live[0].stable_id.expect("stable _id");
+        assert!(
+            ids(&top_k).contains(&nearest_live),
+            "the refill missed the nearest live row"
+        );
+
+        let stats = delete_rows(REFILL_FIRST_DELETES..REFILL_ROWS - REFILL_LAST_LIVE);
+        assert_eq!(
+            stats.n_tombstoned(),
+            REFILL_ROWS - REFILL_LAST_LIVE - REFILL_FIRST_DELETES
+        );
+        let top_k = search(REFILL_K);
+        assert_eq!(
+            top_k.len(),
+            REFILL_LAST_LIVE,
+            "fewer than k live rows, so every one comes back"
+        );
+        assert_eq!(ids(&top_k), ids(&search(REFILL_ROWS)));
     }
 
     /// Commit writes user superfiles in the cell-packed (MultiCellIvf) layout,

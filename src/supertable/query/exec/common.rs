@@ -108,6 +108,7 @@ use crate::{
             read_ahead::BUDGET_SHARE_PERCENT,
             superfile_reader::superfile_reader,
             vector::row_id_from_manifest_entry,
+            widening::{OVER_FETCH_GROWTH_NONE_PASSED, next_want},
         },
         schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, PhysicalSchema, map::FileSchemaMap},
         tombstones::SidecarCache,
@@ -157,36 +158,6 @@ const CALL_SCOPE_SCHEMA: &str = "search_tvf_call";
 /// Numbers the search table-function calls, so each call's scan gets a
 /// name no other call shares (see [`scope_to_call`]).
 static SEARCH_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Multiply a search's `k` by this each time the exact predicate leaves
-/// fewer than `k` rows standing (see [`fill_top_k`]). Doubling bounds the
-/// total work at about twice the final round's, whatever the predicate's
-/// selectivity turns out to be.
-pub(crate) const OVER_FETCH_GROWTH: usize = 2;
-
-/// How many times a fill grows `want` after a round in which no row passed
-/// the predicate: with no pass rate to size the next round by, it looks
-/// much deeper than [`OVER_FETCH_GROWTH`] would.
-const OVER_FETCH_GROWTH_NONE_PASSED: usize = 16;
-
-/// The `want` of a fill's next round after `want` hits left `kept` rows
-/// standing: enough hits to find `k` at the pass rate seen, twice over,
-/// never less than [`OVER_FETCH_GROWTH`] times `want` and never past
-/// `ceiling`. Past the depth an index can answer from, a round costs about
-/// the same whatever its `want`, so a round sized to the pass rate saves the
-/// rounds doubling would spend getting there.
-fn next_want(k: usize, want: usize, kept: usize, ceiling: usize) -> usize {
-    let sized = match kept {
-        0 => want.saturating_mul(OVER_FETCH_GROWTH_NONE_PASSED),
-        kept => want
-            .saturating_mul(k)
-            .div_ceil(kept)
-            .saturating_mul(OVER_FETCH_GROWTH),
-    };
-    sized
-        .max(want.saturating_mul(OVER_FETCH_GROWTH))
-        .min(ceiling)
-}
 
 /// How many times `k` a fill may grow to before it gives up and returns
 /// what it has (see [`over_fetch_ceiling`]). Without a ceiling the growth
@@ -737,6 +708,8 @@ pub(crate) fn unqualified(expr: Expr) -> DfResult<Expr> {
 ///
 /// The predicate's columns are decoded alongside the requested ones for
 /// the check and projected away before the batch is returned.
+///
+/// [`OVER_FETCH_GROWTH`]: crate::supertable::query::widening::OVER_FETCH_GROWTH
 pub(crate) async fn fill_top_k<F, Fut>(
     reader: &SupertableReader,
     k: usize,
