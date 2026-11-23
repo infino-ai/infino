@@ -1580,6 +1580,13 @@ impl FtsReader {
         self.doc_map.initialized()
     }
 
+    /// Whether `column`'s whole length array has been read into its norms.
+    #[cfg(test)]
+    pub(crate) fn norms_loaded(&self, column: &str) -> bool {
+        self.resolve_column_id(column)
+            .is_ok_and(|id| self.columns[id as usize].norms_loaded())
+    }
+
     /// Whether this blob stores its documents under an ordering of its
     /// own rather than in row order.
     pub(crate) fn has_doc_map(&self) -> bool {

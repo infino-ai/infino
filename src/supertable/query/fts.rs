@@ -2244,9 +2244,10 @@ impl SupertableReader {
                     // never contradict. The sidecars were warmed by the
                     // dispatcher, so this lookup is an in-memory hit; on a
                     // miss/error the unit just keeps the snapshot floor.
-                    // The live floor keeps ties, so a strict unit reads only
-                    // its own.
-                    let live_floor = if exact_count || ties_lose {
+                    // A strict unit takes it too: the walk keeps the larger
+                    // of its strict snapshot and the live floor, whose ties
+                    // came from `_id`s this unit was never compared against.
+                    let live_floor = if exact_count {
                         None
                     } else {
                         match &tomb {
@@ -5374,8 +5375,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BoolMode, FanOut, LocatedTerms, SharedTopK, SuperfileHit, SupertableReader,
-        build_work_units, ceilings_at_table_avgdl, fanout_for, walk_dict,
+        BoolMode, FEW_NORMS_MAX_DOCS, FanOut, LocatedTerms, SharedTopK, SuperfileHit,
+        SupertableReader, build_work_units, ceilings_at_table_avgdl, fanout_for, walk_dict,
     };
     use crate::{
         config::{CompactionSettings, OptimizeOptions},
@@ -6076,6 +6077,84 @@ mod tests {
             "the short match ranks first: {every:?}"
         );
         assert_eq!(top_k_scored(&st, "zeta", 1), every[..1]);
+    }
+
+    /// The `k` of the tie tests: the strong commit's three matches fill it,
+    /// the last at the score [`STRONG_TIED`] and [`BULK_TIED`] share.
+    const TIE_K: usize = 3;
+    /// The strong commit's best `alpha` match, above every bulk match, so
+    /// that commit opens first.
+    const STRONG_BEST: &str = "alpha alpha alpha";
+    /// The strong commit's two other matches: the floor once it is merged.
+    const STRONG_TIED: &str = "alpha beta";
+    /// The bulk commit's best match: above the floor, below [`STRONG_BEST`],
+    /// so the bulk superfile still opens.
+    const BULK_BEST: &str = "alpha alpha gamma";
+    /// The bulk commit's other matches, scoring exactly [`STRONG_TIED`]'s.
+    const BULK_TIED: &str = "alpha gamma";
+
+    /// Ranks `alpha` at [`TIE_K`] over a strong commit and a bulk one with
+    /// more than [`FEW_NORMS_MAX_DOCS`] matches, in the order `bulk_first`
+    /// says, one superfile open at a time. Returns the ranked titles and
+    /// whether the bulk superfile read its whole length array.
+    fn rank_beside_a_bulk_superfile(bulk_first: bool) -> (Vec<String>, bool) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let strong = [STRONG_BEST, STRONG_TIED, STRONG_TIED];
+        let mut bulk = vec![BULK_TIED; FEW_NORMS_MAX_DOCS + 1];
+        bulk.push(BULK_BEST);
+        match bulk_first {
+            true => commit_each(&storage, &[&bulk, &strong]),
+            false => commit_each(&storage, &[&strong, &bulk]),
+        }
+        let st = Supertable::open(
+            eager_options(&storage)
+                .with_bound_ordered_open_window(SEQUENTIAL_OPENS)
+                .with_term_tier_entries_per_term(0),
+        )
+        .expect("open");
+        let titles = top_k_scored(&st, "alpha", TIE_K)
+            .into_iter()
+            .map(|(title, _)| title)
+            .collect();
+        let reader = st.reader().expect("reader");
+        let entry = reader
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .find(|e| e.n_docs as usize == bulk.len())
+            .cloned()
+            .expect("the bulk superfile");
+        let superfile = reader.open_superfile(&entry).expect("open superfile");
+        assert!(
+            superfile.parquet_bytes().is_none(),
+            "the bulk superfile is read from storage"
+        );
+        let loaded = superfile.fts().expect("fts index").norms_loaded("title");
+        (titles, loaded)
+    }
+
+    /// A lone term whose `k` scores are held at the floor by lower `_id`s
+    /// scores the superfile past them from its candidates' length buckets:
+    /// its ties lose, so only its documents above the floor can enter, and
+    /// it reads no whole length array though its term has more postings
+    /// than `few_norms` covers.
+    #[test]
+    fn a_lone_term_whose_ties_lose_reads_no_length_array() {
+        let (titles, loaded) = rank_beside_a_bulk_superfile(false);
+        assert_eq!(titles, [STRONG_BEST, BULK_BEST, STRONG_TIED]);
+        assert!(!loaded, "the bulk superfile read its whole length array");
+    }
+
+    /// The same superfiles with the bulk one first: its ties win, so its
+    /// tied document takes the last place, and scoring every tie reads its
+    /// whole length array.
+    #[test]
+    fn a_lone_term_whose_ties_win_keeps_its_tied_row() {
+        let (titles, loaded) = rank_beside_a_bulk_superfile(true);
+        assert_eq!(titles, [STRONG_BEST, BULK_BEST, BULK_TIED]);
+        assert!(loaded, "the bulk superfile scores every tie from its array");
     }
 
     /// Largest allowed gap between an engine score and the brute-force
