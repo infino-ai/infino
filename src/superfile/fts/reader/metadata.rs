@@ -11,6 +11,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::{
@@ -59,7 +60,7 @@ pub struct NormTable {
     /// keeps the shape the scorer is tuned for, and what the stored buckets
     /// are for survives the copy, since the expensive part of the load was
     /// the per-document pass that derived them, not the allocation.
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
     /// Bucket → `k1·(1 - b + b·dequantize_len(bucket)/avgdl)`. A fixed
     /// 256-entry table, boxed so `ColumnMeta` stays pointer-sized (it is
     /// scanned by non-scoring paths — column lookup, listing) while the
@@ -78,6 +79,31 @@ pub struct NormTable {
     /// [`NormTable::bound_scale`] can tell "nothing changed" from "the
     /// average moved" without walking 256 buckets to find out.
     avgdl: f32,
+    /// Whether `bytes` holds `255 - bucket` and `lut` is indexed the same
+    /// way, so a zeroed array reads the longest length (see
+    /// [`NormTable::from_reversed`]). `occupied` is in that index too.
+    reversed: bool,
+}
+
+/// The length norms of a few documents of a column, read without its
+/// whole bucket array: what scoring a short posting list needs. Only
+/// those documents can be looked up.
+pub(crate) struct FewNorms {
+    lut: Arc<[f32; 256]>,
+    /// `(doc, bucket)`, sorted by doc.
+    docs: Vec<(u32, u8)>,
+}
+
+impl FewNorms {
+    /// `k1·(1 - b + b·len/avgdl)` of `doc`, which must be one this table
+    /// was read for.
+    pub(super) fn get(&self, doc: u32) -> f32 {
+        let at = self
+            .docs
+            .binary_search_by_key(&doc, |&(d, _)| d)
+            .expect("a document the few norms were read for");
+        self.lut[usize::from(self.docs[at].1)]
+    }
 }
 
 /// A column's document-length totals, summed over the stored
@@ -195,10 +221,11 @@ impl NormTable {
             return (Self::empty(), stats);
         }
         let table = Self {
-            bytes: Arc::from(bytes),
+            bytes: Bytes::from(bytes),
             lut: build_lut(avgdl, params),
             occupied: (lo, hi),
             avgdl,
+            reversed: false,
         };
         (table, stats)
     }
@@ -217,10 +244,33 @@ impl NormTable {
             return Self::empty();
         }
         Self {
-            bytes,
+            bytes: Bytes::from_owner(bytes),
             lut: build_lut(avgdl, params),
             occupied,
             avgdl,
+            reversed: false,
+        }
+    }
+
+    /// A table over `255 - bucket` per document, `occupied` as the writer
+    /// recorded it: a zeroed array of these reads the longest length
+    /// everywhere, so a table that knows only a few documents' buckets is
+    /// allocated without a fill.
+    pub(super) fn from_reversed(
+        bytes: Bytes,
+        occupied: (u8, u8),
+        avgdl: f32,
+        params: bm25::Bm25Params,
+    ) -> Self {
+        if bytes.is_empty() {
+            return Self::empty();
+        }
+        Self {
+            bytes,
+            lut: lut_for(avgdl, params, true),
+            occupied: (u8::MAX - occupied.1, u8::MAX - occupied.0),
+            avgdl,
+            reversed: true,
         }
     }
 
@@ -233,10 +283,11 @@ impl NormTable {
             return Self::empty();
         }
         Self {
-            bytes: Arc::clone(&self.bytes),
-            lut: build_lut(avgdl, params),
+            bytes: self.bytes.clone(),
+            lut: lut_for(avgdl, params, self.reversed),
             occupied: self.occupied,
             avgdl,
+            reversed: self.reversed,
         }
     }
 
@@ -304,7 +355,7 @@ impl NormTable {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     pub(super) fn parts(&self) -> (&[u8], &[f32; 256]) {
-        (&self.bytes, &self.lut)
+        (self.bytes.as_ref(), &self.lut)
     }
 
     /// [`Self::get`] for eight docs. A loop the compiler always inlines:
@@ -317,6 +368,14 @@ impl NormTable {
             *o = self.get(d);
         }
         out
+    }
+
+    /// The stored length bucket of `doc`; `None` past the table, which an
+    /// empty table (a column the directory says scores no document) is for
+    /// every document.
+    pub(super) fn bucket(&self, doc: u32) -> Option<u8> {
+        let byte = *self.bytes.get(doc as usize)?;
+        Some(if self.reversed { u8::MAX - byte } else { byte })
     }
 
     /// The buckets this table scores by.
@@ -338,12 +397,24 @@ impl NormTable {
     /// read.
     pub(super) fn empty() -> Self {
         Self {
-            bytes: Arc::from(Vec::new()),
+            bytes: Bytes::new(),
             lut: Arc::new([0.0; 256]),
             occupied: (0, 0),
             avgdl: 0.0,
+            reversed: false,
         }
     }
+}
+
+/// [`build_lut`], indexed by `255 - bucket` when `reversed`.
+fn lut_for(avgdl: f32, params: bm25::Bm25Params, reversed: bool) -> Arc<[f32; 256]> {
+    let lut = build_lut(avgdl, params);
+    if !reversed {
+        return lut;
+    }
+    let mut flipped = *lut;
+    flipped.reverse();
+    Arc::new(flipped)
 }
 
 /// Decode table for one parameter set: bucket → `dl_norm_k1`. Filled in
@@ -410,6 +481,24 @@ impl ColumnNorms {
         }
         Self {
             dl_norm_k1: NormTable::from_stored(buckets, stored.occupied, baked_avgdl, params),
+            length_stats: stored.stats,
+            bound_scale: 1.0,
+        }
+    }
+
+    /// [`Self::from_stored`] over a reversed bucket array (see
+    /// [`NormTable::from_reversed`]).
+    pub(super) fn from_reversed(
+        buckets: Bytes,
+        stored: &StoredNorms,
+        params: bm25::Bm25Params,
+        baked_avgdl: f32,
+    ) -> Self {
+        if stored.stats.n_scored_docs == 0 {
+            return Self::empty();
+        }
+        Self {
+            dl_norm_k1: NormTable::from_reversed(buckets, stored.occupied, baked_avgdl, params),
             length_stats: stored.stats,
             bound_scale: 1.0,
         }
@@ -744,6 +833,25 @@ impl ColumnMeta {
     /// bounds hold as they are.
     fn scores_as_declared(&self) -> bool {
         self.params == self.declared_params && self.score_avgdl == self.baked_avgdl
+    }
+
+    /// Where the stored bucket of each document sits, one byte per document,
+    /// when single buckets can be read: the blob stores them and no CRC
+    /// check needs the whole array.
+    pub(super) fn bucket_bytes(&self) -> Option<Range<usize>> {
+        match &self.stored_norms {
+            Some(stored) if !self.verify_crc => Some(stored.buckets.clone()),
+            _ => None,
+        }
+    }
+
+    /// Norms for `docs` (sorted `(doc, bucket)` pairs) at the parameters
+    /// and average this column scores at, as [`Self::norms`] decodes them.
+    pub(super) fn few_norms(&self, docs: Vec<(u32, u8)>) -> FewNorms {
+        FewNorms {
+            lut: build_lut(self.score_avgdl, self.params),
+            docs,
+        }
     }
 
     /// Whether the declared-parameter norms have been built.

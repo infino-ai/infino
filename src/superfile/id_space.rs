@@ -61,6 +61,15 @@ impl RowId {
     }
 }
 
+/// `rows` as a bitmap of their positions. A match hands its rows back ascending, so they append to
+/// the bitmap's last chunk instead of each being searched for its place in it; rows that are not
+/// strictly ascending (only a corrupt doc-id map, naming a row twice, gives them) are inserted one
+/// by one.
+pub(crate) fn row_bitmap(rows: &[RowId]) -> RoaringBitmap {
+    let positions = || rows.iter().map(|row| row.get());
+    RoaringBitmap::from_sorted_iter(positions()).unwrap_or_else(|_| positions().collect())
+}
+
 impl Display for RowId {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         Display::fmt(&self.0, f)
@@ -272,6 +281,18 @@ impl RowSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rows ascending append; a row named twice, the one way a match's rows stop being strictly
+    /// ascending, and rows out of order still make the same set.
+    #[test]
+    fn row_bitmap_holds_each_row_once_however_they_come() {
+        let rows = |ids: &[u32]| ids.iter().map(|&id| RowId::new(id)).collect::<Vec<_>>();
+        let want: RoaringBitmap = [1, 3, 7].into_iter().collect();
+        assert_eq!(row_bitmap(&rows(&[1, 3, 7])), want);
+        assert_eq!(row_bitmap(&rows(&[1, 3, 3, 7])), want);
+        assert_eq!(row_bitmap(&rows(&[3, 1, 7])), want);
+        assert!(row_bitmap(&[]).is_empty());
+    }
 
     /// The identity map hands back the row a blob id already is.
     #[test]

@@ -124,15 +124,14 @@ use crate::{
             },
             tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER, Tokenizer},
         },
-        id_space::RowId,
+        id_space::row_bitmap,
         range::{KeyKind, float_key, signed_key, unsigned_key},
     },
     supertable::{
-        error::QueryError,
-        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri},
+        manifest::{SuperfileEntry, SuperfileUri},
         query::{
             fts::{IndexedSuperfile, PlanLocations, memos_from_plan_locations},
-            prune::{PruneLeaf, select_superfiles},
+            prune::PruneLeaf,
         },
         schema::FieldId,
     },
@@ -480,7 +479,7 @@ impl CandidatePlan {
                             dict,
                         )
                         .await?;
-                    Ok((Some(docs.into_iter().map(RowId::get).collect()), work))
+                    Ok((Some(row_bitmap(&docs)), work))
                 }
                 CandidatePlan::TermsAny {
                     column,
@@ -503,7 +502,7 @@ impl CandidatePlan {
                             dict,
                         )
                         .await?;
-                    Ok((Some(docs.into_iter().map(RowId::get).collect()), work))
+                    Ok((Some(row_bitmap(&docs)), work))
                 }
                 CandidatePlan::TermsLike {
                     column,
@@ -773,31 +772,20 @@ impl CandidatePlan {
         Ok(Resolved { rows, work })
     }
 
-    /// Manifest-only superfile survival gate for this plan: the superfile
-    /// ids that *could* match by term blooms and the term index. `None`
-    /// means no gate: the plan, or one of its `OR` branches, bounds no
-    /// superfile.
-    pub(crate) async fn surviving_superfile_ids(
-        &self,
-        manifest: &ManifestSnapshot,
-    ) -> Result<Option<HashSet<u128>>, QueryError> {
+    /// This plan's manifest-only survival gate, as prune leaves to check
+    /// beside others in one pass: the term blooms and term index of every
+    /// superfile that *could* match. Empty when there is no gate: the plan,
+    /// or one of its `OR` branches, bounds no superfile.
+    pub(crate) fn survival_leaves(&self) -> Vec<PruneLeaf> {
         let mut groups = Vec::new();
         if !self.collect_survival_or_groups(&mut groups) {
-            return Ok(None);
+            return Vec::new();
         }
         // One group is a plain conjunction; several are an `OR` of them.
-        let leaves: Vec<PruneLeaf> = match groups.len() {
-            0 => return Ok(Some(HashSet::new())),
+        match groups.len() {
             1 => groups.swap_remove(0),
             _ => PruneLeaf::any_of(groups).into_iter().collect(),
-        };
-        Ok(Some(
-            select_superfiles(manifest, &leaves)
-                .await?
-                .iter()
-                .map(|e| e.superfile_id.as_u128())
-                .collect(),
-        ))
+        }
     }
 
     /// Flatten this plan into one bloom-conjunction group per `OR` branch.

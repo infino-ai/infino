@@ -29,6 +29,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 use tokio::sync::{OnceCell, Semaphore};
@@ -38,7 +39,8 @@ use super::{
     cursor::{BlockTableCache, CursorUse, TermCursor, TermMeta},
     filter::ExcludeFilter,
     metadata::{
-        ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions, StoredNorms,
+        ColumnLengthStats, ColumnMeta, ColumnNorms, FewNorms, FtsColumnConfig, LENGTH_ARRAY,
+        OpenOptions, StoredNorms, build_lut,
     },
     phrase::{AnyCursor, PhraseCursor, distinct_members},
     scorers::{count_and_planned, cursors_max_doc, df_total},
@@ -48,13 +50,17 @@ use super::{
 };
 use crate::{
     memory::{ConnectionMemoryBudget, Reclaim, Reservation},
+    runtime_bridge::run_on_pool_unless_blocking,
     superfile::{
         ReadError,
         error::FtsError,
         format::{
             self, KEY_SEPARATOR,
             checksum::crc32c,
-            fts::{HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, VERSION_MIN, hdr, term_meta},
+            fts::{
+                DOC_LENGTH_STORED_MAX, HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, VERSION_MIN,
+                hdr, term_meta,
+            },
         },
         fts::{
             analysis::{chain_tokenizer, check_chain, check_recorded_tokenizer},
@@ -95,6 +101,23 @@ pub(crate) struct ScoringView<'a> {
     /// The average document length for the one column named, as this file
     /// labels it.
     pub avgdl: Option<(&'a str, f32)>,
+    /// Norms that stand in for one column's own for this query alone, never
+    /// cached (see [`FtsReader::candidate_norms`]).
+    pub norms: Option<CandidateNorms<'a>>,
+}
+
+/// One query's candidate norms for one column, as this file labels it.
+/// Equal only to themselves.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CandidateNorms<'a> {
+    pub column: &'a str,
+    pub norms: &'a ColumnNorms,
+}
+
+impl PartialEq for CandidateNorms<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.column == other.column && std::ptr::eq(self.norms, other.norms)
+    }
 }
 
 /// Per-term table-wide BM25 idf, keyed by term.
@@ -715,6 +738,122 @@ pub(super) fn short_body_malformed() -> FtsError {
     ))
 }
 
+/// Most postings a term may have for its documents' buckets to be read
+/// one by one instead of with the whole array: the most a short body
+/// holds, the longest list the single-term scorer decodes for them.
+pub(crate) const FEW_NORMS_MAX_DOCS: usize = SHORT_MAX_DF;
+
+/// Documents whose buckets lie at most this many bytes apart are read
+/// together: one storage page.
+const FEW_NORMS_GAP_BYTES: usize = 4096;
+
+/// Most postings [`FtsReader::candidate_norms`] decodes in one superfile:
+/// all of a query's terms, or a lone phrase's rarest word. Past this the
+/// superfile reads its whole array, as it would have anyway.
+pub(crate) const CANDIDATE_MAX_POSTINGS: u64 = 1 << 16;
+
+/// Most of a query's terms one superfile may hold for its candidates to be
+/// bounded term by term.
+pub(crate) const CANDIDATE_MAX_TERMS: usize = 64;
+
+/// Most candidates one superfile may have for its buckets to be read alone.
+const CANDIDATE_MAX_DOCS: usize = 8192;
+
+/// Most bucket reads one superfile's candidates may take: past this, the
+/// whole array costs less than the requests.
+pub(super) const CANDIDATE_MAX_RANGES: usize = 64;
+
+/// A candidate's bound is a sum of a few terms added in another order than
+/// the kernel adds them: widened so a rounding never drops a tie.
+const CANDIDATE_BOUND_SLACK: f32 = 1.0 + 1e-4;
+
+/// The documents of `cursors` (a query's held terms) whose score, bounded
+/// at the shortest length each can have, reaches `floor`, sorted; `None`
+/// when there are too many postings to walk or too many candidates. CPU
+/// over up to [`CANDIDATE_MAX_POSTINGS`] postings, run on the reader pool by
+/// [`FtsReader::candidate_norms`].
+fn candidate_docs(
+    mut cursors: Vec<TermCursor>,
+    weights: &[f32],
+    phrase_parts: &[(Vec<usize>, f32)],
+    lut: &[f32; 256],
+    floor: f32,
+) -> Option<Vec<u32>> {
+    let nt = cursors.len();
+    let df: Vec<u64> = cursors.iter().map(|c| c.df).collect();
+    let mut tfs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let lone_phrase = weights.iter().all(|w| *w == 0.0) && phrase_parts.len() == 1;
+    if lone_phrase {
+        // A match holds every word of the phrase: its documents are the
+        // rarest word's, each looked up in the others, so a stopword's
+        // millions of postings are skipped over rather than decoded.
+        let members = &phrase_parts[0].0;
+        let &lead = members.iter().min_by_key(|&&t| df[t])?;
+        if df[lead] > CANDIDATE_MAX_POSTINGS {
+            return None;
+        }
+        let mut lead_docs: Vec<(u32, u32)> = Vec::with_capacity(df[lead] as usize);
+        let cursor = &mut cursors[lead];
+        while !cursor.is_exhausted() {
+            lead_docs.push((cursor.current_doc_id(), cursor.current_tf()));
+            cursor.next();
+        }
+        for (doc, tf) in lead_docs {
+            let mut row = vec![0; nt];
+            row[lead] = tf;
+            for &m in members.iter().filter(|&&m| m != lead) {
+                let cursor = &mut cursors[m];
+                cursor.skip_to(doc);
+                if !cursor.is_exhausted() && cursor.current_doc_id() == doc {
+                    row[m] = cursor.current_tf();
+                }
+            }
+            tfs.insert(doc, row);
+        }
+    } else {
+        if df.iter().sum::<u64>() > CANDIDATE_MAX_POSTINGS {
+            return None;
+        }
+        for (t, cursor) in cursors.iter_mut().enumerate() {
+            while !cursor.is_exhausted() {
+                tfs.entry(cursor.current_doc_id())
+                    .or_insert_with(|| vec![0; nt])[t] = cursor.current_tf();
+                cursor.next();
+            }
+        }
+    }
+    let mut docs: Vec<u32> = tfs
+        .iter()
+        .filter_map(|(&doc, tf)| {
+            // A document holds at least the query's occurrences, and its
+            // length is scored capped as the writer stores it.
+            let tokens = tf
+                .iter()
+                .fold(0u32, |sum, &t| sum.saturating_add(t))
+                .clamp(1, DOC_LENGTH_STORED_MAX);
+            let norm = lut[usize::from(bm25::quantize_len(tokens))];
+            let mut bound = 0.0f32;
+            for (t, &w) in weights.iter().enumerate() {
+                if w > 0.0 && tf[t] > 0 {
+                    bound += bm25::score_with_dl_norm_k1(w, tf[t], norm);
+                }
+            }
+            for (members, w) in phrase_parts {
+                let occurrences = members.iter().map(|&m| tf[m]).min().unwrap_or(0);
+                if occurrences > 0 {
+                    bound += bm25::score_with_dl_norm_k1(*w, occurrences, norm);
+                }
+            }
+            (bound * CANDIDATE_BOUND_SLACK >= floor).then_some(doc)
+        })
+        .collect();
+    if docs.len() > CANDIDATE_MAX_DOCS {
+        return None;
+    }
+    docs.sort_unstable();
+    Some(docs)
+}
+
 impl FtsReader {
     /// Push the buffers this reader's source keeps: on a lazy open, the
     /// header and doc-lengths directory it read.
@@ -764,15 +903,22 @@ impl FtsReader {
             };
             (params, avgdl)
         };
-        if self
-            .columns
-            .iter()
-            .all(|col| target(col) == (col.params, col.score_avgdl))
+        if scoring.norms.is_none()
+            && self
+                .columns
+                .iter()
+                .all(|col| target(col) == (col.params, col.score_avgdl))
         {
             return None;
         }
         let mut view = self.clone();
         for col in &mut view.columns {
+            if let Some(candidates) = scoring.norms
+                && candidates.column == col.name
+            {
+                col.base_norms = Arc::new(OnceLock::from(candidates.norms.clone()));
+                col.view_norms = Arc::new(OnceLock::new());
+            }
             let (params, avgdl) = target(col);
             if (params, avgdl) == (col.params, col.score_avgdl) {
                 continue;
@@ -792,6 +938,7 @@ impl FtsReader {
     #[cfg(test)]
     pub(crate) fn with_bm25_override(&self, params: bm25::Bm25Params) -> Self {
         let scoring = ScoringView {
+            norms: None,
             params: Some(params),
             avgdl: None,
         };
@@ -1641,6 +1788,303 @@ impl FtsReader {
         col.install_fetched_norms(&array)?;
         self.loads.loaded();
         Ok(())
+    }
+
+    /// The length buckets of `docs` (sorted, distinct) alone, read as a few
+    /// small ranges instead of the column's whole array. `None` when the
+    /// norms are already in memory, there are too many documents, or the
+    /// column cannot be read that way; the caller then loads the norms.
+    pub(super) async fn few_norms(
+        &self,
+        column_id: u32,
+        docs: &[u32],
+    ) -> Result<Option<FewNorms>, FtsError> {
+        let col = &self.columns[column_id as usize];
+        if col.norms_loaded() || docs.is_empty() || docs.len() > FEW_NORMS_MAX_DOCS {
+            return Ok(None);
+        }
+        let Some(buckets) = col.bucket_bytes() else {
+            return Ok(None);
+        };
+        Ok(self
+            .read_buckets(col, buckets, docs, usize::MAX)
+            .await?
+            .map(|pairs| col.few_norms(pairs)))
+    }
+
+    /// The length bucket of each of `docs` in `column_id`, in `docs`' order:
+    /// from the norms when they are in memory, else from the stored buckets,
+    /// as at most `max_ranges` page reads or else the whole array in one
+    /// read; a column without stored buckets loads its norms.
+    pub(super) async fn doc_buckets(
+        &self,
+        column_id: u32,
+        docs: &[u32],
+        max_ranges: usize,
+    ) -> Result<Vec<u8>, FtsError> {
+        // Ids come from postings: a corrupt one past the documents is an
+        // error, not an index past the norms.
+        self.check_ids_in_map(docs.iter().map(|&d| FtsDocId::new(d)))?;
+        let col = &self.columns[column_id as usize];
+        if !col.norms_loaded()
+            && let Some(buckets) = col.bucket_bytes()
+        {
+            let mut sorted = docs.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let pairs = match self
+                .read_buckets(col, buckets.clone(), &sorted, max_ranges)
+                .await?
+            {
+                Some(pairs) => pairs,
+                None => {
+                    let all = self.source.range_async(buckets).await.map_err(|e| {
+                        FtsError::RangeFetch {
+                            what: LENGTH_ARRAY,
+                            source: e,
+                        }
+                    })?;
+                    let mut pairs = Vec::with_capacity(sorted.len());
+                    for &doc in &sorted {
+                        let Some(&bucket) = all.get(doc as usize) else {
+                            return Err(FtsError::Read(ReadError::Malformed(format!(
+                                "doc {doc} past the bucket array of column '{}'",
+                                col.name
+                            ))));
+                        };
+                        pairs.push((doc, bucket));
+                    }
+                    pairs
+                }
+            };
+            return Ok(docs
+                .iter()
+                .map(|d| {
+                    let at = pairs
+                        .binary_search_by_key(d, |&(doc, _)| doc)
+                        .expect("every document was read");
+                    pairs[at].1
+                })
+                .collect());
+        }
+        self.ensure_norms(column_id).await?;
+        let base = col.base_norms.get().expect("the norms were just loaded");
+        docs.iter()
+            .map(|&doc| {
+                base.dl_norm_k1.bucket(doc).ok_or_else(|| {
+                    FtsError::Read(ReadError::Malformed(format!(
+                        "doc {doc} past the loaded norms of column '{}'",
+                        col.name
+                    )))
+                })
+            })
+            .collect()
+    }
+
+    /// The stored buckets of `docs` (sorted, distinct), documents a page or
+    /// less apart read together; `None` when that takes more than
+    /// `max_ranges` reads.
+    async fn read_buckets(
+        &self,
+        col: &ColumnMeta,
+        buckets: Range<usize>,
+        docs: &[u32],
+        max_ranges: usize,
+    ) -> Result<Option<Vec<(u32, u8)>>, FtsError> {
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        for &doc in docs {
+            let at = buckets.start + doc as usize;
+            if at >= buckets.end {
+                return Err(FtsError::Read(ReadError::Malformed(format!(
+                    "doc {doc} past the bucket array of column '{}'",
+                    col.name
+                ))));
+            }
+            match ranges.last_mut() {
+                Some(r) if at < r.end + FEW_NORMS_GAP_BYTES => r.end = at + 1,
+                _ => ranges.push(at..at + 1),
+            }
+            if ranges.len() > max_ranges {
+                return Ok(None);
+            }
+        }
+        let fetched = futures::future::try_join_all(
+            ranges.iter().map(|r| self.source.range_async(r.clone())),
+        )
+        .await
+        .map_err(|e| FtsError::RangeFetch {
+            what: LENGTH_ARRAY,
+            source: e,
+        })?;
+        let mut pairs = Vec::with_capacity(docs.len());
+        let mut r = 0;
+        for &doc in docs {
+            let at = buckets.start + doc as usize;
+            while at >= ranges[r].end {
+                r += 1;
+            }
+            pairs.push((doc, fetched[r][at - ranges[r].start]));
+        }
+        Ok(Some(pairs))
+    }
+
+    /// Norms for one query in this superfile built from its candidates'
+    /// length buckets alone. A candidate is a document whose score, bounded
+    /// from its postings at the shortest length it can have, reaches
+    /// `floor`; it keeps its stored bucket. Every other document reads the
+    /// longest bucket, where it scores no higher than at its own length and
+    /// so stays under `floor` either way. `bare` pairs each bare term with
+    /// its count in the query. `None` when the norms are already in memory,
+    /// the column cannot be read that way, a term has no table idf, or the
+    /// candidates take too many reads. The postings fetch and bucket reads
+    /// stay on the calling runtime; the walk over the postings runs on
+    /// `pool` (rayon's global pool when `None`) behind a oneshot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn candidate_norms(
+        &self,
+        column: &str,
+        bare: &[(&str, u32)],
+        phrases: &[&[String]],
+        idf: &GlobalTermIdf,
+        scoring: &ScoringView<'_>,
+        floor: f32,
+        prefetched: Option<&FetchedTermMemo>,
+        pool: Option<&ThreadPool>,
+    ) -> Result<Option<ColumnNorms>, FtsError> {
+        if !floor.is_finite() {
+            return Ok(None);
+        }
+        let column_id = self.resolve_column_id(column)?;
+        let col = &self.columns[column_id as usize];
+        if col.norms_loaded() {
+            return Ok(None);
+        }
+        let (Some(buckets), Some(stored)) = (col.bucket_bytes(), col.stored_norms.as_deref())
+        else {
+            return Ok(None);
+        };
+        // The query's distinct terms, each bare one weighted as the kernel
+        // weights it (its idf times its count), phrase members at zero.
+        let mut terms: Vec<&str> = Vec::new();
+        let mut weights: Vec<f32> = Vec::new();
+        let mut slots: FxHashMap<&str, usize> = FxHashMap::default();
+        fn slot<'t>(
+            t: &'t str,
+            slots: &mut FxHashMap<&'t str, usize>,
+            terms: &mut Vec<&'t str>,
+            weights: &mut Vec<f32>,
+        ) -> usize {
+            *slots.entry(t).or_insert_with(|| {
+                terms.push(t);
+                weights.push(0.0);
+                terms.len() - 1
+            })
+        }
+        for &(term, count) in bare {
+            let Some(&w) = idf.get(term) else {
+                return Ok(None);
+            };
+            let at = slot(term, &mut slots, &mut terms, &mut weights);
+            weights[at] += w * count as f32;
+        }
+        let mut phrase_parts: Vec<(Vec<usize>, f32)> = Vec::with_capacity(phrases.len());
+        for phrase in phrases {
+            let mut members = Vec::new();
+            let mut weight = 0.0f32;
+            for term in phrase.iter() {
+                let Some(&w) = idf.get(term.as_str()) else {
+                    return Ok(None);
+                };
+                weight += w;
+                let at = slot(term, &mut slots, &mut terms, &mut weights);
+                if !members.contains(&at) {
+                    members.push(at);
+                }
+            }
+            phrase_parts.push((members, weight));
+        }
+        if terms.is_empty() {
+            return Ok(None);
+        }
+        let params = scoring.params.unwrap_or(col.params);
+        let avgdl = match scoring.avgdl {
+            Some((name, avgdl)) if name == col.name => avgdl,
+            _ => col.score_avgdl,
+        };
+        let lut = build_lut(avgdl, params);
+        let mut built = self
+            .build_term_cursors_opt(
+                column_id,
+                &terms,
+                QueryIdf::ThisFile,
+                CursorUse::Match,
+                None,
+                prefetched,
+                None,
+            )
+            .await?;
+        // Only the terms this superfile holds take part: a prefix query asks
+        // about hundreds of expansions, of which one superfile holds a few. A
+        // phrase missing a word here cannot match here.
+        let held: Vec<usize> = (0..terms.len()).filter(|&t| built[t].is_some()).collect();
+        if held.is_empty() || held.len() > CANDIDATE_MAX_TERMS {
+            return Ok(None);
+        }
+        let mut at = vec![usize::MAX; terms.len()];
+        for (i, &t) in held.iter().enumerate() {
+            at[t] = i;
+        }
+        let cursors: Vec<TermCursor> = held
+            .iter()
+            .map(|&t| built[t].take().expect("a held term has a cursor"))
+            .collect();
+        let weights: Vec<f32> = held.iter().map(|&t| weights[t]).collect();
+        let phrase_parts: Vec<(Vec<usize>, f32)> = phrase_parts
+            .into_iter()
+            .filter_map(|(members, w)| {
+                let members = members
+                    .iter()
+                    .map(|&t| (at[t] != usize::MAX).then_some(at[t]))
+                    .collect::<Option<Vec<usize>>>()?;
+                Some((members, w))
+            })
+            .collect();
+        if weights.iter().all(|w| *w == 0.0) && phrase_parts.is_empty() {
+            return Ok(None);
+        }
+        let docs = run_on_pool_unless_blocking(pool, "candidate norms", move || {
+            candidate_docs(cursors, &weights, &phrase_parts, &lut, floor)
+        })
+        .await
+        .map_err(|_| FtsError::TaskDropped("candidate norms"))?;
+        let Some(docs) = docs else {
+            return Ok(None);
+        };
+        let Some(pairs) = self
+            .read_buckets(col, buckets, &docs, CANDIDATE_MAX_RANGES)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // One byte per document, megabytes on a large superfile, stored
+        // reversed in fresh anonymous memory: its zero pages already read the
+        // longest length, and only the pages holding a candidate are written.
+        // An allocator's zeroed block would be filled first.
+        let Ok(mut table) = memmap2::MmapMut::map_anon(self.n_docs as usize) else {
+            return Ok(None);
+        };
+        for (doc, bucket) in pairs {
+            table[doc as usize] = u8::MAX - bucket;
+        }
+        let Ok(table) = table.make_read_only() else {
+            return Ok(None);
+        };
+        Ok(Some(ColumnNorms::from_reversed(
+            Bytes::from_owner(table),
+            stored,
+            col.declared_params,
+            col.baked_avgdl,
+        )))
     }
 
     /// Async term-dictionary fetch for the query path. Resolves
@@ -6006,6 +6450,7 @@ mod tests {
             .into_iter()
             .map(|avgdl| {
                 r.with_scoring(&ScoringView {
+                    norms: None,
                     params: None,
                     avgdl: Some(("body", avgdl)),
                 })
@@ -6048,6 +6493,7 @@ mod tests {
         r.watch_loads(&listener);
         let view = r
             .with_scoring(&ScoringView {
+                norms: None,
                 params: None,
                 avgdl: Some(("body", VIEW_AVERAGE_LENGTHS[0])),
             })
@@ -6572,6 +7018,415 @@ mod tests {
                 }
                 assert_eq!(dest, expect, "window at {base}");
             }
+        }
+    }
+
+    /// Documents in [`candidate_corpus`].
+    const CANDIDATE_CORPUS_DOCS: u32 = 3000;
+
+    /// Hits the candidate-norms tests rank.
+    const CANDIDATE_K: usize = 10;
+
+    /// A positional `body` corpus of spread lengths: `alpha` and `beta` are
+    /// common, `the` very common, `zyzzyva` in every 97th document and
+    /// `quux` in one.
+    fn candidate_corpus() -> (Bytes, &'static str) {
+        const FILLER: [&str; 6] = ["red", "green", "blue", "cyan", "pink", "gray"];
+        let mut next = xorshift(0x5eed_cafe);
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), true).expect("register");
+        for doc in 0..CANDIDATE_CORPUS_DOCS {
+            let len = 1 + next() % 40;
+            let mut words: Vec<&str> = (0..len)
+                .map(|_| match next() % 100 {
+                    0..=3 => "alpha",
+                    4..=11 => "beta",
+                    12..=27 => "the",
+                    n => FILLER[(n % 6) as usize],
+                })
+                .collect();
+            if doc % 97 == 0 {
+                words.push("zyzzyva");
+            }
+            if doc == 1234 {
+                words.push("quux");
+            }
+            b.add_doc(0, doc, &words.join(" ")).expect("add doc");
+        }
+        (
+            Bytes::from(b.finish().expect("finish")),
+            r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#,
+        )
+    }
+
+    /// A lazy reader over `blob` that reads single buckets: no CRC check
+    /// needs the whole array.
+    async fn bucket_reader(blob: &Bytes, json: &str) -> FtsReader {
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob.clone()));
+        FtsReader::open_lazy(src, json, OpenOptions { verify_crc: false })
+            .await
+            .expect("open_lazy")
+    }
+
+    /// The top `k` of `lists` on `r` at `floor`, as rows.
+    async fn ranked(r: &FtsReader, lists: ClauseLists<'_>, floor: f32) -> Vec<(RowId, f32)> {
+        let prep = r
+            .prepare_clauses("body", lists, CANDIDATE_K, floor)
+            .await
+            .expect("prepare");
+        r.hits_to_rows_async(r.run_prepared_in_blob_ids(prep).expect("run"))
+            .await
+            .expect("rows")
+    }
+
+    /// Scoring through candidate norms at the kth-best score returns
+    /// exactly the hits, and scores, of scoring with the whole length
+    /// array, for bare terms under either mode and for a lone phrase, and
+    /// never reads that array.
+    #[tokio::test]
+    async fn candidate_norms_rank_as_the_whole_length_array_does() {
+        let (blob, json) = candidate_corpus();
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let idf: GlobalTermIdf = [("alpha", 2.5), ("beta", 1.5), ("the", 0.4)]
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect();
+        let pair: &[&str] = &["alpha", "beta"];
+        let with_the: &[&str] = &["alpha", "the"];
+        let phrase = [Phrase {
+            terms: vec!["the".to_string(), "alpha".to_string()],
+            offsets: vec![0, 1],
+        }];
+        let lists = |name: &str| match name {
+            "or" => ClauseLists {
+                shoulds: pair,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            },
+            "and" => ClauseLists {
+                musts: with_the,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            },
+            _ => ClauseLists {
+                should_phrases: &phrase,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            },
+        };
+        for name in ["or", "and", "phrase"] {
+            let whole = ranked(&eager, lists(name), f32::NEG_INFINITY).await;
+            assert_eq!(
+                whole.len(),
+                CANDIDATE_K,
+                "{name}: the corpus fills the top k"
+            );
+            let floor = whole[CANDIDATE_K - 1].1;
+
+            let lazy = bucket_reader(&blob, json).await;
+            let query = lists(name);
+            let bare: Vec<(&str, u32)> = query
+                .musts
+                .iter()
+                .chain(query.shoulds)
+                .map(|&t| (t, 1))
+                .collect();
+            let phrases: Vec<&[String]> = query
+                .should_phrases
+                .iter()
+                .map(|p| p.terms.as_slice())
+                .collect();
+            let no_view = ScoringView {
+                norms: None,
+                params: None,
+                avgdl: None,
+            };
+            let norms = lazy
+                .candidate_norms("body", &bare, &phrases, &idf, &no_view, floor, None, None)
+                .await
+                .expect("candidate norms")
+                .unwrap_or_else(|| panic!("{name}: the candidates are read alone"));
+            let view = lazy
+                .with_scoring(&ScoringView {
+                    norms: Some(CandidateNorms {
+                        column: "body",
+                        norms: &norms,
+                    }),
+                    ..no_view
+                })
+                .expect("a view over the candidate norms");
+            assert_eq!(ranked(&view, query, floor).await, whole, "{name}");
+            assert!(
+                !lazy.columns[0].norms_loaded(),
+                "{name}: the length array was never read"
+            );
+        }
+    }
+
+    /// Candidate norms are not built where they cannot help: no floor, a
+    /// term without a table idf, or norms already in memory.
+    #[tokio::test]
+    async fn candidate_norms_step_aside_when_they_cannot_help() {
+        let (blob, json) = candidate_corpus();
+        let idf: GlobalTermIdf = [("alpha".to_string(), 2.5)].into_iter().collect();
+        let no_view = ScoringView {
+            norms: None,
+            params: None,
+            avgdl: None,
+        };
+        let lazy = bucket_reader(&blob, json).await;
+        let alpha_beta = [("alpha", 1), ("beta", 1)];
+        for (name, bare, floor) in [
+            ("no floor", &alpha_beta[..1], f32::NEG_INFINITY),
+            ("no idf", &alpha_beta[..], 1.0),
+        ] {
+            let built = lazy
+                .candidate_norms("body", bare, &[], &idf, &no_view, floor, None, None)
+                .await
+                .expect("candidate norms");
+            assert!(built.is_none(), "{name}");
+        }
+        let eager = FtsReader::open(blob, json).expect("open");
+        eager.ensure_norms(0).await.expect("norms");
+        let built = eager
+            .candidate_norms(
+                "body",
+                &alpha_beta[..1],
+                &[],
+                &idf,
+                &no_view,
+                1.0,
+                None,
+                None,
+            )
+            .await
+            .expect("candidate norms");
+        assert!(built.is_none(), "norms in memory");
+    }
+
+    /// A term of one posting, or of one short block, weighted by the
+    /// table, scores from its own documents' buckets as it does from the
+    /// whole array.
+    #[tokio::test]
+    async fn a_rare_term_scores_from_its_own_buckets() {
+        let (blob, json) = candidate_corpus();
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let idf: GlobalTermIdf = [("quux", 6.0), ("zyzzyva", 3.5)]
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect();
+        for term in ["quux", "zyzzyva"] {
+            let terms = [term];
+            let lists = || ClauseLists {
+                shoulds: &terms,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            };
+            let lazy = bucket_reader(&blob, json).await;
+            let whole = ranked(&eager, lists(), f32::NEG_INFINITY).await;
+            assert!(!whole.is_empty(), "{term}: the corpus holds it");
+            assert_eq!(
+                ranked(&lazy, lists(), f32::NEG_INFINITY).await,
+                whole,
+                "{term}"
+            );
+            assert!(!lazy.columns[0].norms_loaded(), "{term}: no array read");
+        }
+    }
+
+    /// A document's bucket is the same whether read alone, with the whole
+    /// array, or from the norms in memory.
+    #[tokio::test]
+    async fn doc_buckets_agree_however_they_are_read() {
+        let (blob, json) = candidate_corpus();
+        let docs: Vec<u32> = (0..CANDIDATE_CORPUS_DOCS).rev().step_by(7).collect();
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let expected = eager
+            .doc_buckets(0, &docs, CANDIDATE_MAX_RANGES)
+            .await
+            .expect("from the norms");
+        for max_ranges in [CANDIDATE_MAX_RANGES, 0] {
+            let lazy = bucket_reader(&blob, json).await;
+            assert_eq!(
+                lazy.doc_buckets(0, &docs, max_ranges)
+                    .await
+                    .expect("from the stored buckets"),
+                expected,
+                "at most {max_ranges} ranges"
+            );
+            assert!(!lazy.columns[0].norms_loaded());
+        }
+    }
+
+    /// A posting's id past the documents is malformed, not an index past
+    /// the norms, whether the norms are in memory, read as single buckets,
+    /// or loaded on demand.
+    #[tokio::test]
+    async fn doc_buckets_refuse_a_document_past_the_column() {
+        let (blob, json) = candidate_corpus();
+        let docs = [0, CANDIDATE_CORPUS_DOCS];
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        eager.ensure_norms(0).await.expect("norms");
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob.clone()));
+        let checked = FtsReader::open_lazy(src, json, OpenOptions { verify_crc: true })
+            .await
+            .expect("open_lazy");
+        let readers = [
+            ("loaded", eager),
+            ("single buckets", bucket_reader(&blob, json).await),
+            ("loaded on demand", checked),
+        ];
+        for (name, r) in &readers {
+            let result = r.doc_buckets(0, &docs, CANDIDATE_MAX_RANGES).await;
+            assert!(
+                matches!(result, Err(FtsError::Read(ReadError::Malformed(_)))),
+                "{name}: {result:?}"
+            );
+        }
+    }
+
+    /// Where a stored-bucket directory entry keeps the column's count of
+    /// scored documents.
+    const N_SCORED_DOCS_IN_ENTRY: Range<usize> = 24..32;
+
+    /// A directory that says the column scores no document loads an empty
+    /// norm table; a document the column does hold is then malformed, not
+    /// an index past that table. The same blob uncorrupted reads it.
+    #[tokio::test]
+    async fn doc_buckets_refuse_a_document_past_empty_loaded_norms() {
+        let (blob, json) = candidate_corpus();
+        let dir_off =
+            read_u64_le(&blob[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
+                as usize;
+        let mut corrupt = blob.to_vec();
+        corrupt[dir_off + N_SCORED_DOCS_IN_ENTRY.start..dir_off + N_SCORED_DOCS_IN_ENTRY.end]
+            .copy_from_slice(&0u64.to_le_bytes());
+        let corrupt = Bytes::from(corrupt);
+        for (name, blob, ok) in [("intact", &blob, true), ("no scored docs", &corrupt, false)] {
+            let r = bucket_reader(blob, json).await;
+            r.ensure_norms(0).await.expect("norms");
+            let result = r.doc_buckets(0, &[0], CANDIDATE_MAX_RANGES).await;
+            match ok {
+                true => assert!(result.is_ok(), "{name}: {result:?}"),
+                false => assert!(
+                    matches!(result, Err(FtsError::Read(ReadError::Malformed(_)))),
+                    "{name}: {result:?}"
+                ),
+            }
+        }
+    }
+
+    /// Occurrences of each of `alpha` and `beta` in the one long document
+    /// of [`a_length_past_the_stored_cap_stays_a_candidate`]: together one
+    /// past the longest stored length.
+    const LONG_DOC_EACH: usize = 1 << 15;
+
+    /// A document longer than the stored cap is scored at the capped
+    /// length; its candidate bound is too, so at its own score as the
+    /// floor it stays a candidate and ranks as with the whole array. Bound
+    /// at its uncapped length, a bucket longer, it would fall under.
+    #[tokio::test]
+    async fn a_length_past_the_stored_cap_stays_a_candidate() {
+        const TABLE_AVGDL: f32 = 2.0;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let long = [vec!["alpha"; LONG_DOC_EACH], vec!["beta"; LONG_DOC_EACH]].concat();
+        b.add_doc(0, 0, &long.join(" ")).expect("add doc");
+        b.add_doc(0, 1, "alpha beta").expect("add doc");
+        b.add_doc(0, 2, "gray").expect("add doc");
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let idf: GlobalTermIdf = [("alpha", 2.5), ("beta", 1.5)]
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect();
+        let terms: &[&str] = &["alpha", "beta"];
+        let lists = || ClauseLists {
+            shoulds: terms,
+            idf: QueryIdf::Table(&idf),
+            ..ClauseLists::default()
+        };
+        let table = ScoringView {
+            norms: None,
+            params: None,
+            avgdl: Some(("body", TABLE_AVGDL)),
+        };
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let whole = ranked(
+            &eager
+                .with_scoring(&table)
+                .expect("a view at the table average"),
+            lists(),
+            f32::NEG_INFINITY,
+        )
+        .await;
+        assert_eq!(whole[0].0, RowId::new(0), "the long document ranks first");
+        let floor = whole[0].1;
+        let lazy = bucket_reader(&blob, json).await;
+        let norms = lazy
+            .candidate_norms(
+                "body",
+                &[("alpha", 1), ("beta", 1)],
+                &[],
+                &idf,
+                &table,
+                floor,
+                None,
+                None,
+            )
+            .await
+            .expect("candidate norms")
+            .expect("the candidates are read alone");
+        let view = lazy
+            .with_scoring(&ScoringView {
+                norms: Some(CandidateNorms {
+                    column: "body",
+                    norms: &norms,
+                }),
+                ..table
+            })
+            .expect("a view over the candidate norms");
+        assert_eq!(ranked(&view, lists(), floor).await, whole[..1]);
+    }
+
+    /// A lone term scores from its own documents' buckets exactly when it
+    /// has at most [`FEW_NORMS_MAX_DOCS`] postings, the count up to which
+    /// the table's fan-out skips the length-array prewarm.
+    #[tokio::test]
+    async fn few_norms_cover_a_term_of_up_to_the_short_limit() {
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let at_most = FEW_NORMS_MAX_DOCS as u32;
+        for doc in 0..=at_most {
+            let text = match doc < at_most {
+                true => "within past",
+                false => "past",
+            };
+            b.add_doc(0, doc, text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let idf: GlobalTermIdf = [("within", 1.0), ("past", 1.0)]
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect();
+        for (term, df) in [("within", at_most), ("past", at_most + 1)] {
+            let terms = [term];
+            let lists = ClauseLists {
+                shoulds: &terms,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            };
+            let lazy = bucket_reader(&blob, json).await;
+            assert_eq!(
+                ranked(&lazy, lists, f32::NEG_INFINITY).await.len(),
+                CANDIDATE_K
+            );
+            assert_eq!(
+                lazy.columns[0].norms_loaded(),
+                df as usize > FEW_NORMS_MAX_DOCS,
+                "{term}: {df} postings"
+            );
         }
     }
 }
