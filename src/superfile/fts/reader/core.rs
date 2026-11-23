@@ -2215,9 +2215,10 @@ impl FtsReader {
     /// Multi-token phrases require the column to be positional;
     /// otherwise [`FtsError::PositionsUnavailable`].
     /// The second element counts the term-dictionary ranges the builds
-    /// requested (one per `build_term_cursors` call plus one per inline
-    /// phrase member's position recovery) — real byte-source ranges on
-    /// every query, tallied by the caller into the planned count.
+    /// requested (one per `build_term_cursors` call the memo does not cover,
+    /// plus one per inline phrase member's position recovery) — real
+    /// byte-source ranges on every query, tallied by the caller into the
+    /// planned count.
     pub(super) async fn build_atom_cursors(
         &self,
         column_id: u32,
@@ -2249,7 +2250,7 @@ impl FtsReader {
             let term_cursors = self
                 .build_term_cursors_opt(column_id, terms, idf, purpose, None, prefetched, None)
                 .await?;
-            dict_ranges += 1;
+            dict_ranges += super::count::dictionary_fetches(terms, prefetched);
             for cursor in term_cursors {
                 out.push(cursor.map(AnyCursor::Term));
             }
@@ -2263,7 +2264,7 @@ impl FtsReader {
             let cursors = self
                 .build_term_cursors(column_id, &member_refs, idf, purpose, None, prefetched)
                 .await?;
-            dict_ranges += 1;
+            dict_ranges += super::count::dictionary_fetches(&member_refs, prefetched);
             if cursors.len() != member_refs.len() {
                 // A member is absent — the phrase can never match.
                 out.push(None);

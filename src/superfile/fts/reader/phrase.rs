@@ -1895,14 +1895,24 @@ mod tests {
                 .fetch_scored_terms("title", &distinct)
                 .await
                 .expect("memo");
+            let (_, from_dict) = lazy
+                .atoms_match_ids("title", &[], one, BoolMode::And)
+                .await
+                .expect("dictionary match ids");
             source
                 .refused
                 .set(lazy.dict_range.clone())
                 .expect("refused once");
-            let (ids, _) = lazy
+            let (ids, from_memo) = lazy
                 .atoms_match_ids_prefetched("title", &[], one, BoolMode::And, Some(&memo))
                 .await
                 .expect("memo match ids");
+            // The memo spares the one dictionary read the plan counts.
+            assert_eq!(
+                from_memo.planned_ranges + 1,
+                from_dict.planned_ranges,
+                "memo planned ranges, {label}"
+            );
             let ids: Vec<u32> = ids.iter().map(|d| d.get()).collect();
             assert_eq!(ids, expected_ids, "memo match ids, {label}");
             let (count, _) = lazy

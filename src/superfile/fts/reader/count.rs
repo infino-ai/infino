@@ -51,7 +51,7 @@ const LEN_BUCKETS: usize = 1 << u8::BITS;
 
 /// Planned dictionary reads for a cursor build over `tokens`: none when a
 /// memo already resolves every token, one otherwise.
-fn dictionary_fetches(tokens: &[&str], prefetched: Option<&FetchedTermMemo>) -> u64 {
+pub(super) fn dictionary_fetches(tokens: &[&str], prefetched: Option<&FetchedTermMemo>) -> u64 {
     match prefetched.is_some_and(|m| m.covers(tokens)) {
         true => 0,
         false => 1,
