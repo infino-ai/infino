@@ -258,6 +258,65 @@ impl MatchOrder {
         }
     }
 
+    /// Of `candidates`, rows of one superfile read through `r` that may
+    /// match, those whose key is at least the walk's `fetch`-th best so far:
+    /// the rest cannot place, so a caller need not check them further. Their
+    /// keys are not folded in, since a candidate is not yet a match. Every
+    /// candidate is kept until `fetch` rows are in hand.
+    pub(crate) async fn prefilter(
+        &self,
+        r: &Arc<SuperfileReader>,
+        candidates: Vec<u32>,
+    ) -> Result<Vec<u32>, QueryError> {
+        let Some(worst) = self.worst() else {
+            return Ok(candidates);
+        };
+        let budget = &self.manifest.options.connection_memory_budget;
+        let mut placing = Vec::new();
+        for chunk in candidates.chunks(EXACT_SCOPE_TAKE_ROWS) {
+            let batch = take_file_columns(
+                &self.manifest,
+                r,
+                chunk.to_vec(),
+                &[self.column.as_str()],
+                &self.key_schema,
+                &self.op_stats,
+            )
+            .await
+            .map_err(QueryError::DataFusion)?;
+            let _held = budget
+                .try_reserve(batch.get_array_memory_size())
+                .map_err(|over| {
+                    QueryError::OverBudget(format!("during an ordered match walk, {over}"))
+                })?;
+            let (kind, descending) = (self.kind, self.descending);
+            let (ranks, _) = run_on_pool(
+                Some(&self.manifest.options.reader_pool),
+                "ordered match keys",
+                move || ranks_of_chunk(&batch, kind, descending, 0),
+            )
+            .await
+            .map_err(QueryError::internal)??;
+            placing.extend(
+                chunk
+                    .iter()
+                    .zip(&ranks)
+                    .filter(|(_, rank)| **rank >= worst)
+                    .map(|(row, _)| *row),
+            );
+        }
+        Ok(placing)
+    }
+
+    /// The `fetch`-th best rank so far, once `fetch` rows are in hand.
+    fn worst(&self) -> Option<u64> {
+        let found = self.found.lock().expect("match order mutex poisoned");
+        match found.len() >= self.fetch {
+            true => found.peek().map(|Reverse(worst)| *worst),
+            false => None,
+        }
+    }
+
     /// Of `hits`, the matches of one superfile read through `r`, those the
     /// `WHERE` keeps and whose key is at least the walk's `fetch`-th best
     /// once theirs are folded in: a row below it can never place.
