@@ -468,17 +468,17 @@ impl IndexSpec {
     }
 
     /// The declared companions, lowered to what the table options carry.
-    pub(crate) fn companion_specs(&self) -> Vec<CompanionSpec> {
+    pub(crate) fn companion_specs(&self) -> Result<Vec<CompanionSpec>, InfinoError> {
         self.companions
             .iter()
             .map(|companion| {
-                let (fts_columns, vector_columns) = companion.indexes.to_configs();
-                CompanionSpec {
+                let (fts_columns, vector_columns) = companion.indexes.to_configs()?;
+                Ok(CompanionSpec {
                     purpose: companion.purpose.clone(),
                     schema: Arc::clone(&companion.schema),
                     fts_columns,
                     vector_columns,
-                }
+                })
             })
             .collect()
     }
@@ -509,16 +509,7 @@ impl IndexSpec {
     /// Refuses an FTS column that names an analyzer this engine does not
     /// ship, or a `keyword` column with stopwords or a stemmer.
     pub(crate) fn check_analyzers(&self) -> Result<(), InfinoError> {
-        for f in &self.fts {
-            let Some(analyzer) = Analyzer::from_name(&f.analyzer) else {
-                return Err(InfinoError::Config(format!(
-                    "FTS column {:?}: unsupported analyzer {:?}; the analyzers are \
-                     {STANDARD_TOKENIZER:?} and {:?}",
-                    f.column,
-                    f.analyzer,
-                    Analyzer::Keyword.as_str()
-                )));
-            };
+        for (f, analyzer) in self.fts.iter().zip(self.fts_analyzers()?) {
             check_chain(analyzer, f.stopwords, f.stemmer).map_err(|reason| {
                 InfinoError::Config(format!("FTS column {:?}: {reason}", f.column))
             })?;
@@ -527,25 +518,21 @@ impl IndexSpec {
     }
 
     /// FTS base tokenizers, in declaration order (parallel to
-    /// [`fts_columns`](Self::fts_columns)).
-    ///
-    /// # Panics
-    ///
-    /// On a name this engine does not ship. Every caller runs
-    /// [`check_analyzers`](Self::check_analyzers) first (`create_table`
-    /// does, and a spec rebuilt from a catalog record names only shipped
-    /// analyzers); a caller that skipped it must fail loudly rather than
-    /// build the column under `standard`.
-    pub(crate) fn fts_analyzers(&self) -> Vec<Analyzer> {
+    /// [`fts_columns`](Self::fts_columns)). A name this engine does not
+    /// ship is a [`InfinoError::Config`] naming the column, never a
+    /// column built under another analyzer.
+    pub(crate) fn fts_analyzers(&self) -> Result<Vec<Analyzer>, InfinoError> {
         self.fts
             .iter()
             .map(|f| {
-                Analyzer::from_name(&f.analyzer).unwrap_or_else(|| {
-                    panic!(
-                        "FTS column {:?}: analyzer {:?} reached the index without \
-                         check_analyzers",
-                        f.column, f.analyzer
-                    )
+                Analyzer::from_name(&f.analyzer).ok_or_else(|| {
+                    InfinoError::Config(format!(
+                        "FTS column {:?}: unsupported analyzer {:?}; the analyzers are \
+                         {STANDARD_TOKENIZER:?} and {:?}",
+                        f.column,
+                        f.analyzer,
+                        Analyzer::Keyword.as_str()
+                    ))
                 })
             })
             .collect()
@@ -599,12 +586,13 @@ impl IndexSpec {
     /// supertable options take. `rot_seed` / `rerank_codec` are not part of
     /// the public spec, so a column declared through [`Self::vector`]
     /// carries the defaults; one replayed from a schema document carries
-    /// what that document recorded.
-    pub(crate) fn to_configs(&self) -> (Vec<FtsConfig>, Vec<VectorConfig>) {
+    /// what that document recorded. An analyzer this engine does not ship
+    /// is an error (see [`fts_analyzers`](Self::fts_analyzers)).
+    pub(crate) fn to_configs(&self) -> Result<(Vec<FtsConfig>, Vec<VectorConfig>), InfinoError> {
         let fts = self
             .fts
             .iter()
-            .zip(self.fts_analyzers())
+            .zip(self.fts_analyzers()?)
             .map(|(f, analyzer)| {
                 FtsConfig::new(f.column.clone())
                     .analyzer(analyzer)
@@ -626,7 +614,7 @@ impl IndexSpec {
                 }
             })
             .collect();
-        (fts, vectors)
+        Ok((fts, vectors))
     }
 }
 
@@ -685,5 +673,36 @@ mod tests {
         assert_eq!(spec.fts_stemmers(), vec![Stemmer::None]);
         assert_eq!(spec.fts_positions(), vec![false]);
         assert_eq!(spec.fts_stored(), vec![true]);
+        assert_eq!(
+            spec.fts_analyzers().expect("shipped"),
+            vec![Analyzer::Standard]
+        );
+    }
+
+    /// An analyzer this engine does not ship is an error naming the column
+    /// wherever the spec is lowered, whether or not `check_analyzers` ran
+    /// first: never a panic, and never a column built under another one.
+    #[test]
+    fn an_unknown_analyzer_is_an_error_wherever_the_spec_is_lowered() {
+        let spec = IndexSpec::new()
+            .fts(FtsField::new("host").analyzer("keyword"))
+            .fts(FtsField::new("title").analyzer("whitespace"));
+        for err in [
+            spec.check_analyzers().expect_err("check"),
+            spec.fts_analyzers().expect_err("analyzers"),
+            spec.to_configs().expect_err("configs"),
+        ] {
+            assert!(matches!(err, InfinoError::Config(_)), "{err:?}");
+            let message = err.to_string();
+            assert!(
+                message.contains("title") && message.contains("whitespace"),
+                "{message}"
+            );
+        }
+        let spec = IndexSpec::new().fts(FtsField::new("host").analyzer("keyword"));
+        assert_eq!(
+            spec.fts_analyzers().expect("shipped"),
+            vec![Analyzer::Keyword]
+        );
     }
 }

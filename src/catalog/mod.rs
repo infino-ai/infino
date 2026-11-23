@@ -525,7 +525,9 @@ impl Connection {
         indexes
             .check_ranges(&schema)
             .map_err(|e| e.with_context("create_table", Some(name)))?;
-        let (fts_cfg, vec_cfg) = indexes.to_configs();
+        let (fts_cfg, vec_cfg) = indexes
+            .to_configs()
+            .map_err(|e| e.with_context("create_table", Some(name)))?;
         // A companion is a table on storage beside this one; a catalog with
         // no storage, or one forwarding to a hosted service, has nowhere to
         // put it.
@@ -599,6 +601,7 @@ impl Connection {
                     fts: indexes.fts_columns(),
                     fts_analyzers: indexes
                         .fts_analyzers()
+                        .map_err(|e| e.with_context("create_table", Some(name)))?
                         .iter()
                         .map(|a| a.as_str().to_string())
                         .collect(),
@@ -667,7 +670,11 @@ impl Connection {
                 // BoundedStaleness); `open_table` applies the same.
                 opts = opts
                     .with_read_consistency(self.inner.options.read_consistency)
-                    .with_companions(indexes.companion_specs());
+                    .with_companions(
+                        indexes
+                            .companion_specs()
+                            .map_err(|e| e.with_context("create_table", Some(name)))?,
+                    );
 
                 // Create the physical table at its unique location, then
                 // register the name. A losing racer that also created a
@@ -885,7 +892,9 @@ impl Connection {
                 metric_from_str(&v.metric).map_err(|e| e.with_context("open_table", Some(name)))?,
             );
         }
-        let (fts_cfg, vec_cfg) = spec.to_configs();
+        let (fts_cfg, vec_cfg) = spec
+            .to_configs()
+            .map_err(|e| e.with_context("open_table", Some(name)))?;
 
         let storage = backend_to_provider(
             &self.inner.backend.join(&entry.location),
