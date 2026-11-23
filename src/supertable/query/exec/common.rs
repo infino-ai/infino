@@ -57,7 +57,7 @@ use parquet::{
     arrow::{
         ProjectionMask,
         arrow_reader::{
-            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
             RowSelectionPolicy,
         },
         async_reader::{AsyncFileReader, ParquetObjectReader, ParquetRecordBatchStreamBuilder},
@@ -1926,6 +1926,19 @@ fn take_prefetch_reads() -> &'static Semaphore {
     READS.get_or_init(|| Semaphore::new(TAKE_PREFETCH_READS_IN_FLIGHT))
 }
 
+/// What a take fetches ahead, and what its decode needs from the same walk.
+#[derive(Clone)]
+struct TakePrefetch {
+    /// The bytes to fetch, merged.
+    spans: Vec<Range<u64>>,
+    /// The row groups with a hit, in file order.
+    row_groups: Vec<usize>,
+    /// The take's rows numbered as if only `row_groups` were in the file.
+    rows: Vec<u32>,
+    /// Whether `spans` hold every page of every row group in `row_groups`.
+    whole: bool,
+}
+
 /// The column chunks of the `roots` columns (top-level, as the Arrow
 /// schema numbers them) in every row group `sorted` (ascending, distinct
 /// rows) falls in, merged where at most `gap` bytes apart: the bytes a take's decode reads,
@@ -1939,7 +1952,7 @@ fn take_prefetch_spans(
     roots: &[usize],
     max_bytes: u64,
     gap: u64,
-) -> Option<Vec<Range<u64>>> {
+) -> Option<TakePrefetch> {
     let descr = metadata.file_metadata().schema_descr();
     if roots
         .iter()
@@ -1953,16 +1966,21 @@ fn take_prefetch_spans(
         .filter(|&leaf| roots.contains(&descr.get_column_root_idx(leaf)))
         .collect();
     let mut spans: Vec<Range<u64>> = Vec::new();
-    let (mut first_row, mut next) = (0u64, 0usize);
+    let mut row_groups = Vec::new();
+    let mut rows = Vec::with_capacity(sorted.len());
+    let mut whole = true;
+    let (mut first_row, mut kept_rows, mut next) = (0u64, 0u64, 0usize);
     for (index, rg) in metadata.row_groups().iter().enumerate() {
         let end_row = first_row + rg.num_rows() as u64;
         let before = next;
         while next < sorted.len() && u64::from(sorted[next]) < end_row {
+            // At most the row's own number, so it fits in a u32.
+            rows.push((kept_rows + u64::from(sorted[next]) - first_row) as u32);
             next += 1;
         }
         if next > before {
             for &c in &columns {
-                hit_pages(
+                whole &= hit_pages(
                     metadata,
                     index,
                     c,
@@ -1972,18 +1990,26 @@ fn take_prefetch_spans(
                     &mut spans,
                 );
             }
+            row_groups.push(index);
+            kept_rows += end_row - first_row;
         }
         first_row = end_row;
     }
     let merged = merged_within(&spans, gap);
     let bytes: u64 = merged.iter().map(|r| r.end - r.start).sum();
-    (bytes <= max_bytes).then_some(merged)
+    (bytes <= max_bytes).then_some(TakePrefetch {
+        spans: merged,
+        row_groups,
+        rows,
+        whole,
+    })
 }
 
 /// The bytes of leaf column `c` in row group `index` (rows `first_row` to
 /// `end_row`) that a decode of rows `hits` reads, pushed onto `spans`. With
 /// the page index loaded the decode skips pages without a hit, so that is
 /// each page holding one, plus the dictionary page; without it, the chunk.
+/// Whether that is every page of the chunk.
 fn hit_pages(
     metadata: &ParquetMetaData,
     index: usize,
@@ -1992,7 +2018,7 @@ fn hit_pages(
     end_row: u64,
     hits: &[u32],
     spans: &mut Vec<Range<u64>>,
-) {
+) -> bool {
     let (offset, len) = metadata.row_group(index).column(c).byte_range();
     let pages = metadata
         .offset_index()
@@ -2002,13 +2028,13 @@ fn hit_pages(
         .filter(|pages| !pages.is_empty());
     let Some(pages) = pages else {
         spans.push(offset..offset + len);
-        return;
+        return true;
     };
     let first_page = pages[0].offset as u64;
     if first_page > offset {
         spans.push(offset..first_page);
     }
-    let mut hit = 0;
+    let (mut hit, mut every) = (0, true);
     for (i, page) in pages.iter().enumerate() {
         let start_row = first_row + page.first_row_index as u64;
         let page_end_row = pages
@@ -2020,8 +2046,11 @@ fn hit_pages(
         if hit < hits.len() && u64::from(hits[hit]) < page_end_row {
             let start = page.offset as u64;
             spans.push(start..start + page.compressed_page_size as u64);
+        } else {
+            every = false;
         }
     }
+    every
 }
 
 impl AsyncFileReader for ByteSourceAsyncReader {
@@ -2141,7 +2170,7 @@ pub(crate) async fn take_rows_byte_source(
         .iter()
         .filter_map(|name| reader.schema().index_of(name).ok())
         .collect();
-    let spans = take_prefetch_spans(
+    let prefetch = take_prefetch_spans(
         &metadata,
         &sorted,
         &roots,
@@ -2152,7 +2181,7 @@ pub(crate) async fn take_rows_byte_source(
         reader,
         source,
         metadata,
-        spans,
+        prefetch,
         local_doc_ids,
         names,
         pool,
@@ -2172,9 +2201,9 @@ fn take_prefetch_fallbacks() -> u64 {
     TAKE_PREFETCH_FALLBACKS.load(Ordering::Relaxed)
 }
 
-/// Fetch `spans` of the take at once and decode from them on the reader
-/// pool, or with no spans stream through `source`, as does a decode that
-/// reads outside them. The prefetch is reserved from `budget` (at most
+/// Fetch the spans of `prefetch` at once and decode from them on the reader
+/// pool, or with no prefetch stream through `source`, as does a decode that
+/// reads outside it. The prefetch is reserved from `budget` (at most
 /// [`BUDGET_SHARE_PERCENT`] of it, as the scan's read-ahead), and streams
 /// without room there; without room in the cache's write queue it is fetched
 /// but not cached.
@@ -2182,7 +2211,7 @@ async fn take_prefetched(
     reader: &SuperfileReader,
     source: Source,
     metadata: Arc<ParquetMetaData>,
-    spans: Option<Vec<Range<u64>>>,
+    prefetch: Option<TakePrefetch>,
     local_doc_ids: &[u32],
     names: &[&str],
     pool: Option<&ThreadPool>,
@@ -2191,20 +2220,30 @@ async fn take_prefetched(
     let mut prefetched = Vec::new();
     // Held until the decode is done: the prefetched bytes live that long.
     let (mut _reserved, mut _room) = (None, None);
-    let spans = spans.filter(|s| !s.is_empty());
-    let bytes: u64 = spans.iter().flatten().map(|r| r.end - r.start).sum();
+    let prefetch = prefetch.filter(|p| !p.spans.is_empty());
+    let bytes: u64 = prefetch
+        .iter()
+        .flat_map(|p| &p.spans)
+        .map(|r| r.end - r.start)
+        .sum();
     // Bytes the connection's budget has no room for are streamed instead, as
     // the scan's read-ahead leaves them to the scan. Bytes the cache's write
     // queue has no room for are still fetched at once, but not cached: a
     // full queue would drop them anyway, and streaming them reads several
     // times the bytes.
     let reserved = match budget {
-        Some(budget) if spans.is_some() => budget
+        Some(budget) if prefetch.is_some() => budget
             .try_reserve_within_share(bytes as usize, BUDGET_SHARE_PERCENT)
             .map(Some),
         _ => Some(None),
     };
-    if let (Some(spans), Some(reserved)) = (spans, reserved) {
+    if let (Some(prefetch), Some(reserved)) = (prefetch, reserved) {
+        let TakePrefetch {
+            spans,
+            row_groups,
+            rows,
+            whole,
+        } = prefetch;
         _reserved = reserved;
         _room = Some(
             take_prefetch_budget()
@@ -2250,7 +2289,12 @@ async fn take_prefetched(
         let owned: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
         let decoded = run_on_pool_unless_blocking(pool, "take decode", move || {
             let names: Vec<&str> = owned.iter().map(String::as_str).collect();
-            take_rows_prefetched(chunks, metadata, &schema, n_docs, &ids, &names)
+            let hits = HitRowGroups {
+                row_groups,
+                rows,
+                whole,
+            };
+            take_rows_prefetched(chunks, metadata, &schema, n_docs, hits, &ids, &names)
         })
         .await
         .map_err(QueryError::internal)?;
@@ -2319,36 +2363,21 @@ where
         .await
         .map_err(QueryError::store)?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), plan.col_indices.iter().copied());
+    let (_, selection) = row_selection_for_ids(&plan.sorted);
     let stream = builder
         .with_projection(mask)
-        .with_row_selection(plan.selection.clone())
+        .with_row_selection(selection)
         .build()
         .map_err(QueryError::store)?;
     let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(QueryError::store)?;
     finish_take(&plan, batches, local_doc_ids, names)
 }
 
-/// The row groups `sorted` (ascending, distinct rows) falls in, and its rows
-/// numbered as if only those row groups were in the file.
-fn hit_row_groups(metadata: &ParquetMetaData, sorted: &[u32]) -> (Vec<usize>, Vec<u32>) {
-    let mut groups = Vec::new();
-    let mut rows = Vec::with_capacity(sorted.len());
-    let (mut first_row, mut kept_rows, mut next) = (0u64, 0u64, 0usize);
-    for (index, rg) in metadata.row_groups().iter().enumerate() {
-        let end_row = first_row + rg.num_rows() as u64;
-        let before = next;
-        while next < sorted.len() && u64::from(sorted[next]) < end_row {
-            // At most the row's own number, so it fits in a u32.
-            rows.push((kept_rows + u64::from(sorted[next]) - first_row) as u32);
-            next += 1;
-        }
-        if next > before {
-            groups.push(index);
-            kept_rows += end_row - first_row;
-        }
-        first_row = end_row;
-    }
-    (groups, rows)
+/// The row groups a prefetched take decodes, from [`TakePrefetch`].
+struct HitRowGroups {
+    row_groups: Vec<usize>,
+    rows: Vec<u32>,
+    whole: bool,
 }
 
 /// [`take_rows_async`] decoding from `chunks`, synchronously: the reader-pool
@@ -2358,6 +2387,7 @@ fn take_rows_prefetched(
     metadata: Arc<ParquetMetaData>,
     file_schema: &SchemaRef,
     n_docs: u64,
+    hits: HitRowGroups,
     local_doc_ids: &[u32],
     names: &[&str],
 ) -> DfResult<RecordBatch> {
@@ -2367,19 +2397,17 @@ fn take_rows_prefetched(
     };
     // Only the row groups with a hit: a row group with none would still read
     // its dictionary page, which the prefetch leaves out.
-    let (row_groups, rows) = hit_row_groups(&metadata, &plan.sorted);
-    let (_, selection) = row_selection_for_ids(&rows);
+    let (_, selection) = row_selection_for_ids(&hits.rows);
+    let policy = take_selection_policy(hits.whole, file_schema, &plan.col_indices);
     let metadata = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
         .map_err(QueryError::store)?;
     let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(chunks, metadata);
     let mask = ProjectionMask::roots(builder.parquet_schema(), plan.col_indices.iter().copied());
     let batches: Vec<RecordBatch> = builder
         .with_projection(mask)
-        .with_row_groups(row_groups)
+        .with_row_groups(hits.row_groups)
         .with_row_selection(selection)
-        // A mask reads every page between two hits, also the pages the
-        // prefetch skipped; selectors skip them.
-        .with_row_selection_policy(RowSelectionPolicy::Selectors)
+        .with_row_selection_policy(policy)
         .build()
         .map_err(QueryError::store)?
         .collect::<Result<_, _>>()
@@ -2387,13 +2415,32 @@ fn take_rows_prefetched(
     finish_take(&plan, batches, local_doc_ids, names)
 }
 
+/// How a prefetched take of the `col_indices` columns of `file_schema`
+/// applies its row selection. A mask reads every page of a row group, also
+/// pages the prefetch skipped, so only a prefetch of `whole` row groups may
+/// choose one; and only for fixed-width columns, where it decodes a dense
+/// take faster. Over strings, selectors decoded faster at every density
+/// measured.
+fn take_selection_policy(
+    whole: bool,
+    file_schema: &SchemaRef,
+    col_indices: &[usize],
+) -> RowSelectionPolicy {
+    let fixed_width = col_indices
+        .iter()
+        .all(|&i| file_schema.field(i).data_type().is_primitive());
+    match whole && fixed_width {
+        true => RowSelectionPolicy::default(),
+        false => RowSelectionPolicy::Selectors,
+    }
+}
+
 /// What a take of `local_doc_ids` decodes: the projected columns, the output
-/// schema, and the rows as a sorted selection.
+/// schema, and the rows sorted and distinct.
 struct TakePlan {
     col_indices: Vec<usize>,
     out_schema: SchemaRef,
     sorted: Vec<u32>,
-    selection: RowSelection,
 }
 
 /// The [`TakePlan`] of a take, or the batch itself when there is nothing to
@@ -2441,16 +2488,15 @@ fn take_plan(
         .map_err(|e| QueryError::internal(e).into());
     }
 
-    // Distinct, sorted ids → monotonic skip/select runs (decode only the
-    // rows the hits land on, not the whole column). Same selection
-    // contract as `take_by_local_doc_ids` — shared helpers, different
-    // I/O model (async range GETs here vs resident-bytes decode there).
-    let (sorted, selection) = row_selection_for_ids(local_doc_ids);
+    // Distinct, sorted ids. Each path builds its own selection from them:
+    // the prefetched one over only the row groups with a hit.
+    let mut sorted = local_doc_ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
     Ok(Ok(TakePlan {
         col_indices,
         out_schema,
         sorted,
-        selection,
     }))
 }
 
@@ -2824,7 +2870,8 @@ mod tests {
 
         let rows = [5u32, 150, 151, 950];
         let spans = take_prefetch_spans(&metadata, &rows, &[0, 2], TAKE_PREFETCH_MAX_BYTES, 0)
-            .expect("spans");
+            .expect("spans")
+            .spans;
         let covered = |(offset, len): (u64, u64)| {
             spans
                 .iter()
@@ -2862,7 +2909,8 @@ mod tests {
             TAKE_PREFETCH_MAX_BYTES,
             u64::MAX / 2,
         )
-        .expect("spans");
+        .expect("spans")
+        .spans;
         assert_eq!(one, vec![spans[0].start..spans[spans.len() - 1].end]);
     }
 
@@ -2891,8 +2939,9 @@ mod tests {
         assert_eq!(pages(0).len(), 10, "ten pages a row group");
 
         let rows = [5u32, 37, 150];
-        let spans =
-            take_prefetch_spans(&metadata, &rows, &[0], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
+        let spans = take_prefetch_spans(&metadata, &rows, &[0], TAKE_PREFETCH_MAX_BYTES, 0)
+            .expect("spans")
+            .spans;
         let covered = |offset: u64, len: u64| {
             spans
                 .iter()
@@ -2916,6 +2965,112 @@ mod tests {
         assert!(
             covered(chunk_start, first_page - chunk_start),
             "the dictionary page"
+        );
+    }
+
+    /// `bytes` held only at `prefetch`'s spans, as a prefetched decode reads
+    /// them.
+    fn chunks_of(bytes: &Bytes, prefetch: &TakePrefetch) -> PrefetchedChunks {
+        PrefetchedChunks {
+            len: bytes.len() as u64,
+            spans: prefetch
+                .spans
+                .iter()
+                .map(|s| (s.clone(), bytes.slice(s.start as usize..s.end as usize)))
+                .collect(),
+        }
+    }
+
+    /// The row groups `prefetch` decodes.
+    fn hits_of(prefetch: &TakePrefetch) -> HitRowGroups {
+        HitRowGroups {
+            row_groups: prefetch.row_groups.clone(),
+            rows: prefetch.rows.clone(),
+            whole: prefetch.whole,
+        }
+    }
+
+    /// A prefetched take may use a mask only over whole row groups of
+    /// fixed-width columns.
+    #[test]
+    fn a_mask_needs_whole_row_groups_of_fixed_width_columns() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("hits", DataType::Int64, false),
+            Field::new("lang", DataType::LargeUtf8, false),
+        ]));
+        let auto = RowSelectionPolicy::default();
+        assert_eq!(take_selection_policy(true, &schema, &[0]), auto);
+        assert_eq!(
+            take_selection_policy(false, &schema, &[0]),
+            RowSelectionPolicy::Selectors,
+            "pages the prefetch skipped"
+        );
+        assert_eq!(
+            take_selection_policy(true, &schema, &[1]),
+            RowSelectionPolicy::Selectors,
+            "a string column"
+        );
+        assert_eq!(
+            take_selection_policy(true, &schema, &[0, 1]),
+            RowSelectionPolicy::Selectors,
+            "a string among the columns"
+        );
+    }
+
+    /// A dense take with a hit in every page of the row groups it reads
+    /// fetches those row groups whole, so its decode may use a mask, and
+    /// still decodes from its prefetch alone. A row group with no hit stays
+    /// out.
+    #[test]
+    fn dense_take_of_whole_row_groups_decodes_from_its_prefetch_alone() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let values = Arc::new(Int64Array::from_iter_values(0..300)) as ArrayRef;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values]).expect("batch");
+        let mut bytes = Vec::new();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .set_data_page_row_count_limit(10)
+            .set_write_batch_size(10)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let bytes = Bytes::from(bytes);
+        let metadata = Arc::new(
+            ParquetMetaDataReader::new()
+                .with_page_index_policy(PageIndexPolicy::Required)
+                .parse_and_finish(&bytes)
+                .expect("metadata"),
+        );
+        // Every other row of row groups 0 and 2: short runs, a hit in every
+        // page of both, none in row group 1.
+        let rows: Vec<u32> = (0..100).chain(200..300).step_by(2).collect();
+        let prefetch =
+            take_prefetch_spans(&metadata, &rows, &[0], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
+        assert!(
+            prefetch.whole,
+            "every page of row groups 0 and 2 is fetched"
+        );
+        assert_eq!(prefetch.row_groups, vec![0, 2]);
+        let got = take_rows_prefetched(
+            chunks_of(&bytes, &prefetch),
+            metadata,
+            &schema,
+            300,
+            hits_of(&prefetch),
+            &rows,
+            &["a"],
+        )
+        .expect("decodes from the prefetch alone");
+        let want: Vec<i64> = rows.iter().map(|&r| i64::from(r)).collect();
+        assert_eq!(
+            got.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64")
+                .values(),
+            want.as_slice()
         );
     }
 
@@ -2945,17 +3100,20 @@ mod tests {
         );
         // Every other row of pages 0 and 2: short runs, page 1 has no hit.
         let rows: Vec<u32> = (0..10).chain(20..30).step_by(2).collect();
-        let spans =
+        let prefetch =
             take_prefetch_spans(&metadata, &rows, &[0], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
-        let chunks = PrefetchedChunks {
-            len: bytes.len() as u64,
-            spans: spans
-                .into_iter()
-                .map(|s| (s.clone(), bytes.slice(s.start as usize..s.end as usize)))
-                .collect(),
-        };
-        let got = take_rows_prefetched(chunks, metadata, &schema, 1000, &rows, &["a"])
-            .expect("decodes from the prefetch alone");
+        assert!(!prefetch.whole, "page 1 is not fetched");
+        let chunks = chunks_of(&bytes, &prefetch);
+        let got = take_rows_prefetched(
+            chunks,
+            metadata,
+            &schema,
+            1000,
+            hits_of(&prefetch),
+            &rows,
+            &["a"],
+        )
+        .expect("decodes from the prefetch alone");
         let want: Vec<i64> = rows.iter().map(|&r| i64::from(r)).collect();
         assert_eq!(
             got.column(0)
@@ -3008,17 +3166,25 @@ mod tests {
         );
         // Hits in row groups 0 and 2; row group 1 has none.
         let rows: Vec<u32> = vec![3, 41, 205, 299];
-        let spans =
+        let prefetch =
             take_prefetch_spans(&metadata, &rows, &[0], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
-        let chunks = PrefetchedChunks {
-            len: bytes.len() as u64,
-            spans: spans
-                .into_iter()
-                .map(|s| (s.clone(), bytes.slice(s.start as usize..s.end as usize)))
-                .collect(),
-        };
-        let got = take_rows_prefetched(chunks, metadata, &schema, 300, &rows, &["lang"])
-            .expect("decodes from the prefetch alone");
+        assert_eq!(prefetch.row_groups, vec![0, 2]);
+        assert_eq!(
+            prefetch.rows,
+            vec![3, 41, 105, 199],
+            "rows of 0 and 2 laid end to end"
+        );
+        let chunks = chunks_of(&bytes, &prefetch);
+        let got = take_rows_prefetched(
+            chunks,
+            metadata,
+            &schema,
+            300,
+            hits_of(&prefetch),
+            &rows,
+            &["lang"],
+        )
+        .expect("decodes from the prefetch alone");
         let got: Vec<&str> = got
             .column(0)
             .as_any()
@@ -3109,12 +3275,14 @@ mod tests {
                 .any(|s| s.start <= offset && offset + len <= s.end)
         };
 
-        let b =
-            take_prefetch_spans(&metadata, &[3], &[1], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
+        let b = take_prefetch_spans(&metadata, &[3], &[1], TAKE_PREFETCH_MAX_BYTES, 0)
+            .expect("spans")
+            .spans;
         assert!(covered(&b, 2), "b is leaf 2");
         assert!(!covered(&b, 1), "s.y is not projected");
-        let s =
-            take_prefetch_spans(&metadata, &[3], &[0], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
+        let s = take_prefetch_spans(&metadata, &[3], &[0], TAKE_PREFETCH_MAX_BYTES, 0)
+            .expect("spans")
+            .spans;
         assert!(covered(&s, 0) && covered(&s, 1), "both leaves of s");
         assert!(!covered(&s, 2), "b is not projected");
         assert!(take_prefetch_spans(&metadata, &[3], &[2], TAKE_PREFETCH_MAX_BYTES, 0).is_none());
@@ -3787,14 +3955,14 @@ mod tests {
             .await
             .expect("metadata");
         let root = reader.schema().index_of("title").expect("title");
-        let mut spans =
+        let mut prefetch =
             take_prefetch_spans(&metadata, &[0, 3], &[root], u64::MAX, 0).expect("spans");
-        let take = |spans| {
+        let take = |prefetch| {
             take_prefetched(
                 &reader,
                 Source::Lazy(reader.byte_source()),
                 Arc::clone(&metadata),
-                spans,
+                prefetch,
                 &[3, 0],
                 &["title"],
                 None,
@@ -3802,7 +3970,7 @@ mod tests {
             )
         };
         let before = take_prefetch_fallbacks();
-        let whole = take(Some(spans.clone())).await.expect("take");
+        let whole = take(Some(prefetch.clone())).await.expect("take");
         assert_eq!(titles_of(&whole), vec!["delta", "alpha"]);
         assert_eq!(
             take_prefetch_fallbacks(),
@@ -3811,9 +3979,9 @@ mod tests {
         );
 
         // A prefetch missing its last span cannot decode on its own.
-        let last = spans.pop().expect("a span");
-        spans.push(last.start..last.end - 1);
-        let partial = take(Some(spans)).await.expect("take");
+        let last = prefetch.spans.pop().expect("a span");
+        prefetch.spans.push(last.start..last.end - 1);
+        let partial = take(Some(prefetch)).await.expect("take");
         assert_eq!(partial, whole);
         assert!(
             take_prefetch_fallbacks() > before,
