@@ -18,7 +18,8 @@ use arrow_schema::DataType;
 use serde_json::{Map, Value};
 
 use super::{
-    ColumnIndex, FieldDef, FieldId, MAX_MAX_DEPTH, MAX_MAX_FIELDS, TableSchema,
+    ColumnEncoding, ColumnIndex, ENCODING_META_KEY, FieldDef, FieldId, MAX_MAX_DEPTH,
+    MAX_MAX_FIELDS, TableSchema,
     error::SchemaError,
     types::{data_type_from_keys, type_keys},
 };
@@ -132,6 +133,9 @@ pub struct FieldPatch {
     /// An index for a new column. On a live column it must match the
     /// column's: an analyzer chain or a metric is part of the identity.
     pub index: Option<ColumnIndex>,
+    /// How a new column is encoded in the Parquet body
+    /// ([`ENCODING_META_KEY`]). A live column keeps the encoding it has.
+    pub encoding: Option<ColumnEncoding>,
     /// Drop the column.
     pub dropped: bool,
 }
@@ -187,6 +191,13 @@ impl FieldPatch {
         self
     }
 
+    /// The encoding a new column is written with (see
+    /// [`FieldPatch::encoding`]).
+    pub fn with_encoding(mut self, encoding: ColumnEncoding) -> Self {
+        self.encoding = Some(encoding);
+        self
+    }
+
     /// Retire the column.
     pub fn dropped(mut self) -> Self {
         self.dropped = true;
@@ -229,6 +240,10 @@ impl From<&TableSchema> for SchemaPatch {
                     data_type: Some(f.data_type.clone()),
                     nullable: Some(f.nullable),
                     index: f.index.clone(),
+                    encoding: f
+                        .metadata
+                        .get(ENCODING_META_KEY)
+                        .and_then(|name| ColumnEncoding::parse(name)),
                     dropped: false,
                 })
                 .collect(),
@@ -293,6 +308,9 @@ impl SchemaPatch {
                 if let Some(index) = &f.index {
                     keys.insert("index".into(), super::index_to_json(index));
                 }
+                if let Some(encoding) = f.encoding {
+                    keys.insert("encoding".into(), Value::from(encoding.as_str()));
+                }
                 if f.dropped {
                     keys.insert("dropped".into(), Value::from(true));
                 }
@@ -335,6 +353,14 @@ fn field_patch_from_json(json: &Value) -> Result<FieldPatch, String> {
         .transpose()?;
     let nullable = keys.get("nullable").and_then(Value::as_bool);
     let index = keys.get("index").map(super::index_from_json).transpose()?;
+    let encoding = keys
+        .get("encoding")
+        .map(|v| {
+            v.as_str()
+                .and_then(ColumnEncoding::parse)
+                .ok_or_else(|| format!("unknown encoding {v}"))
+        })
+        .transpose()?;
     let dropped = keys
         .get("dropped")
         .and_then(Value::as_bool)
@@ -345,6 +371,7 @@ fn field_patch_from_json(json: &Value) -> Result<FieldPatch, String> {
         data_type,
         nullable,
         index,
+        encoding,
         dropped,
     })
 }
@@ -414,13 +441,26 @@ pub fn merge(
                     name: field.name.clone(),
                 });
             }
+            let mut metadata = BTreeMap::new();
+            if let Some(encoding) = field.encoding {
+                if !encoding.accepts(&data_type) {
+                    return Err(SchemaError::Invalid {
+                        reason: format!(
+                            "column `{}` cannot be encoded {}: the encoding does not take a `{data_type}` column",
+                            field.name,
+                            encoding.as_str()
+                        ),
+                    });
+                }
+                metadata.insert(ENCODING_META_KEY.to_string(), encoding.as_str().to_string());
+            }
             new_names.push(field.name.clone());
             changes.push(SchemaChange::AddColumn {
                 name: field.name.clone(),
                 data_type,
                 nullable,
                 index: field.index.clone(),
-                metadata: BTreeMap::new(),
+                metadata,
             });
             continue;
         };
@@ -850,6 +890,7 @@ mod tests {
             data_type: Some(dt),
             nullable: None,
             index: None,
+            encoding: None,
             dropped: false,
         }
     }
@@ -889,6 +930,7 @@ mod tests {
                     data_type: None,
                     nullable: None,
                     index: None,
+                    encoding: None,
                     dropped: false,
                 },
             ],

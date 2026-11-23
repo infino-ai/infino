@@ -78,6 +78,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arrow::row::{RowConverter, SortField};
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchOptions,
     RecordBatchReader,
@@ -146,7 +147,9 @@ use crate::{
             rerank_codec::RerankCodec,
         },
     },
-    supertable::schema::{FieldId, PhysicalKind, field_id_of, map::FileSchemaMap, with_field_id},
+    supertable::schema::{
+        ColumnEncoding, FieldId, PhysicalKind, field_id_of, map::FileSchemaMap, with_field_id,
+    },
     utils::{
         nulls::{null_row_bytes, share_null_columns},
         terms::validate_column_name,
@@ -1243,6 +1246,15 @@ pub struct BuilderOptions {
     /// range index region over them (`superfile::range`), built from the
     /// rows as the Parquet body stores them. May be empty.
     pub(crate) range_columns: Vec<String>,
+    /// Columns the Parquet body encodes a set way, by name: what the table's
+    /// schema names under `ENCODING_META_KEY`. A column the body does not
+    /// hold, or holds in a type the encoding does not take, is encoded as
+    /// any other. May be empty.
+    pub(crate) column_encodings: Vec<(String, ColumnEncoding)>,
+    /// The table's sort key, by name (`SORT_META_KEY`): a merge writes its
+    /// rows in that order ([`rows_in_key_order`]). Empty for a table
+    /// without one, whose merges keep their inputs' order.
+    pub(crate) sort_columns: Vec<String>,
     /// Finish on the calling thread alone: no join or parallel encode
     /// inside the pool. Set for a build that is itself one of many pool
     /// tasks running side by side, such as a piece of an append, where a
@@ -1450,6 +1462,8 @@ impl BuilderOptions {
             field_ids_outside_schema: HashMap::new(),
             merge_input_mb: None,
             range_columns: Vec::new(),
+            column_encodings: Vec::new(),
+            sort_columns: Vec::new(),
             finish_serial: false,
             scratch: None,
         }
@@ -1470,6 +1484,19 @@ impl BuilderOptions {
     /// Range-index `columns` (see [`BuilderOptions::range_columns`]).
     pub(crate) fn with_range_columns(mut self, columns: Vec<String>) -> Self {
         self.range_columns = columns;
+        self
+    }
+
+    /// Encode `columns` a set way (see [`BuilderOptions::column_encodings`]).
+    pub(crate) fn with_column_encodings(mut self, columns: Vec<(String, ColumnEncoding)>) -> Self {
+        self.column_encodings = columns;
+        self
+    }
+
+    /// Order every merge's rows by `columns` (see
+    /// [`BuilderOptions::sort_columns`]).
+    pub(crate) fn with_sort_columns(mut self, columns: Vec<String>) -> Self {
+        self.sort_columns = columns;
         self
     }
 
@@ -1503,20 +1530,34 @@ impl BuilderOptions {
     /// How the Parquet body of a superfile whose body has `schema` is
     /// written: this builder's codec, row-group size and id page limit, with
     /// every flat column a candidate to drop its dictionary. The encoder
-    /// settles which do from the first row group.
+    /// settles which do from the first row group. A column with a set
+    /// encoding the body's type takes is written that way, with no
+    /// dictionary, and is no candidate.
     pub(crate) fn body_plan(&self, schema: &Schema) -> BodyPlan {
+        let column_encodings: Vec<(String, ColumnEncoding)> = self
+            .column_encodings
+            .iter()
+            .filter(|(name, encoding)| {
+                schema
+                    .field_with_name(name)
+                    .is_ok_and(|f| encoding.accepts(f.data_type()))
+            })
+            .cloned()
+            .collect();
         // A nested column's leaves sit under longer paths, which a
         // per-column dictionary switch on the top-level name would miss.
         let dictionary_candidates = schema
             .fields()
             .iter()
             .filter(|f| !f.data_type().is_nested())
+            .filter(|f| !column_encodings.iter().any(|(name, _)| name == f.name()))
             .map(|f| f.name().clone())
             .collect();
         BodyPlan {
             compression: self.compression,
             row_group_size: self.row_group_size,
             dictionary_candidates,
+            column_encodings,
             column_page_size_limits: vec![(self.id_column.clone(), self.id_page_size_limit)],
             encode_groups_together: !self.finish_serial,
             held_group_bytes: HELD_GROUP_BYTES,
@@ -3656,6 +3697,41 @@ impl SuperfileBuilder {
             superfile_builder.set_term_head_sink(sink, depth);
         }
 
+        // A table with a sort key: the inputs' surviving rows in key order,
+        // each input document's postings following its row there.
+        if !superfile_builder.opts.sort_columns.is_empty() {
+            let gather = rows_in_key_order(
+                inputs,
+                &superfile_builder.parquet_schema,
+                &superfile_builder.opts.sort_columns,
+            )?;
+            let mut rows_of: Vec<Vec<Option<RowId>>> = inputs
+                .iter()
+                .map(|input| {
+                    let n_local = input.reader.fts().map_or(0, |fts| fts.n_docs());
+                    vec![None; n_local as usize]
+                })
+                .collect();
+            for (row, &(i, file_row)) in gather.iter().enumerate() {
+                if let Some(slot) = rows_of
+                    .get_mut(i as usize)
+                    .and_then(|rows| rows.get_mut(file_row as usize))
+                {
+                    *slot = Some(RowId::new(row as u32));
+                }
+            }
+            let n_out_docs = u32::try_from(gather.len()).map_err(|_| BuildError::BatchReadError)?;
+            return Self::merge_rows_to(
+                superfile_builder,
+                inputs,
+                rows_of,
+                n_out_docs,
+                merge,
+                MergeRows::Gathered(gather),
+                output,
+            );
+        }
+
         let mut rows_of = Vec::with_capacity(inputs.len());
         let mut n_out_docs = 0u32;
         for input in inputs {
@@ -5493,6 +5569,93 @@ pub(crate) fn merge_builder_opts(
         opts.lower_analysis_revision_to(&input.reader);
     }
     Ok(opts)
+}
+
+/// The surviving rows of `inputs`, `(input, file row)`, ordered by
+/// `columns`, each a column of `schema` (the body's): the rows a merge of a
+/// table with a sort key writes, in the order it writes them. Rows equal on
+/// every column keep their input order and, within an input, their file
+/// order, so a merge of inputs already in key order keeps them as they are.
+///
+/// Reads the key columns alone, through the merge's own reads, so a column
+/// an input stores under another type or leaves out reads as the merge's
+/// rows do.
+fn rows_in_key_order(
+    inputs: &[MergeInput],
+    schema: &SchemaRef,
+    columns: &[String],
+) -> Result<Vec<(u32, u32)>, BuildError> {
+    let key_fields: Vec<Field> = columns
+        .iter()
+        .filter_map(|column| schema.field_with_name(column).ok().cloned())
+        .collect();
+    let key_schema: SchemaRef = Arc::new(Schema::new(key_fields));
+    let window = DecodeWindow::current();
+    let open: Vec<Option<PassInput>> = inputs
+        .iter()
+        .map(|input| {
+            let metadata = input
+                .reader
+                .arrow_metadata(true)
+                .map_err(|_| BuildError::BatchReadError)?;
+            let values = value_bytes_per_row(&input.reader.parquet_metadata());
+            Ok(Some(PassInput { metadata, values }))
+        })
+        .collect::<Result<_, BuildError>>()?;
+    let mut survivors: Vec<Vec<u32>> = Vec::with_capacity(inputs.len());
+    let mut order: Vec<(u32, u32)> = Vec::new();
+    for (i, input) in inputs.iter().enumerate() {
+        let i = u32::try_from(i).map_err(|_| BuildError::BatchReadError)?;
+        let n_rows =
+            u32::try_from(input.reader.n_docs()).map_err(|_| BuildError::BatchReadError)?;
+        let rows: Vec<u32> = (0..n_rows)
+            .filter(|row| {
+                input
+                    .deleted
+                    .as_ref()
+                    .is_none_or(|deleted| !deleted.contains(*row))
+            })
+            .collect();
+        order.extend(rows.iter().map(|&row| (i, row)));
+        survivors.push(rows);
+    }
+    let slice = GatheredSlice::of(&order, &open)?;
+    let source = slice.source(inputs, &open, window);
+    let converter = RowConverter::new(
+        key_schema
+            .fields()
+            .iter()
+            .map(|f| SortField::new(f.data_type().clone()))
+            .collect(),
+    )
+    .map_err(|e| BuildError::Footer(e.into()))?;
+    let mut keys = Vec::with_capacity(inputs.len());
+    for (i, input_rows) in survivors.iter().enumerate() {
+        let mut rows = converter.empty_rows(input_rows.len(), 0);
+        for batch in source.input(i, Arc::clone(&key_schema))? {
+            converter
+                .append(&mut rows, batch?.columns())
+                .map_err(|e| BuildError::Footer(e.into()))?;
+        }
+        if rows.num_rows() != input_rows.len() {
+            return Err(BuildError::BatchReadError);
+        }
+        keys.push(rows);
+    }
+    let mut at: Vec<(u32, u32)> = Vec::with_capacity(order.len());
+    for (i, rows) in keys.iter().enumerate() {
+        let i = i as u32;
+        at.extend((0..rows.num_rows() as u32).map(|j| (i, j)));
+    }
+    at.sort_by(|a, b| {
+        keys[a.0 as usize]
+            .row(a.1 as usize)
+            .cmp(&keys[b.0 as usize].row(b.1 as usize))
+    });
+    Ok(at
+        .into_iter()
+        .map(|(i, j)| (i, survivors[i as usize][j as usize]))
+        .collect())
 }
 
 /// Some of a gathered row group's rows (see
@@ -12871,5 +13034,123 @@ mod tests {
         let plan = opts.body_plan(&schema);
         assert_eq!(plan.dictionary_candidates, vec!["_id", "note", "qty"]);
         assert_eq!(plan.row_group_size, opts.row_group_size);
+    }
+}
+
+#[cfg(test)]
+mod sort_key_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use bytes::Bytes;
+    use roaring::RoaringBitmap;
+
+    use super::*;
+    use crate::test_helpers::{decimal128_id_field, decimal128_ids};
+
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("series", DataType::Utf8, false),
+            Field::new("t", DataType::Int64, false),
+        ]))
+    }
+
+    /// A superfile of `rows` `(id, series, t)`, in the order given.
+    fn superfile(rows: &[(u64, &str, i64)]) -> Arc<SuperfileReader> {
+        let schema = schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(decimal128_ids(rows.iter().map(|r| r.0))),
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.1))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+            ],
+        )
+        .expect("batch");
+        let opts = BuilderOptions::new(Arc::clone(&schema), "doc_id", vec![], vec![]);
+        let mut builder = SuperfileBuilder::new(opts).expect("builder");
+        builder.add_batch(&batch, &[]).expect("add");
+        Arc::new(
+            SuperfileReader::open(Bytes::from(builder.finish().expect("finish"))).expect("open"),
+        )
+    }
+
+    /// `(series, t)` of every row of `bytes`, in file order.
+    fn rows_of(bytes: Vec<u8>) -> Vec<(String, i64)> {
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open merged");
+        let mut out = Vec::new();
+        for batch in reader.record_batches(None).expect("read") {
+            let batch = batch.expect("batch");
+            let series = batch
+                .column_by_name("series")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .expect("series");
+            let t = batch
+                .column_by_name("t")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .expect("t");
+            for r in 0..batch.num_rows() {
+                out.push((series.value(r).to_string(), t.value(r)));
+            }
+        }
+        out
+    }
+
+    /// A merge of a table with a sort key writes the inputs' surviving
+    /// rows in key order, whatever order its inputs hold them in, and
+    /// leaves out the rows deleted from them.
+    #[test]
+    fn a_merge_with_a_sort_key_writes_its_rows_in_key_order() {
+        let first = superfile(&[(1, "b", 20), (2, "a", 10), (3, "c", 10), (4, "a", 30)]);
+        let second = superfile(&[(5, "b", 10), (6, "a", 20), (7, "c", 5)]);
+        let mut deleted = RoaringBitmap::new();
+        deleted.insert(2); // (3, "c", 10)
+        let inputs = same_shape_inputs(&[
+            (Arc::clone(&first), Some(Arc::new(deleted))),
+            (second, None),
+        ]);
+        let base = BuilderOptions::new_from_reader(&first)
+            .with_sort_columns(vec!["series".to_string(), "t".to_string()]);
+        let mut out = Vec::new();
+        SuperfileBuilder::build_from_readers_fts_merge_to(&inputs, base, &mut out).expect("merge");
+        let rows = rows_of(out);
+        let expected: Vec<(String, i64)> = [
+            ("a", 10),
+            ("a", 20),
+            ("a", 30),
+            ("b", 10),
+            ("b", 20),
+            ("c", 5),
+        ]
+        .into_iter()
+        .map(|(s, t)| (s.to_string(), t))
+        .collect();
+        assert_eq!(rows, expected);
+    }
+
+    /// Without a sort key a merge keeps its inputs' order.
+    #[test]
+    fn a_merge_without_a_sort_key_keeps_input_order() {
+        let first = superfile(&[(1, "b", 20), (2, "a", 10)]);
+        let second = superfile(&[(3, "a", 5)]);
+        let inputs = same_shape_inputs(&[(Arc::clone(&first), None), (second, None)]);
+        let mut out = Vec::new();
+        SuperfileBuilder::build_from_readers_fts_merge_to(
+            &inputs,
+            BuilderOptions::new_from_reader(&first),
+            &mut out,
+        )
+        .expect("merge");
+        let rows = rows_of(out);
+        assert_eq!(
+            rows,
+            vec![
+                ("b".to_string(), 20),
+                ("a".to_string(), 10),
+                ("a".to_string(), 5)
+            ]
+        );
     }
 }

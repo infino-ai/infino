@@ -526,6 +526,15 @@ impl Connection {
         indexes
             .check_ranges(&schema)
             .map_err(|e| e.with_context("create_table", Some(name)))?;
+        indexes
+            .check_encodings(&schema)
+            .map_err(|e| e.with_context("create_table", Some(name)))?;
+        indexes
+            .check_sort(&schema)
+            .map_err(|e| e.with_context("create_table", Some(name)))?;
+        // The encodings ride on their columns' metadata, which the schema
+        // document every later open reads carries.
+        let schema = indexes.stamp_encodings(schema);
         let (fts_cfg, vec_cfg) = indexes.to_configs();
         // A companion is a table on storage beside this one; a catalog with
         // no storage, or one forwarding to a hosted service, has nowhere to
@@ -9594,5 +9603,48 @@ storage:
         );
         assert!(opts.metadata_disk_cache.is_none());
         assert_eq!(opts.superfile_buffer_split_mb, 512);
+    }
+
+    /// A table created with encodings keeps them on its schema document,
+    /// which every later write and compaction reads them from.
+    #[test]
+    fn create_table_keeps_declared_encodings_on_the_schema() {
+        let db = connect("memory://").expect("connect");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("t", DataType::Int64, false),
+            Field::new("v", DataType::Float64, false),
+            Field::new("host", DataType::LargeUtf8, false),
+        ]));
+        db.create_table(
+            "series",
+            schema,
+            IndexSpec::new()
+                .encoding("t", crate::ColumnEncoding::Delta)
+                .encoding("v", crate::ColumnEncoding::ByteStreamSplit),
+        )
+        .expect("create");
+        let document = db.schema("series").expect("schema");
+        let encoding = |name: &str| {
+            document
+                .fields()
+                .iter()
+                .find(|f| f.name == name)
+                .and_then(|f| f.metadata.get(crate::ENCODING_META_KEY).cloned())
+        };
+        assert_eq!(encoding("t").as_deref(), Some("delta"));
+        assert_eq!(encoding("v").as_deref(), Some("byte_stream_split"));
+        assert_eq!(encoding("host"), None);
+        let err = db
+            .create_table(
+                "bad",
+                Arc::new(Schema::new(vec![Field::new(
+                    "host",
+                    DataType::LargeUtf8,
+                    false,
+                )])),
+                IndexSpec::new().encoding("host", crate::ColumnEncoding::Delta),
+            )
+            .expect_err("a string column cannot be delta-encoded");
+        assert!(matches!(err, InfinoError::Config(_)), "{err:?}");
     }
 }

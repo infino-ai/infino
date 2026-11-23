@@ -23,7 +23,10 @@ use crate::{
         range::KeyKind,
         vector::{builder::VectorConfig, distance::Metric, rerank_codec::RerankCodec},
     },
-    supertable::companion::{CompanionSpec, check_purpose},
+    supertable::{
+        companion::{CompanionSpec, check_purpose},
+        schema::{ColumnEncoding, ENCODING_META_KEY, SORT_META_KEY},
+    },
 };
 
 /// Default rotation-matrix RNG seed for vector columns. The seed only
@@ -236,6 +239,8 @@ pub struct IndexSpec {
     fts: Vec<FtsField>,
     vectors: Vec<VectorIndex>,
     ranges: Vec<String>,
+    encodings: Vec<(String, ColumnEncoding)>,
+    sort: Vec<String>,
     companions: Vec<Companion>,
 }
 
@@ -314,6 +319,158 @@ impl IndexSpec {
     /// The range-indexed columns, in declaration order.
     pub(crate) fn range_columns(&self) -> &[String] {
         &self.ranges
+    }
+
+    /// Encode `column` in every superfile's Parquet body as `encoding`
+    /// names: [`ColumnEncoding::Delta`] for an integer, date, time,
+    /// timestamp or duration column, [`ColumnEncoding::ByteStreamSplit`]
+    /// for an `f32` or `f64` one. Built for time series, where timestamps
+    /// arrive in order a steady step apart and metric values change
+    /// slowly: both shrink such a column well past what the dictionary or
+    /// plain encoding does under the same codec.
+    ///
+    /// The encoding is stored on the column ([`ENCODING_META_KEY`]), so
+    /// every append and compaction merge after writes the column the same
+    /// way, and a column a later write adds can name one the same way in
+    /// its field metadata. It changes how the body is written only: every
+    /// query, index and reader works as before, and any Parquet reader
+    /// decodes the body.
+    ///
+    /// ```
+    /// use infino::{ColumnEncoding, IndexSpec};
+    /// let spec = IndexSpec::new()
+    ///     .encoding("time", ColumnEncoding::Delta)
+    ///     .encoding("value", ColumnEncoding::ByteStreamSplit);
+    /// # let _ = spec;
+    /// ```
+    pub fn encoding(mut self, column: impl Into<String>, encoding: ColumnEncoding) -> Self {
+        self.encodings.push((column.into(), encoding));
+        self
+    }
+
+    /// Refuses an encoding the table cannot carry: on a column `schema`
+    /// does not have, of a type the encoding does not take, or declared
+    /// twice.
+    pub(crate) fn check_encodings(&self, schema: &Schema) -> Result<(), InfinoError> {
+        let mut seen = HashSet::new();
+        for (column, encoding) in &self.encodings {
+            let refuse = |reason: String| {
+                Err(InfinoError::Config(format!(
+                    "{} encoding on {column:?}: {reason}",
+                    encoding.as_str()
+                )))
+            };
+            let Ok(field) = schema.field_with_name(column) else {
+                return refuse("the schema has no such column".into());
+            };
+            if !encoding.accepts(field.data_type()) {
+                return refuse(format!(
+                    "the encoding does not take a `{}` column",
+                    field.data_type()
+                ));
+            }
+            if !seen.insert(column.as_str()) {
+                return refuse("declared twice".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// `schema` with each declared encoding ([`ENCODING_META_KEY`]) and
+    /// each sort key column's place ([`SORT_META_KEY`]) named on its column,
+    /// where the table's schema document keeps them. Unchanged when the
+    /// spec declares neither.
+    pub(crate) fn stamp_encodings(&self, schema: SchemaRef) -> SchemaRef {
+        if self.encodings.is_empty() && self.sort.is_empty() {
+            return schema;
+        }
+        let fields: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let encoding = self
+                    .encodings
+                    .iter()
+                    .find(|(column, _)| column == field.name());
+                let place = self.sort.iter().position(|column| column == field.name());
+                if encoding.is_none() && place.is_none() {
+                    return Arc::clone(field);
+                }
+                let mut metadata = field.metadata().clone();
+                if let Some((_, encoding)) = encoding {
+                    metadata.insert(ENCODING_META_KEY.to_string(), encoding.as_str().to_string());
+                }
+                if let Some(place) = place {
+                    metadata.insert(SORT_META_KEY.to_string(), place.to_string());
+                }
+                Arc::new(field.as_ref().clone().with_metadata(metadata))
+            })
+            .collect();
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+    }
+
+    /// Keep the table's rows ordered by `columns`, the first before the
+    /// next: every compaction merge writes its output in that order, so the
+    /// rows that share the first column's value sit together in each file
+    /// it writes, and a filter on it reads only the row groups and pages
+    /// whose Parquet statistics can hold the value. Built for time series:
+    /// a series key first and the time second puts each series' points
+    /// together, in time order, where a dashboard reads them and where its
+    /// timestamps and values compress best.
+    ///
+    /// Rows are in that order from the first compaction that rewrites them;
+    /// a file an append writes keeps the commit's order until then. The
+    /// columns must be scalar columns of the schema (a number, a string, a
+    /// date or a timestamp), each named once. A table with a vector index
+    /// cannot have one. Declared at `create_table` only.
+    ///
+    /// ```
+    /// use infino::IndexSpec;
+    /// let spec = IndexSpec::new().sort_by(["series", "time"]);
+    /// # let _ = spec;
+    /// ```
+    pub fn sort_by<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.sort = columns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Refuses a sort key the table cannot keep: a column `schema` does not
+    /// have, one that is not a scalar, one named twice, or any on a table
+    /// with a vector index.
+    pub(crate) fn check_sort(&self, schema: &Schema) -> Result<(), InfinoError> {
+        if self.sort.is_empty() {
+            return Ok(());
+        }
+        if !self.vectors.is_empty() {
+            return Err(InfinoError::Config(
+                "a sort key on a table with a vector index: the index orders its rows".into(),
+            ));
+        }
+        let mut seen = HashSet::new();
+        for column in &self.sort {
+            let refuse = |reason: String| {
+                Err(InfinoError::Config(format!(
+                    "sort key column {column:?}: {reason}"
+                )))
+            };
+            let Ok(field) = schema.field_with_name(column) else {
+                return refuse("the schema has no such column".into());
+            };
+            if field.data_type().is_nested() {
+                return refuse(format!(
+                    "a `{}` column cannot be sorted on",
+                    field.data_type()
+                ));
+            }
+            if !seen.insert(column.as_str()) {
+                return refuse("named twice".into());
+            }
+        }
+        Ok(())
     }
 
     /// Refuses a range index the table cannot carry: a column `schema`
@@ -639,5 +796,126 @@ mod tests {
         assert_eq!(spec.fts_stemmers(), vec![Stemmer::None]);
         assert_eq!(spec.fts_positions(), vec![false]);
         assert_eq!(spec.fts_stored(), vec![true]);
+    }
+
+    fn series_schema() -> Schema {
+        Schema::new(vec![
+            arrow_schema::Field::new(
+                "time",
+                arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                false,
+            ),
+            arrow_schema::Field::new("value", arrow_schema::DataType::Float64, false),
+            arrow_schema::Field::new("host", arrow_schema::DataType::LargeUtf8, false),
+        ])
+    }
+
+    /// A declared encoding is checked against the column it names: the
+    /// column must exist, take the encoding, and be declared once.
+    #[test]
+    fn an_encoding_the_column_cannot_take_is_refused() {
+        let schema = series_schema();
+        let ok = IndexSpec::new()
+            .encoding("time", ColumnEncoding::Delta)
+            .encoding("value", ColumnEncoding::ByteStreamSplit);
+        ok.check_encodings(&schema)
+            .expect("both columns take their encodings");
+        for (spec, why) in [
+            (
+                IndexSpec::new().encoding("host", ColumnEncoding::Delta),
+                "a string",
+            ),
+            (
+                IndexSpec::new().encoding("value", ColumnEncoding::Delta),
+                "a float",
+            ),
+            (
+                IndexSpec::new().encoding("time", ColumnEncoding::ByteStreamSplit),
+                "a timestamp",
+            ),
+            (
+                IndexSpec::new().encoding("missing", ColumnEncoding::Delta),
+                "no such column",
+            ),
+            (
+                IndexSpec::new()
+                    .encoding("time", ColumnEncoding::Delta)
+                    .encoding("time", ColumnEncoding::Delta),
+                "declared twice",
+            ),
+        ] {
+            assert!(
+                matches!(spec.check_encodings(&schema), Err(InfinoError::Config(_))),
+                "{why} must be refused"
+            );
+        }
+    }
+
+    /// The encodings ride on their columns' metadata; the other columns
+    /// and the metadata a column already had are left as they were.
+    #[test]
+    fn declared_encodings_are_stamped_on_their_columns() {
+        let schema = Arc::new(series_schema());
+        let spec = IndexSpec::new().encoding("time", ColumnEncoding::Delta);
+        let stamped = spec.stamp_encodings(Arc::clone(&schema));
+        let meta = |name: &str| {
+            stamped
+                .field_with_name(name)
+                .expect("column")
+                .metadata()
+                .get(ENCODING_META_KEY)
+                .cloned()
+        };
+        assert_eq!(meta("time").as_deref(), Some("delta"));
+        assert_eq!(meta("value"), None);
+        assert!(Arc::ptr_eq(
+            &IndexSpec::new().stamp_encodings(Arc::clone(&schema)),
+            &schema
+        ));
+    }
+
+    /// A sort key names scalar columns the schema has, each once, on a
+    /// table with no vector index.
+    #[test]
+    fn a_sort_key_the_table_cannot_keep_is_refused() {
+        let schema = series_schema();
+        IndexSpec::new()
+            .sort_by(["host", "time"])
+            .check_sort(&schema)
+            .expect("a string and a timestamp sort");
+        for (spec, why) in [
+            (IndexSpec::new().sort_by(["missing"]), "no such column"),
+            (IndexSpec::new().sort_by(["host", "host"]), "named twice"),
+            (
+                IndexSpec::new()
+                    .sort_by(["time"])
+                    .vector("value", 2, Metric::Cosine),
+                "a vector index",
+            ),
+        ] {
+            assert!(
+                matches!(spec.check_sort(&schema), Err(InfinoError::Config(_))),
+                "{why} must be refused"
+            );
+        }
+    }
+
+    /// Each sort key column carries its place in the key.
+    #[test]
+    fn the_sort_key_is_stamped_on_its_columns_in_order() {
+        let stamped = IndexSpec::new()
+            .sort_by(["host", "time"])
+            .stamp_encodings(Arc::new(series_schema()));
+        let place = |name: &str| {
+            stamped
+                .field_with_name(name)
+                .expect("column")
+                .metadata()
+                .get(SORT_META_KEY)
+                .cloned()
+        };
+        assert_eq!(place("host").as_deref(), Some("0"));
+        assert_eq!(place("time").as_deref(), Some("1"));
+        assert_eq!(place("value"), None);
     }
 }

@@ -90,6 +90,93 @@ pub const INDEX_META_KEY: &str = "infino:index";
 /// to nothing.
 pub const IDENTITY_META_KEY: &str = "infino:identity";
 
+/// Arrow field-metadata key under which a column names how its values are
+/// encoded in each superfile's Parquet body: a [`ColumnEncoding`], spelled
+/// as [`ColumnEncoding::as_str`] gives it. A column keeps the encoding it
+/// was declared or added with (it is part of its metadata, so the schema
+/// document carries it), and every body written after, by an append or a
+/// compaction merge, encodes the column that way. A column without one is
+/// encoded as any other: dictionary or plain, whichever is smaller.
+///
+/// An encoding the column's current type cannot take (a later type change
+/// can make it so) is not applied; the column is then encoded as any other.
+/// Readers need nothing: the encoding is the Parquet body's own, so any
+/// Parquet reader decodes it.
+pub const ENCODING_META_KEY: &str = "infino:encoding";
+
+/// Arrow field-metadata key under which a column says it is part of the
+/// table's sort key, and where: `0` for the first column the rows are
+/// ordered by, `1` for the next. Every compaction merge writes its rows in
+/// that order, so the rows of one series, say, sit together in each file
+/// it writes, and the Parquet statistics of a row group or page skip the
+/// rest. Declared with [`IndexSpec::sort_by`](crate::IndexSpec::sort_by);
+/// part of the column's metadata, so the schema document carries it.
+pub const SORT_META_KEY: &str = "infino:sort";
+
+/// How a column's values are encoded in a superfile's Parquet body, named
+/// on the column by [`ENCODING_META_KEY`] or declared with
+/// [`IndexSpec::encoding`](crate::IndexSpec::encoding).
+///
+/// Both are the Parquet format's own encodings, chosen for time series:
+/// values that arrive in order, a few steps apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ColumnEncoding {
+    /// Parquet `DELTA_BINARY_PACKED`: each value stored as its difference
+    /// from the one before, less the block's least difference, bit-packed.
+    /// Timestamps a steady interval apart cost a few bits each. For
+    /// integer, date, time, timestamp and duration columns.
+    Delta,
+    /// Parquet `BYTE_STREAM_SPLIT`: each value's bytes split into one
+    /// stream per byte position, so the compression codec sees the slowly
+    /// changing high bytes of a metric together. For `f32` and `f64`
+    /// columns.
+    ByteStreamSplit,
+}
+
+impl ColumnEncoding {
+    /// The encoding's name under [`ENCODING_META_KEY`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delta => "delta",
+            Self::ByteStreamSplit => "byte_stream_split",
+        }
+    }
+
+    /// The encoding [`Self::as_str`] names, or `None`.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "delta" => Some(Self::Delta),
+            "byte_stream_split" => Some(Self::ByteStreamSplit),
+            _ => None,
+        }
+    }
+
+    /// Whether a column of `data_type` can be encoded this way.
+    pub fn accepts(self, data_type: &DataType) -> bool {
+        match self {
+            Self::Delta => matches!(
+                data_type,
+                DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::Date32
+                    | DataType::Date64
+                    | DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Timestamp(_, _)
+                    | DataType::Duration(_)
+            ),
+            Self::ByteStreamSplit => matches!(data_type, DataType::Float32 | DataType::Float64),
+        }
+    }
+}
+
 /// Precision of the id column's `Decimal128`: the most a `Decimal128` can
 /// carry, so every 128-bit id fits without truncation, Parquet annotates
 /// the column as `DECIMAL(38, 0)`, and sort order matches the `i128`.
@@ -444,6 +531,36 @@ impl TableSchema {
             .filter(|f| matches!(f.index, Some(ColumnIndex::Range)))
             .map(|f| f.name.clone())
             .collect()
+    }
+
+    /// The columns that name an encoding their current type takes
+    /// ([`ENCODING_META_KEY`]), by name, in declared order: what every body
+    /// the table writes encodes them with.
+    pub(crate) fn column_encodings(&self) -> Vec<(String, ColumnEncoding)> {
+        self.fields
+            .iter()
+            .filter_map(|f| {
+                let encoding = ColumnEncoding::parse(f.metadata.get(ENCODING_META_KEY)?)?;
+                encoding
+                    .accepts(&f.data_type)
+                    .then(|| (f.name.clone(), encoding))
+            })
+            .collect()
+    }
+
+    /// The table's sort key ([`SORT_META_KEY`]): the columns that name a
+    /// place in it, by name, in that order. Empty when no column does.
+    pub(crate) fn sort_columns(&self) -> Vec<String> {
+        let mut keyed: Vec<(u32, &str)> = self
+            .fields
+            .iter()
+            .filter_map(|f| {
+                let place = f.metadata.get(SORT_META_KEY)?.parse::<u32>().ok()?;
+                Some((place, f.name.as_str()))
+            })
+            .collect();
+        keyed.sort_unstable();
+        keyed.into_iter().map(|(_, name)| name.to_owned()).collect()
     }
 
     /// Each range-indexed column's id and type, by name: what a query lowers

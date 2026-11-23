@@ -218,7 +218,8 @@ pub use supertable::{
     },
     reindex::{PlannedRepair, ReindexReport, StalenessReport},
     schema::{
-        ColumnIndex, FieldDef, FieldId, TableSchema,
+        ColumnEncoding, ColumnIndex, ENCODING_META_KEY, FieldDef, FieldId, SORT_META_KEY,
+        TableSchema,
         change::{FieldPatch, SchemaPatch},
         error::SchemaError,
     },

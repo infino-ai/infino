@@ -3411,6 +3411,7 @@ mod tests {
                 data_type: Some(DataType::Int64),
                 nullable: None,
                 index: None,
+                encoding: None,
                 dropped: false,
             }],
             max_fields: None,

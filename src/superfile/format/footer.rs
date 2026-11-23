@@ -47,7 +47,7 @@ use parquet::{
             ArrowColumnChunk, ArrowColumnWriter, ArrowRowGroupWriterFactory, compute_leaves,
         },
     },
-    basic::Compression,
+    basic::{Compression, Encoding},
     file::{
         metadata::{
             FileMetaData, KeyValue, ParquetMetaData, ParquetMetaDataBuilder, ParquetMetaDataReader,
@@ -65,6 +65,7 @@ use crate::{
     config::scratch_root,
     runtime_metrics::ingest::offset_window,
     superfile::{LazyByteSource, LazyByteSourceError, format::kv},
+    supertable::schema::ColumnEncoding,
 };
 
 /// Length of Parquet's trailing `PAR1` magic, in bytes.
@@ -362,19 +363,22 @@ impl ParquetBodyEncoder {
             row_group_size,
             column_page_size_limits,
             &[],
+            &[],
             true,
             &scratch_root(),
         )
     }
 
-    /// [`Self::new`] with the dictionary turned off for `plain_columns` and
-    /// the body's scratch file under `scratch`.
+    /// [`Self::new`] with the dictionary turned off for `plain_columns`,
+    /// `column_encodings` set, and the body's scratch file under `scratch`.
+    #[allow(clippy::too_many_arguments)]
     fn with_plain_columns(
         schema: &Arc<Schema>,
         compression: Compression,
         row_group_size: usize,
         column_page_size_limits: &[(&str, usize)],
         plain_columns: &[String],
+        column_encodings: &[(String, ColumnEncoding)],
         together: bool,
         scratch: &Path,
     ) -> Result<Self, FooterError> {
@@ -383,6 +387,7 @@ impl ParquetBodyEncoder {
             row_group_size,
             column_page_size_limits,
             plain_columns,
+            column_encodings,
         );
 
         let (body_file, writer, columns) = scratch_body(schema, props, scratch)?;
@@ -767,13 +772,15 @@ fn write_slices(batches: &[RecordBatch]) -> Vec<RecordBatch> {
 
 /// Writer properties for a body: `compression` everywhere, cut every
 /// `row_group_size` rows, pages of at most [`DATA_PAGE_ROW_LIMIT`] rows
-/// within the given per-column page limits, and no dictionary for
-/// `plain_columns`.
+/// within the given per-column page limits, no dictionary for
+/// `plain_columns`, and each of `column_encodings` written its way with no
+/// dictionary.
 fn writer_properties(
     compression: Compression,
     row_group_size: usize,
     column_page_size_limits: &[(&str, usize)],
     plain_columns: &[String],
+    column_encodings: &[(String, ColumnEncoding)],
 ) -> WriterProperties {
     let mut props_builder = WriterProperties::builder()
         .set_compression(compression)
@@ -786,6 +793,15 @@ fn writer_properties(
     for col in plain_columns {
         props_builder =
             props_builder.set_column_dictionary_enabled(ColumnPath::from(col.clone()), false);
+    }
+    for (col, encoding) in column_encodings {
+        let encoding = match encoding {
+            ColumnEncoding::Delta => Encoding::DELTA_BINARY_PACKED,
+            ColumnEncoding::ByteStreamSplit => Encoding::BYTE_STREAM_SPLIT,
+        };
+        props_builder = props_builder
+            .set_column_dictionary_enabled(ColumnPath::from(col.clone()), false)
+            .set_column_encoding(ColumnPath::from(col.clone()), encoding);
     }
     props_builder.build()
 }
@@ -930,6 +946,9 @@ pub(crate) struct BodyPlan {
     pub(crate) row_group_size: usize,
     /// Flat top-level columns whose dictionary may be dropped.
     pub(crate) dictionary_candidates: Vec<String>,
+    /// Columns written a set way, with no dictionary; none of them is a
+    /// dictionary candidate.
+    pub(crate) column_encodings: Vec<(String, ColumnEncoding)>,
     /// Per-column data-page size limits, as for [`encode_parquet_body`].
     pub(crate) column_page_size_limits: Vec<(String, usize)>,
     /// Encode several full row groups side by side on the pool, one task
@@ -1009,6 +1028,7 @@ impl BodyPlan {
                 self.row_group_size,
                 &limits,
                 plain,
+                &self.column_encodings,
             ))
         };
         let (with, without) = (props(&[]), props(&self.dictionary_candidates));
@@ -1194,6 +1214,7 @@ impl PlannedBodyEncoder {
             self.plan.row_group_size,
             &self.plan.page_size_limits(),
             &plain_columns,
+            &self.plan.column_encodings,
             self.plan.encode_groups_together,
             &self.plan.scratch,
         )?
@@ -1305,6 +1326,7 @@ impl PassBodyEncoder {
             plan.row_group_size,
             &plan.page_size_limits(),
             &[],
+            &plan.column_encodings,
         );
         let (body_file, writer, _) = scratch_body(schema, props, &plan.scratch)?;
         Ok(Self {
@@ -2647,6 +2669,7 @@ mod tests {
             compression: Compression::ZSTD(ZstdLevel::try_new(3).expect("valid zstd level")),
             row_group_size: TEST_GROUP_ROWS,
             dictionary_candidates: schema.fields().iter().map(|f| f.name().clone()).collect(),
+            column_encodings: Vec::new(),
             column_page_size_limits: Vec::new(),
             encode_groups_together: true,
             held_group_bytes: HELD_GROUP_BYTES,
@@ -3409,6 +3432,7 @@ mod tests {
             TEST_GROUP_ROWS,
             &[],
             plain_columns,
+            &[],
         );
         let mut bytes = Vec::new();
         let mut writer =
@@ -3448,6 +3472,7 @@ mod tests {
                     TEST_GROUP_ROWS,
                     &[],
                     &plain,
+                    &[],
                     together,
                     &scratch_root(),
                 )
@@ -3602,7 +3627,7 @@ mod tests {
         let mut plan = plan(&schema);
         plan.dictionary_candidates = ["id", "sparse", "text"].map(String::from).to_vec();
         let whole = |plain: &[String]| -> ColumnSizes {
-            let props = writer_properties(plan.compression, plan.row_group_size, &[], plain);
+            let props = writer_properties(plan.compression, plan.row_group_size, &[], plain, &[]);
             let mut writer =
                 ArrowWriter::try_new(io::sink(), Arc::clone(&schema), Some(props)).expect("writer");
             writer.write(&batch).expect("write");
@@ -3667,5 +3692,88 @@ mod tests {
             "past the bound the full groups are encoded: held {kept_most} of {held_most}"
         );
         assert_eq!(held, kept, "nor on whether the caller keeps the rows");
+    }
+
+    /// A column with a set encoding is written that way, with no
+    /// dictionary, and reads back as written; the others keep theirs.
+    #[test]
+    fn set_column_encodings_are_what_the_body_is_written_with() {
+        use arrow_array::TimestampMillisecondArray;
+        use arrow_schema::TimeUnit;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "time",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Float64, false),
+            Field::new("host", DataType::Utf8, false),
+        ]));
+        let rows = 10_000;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampMillisecondArray::from_iter_values(
+                    (0..rows).map(|i| 1_767_225_600_000 + i * 10_000),
+                )),
+                Arc::new(Float64Array::from_iter_values(
+                    (0..rows).map(|i| 50.0 + (i as f64 / 100.0).sin()),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|i| format!("host-{}", i % 20)),
+                )),
+            ],
+        )
+        .expect("batch");
+        let encodings = vec![
+            ("time".to_string(), ColumnEncoding::Delta),
+            ("value".to_string(), ColumnEncoding::ByteStreamSplit),
+        ];
+        let props = writer_properties(
+            Compression::ZSTD(ZstdLevel::try_new(3).expect("valid zstd level")),
+            TEST_GROUP_ROWS,
+            &[],
+            &[],
+            &encodings,
+        );
+        let mut bytes = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let bytes = Bytes::from(bytes);
+
+        let reader = SerializedFileReader::new(bytes.clone()).expect("reader");
+        for rg in reader.metadata().row_groups() {
+            for chunk in rg.columns() {
+                let column = chunk.column_path().parts()[0].clone();
+                let used: Vec<Encoding> = chunk.encodings().collect();
+                let dictionary = used
+                    .iter()
+                    .any(|e| matches!(e, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY));
+                match column.as_str() {
+                    "time" => {
+                        assert!(used.contains(&Encoding::DELTA_BINARY_PACKED), "{used:?}");
+                        assert!(!dictionary, "{used:?}");
+                    }
+                    "value" => {
+                        assert!(used.contains(&Encoding::BYTE_STREAM_SPLIT), "{used:?}");
+                        assert!(!dictionary, "{used:?}");
+                    }
+                    _ => assert!(dictionary, "host keeps its dictionary: {used:?}"),
+                }
+            }
+        }
+        let read: Vec<RecordBatch> = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("builder")
+            .build()
+            .expect("reader")
+            .collect::<Result<_, _>>()
+            .expect("read");
+        assert_eq!(
+            concat_batches(&schema, &read).expect("concat"),
+            batch,
+            "the body reads back as written"
+        );
     }
 }
