@@ -127,7 +127,7 @@ use crate::{
             bm25,
             bm25::Bm25Params,
             reader::{
-                Bm25SearchOptions, CANDIDATE_MAX_POSTINGS, CANDIDATE_MAX_TERMS, CandidateNorms,
+                Bm25SearchOptions, CANDIDATE_MAX_CELLS, CANDIDATE_MAX_POSTINGS, CandidateNorms,
                 ClauseLists, ColumnLengthStats, ColumnNorms, FEW_NORMS_MAX_DOCS, FetchedTermMemo,
                 GlobalTermIdf, LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet,
                 PreparedClauses, QueryDict, QueryIdf, ScoringView,
@@ -311,6 +311,25 @@ struct MatchKernel {
     budget: Arc<ConnectionMemoryBudget>,
 }
 
+/// The distinct terms a match resolves in each superfile: its bare terms and
+/// its phrases' members, on both sides of the negation.
+fn located_terms<'a>(
+    match_set: &'a UnrankedMatchSet,
+    negatives: &'a UnrankedNegatives,
+) -> Vec<&'a str> {
+    let mut terms: Vec<&str> = match_set
+        .terms
+        .iter()
+        .chain(&negatives.terms)
+        .chain(match_set.phrases.iter().flat_map(|p| &p.terms))
+        .chain(negatives.phrases.iter().flat_map(|p| &p.terms))
+        .map(String::as_str)
+        .collect();
+    terms.sort_unstable();
+    terms.dedup();
+    terms
+}
+
 /// The dictionary copy a file's match walks share: kept only when the positive walk and the negated
 /// walk both read the dictionary, i.e. the memo answers neither; otherwise it keeps nothing.
 fn walk_dict(
@@ -387,8 +406,14 @@ impl MatchKernel {
         // plain-token queries keep the optimized token_match path.
         let (docs, mut work) = match self.phrase_involved {
             true => {
-                r.atoms_match_ids(&column, &refs, &self.phrases, self.mode)
-                    .await?
+                r.atoms_match_ids_prefetched(
+                    &column,
+                    &refs,
+                    &self.phrases,
+                    self.mode,
+                    memo.as_deref(),
+                )
+                .await?
             }
             false => {
                 r.token_match_prefetched(&column, &refs, self.mode, memo.as_deref(), &dict)
@@ -411,8 +436,14 @@ impl MatchKernel {
                     .await?
                 }
                 false => {
-                    r.atoms_match_ids(&column, &neg_refs, &self.negative_phrases, BoolMode::Or)
-                        .await?
+                    r.atoms_match_ids_prefetched(
+                        &column,
+                        &neg_refs,
+                        &self.negative_phrases,
+                        BoolMode::Or,
+                        memo.as_deref(),
+                    )
+                    .await?
                 }
             };
             work.merge(neg_work);
@@ -2117,8 +2148,8 @@ impl SupertableReader {
                             _ => work + phrases.iter().flat_map(|(_, dfs)| dfs).sum::<u64>(),
                         };
                         let cheap = !distinct.is_empty()
-                            && distinct.len() <= CANDIDATE_MAX_TERMS
-                            && work <= CANDIDATE_MAX_POSTINGS;
+                            && work <= CANDIDATE_MAX_POSTINGS
+                            && work.saturating_mul(distinct.len() as u64) <= CANDIDATE_MAX_CELLS;
                         cheap.then(|| {
                             let phrases: Vec<&[String]> =
                                 phrases.into_iter().map(|(terms, _)| terms).collect();
@@ -3641,14 +3672,10 @@ impl SupertableReader {
         if kept.is_empty() {
             return Ok(None);
         }
-        // Every plain term the kernel resolves, positive and negated: the
-        // index's locations for them let each superfile skip its dictionary.
-        let all_terms: Vec<&str> = match_set
-            .terms
-            .iter()
-            .chain(negatives.terms.iter())
-            .map(String::as_str)
-            .collect();
+        // Every term the kernel resolves, positive and negated, phrase
+        // members included: the index's locations for them let each
+        // superfile skip its dictionary.
+        let all_terms = located_terms(&match_set, &negatives);
         // The match's and the filter's index lookups run side by side.
         let (locations, row_filter) = join(
             self.index_locations(column, &all_terms, &kept)
@@ -3792,12 +3819,7 @@ impl SupertableReader {
         let single_term = match_set.terms.len() == 1 && !match_set.has_phrases();
         let has_negatives = !negatives.is_empty();
         let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
-        let all_terms: Vec<&str> = match_set
-            .terms
-            .iter()
-            .chain(negatives.terms.iter())
-            .map(String::as_str)
-            .collect();
+        let all_terms = located_terms(&match_set, &negatives);
         let locations = self.index_locations(column, &all_terms, &kept).await?;
         let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column.to_owned());
@@ -3858,8 +3880,14 @@ impl SupertableReader {
                             walk_dict(phrase_involved, memo.as_deref(), &refs, &neg_refs, &budget);
                         let (docs, mut work) = match phrase_involved {
                             true => {
-                                r.atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
-                                    .await?
+                                r.atoms_match_ids_prefetched(
+                                    &column_arc,
+                                    &refs,
+                                    &phrase_arc,
+                                    match_mode,
+                                    memo.as_deref(),
+                                )
+                                .await?
                             }
                             false => {
                                 r.token_match_prefetched(
@@ -3885,11 +3913,12 @@ impl SupertableReader {
                                     .await?
                                 }
                                 false => {
-                                    r.atoms_match_ids(
+                                    r.atoms_match_ids_prefetched(
                                         &column_arc,
                                         &neg_refs,
                                         &neg_ph_arc,
                                         BoolMode::Or,
+                                        memo.as_deref(),
                                     )
                                     .await?
                                 }
@@ -3921,21 +3950,30 @@ impl SupertableReader {
                         // never materialized. Covers term-only and phrase
                         // positives alike.
                         let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                        r.atoms_match_count(
+                        r.atoms_match_count_prefetched(
                             &column_arc,
                             &refs,
                             &phrase_arc,
                             match_mode,
                             &neg_refs,
                             &neg_ph_arc,
+                            memo.as_deref(),
                         )
                         .await?
                     } else if single_term {
                         // A single token resolves O(1) from the stored df.
                         r.term_df(&column_arc, &term_arc[0]).await?
                     } else if phrase_involved {
-                        r.atoms_match_count(&column_arc, &refs, &phrase_arc, match_mode, &[], &[])
-                            .await?
+                        r.atoms_match_count_prefetched(
+                            &column_arc,
+                            &refs,
+                            &phrase_arc,
+                            match_mode,
+                            &[],
+                            &[],
+                            memo.as_deref(),
+                        )
+                        .await?
                     } else {
                         // Multi-token AND/OR tallies through the counting sink.
                         r.token_match_count_prefetched(

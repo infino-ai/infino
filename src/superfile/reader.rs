@@ -3107,10 +3107,26 @@ impl SuperfileReader {
         phrases: &[Phrase<String>],
         mode: BoolMode,
     ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
+        self.atoms_match_ids_prefetched(column, terms, phrases, mode, None)
+            .await
+    }
+
+    /// [`Self::atoms_match_ids`] with a memo of located postings: a term or
+    /// phrase member the memo holds is not looked up in the dictionary.
+    pub(crate) async fn atoms_match_ids_prefetched(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Phrase<String>],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.atoms_match_ids(column, terms, phrases, mode).await?)
+        Ok(fts
+            .atoms_match_ids_prefetched(column, terms, phrases, mode, prefetched)
+            .await?)
     }
 
     /// Phrase-aware unranked match **count** — the phrase sibling of
@@ -3127,11 +3143,44 @@ impl SuperfileReader {
         neg_terms: &[&str],
         neg_phrases: &[Phrase<String>],
     ) -> Result<(u64, MatchWork), ReadError> {
+        self.atoms_match_count_prefetched(
+            column,
+            terms,
+            phrases,
+            mode,
+            neg_terms,
+            neg_phrases,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::atoms_match_count`] with a memo of located postings: a term or
+    /// phrase member the memo holds is not looked up in the dictionary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn atoms_match_count_prefetched(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Phrase<String>],
+        mode: BoolMode,
+        neg_terms: &[&str],
+        neg_phrases: &[Phrase<String>],
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .atoms_match_count(column, terms, phrases, mode, neg_terms, neg_phrases)
+            .atoms_match_count_prefetched(
+                column,
+                terms,
+                phrases,
+                mode,
+                neg_terms,
+                neg_phrases,
+                prefetched,
+            )
             .await?)
     }
 

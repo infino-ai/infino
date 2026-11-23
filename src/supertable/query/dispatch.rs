@@ -20,8 +20,8 @@
 //!     superfile reader and runs the kernel, so superfile opens and cold
 //!     object-store range GETs across hundreds of superfiles are all in
 //!     flight at once on the shared multi-thread query runtime. The one
-//!     ceiling is `SupertableOptions::superfiles_in_flight` (256 by
-//!     default), so a table of thousands of superfiles does not start
+//!     ceiling is `SupertableOptions::superfiles_in_flight` (sized from
+//!     the host's memory, at most 1024), so a table of thousands of superfiles does not start
 //!     thousands of opens together. Never cap the fan-out's task count at
 //!     the reader pool's width — `tokio::spawn` dispatches a task, not an
 //!     OS thread, and object-store GETs are latency-bound, so narrowing
