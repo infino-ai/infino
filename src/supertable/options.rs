@@ -560,8 +560,9 @@ pub struct SupertableOptions {
     /// [`crate::memory`].
     pub(crate) connection_memory_budget: Arc<ConnectionMemoryBudget>,
     /// The SQL scan's decoded columns, kept across statements: the process's
-    /// cache (`memory.decoded_column_cache_bytes`), shared by every table, or
-    /// `None` when it keeps none.
+    /// cache (`memory.decoded_column_cache_bytes`, or the size the embedder
+    /// gave [`crate::set_decoded_column_cache_bytes`] first), shared by every
+    /// table, or `None` when it keeps none.
     pub(crate) decoded_columns: Option<Arc<DecodedColumnCache>>,
     /// Single-slot cache for the slow-CAS centroid-section spill, shared by
     /// every manifest snapshot of this table handle and keyed by the

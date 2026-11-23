@@ -10,9 +10,10 @@
 //! one schema generation. Keeping that array lets the next scan of the column
 //! read it instead of the pages ([`CachedScanExec`]).
 //!
-//! One cache serves the process, bounded by `memory.decoded_column_cache_bytes`;
-//! the least recently used arrays leave first. With the setting at `0` there is
-//! none, and every scan decodes as it always has.
+//! One cache serves the process, bounded by `memory.decoded_column_cache_bytes`
+//! or, when the embedder sized it first, by [`set_decoded_column_cache_bytes`];
+//! the least recently used arrays leave first. At a size of `0` there is none,
+//! and every scan decodes as it always has.
 //!
 //! A scan that uses a few rows of a row group reads just those rows and keeps
 //! nothing the first time, so one selective statement doesn't push out the
@@ -24,6 +25,7 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::ArrayRef;
+use tracing::debug;
 
 use crate::{
     config,
@@ -106,17 +108,101 @@ impl DecodedColumnCache {
     }
 }
 
-/// The process's decoded-column cache, `None` when the config keeps none.
+/// The process's decoded-column cache: built once, by the first table
+/// options the process makes ([`process_decoded_column_cache`]), and shared
+/// by every table after it.
+static PROCESS_CACHE: OnceLock<Option<Arc<DecodedColumnCache>>> = OnceLock::new();
+
+/// A cache keeping up to `bytes`, `None` for `0`.
+fn sized(bytes: u64) -> Option<Arc<DecodedColumnCache>> {
+    (bytes > 0).then(|| {
+        Arc::new(DecodedColumnCache::new(
+            usize::try_from(bytes).unwrap_or(usize::MAX),
+        ))
+    })
+}
+
+/// Build `cell`'s cache at `bytes`; `false`, leaving it as it is, when it is
+/// already built.
+fn size_once(cell: &OnceLock<Option<Arc<DecodedColumnCache>>>, bytes: u64) -> bool {
+    cell.set(sized(bytes)).is_ok()
+}
+
+/// The process's decoded-column cache, `None` when it keeps none. Sized by
+/// [`set_decoded_column_cache_bytes`] when the embedder called it first, else
+/// by `memory.decoded_column_cache_bytes`.
 pub(crate) fn process_decoded_column_cache() -> Option<Arc<DecodedColumnCache>> {
-    static CACHE: OnceLock<Option<Arc<DecodedColumnCache>>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let bytes = config::global().memory.decoded_column_cache_bytes;
-            (bytes > 0).then(|| {
-                Arc::new(DecodedColumnCache::new(
-                    usize::try_from(bytes).unwrap_or(usize::MAX),
-                ))
-            })
-        })
+    PROCESS_CACHE
+        .get_or_init(|| sized(config::global().memory.decoded_column_cache_bytes))
         .clone()
+}
+
+/// Size the process's decoded-column cache to `bytes` of decoded columns,
+/// in place of the config's `memory.decoded_column_cache_bytes`; `0` keeps
+/// none.
+///
+/// For an embedder that sizes the cache from its own settings. The cache is
+/// built once, the first time the process makes a table's options, and
+/// keeps its size for the life of the process. Any connection call that
+/// touches a table makes them: creating, opening, querying or dropping one,
+/// including a call that then fails. So call this right after startup,
+/// before the first connection call that names a table.
+/// Returns whether it took effect: `false`, changing nothing, once the cache
+/// is built.
+#[must_use = "the cache keeps the size it was built with when this returns false"]
+pub fn set_decoded_column_cache_bytes(bytes: u64) -> bool {
+    let took = size_once(&PROCESS_CACHE, bytes);
+    if !took {
+        debug!(
+            bytes,
+            "decoded-column cache already built; keeping its size"
+        );
+    }
+    took
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The size a cell is built with.
+    const FIRST_BYTES: u64 = 1 << 20;
+
+    /// A larger size given once the cell is built.
+    const LATER_BYTES: u64 = 1 << 30;
+
+    #[test]
+    fn size_once_sizes_an_unbuilt_cache_and_leaves_a_built_one() {
+        let cell = OnceLock::new();
+        assert!(size_once(&cell, FIRST_BYTES));
+        assert_eq!(
+            cell.get()
+                .expect("built")
+                .as_ref()
+                .expect("sized")
+                .max_bytes(),
+            usize::try_from(FIRST_BYTES).expect("fits")
+        );
+
+        // Built: a second size changes nothing, larger, smaller or none.
+        assert!(!size_once(&cell, LATER_BYTES));
+        assert!(!size_once(&cell, 0));
+        assert_eq!(
+            cell.get()
+                .expect("built")
+                .as_ref()
+                .expect("sized")
+                .max_bytes(),
+            usize::try_from(FIRST_BYTES).expect("fits")
+        );
+    }
+
+    #[test]
+    fn size_once_at_zero_keeps_no_cache() {
+        let cell = OnceLock::new();
+        assert!(size_once(&cell, 0));
+        assert!(cell.get().expect("built").is_none());
+        assert!(!size_once(&cell, FIRST_BYTES));
+        assert!(cell.get().expect("built").is_none());
+    }
 }
