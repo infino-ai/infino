@@ -90,17 +90,17 @@ impl FtsField {
         }
     }
 
-    /// Name the column's base tokenizer: `"standard"` (the default) or
-    /// `"keyword"`. Any other name is refused at `create_table`.
+    /// Set the column's base tokenizer: `"standard"` (the default) or
+    /// `"keyword"`. `create_table` refuses any other name.
     ///
-    /// `keyword` indexes each value as one term, exactly as written: no
-    /// splitting, lowercasing or trimming, so `Foo`, `foo` and `foo.` are
-    /// three different terms. It suits exact values such as host names,
-    /// paths or status codes. A query on such a column is one whole value
-    /// too. It takes no [`stopwords`](FtsField::stopwords) or
+    /// `keyword` indexes each value as one term, exactly as written. It
+    /// does not split, lowercase or trim, so `Foo`, `foo` and `foo.` are
+    /// three different terms. Use it for exact values such as host names,
+    /// paths or status codes. A query on the column is one whole value too.
+    /// It takes no [`stopwords`](FtsField::stopwords) or
     /// [`stemmer`](FtsField::stemmer). A value is at most 32,766 bytes, the
-    /// longest term Lucene takes too: an append carrying a longer one is
-    /// refused whole, as [`SchemaError::KeywordTooLong`](crate::SchemaError::KeywordTooLong).
+    /// same limit as Lucene. An append with a longer value is refused whole
+    /// with [`SchemaError::KeywordTooLong`](crate::SchemaError::KeywordTooLong).
     pub fn analyzer(mut self, name: impl Into<String>) -> Self {
         let name = name.into();
         match Analyzer::from_name(&name) {
@@ -277,7 +277,7 @@ impl IndexSpec {
     /// Mark a column as full-text (BM25) indexed. Takes a plain column
     /// name for the defaults, or an [`FtsField`] to set the analyzer, the
     /// analysis filters and whether the raw text is stored. Below, `host`
-    /// is indexed by the `keyword` analyzer, one exact term per value (see
+    /// uses the `keyword` analyzer: one exact term per value (see
     /// [`FtsField::analyzer`]):
     ///
     /// ```

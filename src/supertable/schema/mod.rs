@@ -784,8 +784,8 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
     match str_of("kind")? {
         "fts" => {
             let defaults = FtsConfig::new("");
-            // Only a shipped base is reproducible; a list naming another
-            // refuses rather than query an index split another way.
+            // Only a known analyzer can be rebuilt. Any other name is
+            // refused, so no index is queried with terms split another way.
             let analyzer = match obj.get("analyzer").and_then(Value::as_str) {
                 None => defaults.analyzer,
                 Some(name) => Analyzer::from_name(name).ok_or_else(|| {
@@ -800,8 +800,7 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
                         // wrote this document.
                         format!(
                             "index uses the analyzer '{name}', which this version of infino \
-                             does not know; a newer version likely wrote the schema, so open \
-                             the table with that version or later"
+                             does not know; open the table with the newer version that wrote it"
                         )
                     }
                 })?,
@@ -1203,10 +1202,9 @@ mod tests {
         );
     }
 
-    /// The analyzer a past release removed and a name no release shipped
-    /// are both refused, each with its own fix: the first is copied out
-    /// with the repair release, the second needs the newer engine that
-    /// wrote it.
+    /// A removed analyzer and a name no release shipped are both refused,
+    /// each with its own fix: copy the first out with the repair release;
+    /// open the second with the newer engine that wrote it.
     #[test]
     fn an_unknown_analyzer_names_a_newer_engine_and_a_removed_one_the_repair() {
         let (user, fts, vectors) = indexed();

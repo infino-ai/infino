@@ -1977,11 +1977,10 @@ impl FtsSummaryAgg {
 
     /// Whether this summary's lex term range *could* contain a term starting
     /// with `prefix` (i.e. `[prefix, prefix_upper_bound)` overlaps the range).
-    /// A `None` range means no term but possibly the empty one — a keyword
-    /// column whose values are all `''` records an empty `(min, max)` as no
-    /// range — so a non-empty prefix matches nothing and this returns `false`
-    /// (prune). An empty prefix matches every term, the empty one included,
-    /// so it always returns `true`. The per-term-range primitive both the
+    /// A `None` range means no term, except possibly the empty one: a keyword
+    /// column whose values are all `''` records no range. So a non-empty
+    /// prefix returns `false` (prune). An empty prefix matches every term,
+    /// the empty one included, so it returns `true`. The check both the
     /// superfile-level (`fts_prefix_skip`) and list-level
     /// (`part_overlaps_prefix`) prefix skips build on.
     pub fn may_match_prefix(&self, prefix: &[u8]) -> bool {

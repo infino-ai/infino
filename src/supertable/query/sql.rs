@@ -241,8 +241,8 @@ fn value_counts_batch(
 
 /// [`value_counts_batch`] for values held as UTF-8 bytes, as terms are:
 /// each value of `counts` above zero, then a null-keyed row counting `nulls`
-/// when there are any. Both columns are built whole rather than one scalar
-/// per value, which a table of many distinct values makes the larger cost.
+/// when there are any. Each column is built in one pass, not one scalar per
+/// value, which is slow with many distinct values.
 /// `None` when a value is not UTF-8 or a count is past what the count column
 /// holds.
 fn term_counts_batch(

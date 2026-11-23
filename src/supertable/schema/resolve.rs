@@ -169,9 +169,8 @@ pub fn resolve_batch(
     Ok(ResolvedBatch { batch, added })
 }
 
-/// Refuses a value of a `keyword`-indexed column longer than a keyword term
-/// may be ([`KEYWORD_TERM_MAX_BYTES`]), so the whole batch is refused before
-/// any of it is written. Any other column, and a null, passes.
+/// Refuses a `keyword` column value longer than [`KEYWORD_TERM_MAX_BYTES`],
+/// before any of the batch is written. Other columns and nulls pass.
 fn check_keyword_lengths(
     column: &str,
     index: Option<&ColumnIndex>,

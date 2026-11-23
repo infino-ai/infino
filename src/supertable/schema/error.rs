@@ -56,13 +56,12 @@ pub enum SchemaError {
         /// The column's name.
         column: String,
     },
-    /// A value of a column indexed by the `keyword` analyzer is longer than
-    /// a term may be. The whole value is one term, kept in the column's
-    /// dictionary and in the bounds each file records, so it is refused at
-    /// append rather than carried in every one of them.
+    /// A value in a `keyword` column is longer than a term may be. The whole
+    /// value is one term, stored in the column's dictionary and in each
+    /// file's term bounds, so a too-long value is refused at append.
     #[error(
-        "column `{column}` is indexed by the keyword analyzer, which keeps each value as one \
-         term of at most {max} bytes, and the batch carries a value of {len} bytes"
+        "column `{column}` is indexed by the keyword analyzer, which takes values of at most \
+         {max} bytes, and the batch carries a value of {len} bytes"
     )]
     KeywordTooLong {
         /// The column's name.

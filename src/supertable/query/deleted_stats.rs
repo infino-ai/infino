@@ -1055,8 +1055,8 @@ mod tests {
     /// The keyword value-count fixture: `n`, a `keyword` column `tag` and
     /// the same text in a `standard` column `plain`, over
     /// [`KEYWORD_FILES`] files and one more whose rows are all deleted,
-    /// with about one row in ten deleted from the rest. The directories
-    /// come back with the table, which lives in them.
+    /// with about one row in ten deleted from the rest. The table is
+    /// returned with the directories that hold it.
     fn keyword_value_table(term_index: bool) -> (TempDir, TempDir, Supertable, SchemaRef) {
         let dir = TempDir::new().expect("tempdir");
         let cache_dir = TempDir::new().expect("cache dir");
@@ -1129,7 +1129,7 @@ mod tests {
     /// nulls, deletes, a file with every row deleted and many files, and
     /// reads no row: from the term index, and from each file's dictionary on
     /// a table that keeps no index. The same values in a `standard` column
-    /// are grouped as before.
+    /// go through the grouped count.
     #[test]
     fn keyword_value_counts_sum_the_terms_less_the_deleted_rows() {
         assert!(MAX_TABLE_VALUE_COUNTS < KEYWORD_POOL as usize);
@@ -1206,12 +1206,11 @@ mod tests {
         (dir, cache_dir, table)
     }
 
-    /// A keyword column's term counts that do not fit the connection memory
-    /// budget are not summed from the terms, from the term index and from
-    /// each file's dictionary alike: the term path declines, keeps nothing
-    /// charged, and `value_counts` goes on to the grouped count, which is
-    /// what then meets the full budget. With room, the terms answer, equal
-    /// to `GROUP BY`, reading no row.
+    /// When a keyword column's term counts do not fit the connection memory
+    /// budget, the term path declines and keeps nothing charged, both from
+    /// the term index and from each file's dictionary. `value_counts` then
+    /// runs the grouped count, which hits the full budget. With room, the
+    /// terms answer, equal to `GROUP BY`, and no row is read.
     #[test]
     fn keyword_value_counts_over_the_budget_run_the_grouped_count() {
         for term_index in [true, false] {

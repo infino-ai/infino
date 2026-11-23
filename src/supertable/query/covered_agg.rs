@@ -1870,10 +1870,9 @@ pub(crate) fn value_counts_from_statistics(
     Some((values, counts_split.nulls))
 }
 
-/// What summing a `keyword` column's term counts needs from the
-/// statistics: the superfiles holding a live value, the values their
-/// deleted rows held (to take off the terms' counts, which include them),
-/// and the live nulls.
+/// What the statistics must give to sum a `keyword` column's term counts:
+/// the superfiles holding a live value, the values their deleted rows held
+/// (term counts include them, so they are subtracted), and the live nulls.
 pub(crate) struct TermCountInputs {
     pub(crate) files: Vec<Arc<SuperfileEntry>>,
     pub(crate) deleted: Vec<(ScalarValue, u64)>,
@@ -1881,7 +1880,7 @@ pub(crate) struct TermCountInputs {
 }
 
 /// [`TermCountInputs`] for `column`, reading the deleted rows' statistics
-/// where they are wanted, as [`non_null_count`] does. `None` when one is
+/// where needed, as [`non_null_count`] does. `None` when one is
 /// not known exactly (a manifest not fully loaded, a column mid-retype,
 /// deleted rows too many to read or holding too many values), or when a
 /// superfile's index of the column does not hold one term per value.

@@ -3148,9 +3148,9 @@ impl SupertableReader {
             .collect())
     }
 
-    /// Every term of `column` with the documents holding it, summed over
-    /// `files`, deleted rows included: from the term index for the
-    /// superfiles it covers, from the dictionaries of the rest.
+    /// Every term of `column` with its document count, summed over `files`,
+    /// deleted rows included. The term index answers for the superfiles it
+    /// covers; the dictionaries answer for the rest.
     ///
     /// The map holds every distinct value of the column, and each file
     /// outside the index hands back its whole term list, so both are charged
@@ -3225,8 +3225,8 @@ impl SupertableReader {
                         .ok_or_else(|| QueryError::Internal("superfile has no FTS index".into()))?;
                     let column = r.column_alias(field, &column_arc);
                     let terms = fts.terms_with_prefix(column, b"", Some(&pool)).await?;
-                    // The file's list is held until the merge below takes
-                    // it, beside every other file's.
+                    // Each file's list is held until the merge below takes
+                    // it.
                     let bytes = terms.iter().map(|t| term_entry_bytes(t.len())).sum();
                     let Ok(held) = budget.try_reserve(bytes) else {
                         return Ok(None);
@@ -5044,8 +5044,8 @@ impl Supertable {
     }
 }
 
-/// Bytes a term held as a map key or a list entry is charged: its own bytes,
-/// the `Vec` that owns them, its count, and the map's slot around the pair.
+/// Bytes charged for one term held as a map key or a list entry: its own
+/// bytes, the `Vec` that owns them, its count, and the map slot around them.
 fn term_entry_bytes(term_len: usize) -> usize {
     term_len + size_of::<Vec<u8>>() + size_of::<u64>() + TERM_SLOT_OVERHEAD
 }
@@ -5054,13 +5054,13 @@ fn term_entry_bytes(term_len: usize) -> usize {
 /// slots its load factor keeps, rounded up.
 const TERM_SLOT_OVERHEAD: usize = 16;
 
-/// The bytes [`TermCounts`] charges the budget at a time, so a column of many
-/// small terms does not charge once per term.
+/// Bytes [`TermCounts`] charges the budget at once, so many small terms do
+/// not each make their own charge.
 const TERM_COUNTS_CHARGE: usize = 64 << 10;
 
-/// Each term of a column with the documents holding it, the bytes it holds
-/// charged to the connection memory budget as it grows and released when it
-/// is dropped.
+/// Each term of a column with its document count. Its bytes are charged to
+/// the connection memory budget as it grows, and released when it is
+/// dropped.
 #[derive(Debug)]
 pub(crate) struct TermCounts {
     counts: HashMap<Vec<u8>, u64>,
@@ -7464,9 +7464,9 @@ mod tests {
     }
 
     /// An empty prefix finds the `''` values of a keyword column in a part
-    /// that holds no other value. The empty string is a real term there,
-    /// but the part's term range reads as empty, and the part-level prune
-    /// used to drop the part on that alone: with and without a term index.
+    /// that holds no other value, with and without a term index. The empty
+    /// string is a real term there, but the part's term range reads as
+    /// empty, so the part-level prune must not drop the part for that.
     #[test]
     fn empty_prefix_keeps_a_part_whose_keyword_values_are_all_empty() {
         for term_index in [true, false] {

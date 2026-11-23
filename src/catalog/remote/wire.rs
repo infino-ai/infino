@@ -67,9 +67,9 @@ fn param_as_f64(v: f32) -> f64 {
 /// the stored score bounds, and a server that filled in its own default
 /// would build bounds the client never asked for.
 ///
-/// Each entry names its `analyzer`; the client sends only `standard`
-/// until the service supports `keyword` (see `RemoteCatalog::create_table`). A
-/// stopword set and a stemmer ride as their own `stopwords` / `stemmer`
+/// Each entry names its `analyzer`. The client sends only `standard`
+/// until the service supports `keyword` (see `RemoteCatalog::create_table`).
+/// A stopword set and a stemmer ride as their own `stopwords` / `stemmer`
 /// keys, each emitted only when set. A server that does not implement a named filter must reject the
 /// request rather than build a table analyzed differently than the
 /// client asked for — which is the request schema's job

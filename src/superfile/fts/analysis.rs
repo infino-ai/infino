@@ -261,11 +261,10 @@ impl Analyzer {
 }
 
 /// Resolve the base-tokenizer name a column recorded, if any. Absent
-/// means `standard`, which every older file is.
+/// means `standard`, as in every older file.
 ///
-/// Aliasing an unknown name to a shipped one would query an index split
-/// one way with terms split another, so any other name refuses the
-/// table instead.
+/// Any other name refuses the table. Reading it as a known analyzer would
+/// query an index split one way with terms split another.
 pub(crate) fn check_recorded_tokenizer(
     column: &str,
     recorded: Option<&str>,
@@ -279,8 +278,8 @@ pub(crate) fn check_recorded_tokenizer(
     }
 }
 
-/// The one analyzer a past release shipped and this engine no longer
-/// reads. Any other unknown name was written by a newer engine.
+/// The one analyzer a past release shipped that this engine cannot read.
+/// Any other unknown name comes from a newer engine.
 pub(crate) const REMOVED_ANALYZER: &str = "ascii_lower";
 
 /// Refuse a chain that cannot be built: `keyword` keeps the whole value,

@@ -605,12 +605,12 @@ impl Supertable {
     ///
     /// Else, on a column indexed by the `keyword` analyzer (see
     /// [`FtsField::analyzer`](crate::FtsField::analyzer)), from its full-text
-    /// index, with no row read: there each term is one whole value, so the
-    /// documents holding a term are the rows holding that value. The values
-    /// of deleted rows are taken off and the nulls added from the
-    /// statistics, so this needs those exact too (deleted rows, and the
-    /// values they held, few enough to read), and the distinct values must fit the
-    /// connection memory budget while they are summed.
+    /// index, reading no row. Each term there is one whole value, so the
+    /// documents holding a term are the rows holding that value. The
+    /// statistics give the deleted rows' values, which are subtracted, and
+    /// the nulls. So this path also needs exact statistics (few enough
+    /// deleted rows and values to read), and the distinct values must fit
+    /// the connection memory budget.
     ///
     /// Otherwise the grouped count runs, budgeted and able to spill. An
     /// unknown column is an error, as is a column itself named `count(*)`.

@@ -320,9 +320,9 @@ token, because stopword lists are written in surface forms (`are`,
 
 ### Base tokenizer
 
-A column picks its base with `FtsField::analyzer` (`analyzer=` in the
-bindings): `standard`, the default, or `keyword`. Any other name is
-refused at `create_table`. See
+Set a column's base with `FtsField::analyzer` (`analyzer=` in the
+bindings): `standard` (the default) or `keyword`. `create_table` refuses
+any other name. See
 [`src/superfile/fts/tokenize.rs`](../src/superfile/fts/tokenize.rs).
 
 | | `standard` | `keyword` |
@@ -330,7 +330,7 @@ refused at `create_table`. See
 | Splitting | Unicode UAX #29 word boundaries; segments containing an alphanumeric or an emoji are kept | None: the whole value is one term |
 | Case | Full Unicode lowercasing | Kept: `Foo` and `foo` are different terms |
 | Non-ASCII | Preserved, so accented and non-Latin scripts stay searchable | Preserved, byte for byte |
-| Length cap | 255 characters per token | 32,766 bytes per value; an append carrying a longer one is refused |
+| Length cap | 255 characters per token | 32,766 bytes per value; an append with a longer value is refused |
 | Empty string | No tokens | One term, the empty string |
 | Filters | Stopwords and a stemmer may follow | None; declaring either is refused |
 
@@ -339,16 +339,16 @@ matched whole: host names, paths, status codes, user ids, tags. On a
 `keyword` column:
 
 - **A query is one value.** Spaces, quotes and `+` / `-` are part of the
-  value, not query syntax, so `bm25_search`, `token_match` and
-  `exact_match` all match the rows whose value equals the query exactly.
-  Each of those rows holds the term once, so BM25 ranks them alike.
+  value, not query syntax. `bm25_search`, `token_match` and `exact_match`
+  all return the rows whose value equals the query exactly. Each such row
+  holds the term once, so BM25 gives them all the same score.
 - **Prefix search keeps case.** `Fo` finds `Foo` and not `foo`.
 - **`value_counts` reads the term index.** Each term is one whole value,
-  so `Table::value_counts` sums each file's term counts, less the deleted
-  rows, instead of grouping the rows.
-- **`text_match` still means words.** The SQL function is defined by
-  `standard` tokens whatever the column's index, so a `keyword` index
-  does not answer it, and does not bound `LIKE` either.
+  so `Table::value_counts` adds up the term counts, minus deleted rows,
+  instead of grouping the rows.
+- **`text_match` still means words.** The SQL function always uses
+  `standard` tokens, whatever the column's index. So a `keyword` index
+  does not answer it, and does not narrow a `LIKE` scan either.
 
 ```rust
 use infino::{FtsField, IndexSpec};
@@ -620,7 +620,7 @@ Two debugging helpers repay the time they take:
 | A query of only common words returns nothing | The column declares `stopwords`, so no clause survived parsing. An empty result, not an error. |
 | A `LIKE` predicate got slower after declaring a filter | Superfile skip pruning for `LIKE` / `ILIKE` turns off on a column carrying a stopword set or stemmer. |
 | Prefix search finds nothing on a stemmed column | The dictionary holds stems and the prefix is not stemmed. |
-| A search on a `keyword` column misses a value that differs only in case | `keyword` keeps case and punctuation; `Foo`, `foo` and `foo.` are three values. Normalize the values upstream if they should match. |
+| A search on a `keyword` column misses a value that differs only in case | `keyword` keeps case and punctuation: `Foo`, `foo` and `foo.` are three values. Normalize them upstream if they should match. |
 | Accented text matches inconsistently | `standard` applies no Unicode normalization. Normalize upstream. |
 
 ## File map

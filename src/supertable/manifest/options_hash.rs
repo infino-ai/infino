@@ -772,10 +772,10 @@ mod tests {
             "a filterless column must hash exactly as it did before \
              filters existed"
         );
-        // Pinned, so a change to the byte stream fails here even when it
-        // moves every hash above together: a `standard` column with no
-        // filter hashes as it did before analyzers and filters joined the
-        // stream, and an existing table's stored hash still verifies.
+        // Pinned, so a change to the byte stream fails here even if it moves
+        // every hash above together. A `standard` column with no filter must
+        // hash as it did before the stream carried analyzers and filters, so
+        // an existing table's stored hash still verifies.
         assert_eq!(
             plain.to_hex(),
             PINNED_STANDARD_COLUMN_HASH,

@@ -252,10 +252,9 @@ impl RemoteCatalog {
     }
 }
 
-/// The hosted service builds `standard` indexes only. A service that did
-/// not know `keyword` could build the column as `standard`, so every
-/// query on it would look up whole values among split words; refuse here
-/// instead.
+/// The hosted service builds only `standard` indexes. A service that does
+/// not know `keyword` could build the column as `standard`, and then every
+/// query would look up whole values among split words. So refuse here.
 fn only_standard_analyzers(
     analyzers: impl IntoIterator<Item = Analyzer>,
 ) -> Result<(), InfinoError> {

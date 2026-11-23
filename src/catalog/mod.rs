@@ -3345,10 +3345,10 @@ mod tests {
         assert_keyword_answers(&reopened, "kws");
     }
 
-    /// A keyword value longer than the 255-character cap `standard` chops
-    /// its tokens at is still one whole term: two values that share their
-    /// first 300 bytes stay apart, and a value of 200 two-byte characters
-    /// matches whole, through every search path and after a reopen.
+    /// `standard` cuts a token at 255 characters; a keyword value longer
+    /// than that is still one term. Two values that share their first 300
+    /// bytes stay apart, and a value of 200 two-byte characters matches
+    /// whole, on every search path and after a reopen.
     #[test]
     fn a_keyword_value_over_255_bytes_stays_one_term() {
         let (conn, dir) = storage_conn();
@@ -3405,10 +3405,10 @@ mod tests {
         }
     }
 
-    /// A keyword value of 32,766 bytes, the longest a term may be, is
-    /// stored; one byte more refuses the whole batch, naming the column and
-    /// the length, and writes none of it. A `standard` column beside it takes
-    /// the same long text.
+    /// A keyword value of 32,766 bytes (the term limit) is stored. One byte
+    /// more refuses the whole batch: the error names the column and the
+    /// length, and no row is written. A `standard` column in the same batch
+    /// takes the same long text.
     #[test]
     fn a_keyword_value_past_the_term_cap_refuses_its_batch() {
         const KEYWORD_TERM_MAX: usize = 32_766;
