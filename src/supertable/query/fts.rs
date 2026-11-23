@@ -2064,6 +2064,21 @@ impl SupertableReader {
                 // A resident superfile has every byte in memory: nothing to
                 // prewarm, and on a warm table a future per superfile is
                 // measurable against a query of a millisecond.
+                // A unit whose documents can only tie the floor and lose the
+                // tie (k scores already hold it from lower `_id`s, see
+                // `tie_skippable`) keeps only scores above it. Then few of a
+                // lone term's documents can reach the floor (those that beat
+                // the tied score), so it scores from candidate norms too
+                // rather than reading the whole length array. Not under a
+                // score tolerance, whose floor is not the k-th score.
+                let ties_lose = !exact_count
+                    && score_tolerance <= 0.0
+                    && shared.tie_skippable(shared.floor(), params.id_min);
+                let lone_term = must_arc.len() + should_arc.len() == 1
+                    && neg_arc.is_empty()
+                    && must_ph_arc.is_empty()
+                    && should_ph_arc.is_empty()
+                    && neg_ph_arc.is_empty();
                 // One bare term with a block or less of postings here scores
                 // from those documents' buckets alone (see `few_norms`), so
                 // prewarming the whole length array would only add its bytes.
@@ -2084,7 +2099,7 @@ impl SupertableReader {
                 // few terms. Only those terms go on: a prefix's other
                 // expansions, thousands of them, are absent here. Elsewhere
                 // the length array is prewarmed and read as before.
-                let candidate_terms = candidate_shape
+                let candidate_terms = (candidate_shape || (ties_lose && lone_term))
                     .then(|| index_locations.held(suid))
                     .flatten()
                     .and_then(|held| {
@@ -2156,9 +2171,10 @@ impl SupertableReader {
                 // included — matches an uncoordinated run; only the amount
                 // of skipped work depends on segment completion order.
                 // An exact count prunes nothing, so it takes no floor.
-                let floor = match exact_count {
-                    true => f32::NEG_INFINITY,
-                    false => shared.floor(),
+                let floor = match (exact_count, ties_lose) {
+                    (true, _) => f32::NEG_INFINITY,
+                    (false, true) => shared.floor().next_up(),
+                    (false, false) => shared.floor(),
                 };
                 // Few documents of a multi-term or phrase query can reach the
                 // floor: scoring reads only their length buckets (see
@@ -2221,7 +2237,9 @@ impl SupertableReader {
                     // never contradict. The sidecars were warmed by the
                     // dispatcher, so this lookup is an in-memory hit; on a
                     // miss/error the unit just keeps the snapshot floor.
-                    let live_floor = if exact_count {
+                    // The live floor keeps ties, so a strict unit reads only
+                    // its own.
+                    let live_floor = if exact_count || ties_lose {
                         None
                     } else {
                         match &tomb {
