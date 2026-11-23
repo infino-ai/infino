@@ -113,6 +113,12 @@ pub const ENCODING_META_KEY: &str = "infino:encoding";
 /// part of the column's metadata, so the schema document carries it.
 pub const SORT_META_KEY: &str = "infino:sort";
 
+/// Arrow field-metadata key set (`true`) on the first column of a sort key
+/// whose rows are unique on it: a compaction merge keeps one row of each run
+/// of rows equal on every sort key column, the one written last. Declared
+/// with [`IndexSpec::dedup_on_sort_key`](crate::IndexSpec::dedup_on_sort_key).
+pub const SORT_UNIQUE_META_KEY: &str = "infino:sort_unique";
+
 /// How a column's values are encoded in a superfile's Parquet body, named
 /// on the column by [`ENCODING_META_KEY`] or declared with
 /// [`IndexSpec::encoding`](crate::IndexSpec::encoding).
@@ -561,6 +567,16 @@ impl TableSchema {
             .collect();
         keyed.sort_unstable();
         keyed.into_iter().map(|(_, name)| name.to_owned()).collect()
+    }
+
+    /// Whether the table's rows are unique on its sort key
+    /// ([`SORT_UNIQUE_META_KEY`]).
+    pub(crate) fn sort_unique(&self) -> bool {
+        self.fields.iter().any(|f| {
+            f.metadata
+                .get(SORT_UNIQUE_META_KEY)
+                .is_some_and(|v| v == "true")
+        })
     }
 
     /// Each range-indexed column's id and type, by name: what a query lowers

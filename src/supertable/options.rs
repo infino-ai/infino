@@ -1647,7 +1647,8 @@ pub(crate) fn builder_options_for(
     .with_field_ids_outside_schema(outside_schema)
     .with_range_columns(schema.range_columns())
     .with_column_encodings(schema.column_encodings())
-    .with_sort_columns(schema.sort_columns());
+    .with_sort_columns(schema.sort_columns())
+    .with_sort_unique(schema.sort_unique());
     // A table with a disk cache keeps its build's temporary files beside it.
     let builder = match &options.disk_cache {
         Some(_) => builder.with_scratch(options.scratch_dir()),

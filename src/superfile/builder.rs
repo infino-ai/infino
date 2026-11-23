@@ -1255,6 +1255,9 @@ pub struct BuilderOptions {
     /// rows in that order ([`rows_in_key_order`]). Empty for a table
     /// without one, whose merges keep their inputs' order.
     pub(crate) sort_columns: Vec<String>,
+    /// Whether a merge keeps one row of each run of rows equal on the sort
+    /// key, the one written last (`SORT_UNIQUE_META_KEY`).
+    pub(crate) sort_unique: bool,
     /// Finish on the calling thread alone: no join or parallel encode
     /// inside the pool. Set for a build that is itself one of many pool
     /// tasks running side by side, such as a piece of an append, where a
@@ -1464,6 +1467,7 @@ impl BuilderOptions {
             range_columns: Vec::new(),
             column_encodings: Vec::new(),
             sort_columns: Vec::new(),
+            sort_unique: false,
             finish_serial: false,
             scratch: None,
         }
@@ -1497,6 +1501,13 @@ impl BuilderOptions {
     /// [`BuilderOptions::sort_columns`]).
     pub(crate) fn with_sort_columns(mut self, columns: Vec<String>) -> Self {
         self.sort_columns = columns;
+        self
+    }
+
+    /// Keep one row per sort key value in every merge (see
+    /// [`BuilderOptions::sort_unique`]).
+    pub(crate) fn with_sort_unique(mut self, unique: bool) -> Self {
+        self.sort_unique = unique;
         self
     }
 
@@ -3704,6 +3715,7 @@ impl SuperfileBuilder {
                 inputs,
                 &superfile_builder.parquet_schema,
                 &superfile_builder.opts.sort_columns,
+                superfile_builder.opts.sort_unique,
             )?;
             let mut rows_of: Vec<Vec<Option<RowId>>> = inputs
                 .iter()
@@ -5577,6 +5589,10 @@ pub(crate) fn merge_builder_opts(
 /// every column keep their input order and, within an input, their file
 /// order, so a merge of inputs already in key order keeps them as they are.
 ///
+/// With `unique`, only the last row of each run of rows equal on every
+/// column is kept: the one from the latest input, inputs being in the order
+/// they were written, or the latest in its file.
+///
 /// Reads the key columns alone, through the merge's own reads, so a column
 /// an input stores under another type or leaves out reads as the merge's
 /// rows do.
@@ -5584,6 +5600,7 @@ fn rows_in_key_order(
     inputs: &[MergeInput],
     schema: &SchemaRef,
     columns: &[String],
+    unique: bool,
 ) -> Result<Vec<(u32, u32)>, BuildError> {
     let key_fields: Vec<Field> = columns
         .iter()
@@ -5652,6 +5669,19 @@ fn rows_in_key_order(
             .row(a.1 as usize)
             .cmp(&keys[b.0 as usize].row(b.1 as usize))
     });
+    if unique {
+        let same = |a: &(u32, u32), b: &(u32, u32)| {
+            keys[a.0 as usize].row(a.1 as usize) == keys[b.0 as usize].row(b.1 as usize)
+        };
+        // Keep each row the next does not equal: the last of its run.
+        let kept: Vec<(u32, u32)> = at
+            .iter()
+            .enumerate()
+            .filter(|&(n, row)| at.get(n + 1).is_none_or(|next| !same(row, next)))
+            .map(|(_, row)| *row)
+            .collect();
+        at = kept;
+    }
     Ok(at
         .into_iter()
         .map(|(i, j)| (i, survivors[i as usize][j as usize]))
@@ -13128,6 +13158,33 @@ mod sort_key_tests {
         .map(|(s, t)| (s.to_string(), t))
         .collect();
         assert_eq!(rows, expected);
+    }
+
+    /// A merge of a table unique on its sort key keeps one row of each run
+    /// of rows equal on the key: the one from the input written last.
+    #[test]
+    fn a_unique_sort_key_keeps_the_last_row_of_each_key() {
+        let first = superfile(&[(1, "a", 10), (2, "b", 10), (3, "a", 20)]);
+        let second = superfile(&[(4, "a", 10), (5, "c", 10)]);
+        let inputs = same_shape_inputs(&[(Arc::clone(&first), None), (second, None)]);
+        let base = BuilderOptions::new_from_reader(&first)
+            .with_sort_columns(vec!["series".to_string(), "t".to_string()])
+            .with_sort_unique(true);
+        let mut out = Vec::new();
+        SuperfileBuilder::build_from_readers_fts_merge_to(&inputs, base, &mut out).expect("merge");
+        let reader = SuperfileReader::open(Bytes::from(out)).expect("open merged");
+        let mut ids = Vec::new();
+        for batch in reader.record_batches(None).expect("read") {
+            let batch = batch.expect("batch");
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("ids");
+            ids.extend((0..batch.num_rows()).map(|r| id.value(r)));
+        }
+        // ("a", 10) was written twice; the second input's row (id 4) is kept.
+        assert_eq!(ids, vec![4, 3, 2, 5]);
     }
 
     /// Without a sort key a merge keeps its inputs' order.

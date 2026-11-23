@@ -25,7 +25,7 @@ use crate::{
     },
     supertable::{
         companion::{CompanionSpec, check_purpose},
-        schema::{ColumnEncoding, ENCODING_META_KEY, SORT_META_KEY},
+        schema::{ColumnEncoding, ENCODING_META_KEY, SORT_META_KEY, SORT_UNIQUE_META_KEY},
     },
 };
 
@@ -241,6 +241,7 @@ pub struct IndexSpec {
     ranges: Vec<String>,
     encodings: Vec<(String, ColumnEncoding)>,
     sort: Vec<String>,
+    sort_unique: bool,
     companions: Vec<Companion>,
 }
 
@@ -402,6 +403,9 @@ impl IndexSpec {
                 }
                 if let Some(place) = place {
                     metadata.insert(SORT_META_KEY.to_string(), place.to_string());
+                    if place == 0 && self.sort_unique {
+                        metadata.insert(SORT_UNIQUE_META_KEY.to_string(), "true".to_string());
+                    }
                 }
                 Arc::new(field.as_ref().clone().with_metadata(metadata))
             })
@@ -438,11 +442,33 @@ impl IndexSpec {
         self
     }
 
+    /// Keep one row for each value of the sort key ([`Self::sort_by`]):
+    /// every compaction merge keeps the row written last of each run of rows
+    /// equal on every sort key column, and drops the rest. For a time series
+    /// keyed by series and time, a point sent twice (a client's retry)
+    /// collapses to one once a merge has rewritten it. Until then both rows
+    /// are read; a file an append writes keeps every row it was given.
+    ///
+    /// ```
+    /// use infino::IndexSpec;
+    /// let spec = IndexSpec::new().sort_by(["series", "time"]).dedup_on_sort_key();
+    /// # let _ = spec;
+    /// ```
+    pub fn dedup_on_sort_key(mut self) -> Self {
+        self.sort_unique = true;
+        self
+    }
+
     /// Refuses a sort key the table cannot keep: a column `schema` does not
     /// have, one that is not a scalar, one named twice, or any on a table
     /// with a vector index.
     pub(crate) fn check_sort(&self, schema: &Schema) -> Result<(), InfinoError> {
         if self.sort.is_empty() {
+            if self.sort_unique {
+                return Err(InfinoError::Config(
+                    "dedup_on_sort_key with no sort key: name one with sort_by".into(),
+                ));
+            }
             return Ok(());
         }
         if !self.vectors.is_empty() {
