@@ -28,9 +28,11 @@ use std::{
     time::Instant,
 };
 
-use arrow::compute::{concat_batches, filter_record_batch, interleave_record_batch, take};
+use arrow::compute::{
+    concat_batches, filter_record_batch, interleave, interleave_record_batch, take,
+};
 use arrow_array::{
-    ArrayRef, BooleanArray, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions,
+    Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -58,7 +60,7 @@ use parquet::{
         ProjectionMask,
         arrow_reader::{
             ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-            RowSelectionPolicy,
+            RowSelectionPolicy, statistics::StatisticsConverter,
         },
         async_reader::{AsyncFileReader, ParquetObjectReader, ParquetRecordBatchStreamBuilder},
     },
@@ -2160,6 +2162,11 @@ pub(crate) async fn take_rows_byte_source(
         .await
         .map_err(QueryError::from)?;
     let source = Source::Lazy(reader.byte_source());
+    if let Some(batch) =
+        take_with_constant_chunks(reader, &metadata, local_doc_ids, names, pool, budget).await?
+    {
+        return Ok(batch);
+    }
     // Fetch the take's column chunks at once rather than letting the decode
     // fetch them a row group at a time: a hit set spread over hundreds of
     // row groups otherwise costs that many round trips one after another.
@@ -2188,6 +2195,168 @@ pub(crate) async fn take_rows_byte_source(
         budget,
     )
     .await
+}
+
+/// Per row group, whether every row of `name` holds one value the footer
+/// records exactly (min == max, both exact, no nulls), with the row groups'
+/// minimums. `None` for a float or nested column or unreadable statistics.
+fn constant_row_groups(
+    metadata: &ParquetMetaData,
+    schema: &Schema,
+    name: &str,
+) -> Option<(ArrayRef, Vec<bool>)> {
+    let field = schema.field_with_name(name).ok()?;
+    if field.data_type().is_floating() || field.data_type().is_nested() {
+        return None;
+    }
+    let converter =
+        StatisticsConverter::try_new(name, schema, metadata.file_metadata().schema_descr()).ok()?;
+    let column = converter.parquet_column_index()?;
+    let row_groups = metadata.row_groups();
+    let mins = converter.row_group_mins(row_groups.iter()).ok()?;
+    let maxes = converter.row_group_maxes(row_groups.iter()).ok()?;
+    if mins.data_type() != field.data_type() {
+        return None;
+    }
+    let constant = row_groups
+        .iter()
+        .enumerate()
+        .map(|(i, rg)| {
+            rg.column(column).statistics().is_some_and(|s| {
+                s.null_count_opt() == Some(0) && s.min_is_exact() && s.max_is_exact()
+            }) && mins.is_valid(i)
+                && maxes.is_valid(i)
+                && matches!(
+                    (ScalarValue::try_from_array(&mins, i), ScalarValue::try_from_array(&maxes, i)),
+                    (Ok(min), Ok(max)) if min == max
+                )
+        })
+        .collect();
+    Some((mins, constant))
+}
+
+/// A take where some projected column is constant in some of the hit row
+/// groups: those rows come from the footer, and each column reads only its
+/// other rows. A filtered take over hour-long superfiles otherwise spends
+/// one small GET per row group on a column (such as `time`) whose value the
+/// footer already holds. `None` when no column has such a row group.
+async fn take_with_constant_chunks(
+    reader: &SuperfileReader,
+    metadata: &Arc<ParquetMetaData>,
+    local_doc_ids: &[u32],
+    names: &[&str],
+    pool: Option<&ThreadPool>,
+    budget: Option<&Arc<ConnectionMemoryBudget>>,
+) -> DfResult<Option<RecordBatch>> {
+    let schema = reader.schema();
+    let starts: Vec<u64> = metadata
+        .row_groups()
+        .iter()
+        .scan(0u64, |next, rg| {
+            let start = *next;
+            *next += rg.num_rows() as u64;
+            Some(start)
+        })
+        .collect();
+    let n_rows = metadata.file_metadata().num_rows().max(0) as u64;
+    if starts.is_empty() || local_doc_ids.iter().any(|&d| u64::from(d) >= n_rows) {
+        return Ok(None);
+    }
+    let doc_rgs: Vec<usize> = local_doc_ids
+        .iter()
+        .map(|&d| {
+            starts
+                .partition_point(|&s| s <= u64::from(d))
+                .saturating_sub(1)
+        })
+        .collect();
+    let constants: Vec<Option<(ArrayRef, Vec<bool>)>> = names
+        .iter()
+        .map(|name| constant_row_groups(metadata, schema, name))
+        .collect();
+    let is_constant = |c: &Option<(ArrayRef, Vec<bool>)>, rg: usize| {
+        c.as_ref()
+            .is_some_and(|(_, flags)| flags.get(rg).copied().unwrap_or(false))
+    };
+    if !constants
+        .iter()
+        .any(|c| doc_rgs.iter().any(|&rg| is_constant(c, rg)))
+    {
+        return Ok(None);
+    }
+    let reads = names.iter().zip(&constants).map(|(name, c)| {
+        let read_ids: Vec<u32> = local_doc_ids
+            .iter()
+            .zip(&doc_rgs)
+            .filter(|(_, rg)| !is_constant(c, **rg))
+            .map(|(d, _)| *d)
+            .collect();
+        async move {
+            if read_ids.is_empty() {
+                return Ok::<Option<ArrayRef>, DataFusionError>(None);
+            }
+            let mut sorted = read_ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let roots: Vec<usize> = schema.index_of(name).ok().into_iter().collect();
+            let spans = take_prefetch_spans(
+                metadata,
+                &sorted,
+                &roots,
+                TAKE_PREFETCH_MAX_BYTES,
+                EXACT_MERGE_GAP_BYTES,
+            );
+            let batch = take_prefetched(
+                reader,
+                Source::Lazy(reader.byte_source()),
+                Arc::clone(metadata),
+                spans,
+                &read_ids,
+                &[*name],
+                pool,
+                budget,
+            )
+            .await?;
+            Ok::<Option<ArrayRef>, DataFusionError>(Some(Arc::clone(batch.column(0))))
+        }
+    });
+    let read = futures::future::try_join_all(reads).await?;
+    let mut fields = Vec::with_capacity(names.len());
+    let mut columns = Vec::with_capacity(names.len());
+    for ((name, c), read) in names.iter().zip(&constants).zip(read) {
+        let field = schema.field_with_name(name).map_err(QueryError::internal)?;
+        let column = match (c, read) {
+            (None, Some(read)) => read,
+            (Some((mins, _)), read) => {
+                let mut k = 0;
+                let picks: Vec<(usize, usize)> = doc_rgs
+                    .iter()
+                    .map(|&rg| match is_constant(c, rg) {
+                        true => (0, rg),
+                        false => {
+                            k += 1;
+                            (1, k - 1)
+                        }
+                    })
+                    .collect();
+                let mut sources: Vec<&dyn Array> = vec![mins.as_ref()];
+                if let Some(read) = &read {
+                    sources.push(read.as_ref());
+                }
+                interleave(&sources, &picks).map_err(QueryError::internal)?
+            }
+            (None, None) => return Ok(None),
+        };
+        fields.push(field.clone());
+        columns.push(column);
+    }
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(local_doc_ids.len())),
+    )
+    .map(Some)
+    .map_err(|e| QueryError::internal(e).into())
 }
 
 /// Takes whose decode read outside their prefetch and decoded again through
@@ -3990,6 +4159,84 @@ mod tests {
         assert!(
             take_prefetch_fallbacks() > before,
             "the fallback is counted"
+        );
+    }
+
+    /// A take reads a column only in the row groups where it varies: in the
+    /// others the footer's exact min == max is every row's value. The rows,
+    /// in request order and with repeats, match the column's own.
+    #[tokio::test]
+    async fn a_take_serves_constant_row_groups_from_statistics() {
+        use arrow_array::Int64Array;
+
+        let schema: Arc<Schema> = Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("day", DataType::Int64, false),
+            Field::new("views", DataType::Int64, false),
+        ]));
+        let mut opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
+        opts.row_group_size = 1000;
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        // `day` is constant in the first and last row groups only.
+        let day = |i: i64| match i {
+            0..1000 => 7,
+            1000..2000 => i % 3,
+            _ => 9,
+        };
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(decimal128_ids(0..3000)),
+                Arc::new(Int64Array::from_iter_values((0..3000).map(day))),
+                Arc::new(Int64Array::from_iter_values((0..3000).map(|i| i * 10))),
+            ],
+        )
+        .expect("build batch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let source = Superfile::new(Bytes::from(b.finish().expect("finish")), false);
+        let reader = SuperfileReader::open_lazy(Arc::clone(&source) as Arc<dyn LazyByteSource>)
+            .await
+            .expect("open lazy");
+        let metadata = reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("metadata");
+        let (_, constant) =
+            constant_row_groups(&metadata, reader.schema(), "day").expect("statistics");
+        assert_eq!(constant, vec![true, false, true]);
+        assert!(
+            constant_row_groups(&metadata, reader.schema(), "views")
+                .expect("statistics")
+                .1
+                .iter()
+                .all(|c| !c)
+        );
+
+        let ids = [2500u32, 10, 1500, 10, 1001];
+        let batch = take_rows_byte_source(&reader, &ids, &["day", "views"], None, None)
+            .await
+            .expect("take");
+        let column = |name: &str| -> Vec<i64> {
+            batch
+                .column_by_name(name)
+                .expect("column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64")
+                .values()
+                .to_vec()
+        };
+        let want_day: Vec<i64> = ids.iter().map(|&i| day(i64::from(i))).collect();
+        let want_views: Vec<i64> = ids.iter().map(|&i| i64::from(i) * 10).collect();
+        assert_eq!(column("day"), want_day);
+        assert_eq!(column("views"), want_views);
+        assert_eq!(
+            batch
+                .schema()
+                .field_with_name("day")
+                .expect("day")
+                .data_type(),
+            &DataType::Int64
         );
     }
 
