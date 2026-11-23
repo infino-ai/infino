@@ -1023,10 +1023,10 @@ mod tests {
         let expected_count = (GROUPS * PROBE_REPEATS) as i64;
         let expected_sum = (PROBE_REPEATS * GROUPS * (GROUPS - 1) / 2) as i64;
 
-        // One thread, so the partitions interleave the same way on every run.
-        // On a multi-thread runtime a loaded machine can run the partitioned
-        // joins one after another, and then their uncopied builds are never
-        // charged at once and the plain session can fit the budget.
+        // One thread, so batches reach the aggregates in the same order on
+        // every run. The charge sums each build batch's buffer size, and
+        // those sizes change with that order; the partitioned case clears
+        // the gate by only about a megabyte.
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
