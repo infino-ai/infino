@@ -2984,14 +2984,29 @@ impl TermIndex {
                         .unwrap_or(e.n_docs)
                 })
         };
-        // Per term: superfile → the key of its best document there.
+        // Per phrase member: superfile → the key of its best document there.
         let mut per_term: HashMap<&str, HashMap<Uuid, f32>> = HashMap::new();
+        let members: HashSet<&str> = phrases.iter().flatten().copied().collect();
         let mut all_terms: Vec<&str> = terms.to_vec();
-        all_terms.extend(phrases.iter().flatten().copied());
+        all_terms.extend(members.iter().copied());
         all_terms.sort_unstable();
         all_terms.dedup();
+        // A bare term repeated in the query weighs as many times as it appears.
+        let mut bare: HashMap<&str, f32> = HashMap::new();
+        for term in terms {
+            *bare.entry(term).or_insert(0.0) += 1.0;
+        }
+        // Bare terms sum straight into a per-ordinal ceiling, so the work is
+        // one pass over their postings rather than a lookup per term per
+        // superfile, which a prefix's thousands of expansions make large.
+        let n = self.root.superfiles.len();
+        let mut term_ceiling = vec![0.0f32; n];
+        let mut last_term = vec![usize::MAX; n];
+        let mut before = vec![0.0f32; n];
         let runs = self.runs_many(column_id, &all_terms).await?;
-        for (term, runs) in all_terms.into_iter().zip(runs) {
+        for (ti, (term, runs)) in all_terms.into_iter().zip(runs).enumerate() {
+            let is_member = members.contains(term);
+            let idf = bare.get(term).map(|count| idf_used(term) * count);
             let mut by_sf = HashMap::new();
             for slice_run in runs.iter() {
                 for p in &slice_run.run.postings {
@@ -3002,11 +3017,31 @@ impl TermIndex {
                         true => legacy_bound_as_key(p.bound, p.df, scored_docs(id)),
                         false => p.bound,
                     };
-                    by_sf.insert(id, key);
+                    if let Some(idf) = idf {
+                        let o = p.superfile as usize;
+                        // A later layer's posting replaces an earlier one's.
+                        if last_term[o] != ti {
+                            last_term[o] = ti;
+                            before[o] = term_ceiling[o];
+                        }
+                        term_ceiling[o] = before[o] + key * idf;
+                    }
+                    if is_member {
+                        by_sf.insert(id, key);
+                    }
                 }
             }
-            per_term.insert(term, by_sf);
+            if is_member {
+                per_term.insert(term, by_sf);
+            }
         }
+        let ordinal: HashMap<Uuid, usize> = self
+            .root
+            .superfiles
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect();
         let mut out: HashMap<Uuid, f32> = HashMap::with_capacity(entries.len());
         for e in entries {
             let id = e.superfile_id;
@@ -3014,12 +3049,7 @@ impl TermIndex {
                 out.insert(id, f32::INFINITY);
                 continue;
             }
-            let mut ceiling = 0.0f32;
-            for term in terms {
-                if let Some(bound) = per_term.get(term).and_then(|m| m.get(&id)) {
-                    ceiling += bound * idf_used(term);
-                }
-            }
+            let mut ceiling = ordinal.get(&id).map_or(0.0, |&o| term_ceiling[o]);
             for phrase in phrases {
                 let mut idf_sum = 0.0f32;
                 let mut min_scaled = f32::INFINITY;
@@ -6441,8 +6471,10 @@ mod tests {
             })
             .collect();
         // (query, plain terms, phrases)
-        let queries: [(&str, &[&str], &[&[&str]]); 5] = [
+        let queries: [(&str, &[&str], &[&[&str]]); 6] = [
             ("alpha", &["alpha"], &[]),
+            // A repeated term scores once per occurrence.
+            ("alpha alpha", &["alpha", "alpha"], &[]),
             ("alpha shared", &["alpha", "shared"], &[]),
             ("\"alpha shared\"", &[], &[&["alpha", "shared"]]),
             (
