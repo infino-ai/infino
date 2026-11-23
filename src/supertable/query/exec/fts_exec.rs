@@ -441,6 +441,16 @@ impl ExecutionPlan for Bm25Exec {
                 Bm25Query::Terms { .. } | Bm25Query::Prefix { .. } => None,
             };
             let predicate = PushedPredicate::compile(&filters, &output_schema);
+            // A term search under a `WHERE` that bounds superfiles and can be
+            // checked from stored columns ranks within the checked rows once
+            // widening comes back short.
+            let check = match (&scope, &predicate, &query) {
+                (Some(_), Some(predicate), Bm25Query::Terms { .. }) => {
+                    RowCheck::new(&reader, predicate, &output_schema)?.map(Arc::new)
+                }
+                _ => None,
+            };
+            let checked_when_short = check.is_some() && widening_ended_short(&reader, k, 0);
             let call = RankedCall {
                 reader: &reader,
                 column: &column,
@@ -455,9 +465,9 @@ impl ExecutionPlan for Bm25Exec {
             // rounds stop as soon as `k` of the kernel's best pass the
             // predicate, which for a predicate most top-ranked rows satisfy
             // is a round or two of the search alone.
-            let widened = call.rows(scope.as_ref(), None).await?;
-            let (Some(scope), Some(predicate), Bm25Query::Terms { query: text, mode }) =
-                (scope.as_ref(), predicate.as_ref(), &query)
+            let widened = call.rows(scope.as_ref(), checked_when_short).await?;
+            let (Some(scope), Some(check), Bm25Query::Terms { query: text, mode }) =
+                (scope.as_ref(), check, &query)
             else {
                 return Ok(widened);
             };
@@ -468,12 +478,8 @@ impl ExecutionPlan for Bm25Exec {
             // every hit the widening looked at. Rank once within the rows the
             // query's terms match, checking the predicate on each superfile's
             // best rows as the search reaches them.
-            let Some(check) = RowCheck::new(&reader, predicate, &output_schema)? else {
-                return Ok(widened);
-            };
             let matched = reader.match_scope(&column, text, *mode, scope).await?;
-            call.checked_rows(&matched, Arc::new(check), text, *mode)
-                .await
+            call.checked_rows(&matched, check, text, *mode).await
         };
 
         let span = match &self.query {
@@ -559,6 +565,7 @@ impl RankedCall<'_> {
             self.output_schema,
             self.projection,
             self.k,
+            false,
             |want: usize| {
                 self.reader.bm25_search_checked_async(
                     self.column,
@@ -573,15 +580,15 @@ impl RankedCall<'_> {
         .await
     }
 
-    /// The call's `k` rows within `scope` under the predicate, widening to
-    /// at most `ceiling` hits a round — `None` is the fill's own ceiling
-    /// ([`fill_ceiling`]), `Some(k)` exactly one round.
+    /// The call's `k` rows within `scope` under the predicate, widening up to
+    /// the fill's ceiling ([`fill_ceiling`]). With `checked_when_short` the
+    /// caller checks the predicate exactly if the rows come back short.
     async fn rows(
         &self,
         scope: Option<&CandidateScope>,
-        ceiling: Option<usize>,
+        checked_when_short: bool,
     ) -> DfResult<RecordBatch> {
-        let ceiling = ceiling.unwrap_or_else(|| fill_ceiling(self.reader, self.k));
+        let ceiling = fill_ceiling(self.reader, self.k);
         fill_top_k_within(
             self.reader,
             self.k,
@@ -590,6 +597,7 @@ impl RankedCall<'_> {
             self.output_schema,
             self.projection,
             ceiling,
+            checked_when_short,
             |want: usize| self.hits(want, scope),
         )
         .await
