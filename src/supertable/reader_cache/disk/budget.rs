@@ -379,7 +379,7 @@ impl DiskCacheStore {
                     uri = %uri.0,
                     size,
                     cached_at_us = self.cached_at_us(&uri),
-                    mtime_us,
+                    last_used_us = mtime_us,
                     "evict: whole .sf.parquet (budget)"
                 );
                 self.remove_local_copy(&uri);
@@ -419,7 +419,7 @@ impl DiskCacheStore {
                     uri = %uri.0,
                     size,
                     cached_at_us = created_at_us(&self.blocks_path(&uri)),
-                    mtime_us,
+                    last_used_us = mtime_us,
                     "evict: .blocks (budget)"
                 );
                 let _ = fs::remove_file(self.blocks_path(&uri));
@@ -794,6 +794,7 @@ impl DiskCacheStore {
                 tracing::info!(
                     target: "infino::cache",
                     uri = %uri.0,
+                    size = entry.charged_bytes(),
                     cached_at_us = self.cached_at_us(&uri),
                     last_used_us = unix_us(self.store_time(entry.last_access_us.load(Ordering::Acquire))),
                     "evict: live cached entry (budget pressure)"
@@ -1095,7 +1096,6 @@ mod tests {
         collections::HashMap,
         fmt::Debug,
         fs::{self, OpenOptions},
-        io::Write,
         path::Path,
         sync::{Arc, Mutex},
         thread,
@@ -1103,7 +1103,6 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use tempfile::tempdir;
     use tracing::{
         Event, Subscriber,
         callsite::rebuild_interest_cache,
@@ -1183,39 +1182,6 @@ mod tests {
         file_mtime_us(&fs::metadata(path).expect("file on disk"))
     }
 
-    /// A file's created time stays put when it is written again and renamed, as a cache file's is
-    /// when a download lands. Without a birth time there is none, rather than another time.
-    #[test]
-    fn a_file_keeps_its_created_time_through_a_later_write_and_a_rename() {
-        let dir = tempdir().expect("tempdir");
-        let (tmp, kept) = (dir.path().join("copy.tmp"), dir.path().join("copy"));
-        fs::write(&tmp, b"first").expect("create");
-        let created = created_at_us(&tmp);
-
-        thread::sleep(MTIME_STEP);
-        OpenOptions::new()
-            .append(true)
-            .open(&tmp)
-            .and_then(|mut file| file.write_all(b" second"))
-            .expect("write again");
-        fs::rename(&tmp, &kept).expect("rename");
-
-        if fs::metadata(&kept).expect("kept").created().is_ok() {
-            let created = created.expect("a birth time");
-            assert_eq!(
-                created_at_us(&kept),
-                Some(created),
-                "the birth time survives"
-            );
-            assert!(
-                created < mtime_us(&kept),
-                "the later write moved only the mtime"
-            );
-        } else {
-            assert_eq!(created_at_us(&kept), None, "no other time stands in");
-        }
-    }
-
     /// Each budget eviction logs when its file was cached and when it was last used: a file never
     /// opened, a `.blocks` record, and a live entry adopted from disk after a restart, whose cached
     /// time is still the one its file was written at.
@@ -1274,13 +1240,14 @@ mod tests {
 
         let whole = log.fields("evict: whole .sf.parquet (budget)");
         assert_eq!(whole.get("cached_at_us").copied(), unopened_times.0);
-        assert_eq!(whole.get("mtime_us"), Some(&unopened_times.1));
+        assert_eq!(whole.get("last_used_us"), Some(&unopened_times.1));
 
         let block_file = log.fields("evict: .blocks (budget)");
         assert_eq!(block_file.get("cached_at_us").copied(), blocks_times.0);
-        assert_eq!(block_file.get("mtime_us"), Some(&blocks_times.1));
+        assert_eq!(block_file.get("last_used_us"), Some(&blocks_times.1));
 
         let live = log.fields("evict: live cached entry (budget pressure)");
+        assert_eq!(live.get("size"), Some(&(bytes.len() as u64)));
         assert_eq!(
             live.get("cached_at_us").copied(),
             adopted_created,

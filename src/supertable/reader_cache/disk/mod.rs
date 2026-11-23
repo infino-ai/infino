@@ -141,9 +141,8 @@ fn file_mtime_us(meta: &fs::Metadata) -> u64 {
 }
 
 /// When the file at `path` was created (its birth time) in microseconds since the unix epoch,
-/// `None` with no file or on a filesystem that keeps no birth time. Renaming keeps it, so a
-/// downloaded copy keeps its download's start across reopens and restarts; a copy admitted as a
-/// hard link keeps when the build created it.
+/// `None` with no file or on a filesystem that keeps no birth time. It is the local copy's birth,
+/// not when the cache took it in: a rename keeps it, and a hard-linked copy keeps the build's.
 fn created_at_us(path: &Path) -> Option<u64> {
     fs::metadata(path).ok()?.created().ok().map(unix_us)
 }
@@ -364,7 +363,6 @@ impl CachedEntry {
 
     /// Every byte this entry keeps charged: its own `size_bytes`, plus the blocks a retained vector
     /// source charges for itself.
-    #[cfg(test)]
     fn charged_bytes(&self) -> u64 {
         let own = self.size_bytes.load(Ordering::Acquire);
         match &self.residency {
@@ -771,8 +769,9 @@ impl DiskCacheStore {
         SystemTime::now().checked_sub(since).unwrap_or(UNIX_EPOCH)
     }
 
-    /// When the oldest local copy of `uri` was created, for an eviction log that deletes them all.
-    /// `None` when none is on disk under its cache name, as before a download lands.
+    /// When the oldest copy of `uri` still on disk was created, for an eviction that deletes them
+    /// all. A promotion that deletes the `.blocks` file leaves only the whole copy's birth.
+    /// `None` when no copy is on disk under its cache name, as before a download lands.
     fn cached_at_us(&self, uri: &SuperfileUri) -> Option<u64> {
         [
             self.cache_path(uri),
