@@ -752,9 +752,14 @@ const FEW_NORMS_GAP_BYTES: usize = 4096;
 /// superfile reads its whole array, as it would have anyway.
 pub(crate) const CANDIDATE_MAX_POSTINGS: u64 = 1 << 16;
 
-/// Most of a query's terms one superfile may hold for its candidates to be
-/// bounded term by term.
-pub(crate) const CANDIDATE_MAX_TERMS: usize = 64;
+/// Held terms a walk of [`CANDIDATE_MAX_POSTINGS`] postings may count.
+const CANDIDATE_TERMS_AT_MAX_POSTINGS: u64 = 64;
+
+/// Most (posting, held term) cells one superfile's candidate walk may fill:
+/// each decoded document keeps a count per held term, so a prefix's hundreds
+/// of rare expansions fit where many terms over many postings do not.
+pub(crate) const CANDIDATE_MAX_CELLS: u64 =
+    CANDIDATE_MAX_POSTINGS * CANDIDATE_TERMS_AT_MAX_POSTINGS;
 
 /// Most candidates one superfile may have for its buckets to be read alone.
 const CANDIDATE_MAX_DOCS: usize = 8192;
@@ -811,7 +816,10 @@ fn candidate_docs(
             tfs.insert(doc, row);
         }
     } else {
-        if df.iter().sum::<u64>() > CANDIDATE_MAX_POSTINGS {
+        let postings = df.iter().sum::<u64>();
+        if postings > CANDIDATE_MAX_POSTINGS
+            || postings.saturating_mul(nt as u64) > CANDIDATE_MAX_CELLS
+        {
             return None;
         }
         for (t, cursor) in cursors.iter_mut().enumerate() {
@@ -2020,7 +2028,7 @@ impl FtsReader {
         // about hundreds of expansions, of which one superfile holds a few. A
         // phrase missing a word here cannot match here.
         let held: Vec<usize> = (0..terms.len()).filter(|&t| built[t].is_some()).collect();
-        if held.is_empty() || held.len() > CANDIDATE_MAX_TERMS {
+        if held.is_empty() {
             return Ok(None);
         }
         let mut at = vec![usize::MAX; terms.len()];
@@ -7154,6 +7162,65 @@ mod tests {
                 "{name}: the length array was never read"
             );
         }
+    }
+
+    /// An `Or` over more held terms than a small query has, as a prefix
+    /// expands to, still scores from its candidates' buckets alone.
+    #[tokio::test]
+    async fn candidate_norms_serve_many_rare_terms() {
+        const TERMS: u32 = 100;
+        const TERM_EVERY: u32 = 30;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), true).expect("register");
+        let mut next = xorshift(0x5eed_cafe);
+        for doc in 0..CANDIDATE_CORPUS_DOCS {
+            let mut text = vec!["red"; (1 + next() % 8) as usize].join(" ");
+            if doc % TERM_EVERY == 0 && doc / TERM_EVERY < TERMS {
+                text.push_str(&format!(" einst{}", doc / TERM_EVERY));
+            }
+            b.add_doc(0, doc, &text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        let names: Vec<String> = (0..TERMS).map(|i| format!("einst{i}")).collect();
+        let terms: Vec<&str> = names.iter().map(String::as_str).collect();
+        let idf: GlobalTermIdf = names
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.clone(), 5.0 + i as f32 * 0.01))
+            .collect();
+        let lists = || ClauseLists {
+            shoulds: &terms,
+            idf: QueryIdf::Table(&idf),
+            ..ClauseLists::default()
+        };
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let whole = ranked(&eager, lists(), f32::NEG_INFINITY).await;
+        assert_eq!(whole.len(), CANDIDATE_K);
+        let floor = whole[CANDIDATE_K - 1].1;
+        let lazy = bucket_reader(&blob, json).await;
+        let bare: Vec<(&str, u32)> = terms.iter().map(|&t| (t, 1)).collect();
+        let no_view = ScoringView {
+            norms: None,
+            params: None,
+            avgdl: None,
+        };
+        let norms = lazy
+            .candidate_norms("body", &bare, &[], &idf, &no_view, floor, None, None)
+            .await
+            .expect("candidate norms")
+            .expect("the candidates are read alone");
+        let view = lazy
+            .with_scoring(&ScoringView {
+                norms: Some(CandidateNorms {
+                    column: "body",
+                    norms: &norms,
+                }),
+                ..no_view
+            })
+            .expect("a view over the candidate norms");
+        assert_eq!(ranked(&view, lists(), floor).await, whole);
+        assert!(!lazy.columns[0].norms_loaded());
     }
 
     /// Candidate norms are not built where they cannot help: no floor, a

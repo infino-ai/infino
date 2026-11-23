@@ -127,7 +127,7 @@ use crate::{
             bm25,
             bm25::Bm25Params,
             reader::{
-                Bm25SearchOptions, CANDIDATE_MAX_POSTINGS, CANDIDATE_MAX_TERMS, CandidateNorms,
+                Bm25SearchOptions, CANDIDATE_MAX_CELLS, CANDIDATE_MAX_POSTINGS, CandidateNorms,
                 ClauseLists, ColumnLengthStats, ColumnNorms, FEW_NORMS_MAX_DOCS, FetchedTermMemo,
                 GlobalTermIdf, LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet,
                 PreparedClauses, QueryDict, QueryIdf, ScoringView,
@@ -2117,8 +2117,8 @@ impl SupertableReader {
                             _ => work + phrases.iter().flat_map(|(_, dfs)| dfs).sum::<u64>(),
                         };
                         let cheap = !distinct.is_empty()
-                            && distinct.len() <= CANDIDATE_MAX_TERMS
-                            && work <= CANDIDATE_MAX_POSTINGS;
+                            && work <= CANDIDATE_MAX_POSTINGS
+                            && work.saturating_mul(distinct.len() as u64) <= CANDIDATE_MAX_CELLS;
                         cheap.then(|| {
                             let phrases: Vec<&[String]> =
                                 phrases.into_iter().map(|(terms, _)| terms).collect();
