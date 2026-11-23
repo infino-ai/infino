@@ -148,7 +148,7 @@ use crate::{
             candidate::{CandidatePlan, CandidateScope, TermMemos},
             dispatch,
             exec::common::{
-                candidate_plan_for_filters, hit_output_schema, resolve_hits_named,
+                RowCheck, candidate_plan_for_filters, hit_output_schema, resolve_hits_named,
                 take_file_columns, take_rows_byte_source,
             },
             heads,
@@ -1357,7 +1357,27 @@ impl SupertableReader {
         scope: Option<&CandidateScope>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let (hits, _) = self
-            .bm25_scored_async(column, query, k, opts, scope, false)
+            .bm25_scored_async(column, query, k, opts, scope, None, false)
+            .await?;
+        Ok(hits)
+    }
+
+    /// [`Self::bm25_search_scoped_async`] keeping only hits that pass
+    /// `check`, a `WHERE` the index cannot bound. Each superfile checks its
+    /// best-scoring rows first and looks deeper only until `k` pass, so the
+    /// running k-th score rises from passing rows alone and a superfile it
+    /// rules out is never checked. `scope` must bound rows.
+    pub(crate) async fn bm25_search_checked_async(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        opts: Bm25SearchOptions,
+        scope: &CandidateScope,
+        check: Arc<RowCheck>,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let (hits, _) = self
+            .bm25_scored_async(column, query, k, opts, Some(scope), Some(check), false)
             .await?;
         Ok(hits)
     }
@@ -1372,6 +1392,7 @@ impl SupertableReader {
         k: usize,
         opts: Bm25SearchOptions,
         scope: Option<&CandidateScope>,
+        check: Option<Arc<RowCheck>>,
         exact_count: bool,
     ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
         if k == 0 {
@@ -1467,6 +1488,7 @@ impl SupertableReader {
             bm25_params,
             score_tolerance,
             scope,
+            check,
             exact_count,
         )
         .await
@@ -1521,6 +1543,7 @@ impl SupertableReader {
         bm25_params: Option<Bm25Params>,
         score_tolerance: f32,
         scope: Option<&CandidateScope>,
+        check: Option<Arc<RowCheck>>,
         exact_count: bool,
     ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
         let ScoredClauses {
@@ -1674,7 +1697,7 @@ impl SupertableReader {
         // order, and its kernel seeds its own floor from its own blocks; the
         // merge would only cost its reads and rounds on every query, and the
         // gate its samples learning so.
-        let rows_scoped = scope.is_some_and(|s| s.bounds_rows(&kept));
+        let rows_scoped = check.is_some() || scope.is_some_and(|s| s.bounds_rows(&kept));
         let index_serves = index_column.is_some()
             && kept.len() > 1
             && all_terms.len() <= tier::MAX_TIER_TERMS
@@ -1912,7 +1935,7 @@ impl SupertableReader {
         // candidate sets admit every row of every kept superfile gates
         // nothing, so it is dropped here and the fast path stays open.
         let per_row_scope: Option<Arc<HashMap<SuperfileUri, Arc<RoaringBitmap>>>> = scope
-            .filter(|s| s.bounds_rows(&kept))
+            .filter(|s| check.is_some() || s.bounds_rows(&kept))
             .and_then(|s| s.allow.clone())
             .map(Arc::new);
         // An exact count walks each superfile whole: the ranged union
@@ -2067,6 +2090,7 @@ impl SupertableReader {
             let op_stats = op_stats.clone();
             let row_counts = Arc::clone(&row_counts);
             let total = Arc::clone(&total);
+            let check = check.clone();
             // This superfile's admitted rows under a bounded scope. `kept`
             // holds only superfiles the scope admits, so the lookup
             // succeeds; an absent entry would mean no row and is treated
@@ -2278,7 +2302,9 @@ impl SupertableReader {
                     // A strict unit takes it too: the walk keeps the larger
                     // of its strict snapshot and the live floor, whose ties
                     // came from `_id`s this unit was never compared against.
-                    let live_floor = if exact_count {
+                    // A checked unit's heap holds rows not yet checked, so it
+                    // publishes nothing mid-walk.
+                    let live_floor = if exact_count || check.is_some() {
                         None
                     } else {
                         match &tomb {
@@ -2320,11 +2346,11 @@ impl SupertableReader {
                     };
                     (live_floor, allow)
                 };
-                let hits = match range {
+                let hits = match (range, check.as_deref()) {
                     // Ranged units exist only for pure multi-should
                     // queries (`fanout_for` never slices when a must
                     // or negated clause exists).
-                    Some((start, end)) => {
+                    (Some((start, end)), _) => {
                         let cell = cell_for(&cursor_sets, suid);
                         // The global idf is one map for the whole query, so
                         // every slice of a superfile wants cursors built
@@ -2397,7 +2423,111 @@ impl SupertableReader {
                         };
                         r.hits_to_rows_async(hits).await?
                     }
-                    None => {
+                    (None, Some(check)) => {
+                        let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
+                        let should_refs: Vec<&str> =
+                            should_arc.iter().map(|s| s.as_str()).collect();
+                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                        let Some(mut admitted) = allow else {
+                            return Err(QueryError::Internal(
+                                "a checked search needs a scope that bounds rows".to_owned(),
+                            ));
+                        };
+                        // The unit's best `want` admitted rows, checked where
+                        // not checked before. Rows that fail leave the
+                        // admitted set, so the next round reaches deeper.
+                        let mut passing = RoaringBitmap::new();
+                        let mut want = k;
+                        loop {
+                            let prep = r
+                                .prepare_clauses(
+                                    &column_arc,
+                                    ClauseLists {
+                                        musts: &must_refs,
+                                        shoulds: &should_refs,
+                                        negatives: &neg_refs,
+                                        must_phrases: &must_ph_arc,
+                                        should_phrases: &should_ph_arc,
+                                        negative_phrases: &neg_ph_arc,
+                                        idf: QueryIdf::Table(&global_idf),
+                                        prefetched: memo.as_deref(),
+                                        live_floor: None,
+                                        allow: Some(Arc::clone(&admitted)),
+                                        exact_count: false,
+                                    },
+                                    want,
+                                    floor,
+                                    &scoring,
+                                )
+                                .instrument(trace::phase(phases, || detail_span!("fts.prepare")))
+                                .await?;
+                            if let Some(stats) = &op_stats {
+                                stats.add_fts_postings_bytes(prep.postings_bytes());
+                                stats.add_planned_read_ranges(prep.planned_ranges());
+                                stats.add_kernel_cpu_ns(prep.inline_kernel_cpu_ns());
+                            }
+                            let hits = match prep {
+                                prep @ PreparedClauses::Done { .. } => {
+                                    r.run_prepared_in_blob_ids(prep, &scoring)?
+                                }
+                                prep => {
+                                    let kernel_reader = Arc::clone(&r);
+                                    let kernel_stats = op_stats.clone();
+                                    let kernel_column = column_arc.clone();
+                                    let kernel_candidates = candidates.clone();
+                                    run_on_pool_unless_blocking(
+                                        Some(&reader_pool),
+                                        "checked fts kernel",
+                                        move || {
+                                            op_stats::timed_kernel(&kernel_stats, || {
+                                                kernel_reader.run_prepared_in_blob_ids(
+                                                    prep,
+                                                    &ScoringView {
+                                                        norms: kernel_candidates.as_ref().map(
+                                                            |norms| CandidateNorms {
+                                                                column: &kernel_column,
+                                                                norms,
+                                                            },
+                                                        ),
+                                                        ..table_scoring(
+                                                            &kernel_column,
+                                                            bm25_params,
+                                                            avgdl,
+                                                        )
+                                                    },
+                                                )
+                                            })
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|e| QueryError::Internal(e.to_string()))??
+                                }
+                            };
+                            let hits = r.hits_to_rows_async(hits).await?;
+                            let fresh: RoaringBitmap = hits
+                                .iter()
+                                .map(|(row, _)| row.get())
+                                .filter(|row| !passing.contains(*row))
+                                .collect();
+                            let kept = check.keep(&r, &fresh).await?;
+                            passing |= &kept;
+                            // Fewer than `want` means every admitted row that
+                            // can reach the floor was scored.
+                            let exhausted = hits.len() < want;
+                            let found: Vec<(RowId, f32)> = hits
+                                .into_iter()
+                                .filter(|(row, _)| passing.contains(row.get()))
+                                .collect();
+                            if found.len() >= k || exhausted {
+                                break found;
+                            }
+                            let mut rest = admitted.as_ref().clone();
+                            rest -= &fresh - &kept;
+                            admitted = Arc::new(rest);
+                            want = want.saturating_mul(CHECKED_UNIT_GROWTH);
+                        }
+                    }
+                    (None, None) => {
                         let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
                         let should_refs: Vec<&str> =
                             should_arc.iter().map(|s| s.as_str()).collect();
@@ -3122,7 +3252,7 @@ impl SupertableReader {
         // Prefix search takes no search options, so columns score with the
         // parameters they declared.
         let (hits, _) = self
-            .bm25_search_clauses(column, clauses, kept, k, None, 0.0, None, false)
+            .bm25_search_clauses(column, clauses, kept, k, None, 0.0, None, None, false)
             .await?;
         Ok(hits)
     }
@@ -4486,7 +4616,7 @@ impl SupertableReader {
                 .await?;
             return Ok((Vec::new(), count));
         }
-        self.bm25_scored_async(column, query, k, opts, None, true)
+        self.bm25_scored_async(column, query, k, opts, None, None, true)
             .await
     }
 
@@ -4590,6 +4720,10 @@ const SUBRANGE_MIN_DOCS: u32 = 50_000;
 /// superfile's Parquet rows. FTS hits *are* rows by the time they leave
 /// the reader, so the type comes off here, at the one place they enter
 /// that shape.
+/// How many times a checked unit grows the rows it scores after a round in
+/// which fewer than `k` of them passed the check.
+const CHECKED_UNIT_GROWTH: usize = 4;
+
 fn rows_as_local_ids(hits: Vec<(RowId, f32)>) -> Vec<(u32, f32)> {
     hits.into_iter().map(|(row, s)| (row.get(), s)).collect()
 }

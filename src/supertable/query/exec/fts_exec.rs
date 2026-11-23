@@ -40,11 +40,12 @@
 //! until `k` survive or the fill's ceiling is reached
 //! ([`fill_ceiling`]). Stopped short at a ceiling below the table's
 //! size, the rows the predicate keeps may rank below everything it looked
-//! at: the function then checks the predicate on the rows the query's
-//! terms match ([`SupertableReader::match_scope`], [`exact_scope`]) and
-//! ranks once more within exactly the ones it keeps, so the answer is the
-//! top `k` among matching rows however deep they rank, at the cost of a
-//! decode over the query's matches rather than the table. A predicate that
+//! at: the function then ranks once more within the rows the query's
+//! terms match ([`SupertableReader::match_scope`]), checking the predicate
+//! on each superfile's best-scoring rows as the search reaches them
+//! ([`SupertableReader::bm25_search_checked_async`]), so the answer is the
+//! top `k` among matching rows however deep they rank, and the predicate
+//! is decoded only for rows that could place. A predicate that
 //! cannot be evaluated before ranking (one on `score`) keeps what the
 //! widening found. `bm25_search_prefix` takes the widening alone.
 
@@ -77,8 +78,8 @@ use crate::{
             SuperfileHit,
             candidate::CandidateScope,
             exec::common::{
-                Arity, PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
-                exact_scope, fill_ceiling, fill_top_k_within, live_reader,
+                Arity, PushedPredicate, RowCheck, arg_to_string, arg_to_usize,
+                candidate_plan_for_filters, fill_ceiling, fill_top_k_within, live_reader,
                 output_schema_with_score, scope_to_call, top_k_statistics, traced_tvf,
                 widening_ended_short,
             },
@@ -464,14 +465,15 @@ impl ExecutionPlan for Bm25Exec {
                 return Ok(widened);
             }
             // Short at the ceiling: rows the predicate keeps may rank below
-            // every hit the widening looked at. Check the predicate on the
-            // rows the query's terms match, and rank once within exactly the
-            // ones it keeps.
+            // every hit the widening looked at. Rank once within the rows the
+            // query's terms match, checking the predicate on each superfile's
+            // best rows as the search reaches them.
+            let Some(check) = RowCheck::new(&reader, predicate, &output_schema)? else {
+                return Ok(widened);
+            };
             let matched = reader.match_scope(&column, text, *mode, scope).await?;
-            match exact_scope(&reader, &matched, predicate, &output_schema).await? {
-                Some(exact) => call.rows(Some(&exact), Some(k)).await,
-                None => Ok(widened),
-            }
+            call.checked_rows(&matched, Arc::new(check), text, *mode)
+                .await
         };
 
         let span = match &self.query {
@@ -538,6 +540,37 @@ impl RankedCall<'_> {
                     .await
             }
         }
+    }
+
+    /// The call's `k` rows within `scope` whose hits pass `check`: one round,
+    /// since every hit the search returns has passed it.
+    async fn checked_rows(
+        &self,
+        scope: &CandidateScope,
+        check: Arc<RowCheck>,
+        text: &str,
+        mode: BoolMode,
+    ) -> DfResult<RecordBatch> {
+        fill_top_k_within(
+            self.reader,
+            self.k,
+            self.predicate,
+            self.scalar_schema,
+            self.output_schema,
+            self.projection,
+            self.k,
+            |want: usize| {
+                self.reader.bm25_search_checked_async(
+                    self.column,
+                    text,
+                    want,
+                    Bm25SearchOptions::new().with_mode(mode),
+                    scope,
+                    Arc::clone(&check),
+                )
+            },
+        )
+        .await
     }
 
     /// The call's `k` rows within `scope` under the predicate, widening to
