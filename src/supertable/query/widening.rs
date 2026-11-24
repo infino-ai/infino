@@ -11,21 +11,19 @@
 //! sizes each round from the pass rate the last one saw, for the full-text
 //! and vector `WHERE` fills and the vector search's refill past deletes.
 
-/// Multiply a search's `k` by this each time the exact predicate leaves
-/// fewer than `k` rows standing (see [`fill_top_k`]). Doubling bounds the
-/// total work at about twice the final round's, whatever the predicate's
-/// selectivity turns out to be.
-///
-/// [`fill_top_k`]: crate::supertable::query::exec::common::fill_top_k
+/// The least a widening round grows by: [`next_want`] never asks for fewer
+/// than this many times the last round's hits. Growing by at least this much
+/// bounds the total work at about twice the final round's.
 pub(crate) const OVER_FETCH_GROWTH: usize = 2;
 
-/// How many times a fill grows `want` after a round in which no row passed
-/// the predicate: with no pass rate to size the next round by, it looks
-/// much deeper than [`OVER_FETCH_GROWTH`] would.
+/// How many times a round grows `want` after a round in which no hit
+/// survived: with no pass rate to size the next round by, it looks much
+/// deeper than [`OVER_FETCH_GROWTH`] would.
 pub(crate) const OVER_FETCH_GROWTH_NONE_PASSED: usize = 16;
 
-/// The `want` of a fill's next round after `want` hits left `kept` rows
-/// standing: enough hits to find `k` at the pass rate seen, twice over,
+/// The hits the next round asks for, after a round that asked for `want`
+/// kept `kept` of them (passing the `WHERE`, or live past the deletes):
+/// enough hits to find `k` at the pass rate seen, twice over,
 /// never less than [`OVER_FETCH_GROWTH`] times `want` and never past
 /// `ceiling`. Past the depth an index can answer from, a round costs about
 /// the same whatever its `want`, so a round sized to the pass rate saves the
