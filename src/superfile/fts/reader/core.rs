@@ -869,6 +869,12 @@ impl FtsReader {
         self.source.held_buffers(out);
     }
 
+    /// Push the lookup tables this reader's source keeps (see
+    /// [`LazyByteSource::held_tables`]).
+    pub(crate) fn held_tables(&self, out: &mut Vec<(usize, usize)>) {
+        self.source.held_tables(out);
+    }
+
     /// Heap bytes reads have loaded into this reader since it opened: the
     /// doc-id map, each column's norms and long terms' block tables.
     pub(crate) fn held_bytes(&self) -> usize {
