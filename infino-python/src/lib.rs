@@ -1009,12 +1009,13 @@ impl Table {
     /// Whether the write that carried `token` committed, as the table holds
     /// it now. Returns a dict whose `"status"` is `"committed"` (with
     /// `manifest_id`, `committed_ms`, and for a `(scope, seq)` token `seq`,
-    /// the scope's latest committed number), `"absent"` (the table never
-    /// held it, or held it before `since_ms`), or `"expired"` (retention
-    /// may have dropped it after `since_ms`, so whether it committed is
-    /// unknown). Pass as `since_ms` a time, in milliseconds since the Unix
-    /// epoch, before the write was first tried.
-    #[pyo3(signature = (token, since_ms=0))]
+    /// the scope's latest committed number, at or past the one asked
+    /// about), `"absent"` (the table never held it, held it before
+    /// `since_ms`, or holds the scope at an earlier number), or `"expired"`
+    /// (retention may have dropped it after `since_ms`, so whether it
+    /// committed is unknown). `since_ms` is required: pass a time, in
+    /// milliseconds since the Unix epoch, before the write was first tried.
+    #[pyo3(signature = (token, since_ms))]
     fn idempotency_token_status<'py>(
         &self,
         py: Python<'py>,

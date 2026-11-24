@@ -142,9 +142,6 @@ pub infino::IdempotencyToken::Key(&'a str)
 pub infino::IdempotencyToken::Sequence
 pub infino::IdempotencyToken::Sequence::scope: &'a str
 pub infino::IdempotencyToken::Sequence::seq: u64
-impl<'a> infino::IdempotencyToken<'a>
-pub fn infino::IdempotencyToken<'a>::from_header_value(&'a str) -> core::option::Option<Self>
-pub fn infino::IdempotencyToken<'a>::to_header_value(&self) -> core::option::Option<alloc::string::String>
 impl<'a> core::clone::Clone for infino::IdempotencyToken<'a>
 pub fn infino::IdempotencyToken<'a>::clone(&self) -> Self
 impl<'a> core::cmp::Eq for infino::IdempotencyToken<'a>

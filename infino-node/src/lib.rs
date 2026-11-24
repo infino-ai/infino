@@ -601,7 +601,6 @@ pub struct FieldClause {
     pub fields: Vec<String>,
 }
 
-/// Row counts from an `update` / `delete`.
 /// An idempotency token: `key` alone, or `scope` with `seq` for the
 /// `seq`th commit of the writer `scope`.
 #[napi(object)]
@@ -645,15 +644,16 @@ fn token_of(input: &Option<IdempotencyTokenInput>) -> Result<Option<IdempotencyT
 /// Whether the write that carried a token committed.
 #[napi(object)]
 pub struct IdempotencyTokenStatus {
-    /// `"committed"`, `"absent"` (never held, or held before `sinceMs`), or
-    /// `"expired"` (retention may have dropped it after `sinceMs`, so whether
-    /// it committed is unknown).
+    /// `"committed"`, `"absent"` (never held, held before `sinceMs`, or the
+    /// scope is held at an earlier number), or `"expired"` (retention may
+    /// have dropped it after `sinceMs`, so whether it committed is unknown).
     pub status: String,
     /// The manifest the token was recorded in, when committed.
     pub manifest_id: Option<i64>,
     /// When it committed, in milliseconds since the Unix epoch.
     pub committed_ms: Option<i64>,
-    /// For a sequence token, the scope's latest committed number.
+    /// For a sequence token, the scope's latest committed number, at or
+    /// past the one asked about.
     pub seq: Option<i64>,
 }
 
@@ -698,6 +698,7 @@ impl IdempotencyTokenStatus {
     }
 }
 
+/// Row counts from an `update` / `delete`.
 #[napi(object)]
 pub struct MutationStats {
     /// Rows the predicate matched.
@@ -1317,14 +1318,14 @@ impl Table {
 
     /// Whether the write that carried `token` committed, as the table holds
     /// it now. `since_ms` is a time, in milliseconds since the Unix epoch,
-    /// before the write was first tried; omit for 0.
+    /// before the write was first tried.
     #[napi]
     pub fn idempotency_token_status(
         &self,
         token: IdempotencyTokenInput,
-        since_ms: Option<i64>,
+        since_ms: i64,
     ) -> Result<IdempotencyTokenStatus> {
-        let since_ms = u64::try_from(since_ms.unwrap_or(0))
+        let since_ms = u64::try_from(since_ms)
             .map_err(|_| Error::new(Status::InvalidArg, "sinceMs must not be negative"))?;
         self.inner
             .idempotency_token_status(token.as_token()?, since_ms)

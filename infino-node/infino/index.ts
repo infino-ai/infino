@@ -167,16 +167,20 @@ export type IdempotencyTokenStatus =
       manifestId: number;
       /** When it committed, in milliseconds since the Unix epoch. */
       committedMs: number;
-      /** For a `{ scope, seq }` token, the scope's latest committed number. */
+      /** For a `{ scope, seq }` token, the scope's latest committed number, at or past the one asked about. */
       seq?: number;
     }
-  /** The table never held the token, or held it before `sinceMs`. */
+  /** The table never held the token, held it before `sinceMs`, or holds the scope at an earlier number. */
   | { status: "absent" }
   /** Retention may have dropped it after `sinceMs`: whether it committed is unknown. */
   | { status: "expired" };
 
 function nativeToken(token: IdempotencyToken): { key?: string; scope?: string; seq?: number } {
-  return typeof token === "string" ? { key: token } : { scope: token.scope, seq: token.seq };
+  if (typeof token === "string") return { key: token };
+  if (!Number.isSafeInteger(token.seq) || token.seq < 0) {
+    throw new RangeError(`idempotencyToken: seq must be a non-negative integer up to 2^53 - 1, got ${token.seq}`);
+  }
+  return { scope: token.scope, seq: token.seq };
 }
 
 /** Row counts returned by `update` / `delete`. */
@@ -644,9 +648,9 @@ export class Table {
   /**
    * Whether the write that carried `token` committed, as the table holds it
    * now. Pass as `sinceMs` a time, in milliseconds since the Unix epoch,
-   * before the write was first tried (default 0).
+   * before the write was first tried.
    */
-  idempotencyTokenStatus(token: IdempotencyToken, sinceMs = 0): IdempotencyTokenStatus {
+  idempotencyTokenStatus(token: IdempotencyToken, sinceMs: number): IdempotencyTokenStatus {
     const out = guard(this.remote, () => this.inner.idempotencyTokenStatus(nativeToken(token), sinceMs));
     switch (out.status) {
       case "committed":

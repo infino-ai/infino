@@ -109,6 +109,17 @@ pub const FORMAT_VERSION: &str = "4.0";
 /// major makes it do. A list stays at major 4 while it holds none, so a
 /// table whose writers never pass a token stays readable by engines without
 /// them; one whose tokens have all expired returns to major 4.
+///
+/// Every reader and writer of a table must run an engine that knows this
+/// major before any caller passes a token to it: an older engine refuses
+/// the table from the first token until a commit after the last one
+/// expires, by default seven days later. The next incompatible change to
+/// the list takes major 6.
+///
+/// The expiry watermark ([`Idempotency::expired_through_ms`]) outlives the
+/// tokens and rides a major 4 list, where a major 4 engine's commit drops
+/// it. It is best effort on a fleet that mixes versions: once dropped, a
+/// status call reports a token that expired as absent rather than expired.
 pub const FORMAT_VERSION_TOKENS: &str = "5.0";
 
 /// The major before rollups objects: every part's rollups inline in the
@@ -3081,6 +3092,7 @@ mod tests {
         slice::from_ref,
         str::from_utf8,
         sync::Arc,
+        time::Duration,
     };
 
     use arrow_array::{
@@ -3102,7 +3114,10 @@ mod tests {
         *,
     };
     use crate::{
-        supertable::schema::{FieldId, LegacyNames, TableSchema, with_field_id},
+        supertable::{
+            idempotency::{IdempotencyToken, MAX_KEY_ENTRIES},
+            schema::{FieldId, LegacyNames, TableSchema, with_field_id},
+        },
         test_helpers::fid,
     };
 
@@ -5571,15 +5586,18 @@ mod tests {
     }
 
     fn with_tokens(mut list: Manifest) -> Manifest {
+        let week = Duration::from_secs(7 * 24 * 60 * 60);
         list.idempotency.record(
-            crate::supertable::idempotency::IdempotencyToken::Key("k"),
+            &IdempotencyToken::Key("k").to_owned_token(4),
             3,
             1_000,
+            week,
         );
         list.idempotency.record(
-            crate::supertable::idempotency::IdempotencyToken::Sequence { scope: "w", seq: 7 },
+            &IdempotencyToken::Sequence { scope: "w", seq: 7 }.to_owned_token(4),
             3,
             1_000,
+            week,
         );
         list
     }
@@ -5619,12 +5637,8 @@ mod tests {
     #[test]
     fn an_emptied_token_map_returns_the_list_to_the_current_major() {
         let mut list = with_tokens(empty_list());
-        list.idempotency.expire(
-            1_000 + 8 * 24 * 60 * 60 * 1000,
-            std::time::Duration::from_secs(7 * 24 * 60 * 60),
-            crate::supertable::idempotency::MAX_KEY_ENTRIES,
-            4,
-        );
+        list.idempotency
+            .expire(1_000 + 8 * 24 * 60 * 60 * 1000, MAX_KEY_ENTRIES, 4);
         assert!(!list.idempotency.holds_tokens());
         let decoded =
             decode(&encode(&list).expect("encode"), &LegacyNames::none()).expect("decode");

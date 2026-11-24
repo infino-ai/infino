@@ -183,7 +183,7 @@ class Table:
     # `{"status": "committed", "manifest_id", "committed_ms", "seq"}`,
     # `{"status": "absent"}`, or `{"status": "expired"}`.
     def idempotency_token_status(
-        self, token: IdempotencyToken, since_ms: int = 0
+        self, token: IdempotencyToken, since_ms: int
     ) -> dict[str, Any]: ...
     # `k1` / `b` override the columns' declared parameters for this search
     # only; pass both or neither. Results stay exact — only pruning power is

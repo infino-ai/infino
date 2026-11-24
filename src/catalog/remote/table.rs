@@ -211,18 +211,15 @@ fn reject_remote_overrides(opts: &VectorSearchOptions) -> Result<(), InfinoError
     Ok(())
 }
 
-/// The request header a hosted append carries its idempotency token in.
-pub(crate) const IDEMPOTENCY_TOKEN_HEADER: &str = "Idempotency-Token";
-
-/// `token` as an [`IDEMPOTENCY_TOKEN_HEADER`] value, or refused when it
-/// cannot travel as one.
-fn token_header(token: IdempotencyToken<'_>) -> Result<String, InfinoError> {
-    token.to_header_value().ok_or_else(|| {
-        InfinoError::Unsupported(format!(
-            "idempotency token {token:?} cannot travel to a hosted table: it must be non-empty \
-             visible ASCII, with no leading or trailing space"
-        ))
-    })
+/// Idempotency tokens are recorded by the engine that commits, and the
+/// hosted append and its status call carry none yet: a token is refused
+/// rather than dropped, since a retry that looked protected would apply the
+/// rows twice.
+fn refuse_token(op: &str) -> InfinoError {
+    InfinoError::Unsupported(format!(
+        "{op} with an idempotency token is not available on a hosted table yet; append without \
+         one"
+    ))
 }
 
 /// Parse an update/delete response (`{matched, n_tombstoned, n_not_found}`)
@@ -248,44 +245,26 @@ impl Table for RemoteTable {
         self.schema.clone()
     }
 
-    /// A token travels as the `Idempotency-Token` header, so a hosted
-    /// table records it with the rows as a local table does.
     fn append(
         &self,
         batch: &RecordBatch,
         idempotency_token: Option<IdempotencyToken<'_>>,
     ) -> Result<(), InfinoError> {
-        let header = idempotency_token.map(token_header).transpose()?;
-        let headers: Vec<(&str, &str)> = header
-            .iter()
-            .map(|value| (IDEMPOTENCY_TOKEN_HEADER, value.as_str()))
-            .collect();
+        if idempotency_token.is_some() {
+            return Err(refuse_token("append"));
+        }
         let body = wire::batches_to_ipc(std::slice::from_ref(batch))?;
-        self.catalog.post_arrow_with_headers(
-            "append",
-            &[("table", self.table_name.as_str())],
-            &headers,
-            body,
-        )?;
+        self.catalog
+            .post_arrow("append", &[("table", self.table_name.as_str())], body)?;
         Ok(())
     }
 
     fn idempotency_token_status(
         &self,
-        token: IdempotencyToken<'_>,
-        since_ms: u64,
+        _token: IdempotencyToken<'_>,
+        _since_ms: u64,
     ) -> Result<TokenStatus, InfinoError> {
-        let op = "idempotency_token_status";
-        let token = match token {
-            IdempotencyToken::Key(key) => json!({ "key": key }),
-            IdempotencyToken::Sequence { scope, seq } => json!({ "scope": scope, "seq": seq }),
-        };
-        let response = self.catalog.post_json(
-            op,
-            json!({ "table_name": self.table_name, "token": token, "since_ms": since_ms }),
-        )?;
-        serde_json::from_value(read_json(op, response)?)
-            .map_err(|e| InfinoError::Backend(format!("{op} response: {e}")))
+        Err(refuse_token("idempotency_token_status"))
     }
 
     /// Staging writes superfiles to the table's storage, which the hosted

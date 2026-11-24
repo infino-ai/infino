@@ -60,6 +60,7 @@ use std::{
     ops::Deref,
     sync::{Arc, OnceLock},
     thread::available_parallelism,
+    time::Duration,
 };
 
 use arrow::compute::kernels::aggregate as agg;
@@ -113,7 +114,7 @@ use crate::{
     supertable::{
         CommitError,
         error::ManifestError,
-        idempotency::{self, IdempotencyToken, TokenStatus},
+        idempotency::{self, IdempotencyToken, OwnedToken, TokenStatus},
         manifest::{
             commit::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
@@ -1987,11 +1988,16 @@ impl ManifestSnapshot {
         }
     }
 
-    /// Whether this snapshot's list records `token` as committed.
-    pub(crate) fn holds_idempotency_token(&self, token: IdempotencyToken<'_>) -> bool {
-        self.list
-            .as_ref()
-            .is_some_and(|list| list.idempotency.committed(token))
+    /// Whether this snapshot's list records `token`'s write as committed;
+    /// see [`idempotency::Idempotency::committed`].
+    pub(crate) fn holds_idempotency_token(
+        &self,
+        token: &OwnedToken,
+    ) -> Result<bool, idempotency::TokenReused> {
+        match &self.list {
+            Some(list) => list.idempotency.committed(token),
+            None => Ok(false),
+        }
     }
 
     /// What this snapshot's list records about `token`; see
@@ -2008,17 +2014,19 @@ impl ManifestSnapshot {
     }
 
     /// This snapshot with `token` recorded as committed by `manifest_id`,
-    /// id unchanged, for the commit that publishes it. `None` for a
-    /// snapshot with no list, which has nowhere to record it.
+    /// id unchanged, for the commit that publishes it, and `ttl` as the
+    /// table's token retention. `None` for a snapshot with no list, which
+    /// has nowhere to record it.
     pub(crate) fn with_idempotency_token_recorded(
         &self,
-        token: IdempotencyToken<'_>,
+        token: &OwnedToken,
         manifest_id: u64,
         now_ms: u64,
+        ttl: Duration,
     ) -> Option<Self> {
         self.list.as_ref()?;
         Some(self.with_list_edited(false, |list| {
-            list.idempotency.record(token, manifest_id, now_ms);
+            list.idempotency.record(token, manifest_id, now_ms, ttl);
         }))
     }
 
@@ -3128,7 +3136,6 @@ impl ManifestSnapshot {
         if !idempotency.is_empty() {
             idempotency.expire(
                 idempotency::now_ms(),
-                opts.idempotency_token_ttl,
                 idempotency::MAX_KEY_ENTRIES,
                 self.get_next_manifest_id(),
             );
@@ -6401,10 +6408,13 @@ impl ClusterCentroids {
 ///   absent for a create): the write did not land, and `error` stands.
 /// - The pointer moved to another commit: this one lost the slot, or
 ///   landed and was built on since. For a `tokened` commit, one whose list
-///   records an idempotency token, that is reported as contention: the
-///   commit loop refreshes and the token in the list it reads settles
-///   which. For any other commit `error` stands, since a retry could not
-///   tell that it landed and might apply it twice.
+///   records an idempotency token, whose write failed with no answer (a
+///   timeout, a 5xx, a dropped connection, once retries ran out), that is
+///   reported as contention: the commit loop refreshes and the token in the
+///   list it reads settles which. A refusal, such as rejected credentials,
+///   cannot have landed and stands as itself, so the caller sees what to
+///   fix. For any other commit `error` stands, since a retry could not tell
+///   that it landed and might apply it twice.
 /// - The read-back fails too: nothing is known, and `error` stands.
 async fn settle_pointer_write(
     storage: &dyn StorageProvider,
@@ -6440,7 +6450,12 @@ async fn settle_pointer_write(
         {
             Err(error)
         }
-        _ if tokened => {
+        _ if tokened
+            && matches!(
+                error,
+                CommitError::Storage(StorageError::TransientExhausted { .. })
+            ) =>
+        {
             record("lost", "pointer");
             Err(CommitError::WriteContentionExhausted)
         }
@@ -9083,9 +9098,10 @@ mod tests {
     async fn a_failed_pointer_write_finding_the_pointer_moved_retries_only_a_tokened_commit() {
         // The pointer names another commit's list and its etag is not the
         // one this commit expected: it lost the slot, or landed and was
-        // built on. A tokened commit's retry tells which from the token, so
-        // it is contention; any other commit keeps its error, since a retry
-        // could apply it twice.
+        // built on. A tokened commit whose write got no answer tells which
+        // from the token on retry, so it is contention; a refusal, which
+        // cannot have landed, keeps its error, as does any other commit,
+        // since a retry could apply it twice.
         let (_dir, storage) = local_storage();
         let pointer = |manifest_id: u64| PointerFile {
             manifest_id,
@@ -9095,30 +9111,53 @@ mod tests {
         write_pointer(storage.as_ref(), &pointer(3), None)
             .await
             .expect("another commit's pointer");
-        let failure = || {
-            CommitError::Storage(StorageError::NotFound {
-                uri: "the pointer write's own error".into(),
+        let no_answer = || {
+            CommitError::Storage(StorageError::TransientExhausted {
+                uri: "the pointer write's own timeout".into(),
+                source: "timed out".into(),
             })
         };
-        let tokened =
-            settle_pointer_write(storage.as_ref(), &pointer(2), Some("seen"), true, failure())
-                .await;
+        let refused = || {
+            CommitError::Storage(StorageError::PermissionDenied {
+                uri: "the pointer write's own refusal".into(),
+            })
+        };
+        let tokened = settle_pointer_write(
+            storage.as_ref(),
+            &pointer(2),
+            Some("seen"),
+            true,
+            no_answer(),
+        )
+        .await;
         assert!(
             matches!(tokened, Err(CommitError::WriteContentionExhausted)),
             "{tokened:?}"
+        );
+        let tokened_refused =
+            settle_pointer_write(storage.as_ref(), &pointer(2), Some("seen"), true, refused())
+                .await;
+        assert!(
+            matches!(
+                tokened_refused,
+                Err(CommitError::Storage(StorageError::PermissionDenied { .. }))
+            ),
+            "a refusal reaches the caller as itself: {tokened_refused:?}"
         );
         let plain = settle_pointer_write(
             storage.as_ref(),
             &pointer(2),
             Some("seen"),
             false,
-            failure(),
+            no_answer(),
         )
         .await;
         assert!(
             matches!(
                 plain,
-                Err(CommitError::Storage(StorageError::NotFound { .. }))
+                Err(CommitError::Storage(
+                    StorageError::TransientExhausted { .. }
+                ))
             ),
             "{plain:?}"
         );
@@ -9127,7 +9166,7 @@ mod tests {
             &pointer(3),
             Some("seen"),
             false,
-            failure(),
+            no_answer(),
         )
         .await;
         assert!(

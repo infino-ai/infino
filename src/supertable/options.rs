@@ -743,6 +743,11 @@ pub struct SupertableOptions {
     /// list is written, and asking about the token answers
     /// [`TokenStatus::Expired`](crate::supertable::idempotency::TokenStatus::Expired);
     /// a retry carrying it would commit again. Zero keeps tokens forever.
+    ///
+    /// A commit that records a token writes this value into the manifest
+    /// list, and every handle expires tokens by the value the list holds, so
+    /// the latest recording commit's setting governs the whole table. A
+    /// handle that never passes a token does not change it.
     /// Default seven days; set via [`Self::with_idempotency_token_ttl`].
     pub idempotency_token_ttl: Duration,
     /// How many sealed-sidecar retries a mutation may spend without forward
@@ -1350,7 +1355,8 @@ impl SupertableOptions {
         self
     }
 
-    /// Override how long idempotency tokens are remembered. See
+    /// Override how long idempotency tokens are remembered once this handle
+    /// records one; the table keeps the latest recording commit's value. See
     /// [`Self::idempotency_token_ttl`]. Default seven days; zero keeps them
     /// forever.
     pub fn with_idempotency_token_ttl(mut self, ttl: Duration) -> Self {

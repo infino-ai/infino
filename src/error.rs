@@ -604,6 +604,8 @@ impl From<SupertableBuildError> for InfinoError {
             SupertableBuildError::Schema(SchemaError::TableExists { .. }) => {
                 InfinoError::AlreadyExists(message)
             }
+            // A held idempotency token reused by another write.
+            SupertableBuildError::IdempotencyTokenReused(_) => InfinoError::AlreadyExists(message),
             // The cause is already classified; hand it to the caller whole
             // rather than flattening it into its own message.
             SupertableBuildError::Schema(schema) => InfinoError::Schema(schema),
@@ -737,6 +739,15 @@ impl From<MutationCommitError> for InfinoError {
         // through a synchronous append.
         if let MutationCommitError::AppendFlush(SupertableBuildError::Schema(schema)) = &e {
             return InfinoError::from(SupertableBuildError::Schema(schema.clone()));
+        }
+        // A token reused with other rows, found held only once the commit
+        // read a list newer than the handle's, is refused as it is when the
+        // handle already held the list.
+        if let MutationCommitError::AppendFlush(
+            reused @ SupertableBuildError::IdempotencyTokenReused(_),
+        ) = e
+        {
+            return InfinoError::from(reused);
         }
         InfinoError::Backend(e.to_string())
     }

@@ -394,16 +394,28 @@ impl Supertable {
     /// nothing and returns `Ok`: a caller that retries after an error, or
     /// resumes after a crash, with the same token applies the rows once.
     /// [`Self::idempotency_token_status`] tells a resuming caller whether
-    /// a token committed. A table keeps a token for its retention (seven
-    /// days unless the table sets another), and at most the newest 10,000
-    /// key tokens; a batch with no rows records none.
+    /// a token committed. A batch with no rows records none.
+    ///
+    /// A token names one exact write. A call reusing a held token with a
+    /// different number of rows is refused with
+    /// [`InfinoError::AlreadyExists`] and commits nothing.
+    ///
+    /// A table keeps a token for its retention: the token retention of the
+    /// latest commit that recorded one, seven days by default. It also
+    /// keeps at most the newest 10,000 key tokens, so under heavy keyed
+    /// traffic the cap, not the retention, bounds how long a key is kept: at
+    /// 100 keyed appends a second a key lasts about 100 seconds. A writer
+    /// that commits often should use a sequence token, which keeps one entry
+    /// per writer.
     ///
     /// Readers of a table that has recorded a token must be at least this
     /// engine version: the manifest list carrying tokens is written at a
-    /// format version an older reader refuses. With `None` the table is
+    /// format version an older reader refuses, until every token has expired
+    /// and a later commit has rewritten the list. With `None` the table is
     /// written exactly as without tokens.
     ///
-    /// Refused with a token for a table with no storage (`memory://`).
+    /// Refused with a token, as [`InfinoError::Unsupported`], for a hosted
+    /// table and for a table with no storage (`memory://`).
     pub fn append(
         &self,
         batch: &RecordBatch,
@@ -415,12 +427,15 @@ impl Supertable {
     /// Whether the write carrying `token` committed, as the table records
     /// it now.
     ///
-    /// [`TokenStatus::Committed`] means it did. [`TokenStatus::Absent`] means
-    /// the table never recorded it or recorded it before `since_ms`
-    /// (milliseconds since the Unix epoch). [`TokenStatus::Expired`] means
-    /// retention dropped tokens at least as recent as `since_ms`, so whether
-    /// it committed is unknown: pass the time the write was first attempted
-    /// as `since_ms`, so that an expired token is never read as absent.
+    /// [`TokenStatus::Committed`] means it did; for a sequence token, that
+    /// the scope's latest committed number is at or past the one asked
+    /// about. [`TokenStatus::Absent`] means the table holds no record of it
+    /// and has dropped no token as recent as `since_ms` (milliseconds since
+    /// the Unix epoch), or holds the scope at an earlier number.
+    /// [`TokenStatus::Expired`] means retention dropped tokens at least as
+    /// recent as `since_ms`, so whether it committed is unknown: pass the
+    /// time the write was first attempted as `since_ms`, so that an expired
+    /// token is never read as absent.
     pub fn idempotency_token_status(
         &self,
         token: IdempotencyToken<'_>,
