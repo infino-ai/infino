@@ -11213,8 +11213,13 @@ mod tests {
         use std::collections::HashSet;
         let (blob, json, all) = build_large_corpus(16, 4, 2600, RerankCodec::Fp32, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
-        // k * rerank_mult = 64 * 41 = 2624 >= 2600: nothing truncated.
-        let hits = r.search("v", &all[42], 64, 4, 41).await.expect("search");
+        // k * rerank_mult = 64 * 41 = 2624 >= 2600: nothing truncated. Probe
+        // every cluster: the build may split runs past the 4 planted phases.
+        let probe_all = all.len();
+        let hits = r
+            .search("v", &all[42], 64, probe_all, 41)
+            .await
+            .expect("search");
         assert_eq!(hits[0].0, 42, "recovers planted self");
         let l2sq =
             |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum() };

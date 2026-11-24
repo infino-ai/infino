@@ -45,8 +45,8 @@ use crate::{
             },
             ivf_merge::MergedIvfSubsection,
             kmeans::{
-                assign_to_centroids, assign_to_transposed_centroids, kmeans,
-                kmeans_with_assignments,
+                assign_to_centroids, assign_to_transposed_centroids, emeans,
+                emeans_with_assignments,
             },
             quant::BitQuantizer,
             rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
@@ -85,7 +85,7 @@ const VECTOR_DIM_MAX: usize = 4096;
 /// k-means streams.
 const RESERVOIR_SEED_XOR_MASK: u64 = 0x5a5a_5a5a_5a5a_5a5a;
 
-/// Lloyd k-means iteration count for pass-1 centroid training. Five
+/// e-means pass count for pass-1 centroid training. Five
 /// is the standard turn-key default; returns diminish past it on
 /// typical embedding distributions.
 const KMEANS_ITERS: usize = 5;
@@ -1268,16 +1268,16 @@ fn materialized_centroids(
     // row-derived byte-target uncapped; everything below keeps the
     // legacy row-count cap so the 1M/10M cold-GET layout stays on the
     // measured shape. Oversized fine-run splitting always runs — the
-    // cap alone does not stop Lloyd from parking 2×-skewed runs that
+    // cap alone does not stop k-means from parking 2×-skewed runs that
     // flatten fine-first p=1 recall below 0.99.
     let requested = effective_cell_n_cent(requested_n_cent, n_docs);
-    // Keep the final Lloyd assignments — `split_oversized_fine_runs`
+    // Keep the final assignments: `split_oversized_fine_runs`
     // consumes them for the first bound check so a balanced pack (the
     // common commit-cell case) does not pay a redundant full sample
-    // assign on top of the train. `kmeans` alone would drop them and
-    // force that duplicate pass (see `kmeans_with_assignments`).
+    // assign on top of the train. `emeans` alone would drop them and
+    // force that duplicate pass (see `emeans_with_assignments`).
     let (mut centroids, assignments) =
-        kmeans_with_assignments(sample, dim, requested, KMEANS_ITERS, cfg.rot_seed);
+        emeans_with_assignments(sample, dim, requested, KMEANS_ITERS, cfg.rot_seed);
     let n_cent = split_oversized_fine_runs(
         &mut centroids,
         sample,
@@ -1299,7 +1299,7 @@ fn materialized_centroids(
 /// `requested == 1`) can never exceed the bound and pass through untouched.
 ///
 /// When `initial_assignments` matches the current `centroids` (the final
-/// Lloyd labeling from [`kmeans_with_assignments`]), the first round
+/// labeling from [`emeans_with_assignments`]), the first round
 /// skips `assign_to_centroids` and only scans counts — balanced packs
 /// return without another distance pass. Pass `None` when the caller
 /// has no labeling (tests / synthetic centroid fixtures); the first
@@ -1322,7 +1322,7 @@ fn split_oversized_fine_runs(
     }
     let target = sample_n.div_ceil(requested.max(1)).max(1);
     let bound = target.saturating_mul(FINE_RUN_SPLIT_BOUND_FACTOR);
-    // Reuse the caller's Lloyd labeling on round 0 when it covers every
+    // Reuse the caller's labeling on round 0 when it covers every
     // sample row; any later round (or a missing/mismatched labeling)
     // re-assigns against the current centroids.
     let (mut assignments, mut need_assign) = match initial_assignments {
@@ -1358,7 +1358,7 @@ fn split_oversized_fine_runs(
             let sub_seed = seed
                 .wrapping_add(FINE_RUN_SPLIT_SEED_OFFSET)
                 .wrapping_add(((round as u64) << u32::BITS) | c as u64);
-            let sub = kmeans(&rows, dim, k, KMEANS_ITERS, sub_seed);
+            let sub = emeans(&rows, dim, k, KMEANS_ITERS, sub_seed);
             centroids[c * dim..(c + 1) * dim].copy_from_slice(&sub[..dim]);
             centroids.extend_from_slice(&sub[dim..]);
         }
@@ -2662,7 +2662,7 @@ fn build_subsection_streaming(
         let centroids = if sample_rows == 0 || n_docs == 0 {
             vec![0.0f32; n_cent * dim]
         } else {
-            kmeans(reservoir.sample(), dim, n_cent, KMEANS_ITERS, cfg.rot_seed)
+            emeans(reservoir.sample(), dim, n_cent, KMEANS_ITERS, cfg.rot_seed)
         };
         // Drop the reservoir immediately — k-means has converged
         // and the sample bytes aren't needed for pass 2.

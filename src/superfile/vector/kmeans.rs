@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! K-means clustering — 5-iteration Lloyd's algorithm.
+//! K-means clustering: 5-iteration Lloyd's algorithm, plus e-means for
+//! a superfile's fine centroids ([`emeans_with_assignments`]).
 //!
 //! Used to derive the `n_cent` IVF centroids per vector index at
 //! build time. Five iterations is the standard turn-key default —
@@ -26,6 +27,7 @@
 //! The seed is derived from this column's `rot_seed` (offset by 7) so
 //! the rotation and clustering use distinct PRNG streams.
 
+use emeans::{Emeans, Model};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 
@@ -78,17 +80,79 @@ pub fn kmeans_with_assignments(
     assert!(n > 0, "kmeans: at least one doc required");
     assert!(k <= n, "kmeans: k ({k}) > n_docs ({n})");
 
+    let centroids = random_init(vectors, dim, k, n, seed);
+    lloyd_refine(vectors, dim, k, iters, centroids)
+}
+
+/// Same random init as [`kmeans_with_assignments`], refined with `iters` e-means passes
+/// instead of Lloyd. Used for a superfile's fine centroids, where e-means gives more even
+/// clusters, so a query reads fewer rows for the same recall. The assignments are the
+/// last pass's labels, as with Lloyd.
+///
+/// # Panics
+///
+/// Same as [`kmeans_with_assignments`].
+pub fn emeans_with_assignments(
+    vectors: &[f32],
+    dim: usize,
+    k: usize,
+    iters: usize,
+    seed: u64,
+) -> (Vec<f32>, Vec<u32>) {
+    let model = train_emeans(vectors, dim, k, iters, seed, true);
+    let assignments = model
+        .labels()
+        .expect("emeans: labels captured")
+        .iter()
+        .map(|&l| u32::try_from(l).expect("emeans: the last pass labels every row"))
+        .collect();
+    (model.into_centroids(), assignments)
+}
+
+/// Centroids-only e-means (drops assignments), mirroring [`kmeans`].
+pub fn emeans(vectors: &[f32], dim: usize, k: usize, iters: usize, seed: u64) -> Vec<f32> {
+    train_emeans(vectors, dim, k, iters, seed, false).into_centroids()
+}
+
+fn train_emeans(
+    vectors: &[f32],
+    dim: usize,
+    k: usize,
+    iters: usize,
+    seed: u64,
+    capture_assignments: bool,
+) -> Model {
+    assert!(dim > 0, "emeans: dim must be > 0");
+    assert!(k > 0, "emeans: k must be > 0");
+    assert_eq!(
+        vectors.len() % dim,
+        0,
+        "emeans: vectors len {} not multiple of dim {dim}",
+        vectors.len()
+    );
+    let n = vectors.len() / dim;
+    assert!(n > 0, "emeans: at least one doc required");
+    assert!(k <= n, "emeans: k ({k}) > n_docs ({n})");
+
+    let init = random_init(vectors, dim, k, n, seed);
+    Emeans::new(dim, k)
+        .nepochs(iters.max(1) as f64)
+        .seed(seed)
+        .capture_assignments(capture_assignments)
+        .train_from(vectors, &init)
+        .expect("emeans: inputs validated above")
+}
+
+/// `k` rows drawn uniformly from `vectors`. Repeats are allowed; for small k vs n
+/// a duplicate is unlikely.
+fn random_init(vectors: &[f32], dim: usize, k: usize, n: usize, seed: u64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed.wrapping_add(KMEANS_SEED_OFFSET));
     let mut centroids = vec![0f32; k * dim];
-
-    // Init: random sample of input vectors. (Repetition is allowed; for
-    // small k vs n the chance of a duplicate is negligible.)
     for i in 0..k {
         let idx = rng.random_range(0..n);
         centroids[i * dim..(i + 1) * dim].copy_from_slice(&vectors[idx * dim..(idx + 1) * dim]);
     }
-
-    lloyd_refine(vectors, dim, k, iters, centroids)
+    centroids
 }
 
 /// k-means++ (D²-weighted) init followed by the same Lloyd refinement. Returns
@@ -383,6 +447,25 @@ mod tests {
         let c1 = kmeans(&vectors, 8, 4, 5, 12345);
         let c2 = kmeans(&vectors, 8, 4, 5, 12345);
         assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn emeans_same_result_at_any_thread_count() {
+        let (n, dim, k) = (20_000, 96, 64);
+        let vectors: Vec<f32> = (0..n * dim)
+            .map(|i| ((i * 7919) % 1000) as f32 / 1000.0)
+            .collect();
+        let run = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool")
+                .install(|| emeans_with_assignments(&vectors, dim, k, 5, 12345))
+        };
+        let one = run(1);
+        for threads in [3, 32] {
+            assert_eq!(one, run(threads), "threads {threads}");
+        }
     }
 
     #[test]
