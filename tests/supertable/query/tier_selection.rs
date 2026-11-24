@@ -10,20 +10,30 @@
 //! documents that carry both terms before any superfile is read.
 #![deny(clippy::unwrap_used)]
 
-use std::{iter::repeat_n, sync::Arc};
+use std::{fs, iter::repeat_n, ops::Range, path::Path, sync::Arc};
 
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Bm25SearchOptions, BoolMode,
+    Bm25SearchOptions, BoolMode, CompactionSettings, OptimizeOptions,
     runtime_metrics::op_stats::with_op_stats,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::builder::FtsConfig,
     supertable::{Supertable, SupertableOptions, query::SuperfileHit},
+    test_helpers::copy_dir_recursive,
 };
 use tempfile::TempDir;
 
 use super::tier_harness::*;
+
+/// Where a term index root's format version sits: after its magic.
+const VERSION_BYTES: Range<usize> = 8..12;
+
+/// The term index root format before slices recorded where their block index ends.
+const ROOT_WITHOUT_INDEX_ENDS: u32 = 6;
+
+/// The term index root format that records where each slice's block index ends.
+const ROOT_WITH_INDEX_ENDS: u32 = 7;
 
 #[test]
 fn tiers_change_which_superfiles_open_and_nothing_else() {
@@ -245,8 +255,7 @@ fn tied_short_text_stops_the_merge_early_and_answers_the_same() {
         drop(w);
         // One segment, so a term's tier is a few blocks rather than one per
         // commit, and the early stop has something to skip.
-        st.optimize(&infino::OptimizeOptions::default())
-            .expect("optimize");
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
         (dir, st)
     };
     let (_with_dir, with) = build(true);
@@ -385,13 +394,11 @@ fn a_heads_off_segment_merged_with_a_tiered_one_keeps_its_documents() {
     };
     let fold = |st: &Supertable| {
         // The index segments merge; the superfiles stay as committed.
-        st.optimize(&infino::OptimizeOptions::compact(
-            infino::CompactionSettings {
-                min_fill_percent: 100,
-                min_superfiles_for_merge: u64::MAX,
-                ..infino::CompactionSettings::default()
-            },
-        ))
+        st.optimize(&OptimizeOptions::compact(CompactionSettings {
+            min_fill_percent: 100,
+            min_superfiles_for_merge: u64::MAX,
+            ..CompactionSettings::default()
+        }))
         .expect("optimize");
     };
     let build = |tiers: bool| Build {
@@ -836,12 +843,11 @@ fn two_text_columns_keep_their_heads_apart() {
 /// tiers.
 #[test]
 fn a_table_indexed_by_the_layout_before_tiers_serves_as_before_and_rebuilds() {
-    use infino::test_helpers::copy_dir_recursive;
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/pre_tier_term_index_table");
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_tier_term_index_table");
     let work = TempDir::new().expect("tempdir");
     copy_dir_recursive(&fixture, work.path());
-    let open = |dir: &std::path::Path| -> Supertable {
+    let open = |dir: &Path| -> Supertable {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir).expect("provider"));
         let mut fts = FtsConfig::new("body");
@@ -923,13 +929,11 @@ fn a_table_indexed_by_the_layout_before_tiers_serves_as_before_and_rebuilds() {
         );
     }
     // The maintenance rebuild writes the current layout throughout.
-    st.optimize(&infino::OptimizeOptions::compact(
-        infino::CompactionSettings {
-            min_fill_percent: 100,
-            min_superfiles_for_merge: u64::MAX,
-            ..infino::CompactionSettings::default()
-        },
-    ))
+    st.optimize(&OptimizeOptions::compact(CompactionSettings {
+        min_fill_percent: 100,
+        min_superfiles_for_merge: u64::MAX,
+        ..CompactionSettings::default()
+    }))
     .expect("optimize");
     let mut served = false;
     for (q, mode) in &shapes {
@@ -939,6 +943,124 @@ fn a_table_indexed_by_the_layout_before_tiers_serves_as_before_and_rebuilds() {
         served |= stats.tier_entries > 0 || stats.superfiles_resolved > 0;
     }
     assert!(served, "after the rebuild the tiers serve");
+}
+
+/// The term index root the latest manifest in table `dir` names, as stored.
+fn current_term_index_root(dir: &Path) -> Vec<u8> {
+    let latest = fs::read_dir(dir.join("manifest"))
+        .expect("manifests")
+        .map(|entry| entry.expect("manifest entry").path())
+        .max()
+        .expect("a manifest");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(latest).expect("manifest")).expect("manifest json");
+    let uri = manifest["term_index_uri"].as_str().expect("a term index");
+    fs::read(dir.join(uri)).expect("root")
+}
+
+/// A table whose term index was written by the layout before checked slices (root at version 6,
+/// slices at version 3 with tiers and heads, the committed fixture): the current reader answers
+/// from it as a table without the index does, its tiers serving; then after a commit writes a root
+/// of the current layout naming the old slices beside a new layer; then after the maintenance pass.
+/// The fold over the old slices is pinned beside the fold itself.
+#[test]
+fn a_table_indexed_by_the_layout_before_checks_serves_beside_new_layers() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_checked_term_index_table");
+    let copy = || {
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&fixture, dir.path());
+        dir
+    };
+    let (indexed_dir, plain_dir) = (copy(), copy());
+    let old_slices: Vec<Vec<u8>> = fs::read_dir(fixture.join("term-index"))
+        .expect("fixture index")
+        .filter_map(|entry| {
+            let name = entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("name");
+            let hex = name
+                .strip_prefix("slice-")?
+                .strip_suffix(".bin")?
+                .to_owned();
+            Some(
+                (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+                    .collect(),
+            )
+        })
+        .collect();
+    assert!(!old_slices.is_empty());
+    let names_old_slices = |root: &[u8]| {
+        old_slices
+            .iter()
+            .all(|hash| root.windows(hash.len()).any(|w| w == hash.as_slice()))
+    };
+    let version =
+        |root: &[u8]| u32::from_le_bytes(root[VERSION_BYTES].try_into().expect("version"));
+    let indexed = Supertable::open(options_for(
+        &indexed_dir,
+        Build {
+            tiers: true,
+            ..Build::default()
+        },
+    ))
+    .expect("open the fixture");
+    let plain = Supertable::open(options_for(
+        &plain_dir,
+        Build {
+            without_index: true,
+            ..Build::default()
+        },
+    ))
+    .expect("open the fixture without its index");
+    let same = |when: &str| {
+        let mut served = false;
+        for (query, mode) in queries() {
+            let (a, stats, _) = run(&indexed, &query, mode, 10);
+            let (b, _, _) = run(&plain, &query, mode, 10);
+            assert_eq!(a, b, "{when}: {query:?} {mode:?}");
+            served |= stats.tier_entries > 0 || stats.superfiles_resolved > 0;
+        }
+        assert!(served, "{when}: the index serves");
+    };
+    let root = current_term_index_root(indexed_dir.path());
+    assert_eq!(
+        version(&root),
+        ROOT_WITHOUT_INDEX_ENDS,
+        "the fixture's root"
+    );
+    assert!(names_old_slices(&root));
+    same("the old layout");
+    for st in [&indexed, &plain] {
+        let mut w = st.writer().expect("writer");
+        let docs: Vec<String> = (0..20).map(|i| document(1_000 + i)).collect();
+        let col: ArrayRef = Arc::new(LargeStringArray::from(
+            docs.iter().map(String::as_str).collect::<Vec<_>>(),
+        ));
+        w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    let root = current_term_index_root(indexed_dir.path());
+    assert_eq!(
+        version(&root),
+        ROOT_WITH_INDEX_ENDS,
+        "a commit writes the current root"
+    );
+    assert!(names_old_slices(&root), "beside the old slices");
+    same("old and current layers");
+    indexed
+        .optimize(&OptimizeOptions::compact(CompactionSettings {
+            min_fill_percent: 100,
+            min_superfiles_for_merge: u64::MAX,
+            ..CompactionSettings::default()
+        }))
+        .expect("optimize");
+    same("after the maintenance pass");
 }
 
 /// A prefix over a table the term index covers scores each document by the

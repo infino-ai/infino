@@ -1,0 +1,87 @@
+{
+  "format_version": "4.0",
+  "manifest_id": 1,
+  "options_hash": "blake3:c9e7fc9e3f52b5067babce99a7c27fc003888033cfc8becd882788e24da5242c",
+  "schema": {
+    "fields": [
+      {
+        "id": 1,
+        "index": {
+          "analyzer": "standard",
+          "b": 0.75,
+          "k1": 1.2000000476837158,
+          "kind": "fts",
+          "positions": true,
+          "stored": true
+        },
+        "name": "body",
+        "nullable": true,
+        "type": "large_utf8"
+      }
+    ],
+    "last_field_id": 1,
+    "max_depth": 20,
+    "max_fields": 10000,
+    "schema_id": 1,
+    "tombstoned": []
+  },
+  "id_column": "_id",
+  "commit_token": "ee1bbdea-447c-43fe-b130-34ab7cabdf14",
+  "vector_index_storage_prefix": null,
+  "deleted_user_ids_inline_b64": null,
+  "slow_vector_state_uri": null,
+  "slow_vector_state_content_hash": null,
+  "term_index_uri": "term-index/root-242a811bfbeffb748165da45f5d8c4cdcf29dd843aaa3c89157fe4e3adae50d4.bin",
+  "term_index_content_hash": "blake3:242a811bfbeffb748165da45f5d8c4cdcf29dd843aaa3c89157fe4e3adae50d4",
+  "term_index_complete": true,
+  "partition_strategy": {
+    "kind": "ingestion_time",
+    "granularity_secs": 86400
+  },
+  "global_vector_index": null,
+  "drained_ranges": [],
+  "parts": [
+    {
+      "part_id": "7f566401-4f52-4d0d-9768-5f8a59bf165e",
+      "uri": "manifest-parts/part-02f1933cb945bfa69d81e38a7d106c7b5b0a49558ff7a528e98e3bcfdf10965a.avro.zst",
+      "n_superfiles": 1,
+      "size_bytes_compressed": 5711,
+      "size_bytes_uncompressed": 5711,
+      "content_hash": "blake3:02f1933cb945bfa69d81e38a7d106c7b5b0a49558ff7a528e98e3bcfdf10965a",
+      "routing_uri": "manifest-parts/part-02f1933cb945bfa69d81e38a7d106c7b5b0a49558ff7a528e98e3bcfdf10965a.avro.zst",
+      "routing_content_hash": "blake3:02f1933cb945bfa69d81e38a7d106c7b5b0a49558ff7a528e98e3bcfdf10965a",
+      "id_range": [
+        "33120122825691469559488810319872",
+        "33120122825691469559488810319971"
+      ],
+      "scalar_stats_agg": {},
+      "scalar_stats_agg_ipc": "/////+ABAAAQAAAAAAAKAAwACgAJAAQACgAAABAAAAAAAQQACAAIAAAABAAIAAAABAAAAAgAAAB4AQAAOAEAAAQBAADUAAAAqAAAAHQAAAA8AAAABAAAALj+//8QAAAAFAAAAAAAAQIQAAAAov7//0AAAAAAAAAADwAAADQyOTQ5NjcyOTVfX21heADs/v//EAAAABQAAAAAAAECEAAAANb+//9AAAAAAAAAAA8AAAA0Mjk0OTY3Mjk1X19taW4AIP///xAAAAAUAAAAAAABAhAAAAAK////QAAAAAAAAAAIAAAAMV9fbnVsbHMAAAAAUP///xQAAAAMAAAAAAABFAwAAAAAAAAA2P///wYAAAAxX19tYXgAAHj///8YAAAADAAAAAAAARQQAAAAAAAAAAQABAAEAAAABgAAADFfX21pbgAApP///xAAAAAUAAAAAAABAhAAAACO////QAAAAAAAAAAIAAAAMF9fbnVsbHMAAAAA1P///xQAAAAMAAAAAAABBxAAAAAAAAAAwv///yYAAAAGAAAAMF9fbWF4AAAQABQAEAAOAA8ABAAAAAgAEAAAABwAAAAMAAAAAAABBxgAAAAAAAAAAAAGAAgABAAGAAAAJgAAAAYAAAAwX19taW4AAAAAAAD/////+AEAABAAAAAMABoAGAAXAAQACAAMAAAAIAAAAOAAAAAAAAAAAAAAAAAAAAMEAAoAGAAMAAgABAAKAAAAnAAAABAAAAABAAAAAAAAAAAAAAAIAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAEgAAAAAAAAAAAAAAAQAAAAAAAAAIAAAAAAAAABAAAAAAAAAAGAAAAAAAAAABAAAAAAAAACAAAAAAAAAAEAAAAAAAAAAwAAAAAAAAAAEAAAAAAAAAOAAAAAAAAAAIAAAAAAAAAEAAAAAAAAAAAQAAAAAAAABIAAAAAAAAABAAAAAAAAAAWAAAAAAAAAAqAAAAAAAAAIgAAAAAAAAAAQAAAAAAAACQAAAAAAAAABAAAAAAAAAAoAAAAAAAAAALAAAAAAAAALAAAAAAAAAAAQAAAAAAAAC4AAAAAAAAAAgAAAAAAAAAwAAAAAAAAAABAAAAAAAAAMgAAAAAAAAACAAAAAAAAADQAAAAAAAAAAEAAAAAAAAA2AAAAAAAAAAIAAAAAAAAAP8AAAAAAAAAAAAAAnPQXhKefOMIogEAAP8AAAAAAAAAYwAAAnPQXhKefOMIogEAAP8AAAAAAAAAAAAAAAAAAAD/AAAAAAAAAAAAAAAAAAAAKgAAAAAAAAB0aGUgZGF0YSBkYXRhIGRhdGEgZmlsbGVyIGZpbGxlciB6ZWJyYSB3MTMAAAAAAAD/AAAAAAAAAAAAAAAAAAAACwAAAAAAAAB0aGUgeWFrIHc1NQAAAAAA/wAAAAAAAAAAAAAAAAAAAP8AAAAAAAAAAQAAAAAAAAD/AAAAAAAAAAEAAAAAAAAA/////wAAAAA=",
+      "fts_summary_agg": {
+        "1": {
+          "term_bloom_union": "",
+          "n_terms_distinct": 72,
+          "term_range_union": {
+            "min": "ZGF0YQ==",
+            "max": "emVicmE="
+          },
+          "length_stats": {
+            "total_tokens": 887,
+            "n_scored_docs": 100
+          }
+        }
+      },
+      "fts_length_totals": {
+        "1": {
+          "total_tokens": 887,
+          "n_scored_docs": 100
+        }
+      },
+      "summaries_uri": "manifest-summaries/summ-066ef53e432a7300bab045a44ebd98bc4be3266af4922ef4a5a53ee2001a35fe.bin",
+      "summaries_content_hash": "blake3:066ef53e432a7300bab045a44ebd98bc4be3266af4922ef4a5a53ee2001a35fe",
+      "summaries_size_bytes": 11452
+    }
+  ],
+  "tombstone_seqs": {},
+  "superseded_cells": {},
+  "split_checks": {}
+}

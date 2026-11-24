@@ -900,7 +900,8 @@ pub(crate) mod test_support {
     #[derive(Debug)]
     pub(crate) struct RecordingStorage {
         inner: Arc<dyn StorageProvider>,
-        ranges: Mutex<Vec<Range<u64>>>,
+        /// Each ranged GET's object key and range, in order.
+        ranges: Mutex<Vec<(String, Range<u64>)>>,
         /// Ranged GETs to let through before parking one; `None` parks none.
         pause_after: Mutex<Option<usize>>,
         paused: AtomicBool,
@@ -923,7 +924,19 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn ranges_since(&self, from: usize) -> Vec<Range<u64>> {
-            self.ranges.lock().expect("ranges")[from..].to_vec()
+            self.ranges.lock().expect("ranges")[from..]
+                .iter()
+                .map(|(_, range)| range.clone())
+                .collect()
+        }
+
+        /// The ranged GETs from the `from`th on of objects whose key ends with `key`.
+        pub(crate) fn ranges_of_since(&self, key: &str, from: usize) -> Vec<Range<u64>> {
+            self.ranges.lock().expect("ranges")[from..]
+                .iter()
+                .filter(|(uri, _)| uri.ends_with(key))
+                .map(|(_, range)| range.clone())
+                .collect()
         }
 
         pub(crate) fn pause_next_read(&self) {
@@ -969,7 +982,10 @@ pub(crate) mod test_support {
             self.inner.get(uri).await
         }
         async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
-            self.ranges.lock().expect("ranges").push(range.clone());
+            self.ranges
+                .lock()
+                .expect("ranges")
+                .push((uri.to_string(), range.clone()));
             if self.take_pause() {
                 self.paused.store(true, Ordering::SeqCst);
                 self.resume.notified().await;

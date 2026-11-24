@@ -332,11 +332,19 @@ superfiles it covers, each with its smallest document id, and per
 *layer* the key range and content hash of every *slice*. A slice is a
 few megabytes covering one contiguous range of `column`-and-term keys —
 a front-coded block dictionary over a postings region — so a lookup
-binary-searches the root for the one slice that can hold the key,
-fetches it, and reads one block; a prefix scan touches one slice or a
-few adjacent ones. Root and slices are content-addressed and immutable,
-cached on local disk like manifest parts, and kept live by garbage
-collection for as long as a manifest names them.
+binary-searches the root for the one slice that can hold the key and
+reads only what it needs of it: the slice's header and block index in
+one request, kept in memory, then the key's block, then its run, each
+checked by a crc32c of its own. A slice of an older layout, or one
+small enough for that first request, is read whole and checked by its
+content hash; a prefix scan reads one slice or a few adjacent ones
+whole. A slice already on local disk is read whole from there. A
+slice read by range is read whole in the background, kept in memory
+and written to local disk when the table has a disk cache; with none,
+only once reused and only when the whole index fits in memory. Root and slices are
+content-addressed and immutable; slices on local disk are cached like
+manifest parts, and all are kept live by garbage collection for as
+long as a manifest names them.
 
 Every commit publishes its superfiles' postings in the same atomic
 step as their entries: the writer already holds each new superfile's

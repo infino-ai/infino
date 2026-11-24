@@ -4989,7 +4989,8 @@ mod tests {
         assert!(after_first > 0, "the first take reads storage");
         assert_eq!(take(), first);
         // The FTS subsection is read through, never kept, by design; what the
-        // take read is kept.
+        // take read is kept. Only the superfile's reads count: with no metadata
+        // disk cache, a fresh handle reads the term index from storage again.
         let reader = open().reader().expect("reader");
         let entry = &reader.manifest().superfiles[0];
         let (fts_at, fts_len) = entry
@@ -4997,8 +4998,13 @@ mod tests {
             .as_ref()
             .and_then(|o| o.fts)
             .expect("an FTS subsection");
+        let superfile = entry.storage_path();
+        assert!(
+            !recording.ranges_of_since(&superfile, 0).is_empty(),
+            "the first take reads the superfile by range"
+        );
         let outside: Vec<Range<u64>> = recording
-            .ranges_since(after_first)
+            .ranges_of_since(&superfile, after_first)
             .into_iter()
             .filter(|r| r.start < fts_at || r.end > fts_at + fts_len)
             .collect();
