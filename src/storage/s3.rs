@@ -1177,9 +1177,9 @@ mod tests {
         assert_eq!(path.to_string(), "tbl/data/seg-1");
     }
 
-    // ---- a stalled range GET, through the real client --------------------
+    // ---- stalled reads, through the real client ---------------------------
 
-    /// The bucket, credentials and region the stalled-GET tests' provider is built with; the
+    /// The bucket, credentials and region the stalled-read tests' provider is built with; the
     /// endpoint checks none of them.
     const STALL_BUCKET: &str = "bucket";
     const STALL_ACCESS_KEY: &str = "AKIATESTKEY";

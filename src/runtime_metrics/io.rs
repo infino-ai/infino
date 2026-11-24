@@ -218,8 +218,8 @@ pub struct UsageMeter {
     put_bytes: AtomicU64,
     list_count: AtomicU64,
     delete_count: AtomicU64,
-    /// Second requests sent beside a read whose headers were late. Not part of the snapshot: a
-    /// hedge is not a read and is never billed as one.
+    /// Second requests sent beside a read whose headers were late. Kept out of the snapshot so its
+    /// GET counts mean reads; the store still bills each hedge as a request.
     hedge_count: AtomicU64,
     class_get_count: [AtomicU64; N_URI_CLASSES],
     class_get_bytes: [AtomicU64; N_URI_CLASSES],

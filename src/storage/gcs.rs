@@ -587,7 +587,7 @@ mod tests {
         Endpoint, Read, Stall, assert_stalled_read_recovers, stalling_endpoint,
     };
 
-    /// The bucket the stalled-GET test reads from (the stalling endpoint serves any path).
+    /// The bucket the stalled-read tests reads from (the stalling endpoint serves any path).
     const STALL_BUCKET: &str = "bucket";
 
     fn test_provider() -> GcsStorageProvider {
@@ -919,7 +919,7 @@ mod tests {
         assert_eq!(path.to_string(), "tbl/data/seg-1");
     }
 
-    // ---- a stalled range GET, through the real client --------------------
+    // ---- stalled reads, through the real client ---------------------------
 
     /// A GCS provider whose store is `endpoint`, its usage counted on `meter`.
     fn stalling_provider(endpoint: &Endpoint, meter: &Arc<UsageMeter>) -> GcsStorageProvider {

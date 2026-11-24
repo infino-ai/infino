@@ -529,7 +529,7 @@ mod tests {
         Endpoint, Read, Stall, assert_stalled_read_recovers, stalling_endpoint,
     };
 
-    /// The account and container the stalled-GET test reads from (the stalling endpoint serves
+    /// The account and container the stalled-read tests reads from (the stalling endpoint serves
     /// any path).
     const STALL_ACCOUNT: &str = "acct";
     const STALL_CONTAINER: &str = "container";
@@ -773,7 +773,7 @@ mod tests {
         assert_eq!(path.to_string(), "tbl/data/seg-1");
     }
 
-    // ---- a stalled range GET, through the real client --------------------
+    // ---- stalled reads, through the real client ---------------------------
 
     /// An Azure provider whose store is `endpoint`, its usage counted on `meter`.
     fn stalling_provider(endpoint: &Endpoint, meter: &Arc<UsageMeter>) -> AzureStorageProvider {

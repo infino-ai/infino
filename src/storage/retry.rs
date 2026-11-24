@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Shared transient-retry + range-completion helpers for the
-//! object-store-backed providers. One copy so retry semantics can't
-//! drift between backends; each backend keeps its own error
-//! translation and feeds already-translated results in.
+//! Shared retry and read helpers for the object-store-backed providers: transient retries, and
+//! reads that recover from a stuck store (a second request when headers are late, and a fresh
+//! request for the missing bytes when a body goes quiet). One copy so the rules can't drift between
+//! backends; each backend keeps its own error translation and feeds translated results in.
 
 use std::{error::Error, future::Future, ops::Range, pin::pin, time::Duration};
 
@@ -359,11 +359,13 @@ const BODY_IDLE: Duration = Duration::from_secs(5);
 /// from the store keeps its budget.
 const REISSUE_WITHIN: Duration = Duration::from_secs(60);
 
-/// Most second requests for reads' headers out at once across the process. Each lives at most
-/// [`STUCK_AFTER`], so a stuck one can't hold its permit from other reads for long. A healthy store
-/// answers headers far below that delay and sends none; one so slow that every read passes it gets
-/// this many at a time instead of one per read, while a read that is truly stuck still gets its
-/// second request once a permit frees.
+/// Most second requests for reads' headers out at once across the process. Each holds its permit
+/// until it or its read's first request answers. One as stuck as its first holds it until
+/// `object_store`'s own retries end one of them: usually the first request's retry after the
+/// client's timeout, at worst [`RETRY_TIMEOUT`]. Reads waiting for a permit keep racing their first
+/// request, so they are never slower than without hedging. A healthy store answers headers far
+/// below [`STUCK_AFTER`] and sends none; one so slow that every read passes it gets this many at a
+/// time instead of one per read.
 const READ_HEDGES_IN_FLIGHT: usize = 16;
 
 /// The permits [`READ_HEDGES_IN_FLIGHT`] counts.
@@ -519,7 +521,8 @@ type BodyStream<'a> = BoxStream<'a, Result<Bytes, StorageError>>;
 
 /// Why a response stopped before the read had all its bytes.
 enum Stop {
-    /// The body ended: `object_store` hands back a body cut short as if it were whole.
+    /// The body ended at the wrong length: short (`object_store` hands back a body cut short as if
+    /// it were whole), or, for a whole read, longer than its headers state.
     Ended,
     /// No frame for [`BODY_IDLE`].
     Idle,
@@ -529,10 +532,13 @@ enum Stop {
 }
 
 /// Open a read's response: `open` sends one request and answers once its headers arrive. While the
-/// first request has no headers, every [`STUCK_AFTER`] a second request goes out beside it under
-/// one of `hedging`'s permits, and lives at most [`STUCK_AFTER`] itself: the first headers win.
+/// first request has no headers, a second request goes out beside it [`STUCK_AFTER`] after it was
+/// sent, under one of `hedging`'s permits, and runs until one of the two answers: the first headers
+/// win. It is not cut short, so on a store whose every answer takes longer than [`STUCK_AFTER`] a
+/// stuck read still finishes through it. A read has one second request at a time; after one fails,
+/// the next goes out [`STUCK_AFTER`] later.
 /// A request that loses is dropped before any of its body is read, so a hedge costs one request,
-/// never a second body, and a hedge that is as stuck as the first gives way to the next one.
+/// never a second body, though the store may already have sent its first bytes.
 ///
 /// The first request's failure is the answer, and a hedge in flight is dropped: a request that
 /// fails is not stuck, and the read's own re-issue sends a fresh one, so a read failing on every
@@ -569,10 +575,11 @@ where
                 Err(e) if !is_retryable(&e) => {
                     return (&mut first).now_or_never().unwrap_or(Err(e));
                 }
+                // A hedge that failed in a way a retry may fix leaves the first running; the next
+                // goes out `STUCK_AFTER` later.
                 Err(_) => {}
             },
             answer = &mut first => return answer,
-            () = time::sleep(STUCK_AFTER) => {}
         }
     }
 }
@@ -698,6 +705,9 @@ where
     let mut reissue = Reissue::new();
     // The ETag of the response the gathered bytes came with.
     let mut version = None;
+    // The most bytes the read has held: only passing it is progress, so a read that keeps starting
+    // over on an object that keeps changing still runs out of re-issues.
+    let mut most = 0;
     while !got.done() {
         let missing = range.start + got.len()..range.end;
         let stop = match race_headers(&hedging, || open(missing.clone())).await {
@@ -713,12 +723,13 @@ where
             }
             Err(e) => Some(Stop::Failed(e)),
         };
-        let advanced = range.start + got.len() > missing.start;
+        let advanced = got.len() > most;
         if advanced {
+            most = got.len();
             reissue.advanced();
         }
         let Some(stop) = stop else { break };
-        // A body cut short after bringing bytes is asked for the rest at once, as main did.
+        // A body cut short after bringing bytes asks for the rest at once: the store was answering.
         if advanced && matches!(stop, Stop::Ended) {
             continue;
         }
@@ -1325,6 +1336,14 @@ mod tests {
 
     /// One-byte frames the moving-body test sends.
     const TRICKLE_FRAMES: u64 = 20;
+    /// Reads the hedge-bound test keeps stuck at once.
+    const STUCK_READS: usize = 3;
+    /// How long the hedge-bound test keeps its reads stuck.
+    const STUCK_FOR: Duration = Duration::from_secs(30);
+    /// A store answer slower than `STUCK_AFTER`: a hedge cut short at `STUCK_AFTER` never gets it.
+    const SLOW_ANSWER: Duration = Duration::from_secs(3);
+    /// How long a failing hedge takes to fail.
+    const HEDGE_FAILS_AFTER: Duration = Duration::from_secs(1);
 
     /// Slow frames the cut-timing test sends before its body goes quiet: enough to move the body's
     /// timer more than once.
@@ -1801,28 +1820,33 @@ mod tests {
             permits,
             meter: &hedges,
         };
-        let r = read_range("u", 0..3, hedging, |range| {
-            let first = opens.note(&range) == 0;
-            async move {
-                if first {
-                    pending::<()>().await;
+        let r = time::timeout(
+            TEST_READ_BOUND,
+            read_range("u", 0..3, hedging, |range| {
+                let first = opens.note(&range) == 0;
+                async move {
+                    if first {
+                        pending::<()>().await;
+                    }
+                    Ok(whole(range))
                 }
-                Ok(whole(range))
-            }
-        })
+            }),
+        )
         .await
+        .expect("the read ends")
         .expect("test");
         assert_eq!(&r[..], b"abc");
         assert_eq!(started.elapsed(), freed_at);
         assert_eq!(hedges.hedge_count(), 1);
     }
 
-    /// A hedge that is itself stuck is dropped after `STUCK_AFTER` and its permit freed, so another
-    /// read's stuck request gets its hedge, though the first read never finishes.
+    /// A hedge that fails frees its permit at once, so another read's stuck request gets its hedge,
+    /// though the first read never finishes.
     #[tokio::test(start_paused = true)]
-    async fn a_stuck_hedge_frees_its_permit_for_another_read() {
+    async fn a_failed_hedge_frees_its_permit_for_another_read() {
         let permits = bound(1);
         let hedges = UsageMeter::new();
+        let stuck_opens = Opens::new();
         let stuck = read_range(
             "u",
             0..3,
@@ -1830,7 +1854,16 @@ mod tests {
                 permits,
                 meter: &hedges,
             },
-            |_| pending::<Result<Response<'static>, StorageError>>(),
+            |range| {
+                let first = stuck_opens.note(&range) == 0;
+                async move {
+                    if first {
+                        pending::<()>().await;
+                    }
+                    time::sleep(HEDGE_FAILS_AFTER).await;
+                    Err::<Response<'static>, _>(transient())
+                }
+            },
         );
         let opens = Opens::new();
         let started = time::Instant::now();
@@ -1851,15 +1884,43 @@ mod tests {
                 }
             },
         );
-        let r = tokio::select! {
-            biased;
-            _ = stuck => panic!("every request of this read is stuck"),
-            r = other => r,
-        }
+        let r = time::timeout(TEST_READ_BOUND, async {
+            tokio::select! {
+                biased;
+                _ = stuck => panic!("every request of this read is stuck or fails"),
+                r = other => r,
+            }
+        })
+        .await
+        .expect("the other read ends")
         .expect("test");
         assert_eq!(&r[..], b"abc");
-        assert_eq!(started.elapsed(), STUCK_AFTER * 2);
+        assert_eq!(started.elapsed(), STUCK_AFTER + HEDGE_FAILS_AFTER);
         assert_eq!(hedges.hedge_count(), 2);
+    }
+
+    /// A hedge whose answer comes later than `STUCK_AFTER` is not cut short: it answers the read
+    /// the first request never would.
+    #[tokio::test(start_paused = true)]
+    async fn a_hedge_slower_than_the_delay_still_answers() {
+        let hedges = UsageMeter::new();
+        let opens = Opens::new();
+        let started = time::Instant::now();
+        let r = read(0..3, &hedges, |range| {
+            let first = opens.note(&range) == 0;
+            async move {
+                if first {
+                    pending::<()>().await;
+                }
+                time::sleep(SLOW_ANSWER).await;
+                Ok(whole(range))
+            }
+        })
+        .await
+        .expect("test");
+        assert_eq!(&r[..], b"abc");
+        assert_eq!(started.elapsed(), STUCK_AFTER + SLOW_ANSWER);
+        assert_eq!(hedges.hedge_count(), 1);
     }
 
     /// The first request failing ends the race at once: the second is dropped, not waited for.
@@ -2203,7 +2264,9 @@ mod tests {
             Ok(Some(response(0..3, body(vec![Ok(served(&(0..5)))]))))
         })
         .await;
-        assert!(matches!(r, Err(StorageError::Permanent { .. })));
+        let e = r.expect_err("a body that stays too long");
+        assert!(matches!(e, StorageError::Permanent { .. }));
+        assert!(e.to_string().contains("long read"), "{e}");
     }
 
     /// A second request the store refused answers for both: the stalled first is not waited for.
@@ -2241,18 +2304,107 @@ mod tests {
             permits,
             meter: &hedges,
         };
-        let r = read_range("u", 0..3, hedging, |range| {
-            opens.note(&range);
-            async move {
-                time::sleep(answers_at).await;
-                Ok(whole(range))
-            }
-        })
+        let r = time::timeout(
+            TEST_READ_BOUND,
+            read_range("u", 0..3, hedging, |range| {
+                opens.note(&range);
+                async move {
+                    time::sleep(answers_at).await;
+                    Ok(whole(range))
+                }
+            }),
+        )
         .await
+        .expect("the read ends")
         .expect("test");
         assert_eq!(&r[..], b"abc");
         assert_eq!(started.elapsed(), answers_at);
         assert_eq!((opens.count(), hedges.hedge_count()), (1, 0));
+    }
+
+    /// A read dropped while its second request is out drops both requests and frees the permit.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_dropped_mid_race_frees_its_permit() {
+        let permits = bound(1);
+        let hedges = UsageMeter::new();
+        let read = read_range(
+            "u",
+            0..3,
+            Hedging {
+                permits,
+                meter: &hedges,
+            },
+            |_| pending::<Result<Response<'static>, StorageError>>(),
+        );
+        let dropped_at = STUCK_AFTER * 3 / 2;
+        assert!(
+            time::timeout(dropped_at, read).await.is_err(),
+            "every request is stuck"
+        );
+        assert_eq!((hedges.hedge_count(), permits.available_permits()), (1, 1));
+    }
+
+    /// A second request that wins gives its permit back before its body is read, so a slow body
+    /// never holds a permit another read's hedge needs.
+    #[tokio::test(start_paused = true)]
+    async fn a_winning_hedge_frees_its_permit_before_its_body() {
+        let permits = bound(1);
+        let hedges = UsageMeter::new();
+        let opens = Opens::new();
+        let body_after = STUCK_AFTER / 2;
+        let read = read_range(
+            "u",
+            0..3,
+            Hedging {
+                permits,
+                meter: &hedges,
+            },
+            |range| {
+                let first = opens.note(&range) == 0;
+                async move {
+                    if first {
+                        pending::<()>().await;
+                    }
+                    let frame = served(&range);
+                    let late = stream::once(async move {
+                        time::sleep(body_after).await;
+                        Ok(frame)
+                    });
+                    Ok(response(range, late.boxed()))
+                }
+            },
+        );
+        let during_body = async {
+            time::sleep(STUCK_AFTER + body_after / 2).await;
+            permits.available_permits()
+        };
+        let (r, free) = tokio::join!(time::timeout(TEST_READ_BOUND, read), during_body);
+        assert_eq!(&r.expect("the read ends").expect("test")[..], b"abc");
+        assert_eq!((hedges.hedge_count(), free), (1, 1));
+    }
+
+    /// A read whose object keeps changing between its requests still runs out of re-issues: bytes
+    /// gathered again after starting over are no progress until they pass what it held before.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_of_an_object_that_keeps_changing_ends() {
+        let hedges = UsageMeter::new();
+        let opens = Opens::new();
+        let r = read(0..5, &hedges, |range| {
+            let tag = if opens.note(&range).is_multiple_of(2) {
+                "v1"
+            } else {
+                "v2"
+            };
+            let one = range.start..range.start + 1;
+            async move { Ok(tagged(tag, response(range, body(vec![Ok(served(&one))])))) }
+        })
+        .await;
+        assert!(r.is_err(), "a read that never gathers its bytes fails");
+        assert!(
+            opens.count() <= 2 * (1 + MAX_TRANSIENT_RETRIES as usize),
+            "{}",
+            opens.count()
+        );
     }
 
     /// A closed bound sends no second request; the first answers.
@@ -2267,14 +2419,18 @@ mod tests {
             permits,
             meter: &hedges,
         };
-        let r = read_range("u", 0..3, hedging, |range| {
-            opens.note(&range);
-            async move {
-                time::sleep(answers_at).await;
-                Ok(whole(range))
-            }
-        })
+        let r = time::timeout(
+            TEST_READ_BOUND,
+            read_range("u", 0..3, hedging, |range| {
+                opens.note(&range);
+                async move {
+                    time::sleep(answers_at).await;
+                    Ok(whole(range))
+                }
+            }),
+        )
         .await
+        .expect("the read ends")
         .expect("test");
         assert_eq!(&r[..], b"abc");
         assert_eq!((opens.count(), hedges.hedge_count()), (1, 0));
@@ -2313,17 +2469,22 @@ mod tests {
         );
     }
 
-    /// A hedge as stuck as the first gives way after `STUCK_AFTER` to the next one, which answers.
+    /// After a hedge fails, the next goes out `STUCK_AFTER` later, and answers.
     #[tokio::test(start_paused = true)]
-    async fn a_stuck_hedge_gives_way_to_the_next() {
+    async fn a_failed_hedge_is_followed_by_the_next() {
         let hedges = UsageMeter::new();
         let opens = Opens::new();
         let started = time::Instant::now();
         let r = read(0..3, &hedges, |range| {
             let n = opens.note(&range);
             async move {
-                if n < 2 {
-                    pending::<()>().await;
+                match n {
+                    0 => pending::<()>().await,
+                    1 => {
+                        time::sleep(HEDGE_FAILS_AFTER).await;
+                        return Err(transient());
+                    }
+                    _ => {}
                 }
                 Ok(whole(range))
             }
@@ -2331,7 +2492,7 @@ mod tests {
         .await
         .expect("test");
         assert_eq!(&r[..], b"abc");
-        assert_eq!(started.elapsed(), STUCK_AFTER * 3);
+        assert_eq!(started.elapsed(), STUCK_AFTER * 2 + HEDGE_FAILS_AFTER);
         assert_eq!(hedges.hedge_count(), 2);
     }
 
@@ -2339,8 +2500,6 @@ mod tests {
     /// are in flight at once than the bound has permits.
     #[tokio::test(start_paused = true)]
     async fn hedges_in_flight_never_pass_the_bound() {
-        const READS: usize = 3;
-        const STUCK_FOR: Duration = Duration::from_secs(30);
         let permits = bound(1);
         let hedges = UsageMeter::new();
         let live = Cell::new(0usize);
@@ -2366,8 +2525,16 @@ mod tests {
         };
         let all = future::join3(stuck(), stuck(), stuck());
         assert!(time::timeout(STUCK_FOR, all).await.is_err());
-        assert_eq!(peak.get(), READS + 1, "every first request and one hedge");
-        assert!(hedges.hedge_count() > READS as u64, "hedges kept going out");
+        assert_eq!(
+            peak.get(),
+            STUCK_READS + 1,
+            "every first request and one hedge"
+        );
+        assert_eq!(
+            hedges.hedge_count(),
+            1,
+            "a stuck hedge holds its permit until it answers"
+        );
     }
 
     /// A success ready in the same poll as a hedge's refusal wins.
@@ -2398,6 +2565,7 @@ mod tests {
     async fn read_whole_takes_a_full_body_that_then_goes_quiet() {
         let hedges = UsageMeter::new();
         let opens = Opens::new();
+        let started = time::Instant::now();
         let (bytes, _) = read_all(&hedges, || {
             opens.note(&(0..5));
             async { Ok(Some(response(0..5, stalling(vec![served(&(0..5))])))) }
@@ -2407,6 +2575,8 @@ mod tests {
         .expect("a body");
         assert_eq!(&bytes[..], b"abcde");
         assert_eq!(opens.count(), 1);
+        // It waits one idle time for the end that never comes; a real body ends at its length.
+        assert_eq!(started.elapsed(), BODY_IDLE);
     }
 
     /// A lone frame is returned as it came, without a copy; several are copied once into a buffer
