@@ -89,7 +89,7 @@ pub struct RandomRotation {
     /// State for the BLOCKED transform, built on first use.
     ///
     /// Only the 4-bit plane walks the blocked form, but this type is on the
-    /// default path — every 1-bit RaBitQ column constructs one — and the
+    /// default path (every 1-bit RaBitQ column or multi-cell blob builds one), and the
     /// block permutations plus sign diagonals run ~74 KB per rotation at
     /// dim 1536. Building them eagerly charges that to callers that never
     /// read them. The state is a pure function of `(dim, seed)`, so
@@ -343,6 +343,18 @@ impl RandomRotation {
     fn blocked(&self) -> &BlockedState {
         self.blocked
             .get_or_init(|| BlockedState::build(self.dim, self.padded_dim, self.seed))
+    }
+
+    /// Heap bytes of the rotation's sign diagonals. Not counted: the struct itself, which lives
+    /// wherever its owner puts it, and the blocked state, which only a graph index's own rotation
+    /// builds.
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.signs.capacity() * size_of::<Vec<f32>>()
+            + self
+                .signs
+                .iter()
+                .map(|diagonal| diagonal.capacity() * size_of::<f32>())
+                .sum::<usize>()
     }
 
     /// Transform working size: `dim` rounded up to a power of two — the

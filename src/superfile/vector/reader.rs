@@ -49,7 +49,8 @@ use crate::{
             {self},
         },
         lazy_source::{
-            LazyByteSource, LazyByteSourceError, PrefetchedSource, RangeCoalescePlan, Source,
+            ARC_COUNTS_BYTES, LazyByteSource, LazyByteSourceError, PrefetchedSource,
+            RangeCoalescePlan, Source,
         },
         load_watch::{LoadListener, LoadWatch},
         vector::{
@@ -111,6 +112,11 @@ struct Sq8ParsedMeta {
     scale: Vec<f32>,
     offset: Vec<f32>,
     per_doc_norms: Option<Arc<[f32]>>,
+}
+
+/// Heap bytes of a column's parsed quantizer (`scale`, `offset`) and per-doc norms.
+fn sq8_meta_bytes(scale: &[f32], offset: &[f32], norms: Option<&[f32]>) -> usize {
+    (scale.len() + offset.len() + norms.map_or(0, <[f32]>::len)) * size_of::<f32>()
 }
 
 /// Per-column reader state; cached at open time.
@@ -187,11 +193,9 @@ pub struct ColumnReader {
     /// the drain) skips resolving the stable `_id` through a scalar `_id` column.
     stable_ids_off: Option<usize>,
     quant: BitQuantizer,
-    /// Cached random rotation built once at open from `(dim, rot_seed)`.
-    /// Construction is `O(dim³)` for Gram-Schmidt — at dim=384 that's
-    /// ~7.9 ms, dominant over every other per-query stage if rebuilt
-    /// per `search()`. Build once, reuse forever.
-    rot: RandomRotation,
+    /// The column's random rotation, built at open from `(dim, rot_seed)`. Every cell of a
+    /// multi-cell blob takes the blob's one column config, so its cells share one rotation.
+    rot: Arc<RandomRotation>,
 }
 
 /// Shared context threaded through the probe → shortlist → score pipeline.
@@ -214,14 +218,36 @@ struct ProbeCtx<'a> {
 }
 
 impl ColumnReader {
-    /// Heap bytes a read has loaded into this column since open: the parsed
-    /// quantizer and per-doc norms. Its transposed codes are not counted:
-    /// each holds its own reservation against the connection's budget.
+    /// Bytes this column holds: its own structures, and its quantizer and per-doc norms, parsed
+    /// at open or by a read since. Not counted here: its rotation, which the cells of a blob share
+    /// (the [`VectorReader`] counts each once), and its transposed codes, which hold their own
+    /// reservations against the connection's budget.
+    ///
+    /// The structures count because a multi-cell blob opens one column per cell: a few hundred
+    /// bytes each, a hundred or more per file.
     fn held_bytes(&self) -> usize {
-        self.lazy_sq8_parsed.get().map_or(0, |parsed| {
-            let norms = parsed.per_doc_norms.as_ref().map_or(0, |norms| norms.len());
-            (parsed.scale.len() + parsed.offset.len() + norms) * size_of::<f32>()
-        })
+        let quant = match (&self.sq8_meta, self.lazy_sq8_parsed.get()) {
+            (
+                Some(Sq8ColumnMeta::Eager {
+                    scale,
+                    offset,
+                    per_doc_norms,
+                }),
+                _,
+            ) => sq8_meta_bytes(scale, offset, per_doc_norms.as_deref()),
+            (_, Some(parsed)) => sq8_meta_bytes(
+                &parsed.scale,
+                &parsed.offset,
+                parsed.per_doc_norms.as_deref(),
+            ),
+            _ => 0,
+        };
+        size_of::<Self>()
+            + self.name.capacity()
+            + ARC_COUNTS_BYTES
+            + size_of::<TransposedCodeCache>()
+            + LoadWatch::SLOT_BYTES
+            + quant
     }
 
     /// byte range covering one cluster's
@@ -396,9 +422,15 @@ impl VectorReader {
         self.source.held_buffers(out);
     }
 
-    /// Heap bytes reads have loaded into this reader since open: each
-    /// column's parsed quantizer and norms, and the stable-id region a cold
-    /// probe stashed.
+    /// Push the lookup tables this reader's source keeps: on a lazy open of a multi-cell blob,
+    /// the table of the two ranges it installed per cell.
+    pub(crate) fn held_tables(&self, out: &mut Vec<(usize, usize)>) {
+        self.source.held_tables(out);
+    }
+
+    /// Bytes this reader holds: each column (see [`ColumnReader::held_bytes`]), each distinct
+    /// rotation once, the per-cell routing tables, and the stable-id region a cold probe
+    /// stashed. Called on every kept-reader hit, so it allocates nothing.
     pub(crate) fn held_bytes(&self) -> usize {
         let stashed = self
             .cold_stable_id_region
@@ -406,7 +438,19 @@ impl VectorReader {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map_or(0, Bytes::len);
+        // A blob's cells share one rotation and sit side by side, so a column whose rotation is
+        // not the previous column's starts a new one.
+        let mut previous: Option<&Arc<RandomRotation>> = None;
+        let mut rotations = 0;
+        for col in &self.columns {
+            if !previous.is_some_and(|rot| Arc::ptr_eq(rot, &col.rot)) {
+                rotations += ARC_COUNTS_BYTES + size_of::<RandomRotation>() + col.rot.held_bytes();
+            }
+            previous = Some(&col.rot);
+        }
         stashed
+            + rotations
+            + (self.cell_ids.capacity() + self.flat_cluster_base.capacity()) * size_of::<u32>()
             + self
                 .columns
                 .iter()
@@ -1307,7 +1351,7 @@ impl VectorReader {
                 per_cluster_blocks_off,
                 stable_ids_off,
                 quant,
-                rot: RandomRotation::new(dim, rot_seed),
+                rot: Arc::new(RandomRotation::new(dim, rot_seed)),
             });
             column_id_by_name.insert(cfg.column.clone(), i as u32);
         }
@@ -1375,6 +1419,7 @@ impl VectorReader {
                 cfg.metric
             )))
         })?;
+        let rot = Arc::new(RandomRotation::new(cfg.dim, cfg.rot_seed));
         let mut columns = Vec::with_capacity(n_cells);
         let mut cell_ids = Vec::with_capacity(n_cells);
         let mut flat_cluster_base = Vec::with_capacity(n_cells + 1);
@@ -1439,6 +1484,7 @@ impl VectorReader {
             let col = Self::parse_cell_subsection(
                 &source,
                 cfg,
+                &rot,
                 metric,
                 rerank_codec,
                 subsection_off,
@@ -1671,6 +1717,7 @@ impl VectorReader {
     fn parse_cell_subsection(
         source: &Source,
         cfg: &VectorColumnConfig,
+        rot: &Arc<RandomRotation>,
         metric: Metric,
         rerank_codec: RerankCodec,
         subsection_off: usize,
@@ -1898,7 +1945,7 @@ impl VectorReader {
             per_cluster_blocks_off,
             stable_ids_off,
             quant,
-            rot: RandomRotation::new(dim, rot_seed),
+            rot: Arc::clone(rot),
         })
     }
 
@@ -6911,6 +6958,123 @@ mod tests {
             err,
             VectorError::Read(ReadError::ChecksumMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn every_cell_of_a_blob_shares_one_rotation_built_from_its_dim_and_seed() {
+        let (bytes, json) = build_multi_cell_blob();
+        let reader =
+            VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: true })
+                .expect("open the multi-cell blob");
+        assert!(
+            reader.columns.len() > 1,
+            "the fixture packs more than one cell"
+        );
+        let first = &reader.columns[0];
+        let probe: Vec<f32> = (0..first.dim)
+            .map(|d| d as f32 - first.dim as f32 / 2.0)
+            .collect();
+        for col in &reader.columns {
+            assert!(
+                Arc::ptr_eq(&col.rot, &first.rot),
+                "cell {} has a rotation of its own",
+                col.name
+            );
+            let own = RandomRotation::new(col.dim, col.rot_seed);
+            let (mut shared_out, mut own_out) = (vec![0.0; col.dim], vec![0.0; col.dim]);
+            col.rot.apply(&probe, &mut shared_out);
+            own.apply(&probe, &mut own_out);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&shared_out),
+                bits(&own_out),
+                "cell {} rotates differently",
+                col.name
+            );
+        }
+    }
+
+    /// A kept multi-cell reader is charged for every cell's structures and quantizer, and for
+    /// the one rotation its cells share, once.
+    #[test]
+    fn a_multi_cell_reader_is_charged_its_cells_and_one_rotation() {
+        let (bytes, json) = build_multi_cell_blob();
+        let reader =
+            VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: true })
+                .expect("open the multi-cell blob");
+        let rotation =
+            ARC_COUNTS_BYTES + size_of::<RandomRotation>() + reader.columns[0].rot.held_bytes();
+        let columns: usize = reader.columns.iter().map(ColumnReader::held_bytes).sum();
+        let held = reader.held_bytes();
+        assert!(
+            held >= columns + rotation,
+            "held {held} misses the cells ({columns}) or their rotation ({rotation})"
+        );
+        assert!(
+            held < columns + 2 * rotation,
+            "held {held} counts the shared rotation ({rotation}) more than once"
+        );
+        for col in &reader.columns {
+            let Some(Sq8ColumnMeta::Eager {
+                scale,
+                offset,
+                per_doc_norms,
+            }) = &col.sq8_meta
+            else {
+                panic!("an open over bytes in memory parses the quantizer at open");
+            };
+            let quant = sq8_meta_bytes(scale, offset, per_doc_norms.as_deref());
+            assert!(quant > 0, "the fixture's cells carry a quantizer");
+            assert!(
+                col.held_bytes() >= size_of::<ColumnReader>() + quant,
+                "cell {} is not charged its quantizer ({quant} bytes)",
+                col.name
+            );
+        }
+    }
+
+    /// Each column of a blob with several vector columns has a rotation of its own, and each
+    /// counts.
+    #[test]
+    fn each_vector_column_of_a_blob_is_charged_its_own_rotation() {
+        let dim = 32usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        for (column, rot_seed) in [("a", 11u64), ("b", 22)] {
+            b.register_column(VectorConfig {
+                column: column.into(),
+                dim,
+                rot_seed,
+                metric: Metric::L2Sq,
+                rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
+            })
+            .expect("register column");
+        }
+        for i in 0..n_docs {
+            for c in 0..2u32 {
+                let v: Vec<f32> = (0..dim)
+                    .map(|j| (i * (c + 1) + j as u32) as f32 * 0.1)
+                    .collect();
+                b.add(c, &v).expect("add");
+            }
+        }
+        let blob = b.finish().expect("finish");
+        let json = r#"[{"column":"a","dim":32,"n_cent":4,"rot_seed":11,"metric":"l2sq"},{"column":"b","dim":32,"n_cent":4,"rot_seed":22,"metric":"l2sq"}]"#;
+        let reader = VectorReader::open(Bytes::from(blob), json).expect("open");
+        assert_eq!(reader.columns.len(), 2);
+        assert!(!Arc::ptr_eq(&reader.columns[0].rot, &reader.columns[1].rot));
+        let rotations: usize = reader
+            .columns
+            .iter()
+            .map(|c| ARC_COUNTS_BYTES + size_of::<RandomRotation>() + c.rot.held_bytes())
+            .sum();
+        let columns: usize = reader.columns.iter().map(ColumnReader::held_bytes).sum();
+        assert!(
+            reader.held_bytes() >= columns + rotations,
+            "held {} misses a column's rotation ({rotations} for both)",
+            reader.held_bytes()
+        );
     }
 
     #[test]

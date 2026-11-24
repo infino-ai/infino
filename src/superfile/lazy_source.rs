@@ -215,6 +215,12 @@ pub trait LazyByteSource: Send + Sync {
     /// itself.
     fn held_buffers(&self, _out: &mut Vec<Bytes>) {}
 
+    /// Push the lookup tables this source keeps beside its buffers, and
+    /// those of the sources it reads through, each as its address and heap
+    /// bytes, so [`held_table_bytes`] counts a table reached twice once.
+    /// Default: none.
+    fn held_tables(&self, _out: &mut Vec<(usize, usize)>) {}
+
     /// Tail-fetch path: — fetch the last `len` bytes of the
     /// backing object AND surface the total object size.
     ///
@@ -371,6 +377,13 @@ impl Source {
     pub(crate) fn held_buffers(&self, out: &mut Vec<Bytes>) {
         if let Self::Lazy(source) = self {
             source.held_buffers(out);
+        }
+    }
+
+    /// [`LazyByteSource::held_tables`] of a lazy source.
+    pub(crate) fn held_tables(&self, out: &mut Vec<(usize, usize)>) {
+        if let Self::Lazy(source) = self {
+            source.held_tables(out);
         }
     }
 
@@ -752,15 +765,20 @@ impl LazyByteSource for LazySubSource {
     fn held_buffers(&self, out: &mut Vec<Bytes>) {
         self.inner.held_buffers(out);
     }
+
+    fn held_tables(&self, out: &mut Vec<(usize, usize)>) {
+        self.inner.held_tables(out);
+    }
 }
 
 /// Prefetched overlay: — overlay that serves pre-fetched byte ranges
 /// from memory and falls through to an underlying
 /// [`LazyByteSource`] on miss.
 ///
-/// `VectorReader::open_lazy` uses this to install the 2–3
-/// open-time range fetches it issues against the underlying
-/// source, then hands the overlay to `open_with_source`. Every
+/// `VectorReader::open_lazy` uses this to install the open-time
+/// range fetches it issues against the underlying source (a
+/// multi-cell blob adds two per cell), then hands the overlay
+/// to `open_with_source`. Every
 /// per-region read inside `open_with_source` (sub-header,
 /// codec_meta, etc.) lives inside one of the installed ranges
 /// and resolves zero-copy via [`Self::try_get_range_sync`] —
@@ -775,10 +793,7 @@ impl LazyByteSource for LazySubSource {
 pub(crate) struct PrefetchedSource {
     inner: Arc<dyn LazyByteSource>,
     /// (absolute_start, bytes). One entry per pre-fetched
-    /// range. Lookup walks the vec linearly — the open-time
-    /// path installs ≤ 3 ranges per superfile so the linear
-    /// scan is faster than a tree-keyed structure (cache-line
-    /// hot, no allocation).
+    /// range. Lookup walks the vec linearly.
     prefetched: Vec<(u64, Bytes)>,
 }
 
@@ -893,7 +908,18 @@ impl LazyByteSource for PrefetchedSource {
         out.extend(self.prefetched.iter().map(|(_, bytes)| bytes.clone()));
         self.inner.held_buffers(out);
     }
+
+    fn held_tables(&self, out: &mut Vec<(usize, usize)>) {
+        out.push((
+            self.prefetched.as_ptr() as usize,
+            self.prefetched.capacity() * size_of::<(u64, Bytes)>(),
+        ));
+        self.inner.held_tables(out);
+    }
 }
+
+/// The strong and weak counts an `Arc` allocation carries ahead of its value.
+pub(crate) const ARC_COUNTS_BYTES: usize = 2 * size_of::<usize>();
 
 /// The bytes `buffers` cover in memory, counting a byte several of them
 /// share once: an overlay a sub-reader builds over its parent's often holds
@@ -910,6 +936,14 @@ pub(crate) fn held_buffer_bytes(buffers: &mut [Bytes]) -> usize {
         covered_to = covered_to.max(end);
     }
     held
+}
+
+/// The heap bytes of `tables` (address, bytes), counting a table several
+/// sources reach once.
+pub(crate) fn held_table_bytes(tables: &mut Vec<(usize, usize)>) -> usize {
+    tables.sort_unstable();
+    tables.dedup();
+    tables.iter().map(|&(_, bytes)| bytes).sum()
 }
 
 #[cfg(test)]
@@ -950,6 +984,17 @@ mod tests {
         child.held_buffers(&mut buffers);
         assert_eq!(buffers.len(), 2, "its own and its parent's");
         assert_eq!(held_buffer_bytes(&mut buffers), 4 + 16);
+        let mut tables = Vec::new();
+        child.held_tables(&mut tables);
+        assert_eq!(tables.len(), 2, "its table and its parent's");
+        let both = tables.iter().map(|&(_, bytes)| bytes).sum::<usize>();
+        assert!(both > 0, "a table with an entry holds heap");
+        parent.held_tables(&mut tables);
+        assert_eq!(
+            held_table_bytes(&mut tables),
+            both,
+            "a table reached twice counts once"
+        );
     }
 
     #[tokio::test]
