@@ -83,21 +83,21 @@ use std::{
 };
 
 use arrow_array::ArrayRef;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::{
     catalog::TableProvider,
     common::{
-        DFSchema, ScalarValue,
+        Column, DFSchema, ScalarValue,
         tree_node::{Transformed, TreeNodeRecursion},
     },
-    datasource::{DefaultTableSource, provider_as_source},
+    datasource::{DefaultTableSource, MemTable, provider_as_source},
     error::{DataFusionError, Result as DfResult},
     execution::{SessionState, SessionStateBuilder},
     functions::core::expr_fn::{coalesce, greatest, least},
     functions_aggregate::expr_fn::{count, max, min, sum},
     logical_expr::{
-        Aggregate, EmptyRelation, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator,
-        TableScan, TableSource, lit,
+        Aggregate, Distinct, EmptyRelation, Expr, Filter, LogicalPlan, LogicalPlanBuilder,
+        Operator, TableScan, TableSource, lit,
         utils::{conjunction, split_conjunction},
     },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
@@ -106,25 +106,44 @@ use datafusion::{
 use futures::future::{join_all, try_join_all};
 use roaring::RoaringBitmap;
 use tracing::debug;
+use uuid::Uuid;
 
-use crate::supertable::{
-    error::QueryError,
-    manifest::{
-        ManifestSnapshot, SuperfileEntry, add_sum_arrays, list::ScalarValueCounts,
-        load_section_groups_blocking,
-    },
-    query::{
-        deleted_stats::{
-            CountsChange, DeletedRowStatsRequest, LiveBound, LiveColumn, RequestedColumn, Unknown,
-            better_bound, read_requested, strictly_better,
+use crate::{
+    superfile::fts::tokenize::KEYWORD_TOKENIZER,
+    supertable::{
+        error::QueryError,
+        manifest::{
+            ManifestSnapshot, SuperfileEntry, add_sum_arrays, list::ScalarValueCounts,
+            load_section_groups, load_section_groups_blocking,
         },
-        provider::{CountedRange, SupertableProvider},
-        range_counts::RangeBucket,
-        skip::{ColumnTypeGuard, file_lacks_column},
-        value_count_carry::{counts_of, counts_without, take_off},
+        query::{
+            deleted_stats::{
+                CountsChange, DeletedRowStatsRequest, LiveBound, LiveColumn, RequestedColumn,
+                Unknown, better_bound, read_requested, strictly_better,
+            },
+            fts::TermCounts,
+            provider::{CountedRange, SupertableProvider},
+            range_counts::RangeBucket,
+            skip::{ColumnTypeGuard, file_lacks_column},
+            sql::term_counts_batch,
+            value_count_carry::{counts_of, counts_without, take_off},
+        },
+        schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
     },
-    schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
 };
+
+/// The fewest rows per term (rows over each superfile's distinct terms
+/// added up; see [`term_counts_pay`]) at which a `keyword` column's grouping
+/// is read from its term counts rather than scanned. Measured on a warm
+/// local table of 16 superfiles of 250,000 rows each, grouping one keyword
+/// column: at about 10 rows per term the term counts cost what the scan
+/// does (17 ms each), at about 20 they take a quarter of it (3.7 ms against
+/// 15 ms), and at 50 an eighth. Below the threshold the grouping is scanned
+/// as planned.
+pub(crate) const TERM_COUNTS_MIN_ROWS_PER_TERM: u64 = 16;
+
+/// The memory table a grouping answered from term counts reads.
+pub(crate) const TERM_COUNTS_TABLE: &str = "__term_counts";
 
 /// The comparisons that are never true when their column is null (a null
 /// compared is null), so a `column IS NOT NULL` beside one narrows nothing.
@@ -137,9 +156,17 @@ const NULL_REJECTING_COMPARISONS: [Operator; 6] = [
     Operator::GtEq,
 ];
 
-/// What a dry run's rewrite collects: the deleted rows each rewritten
-/// aggregate wants, by the provider to read them through.
-type StatsCollector = Mutex<Vec<(SupertableProvider, Vec<DeletedRowStatsRequest>)>>;
+/// What a dry run's rewrite collects, each by the provider to read it
+/// through: the deleted rows each rewritten aggregate wants, and the
+/// `keyword` columns whose term counts would answer a grouping the
+/// statistics do not.
+#[derive(Default)]
+struct Wanted {
+    deleted: Vec<(SupertableProvider, Vec<DeletedRowStatsRequest>)>,
+    terms: Vec<(SupertableProvider, String)>,
+}
+
+type StatsCollector = Mutex<Wanted>;
 
 /// The covered/residual aggregate rewrite. Registered on the
 /// `query_sql` session after DataFusion's built-in rules.
@@ -259,9 +286,25 @@ pub(crate) async fn prepare_aggregate_inputs(
     plan: &LogicalPlan,
     state: &SessionState,
 ) -> Result<(), QueryError> {
+    read_value_frequencies(plan).await?;
     let mut sources: Vec<Arc<dyn TableSource>> = Vec::new();
     let mut aggregated: Vec<Arc<dyn TableSource>> = Vec::new();
+    // The columns the plan groups by alone, and the `keyword` columns of the
+    // tables it reads: term counts can answer only a grouping of one of
+    // those, so only such a plan pays for the dry run below.
+    let mut grouped: Vec<String> = Vec::new();
+    let mut keywords: Vec<(SupertableProvider, String)> = Vec::new();
     plan.apply_with_subqueries(|node| {
+        if let Some(column) = single_grouped_column(node) {
+            grouped.push(column.to_string());
+        }
+        if let LogicalPlan::TableScan(scan) = node
+            && let Some(provider) = supertable_provider(&scan.source)
+        {
+            for column in keyword_columns(provider.manifest()) {
+                keywords.push((provider.share(), column));
+            }
+        }
         if let LogicalPlan::Aggregate(agg) = node
             && let Some(scan) = aggregated_scan(agg)
         {
@@ -275,6 +318,15 @@ pub(crate) async fn prepare_aggregate_inputs(
         Ok(TreeNodeRecursion::Continue)
     })
     .map_err(QueryError::DataFusion)?;
+    // The dry run costs about what a small grouping does, so it runs for
+    // term counts only when a grouped `keyword` column would read them.
+    let mut over_keywords = false;
+    for (provider, column) in &keywords {
+        if grouped.contains(column) && term_counts_wanted(provider, column).await {
+            over_keywords = true;
+            break;
+        }
+    }
     try_join_all(
         sources
             .iter()
@@ -296,7 +348,9 @@ pub(crate) async fn prepare_aggregate_inputs(
             with_deletes.push(provider);
         }
     }
-    if with_deletes.is_empty() {
+    // A grouping of a `keyword` column may be answered from its term
+    // counts, which only a dry run of the rewrite asks for.
+    if with_deletes.is_empty() && !over_keywords {
         return Ok(());
     }
     join_all(
@@ -316,11 +370,171 @@ pub(crate) async fn prepare_aggregate_inputs(
         debug!(%error, "aggregate inputs left unread: the statement does not optimize");
         return Ok(());
     }
-    let requests = mem::take(&mut *collector.lock().expect("requests rows poisoned"));
-    for (provider, requests) in requests {
+    let wanted = mem::take(&mut *collector.lock().expect("requests rows poisoned"));
+    for (provider, requests) in wanted.deleted {
         read_requested(&provider, state, provider.deleted_stats(), requests).await;
     }
+    // The optimizer runs its rules over several passes, and the dry run asks
+    // again on each: each column of each table is read once.
+    let mut terms: Vec<(SupertableProvider, String)> = Vec::new();
+    for (provider, column) in wanted.terms {
+        if !terms
+            .iter()
+            .any(|(seen, name)| *name == column && seen.shares_term_counts(&provider))
+        {
+            terms.push((provider, column));
+        }
+    }
+    for (provider, column) in terms {
+        keep_term_counts(&provider, state, &column).await;
+    }
     Ok(())
+}
+
+/// For each table `plan` reads, how many rows hold the `keyword` values its
+/// filters compare to, read from the term index before the plan is
+/// optimized: the pushdown decides by them whether an equality is read from
+/// the postings (see [`SupertableProvider::read_value_frequencies`]).
+async fn read_value_frequencies(plan: &LogicalPlan) -> Result<(), QueryError> {
+    let mut providers: Vec<SupertableProvider> = Vec::new();
+    let mut filters: Vec<Expr> = Vec::new();
+    plan.apply_with_subqueries(|node| {
+        match node {
+            LogicalPlan::Filter(filter) => {
+                filters.extend(split_conjunction(&filter.predicate).into_iter().cloned());
+            }
+            LogicalPlan::TableScan(scan) => {
+                filters.extend(scan.filters.iter().cloned());
+                if let Some(provider) = supertable_provider(&scan.source)
+                    && !keyword_columns(provider.manifest()).is_empty()
+                {
+                    providers.push(provider.share());
+                }
+            }
+            _ => {}
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(QueryError::DataFusion)?;
+    if filters.is_empty() {
+        return Ok(());
+    }
+    join_all(
+        providers
+            .iter()
+            .map(|provider| provider.read_value_frequencies(&filters)),
+    )
+    .await;
+    Ok(())
+}
+
+/// A `keyword` column's live value counts read from its term index before
+/// the statement is optimized, for the rewrite to answer a grouping of the
+/// column from (see [`prepare_aggregate_inputs`]). The counts stay charged
+/// to the connection memory budget until the rewrite takes them. Counts the
+/// rewrite never takes (planning failed between the read and the rewrite)
+/// stay charged until a later statement grouping the same column replaces
+/// them or the session context is dropped: at most one entry per column.
+pub(crate) struct LiveTermCounts {
+    pub(crate) counts: TermCounts,
+    /// The live rows that hold no value.
+    pub(crate) nulls: u64,
+    /// How many rows of each superfile were deleted when they were counted:
+    /// the rewrite answers from the counts only while those are still the
+    /// rows its provider sees deleted.
+    pub(crate) deleted_rows: Vec<(Uuid, u64)>,
+}
+
+/// Read `column`'s term counts through `provider` and keep them on it for
+/// the rewrite, unless the statistics answer the column without them. What
+/// the provider kept from an earlier statement is dropped first.
+///
+/// The provider lives in the cached session context and keeps one entry per
+/// column, not per statement, so two statements running at once on the same
+/// reader can drop or take each other's counts: one of them then scans, and
+/// both hold budget for a moment. The answer stays exact either way, since
+/// both read the same snapshot and the rewrite checks the deleted rows
+/// again before it uses any counts (see [`grouping_from_terms`]).
+///
+/// A failed read keeps nothing: the grouping then runs as planned, which
+/// reports a fault the scan shares.
+async fn keep_term_counts(provider: &SupertableProvider, state: &SessionState, column: &str) {
+    drop(provider.take_term_counts(column));
+    if !term_counts_wanted(provider, column).await {
+        return;
+    }
+    let Some(reader) = provider.reader() else {
+        return;
+    };
+    match reader.live_term_counts(provider, state, column).await {
+        Ok(Some(counts)) => provider.keep_term_counts(column, counts),
+        Ok(None) => debug!(column, "term counts declined: the grouping is scanned"),
+        Err(error) => debug!(%error, column, "term counts unread: the grouping is scanned"),
+    }
+}
+
+/// Whether a grouping of `column` would be answered from its term counts:
+/// the statistics do not answer it, and the counts cost less than a scan
+/// (see [`term_counts_worth_reading`]).
+async fn term_counts_wanted(provider: &SupertableProvider, column: &str) -> bool {
+    value_counts_from_statistics(provider, column).is_none()
+        && term_counts_worth_reading(provider.manifest(), column).await
+}
+
+/// Whether `column` is indexed by the `keyword` analyzer, which holds each
+/// whole value as one term.
+pub(crate) fn is_keyword_column(manifest: &ManifestSnapshot, column: &str) -> bool {
+    manifest
+        .try_fts_tokenizer_for(column)
+        .is_some_and(|tokenizer| tokenizer.name() == KEYWORD_TOKENIZER)
+}
+
+/// The `keyword` columns of `manifest`'s table.
+fn keyword_columns(manifest: &ManifestSnapshot) -> Vec<String> {
+    manifest
+        .fts_configs()
+        .iter()
+        .filter(|config| is_keyword_column(manifest, &config.column))
+        .map(|config| config.column.clone())
+        .collect()
+}
+
+/// The one column `node` groups by, as the statement is written, before
+/// the optimizer has turned a distinct listing or a distinct count into a
+/// grouping: `GROUP BY column` (under an alias or not), `SELECT DISTINCT
+/// column`, or `COUNT(DISTINCT column)` with no `GROUP BY`. These are the
+/// shapes term counts can answer (see
+/// [`rewrite_grouped_count_from_value_counts`]); `None` for any other node.
+/// A column renamed by a subquery is missed, and its grouping is then
+/// scanned, as it would be without term counts.
+fn single_grouped_column(node: &LogicalPlan) -> Option<&str> {
+    match node {
+        LogicalPlan::Aggregate(aggregate) => {
+            if let Some(column) = grouping_column(aggregate) {
+                return Some(column.name.as_str());
+            }
+            let ([], [expr]) = (
+                aggregate.group_expr.as_slice(),
+                aggregate.aggr_expr.as_slice(),
+            ) else {
+                return None;
+            };
+            let Expr::AggregateFunction(func) = unaliased(expr) else {
+                return None;
+            };
+            match func.params.args.as_slice() {
+                [Expr::Column(column)] if func.params.distinct && func.func.name() == "count" => {
+                    Some(column.name.as_str())
+                }
+                _ => None,
+            }
+        }
+        LogicalPlan::Distinct(Distinct::All(input)) => match input.schema().fields().as_ref() {
+            [field] => Some(field.name().as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Our provider behind `source`, when it is one.
@@ -402,15 +616,23 @@ fn dry_run(state: &SessionState, collector: &Arc<StatsCollector>) -> SessionStat
 /// [`CoveredAggregateRewrite::collector`]).
 struct StatsRequests {
     list: Vec<DeletedRowStatsRequest>,
+    /// The `keyword` columns whose term counts would answer a grouping the
+    /// statistics leave to the scan; asked for only while looking.
+    terms: Vec<String>,
     quiet: bool,
 }
 
 impl StatsRequests {
-    fn logged() -> Self {
+    fn new(quiet: bool) -> Self {
         Self {
             list: Vec::new(),
-            quiet: false,
+            terms: Vec::new(),
+            quiet,
         }
+    }
+
+    fn logged() -> Self {
+        Self::new(false)
     }
 }
 
@@ -426,20 +648,19 @@ fn try_rewrite(
     plan: &LogicalPlan,
     collector: Option<&StatsCollector>,
 ) -> DfResult<Option<LogicalPlan>> {
-    let mut wants = StatsRequests {
-        list: Vec::new(),
-        quiet: collector.is_some(),
-    };
+    let mut wants = StatsRequests::new(collector.is_some());
     let rewritten = try_rewrite_wanting(plan, &mut wants)?;
     if let Some(collector) = collector
-        && !wants.list.is_empty()
         && let LogicalPlan::Aggregate(agg) = plan
         && let Some(provider) = aggregated_scan(agg).and_then(provider_of)
     {
-        collector
-            .lock()
-            .expect("requests rows poisoned")
-            .push((provider.share(), wants.list));
+        let mut wanted = collector.lock().expect("requests rows poisoned");
+        if !wants.list.is_empty() {
+            wanted.deleted.push((provider.share(), wants.list));
+        }
+        for column in wants.terms {
+            wanted.terms.push((provider.share(), column));
+        }
     }
     Ok(rewritten)
 }
@@ -526,10 +747,7 @@ fn try_rewrite_wanting(
     // the value counts.
     let counted = provider.counted_range(&predicate);
     let range_indexed = counted.is_some();
-    let mut unread = StatsRequests {
-        list: Vec::new(),
-        quiet: requests.quiet,
-    };
+    let mut unread = StatsRequests::new(requests.quiet);
     let counts_wanted = match range_indexed {
         true => &mut unread,
         false => &mut *requests,
@@ -688,10 +906,7 @@ pub(crate) async fn non_null_count(
     column: &str,
 ) -> Option<u64> {
     let kinds = [AggKind::Count(column.to_string())];
-    let mut requests = StatsRequests {
-        list: Vec::new(),
-        quiet: true,
-    };
+    let mut requests = StatsRequests::new(true);
     let mut answered = table_statistics(provider, &kinds, "non-null count", &mut requests);
     if !requests.list.is_empty() {
         let wanted = mem::take(&mut requests.list);
@@ -1508,15 +1723,20 @@ fn rewrite_grouped_count_from_value_counts(
     aggregate: &Aggregate,
     requests: &mut StatsRequests,
 ) -> DfResult<Option<LogicalPlan>> {
-    let [Expr::Column(group_column)] = aggregate.group_expr.as_slice() else {
+    let Some(group_column) = grouping_column(aggregate) else {
         return Ok(None);
     };
     let Some(kinds) = parse_aggregates(&aggregate.aggr_expr) else {
         return Ok(None);
     };
-    if !matches!(kinds.as_slice(), [AggKind::CountStar]) {
-        return Ok(None);
-    }
+    // `GROUP BY column` with no aggregate is the column's distinct values:
+    // `SELECT DISTINCT column`, and `COUNT(DISTINCT column)` once DataFusion
+    // has turned it into a grouping.
+    let counted = match kinds.as_slice() {
+        [AggKind::CountStar] => true,
+        [] => false,
+        _ => return Ok(None),
+    };
     // The value counts are exact counts of the column's non-null values.
     // Over the whole table the null group is counted from the null counts
     // as well; filtered to the non-null values, there is none.
@@ -1534,16 +1754,37 @@ fn rewrite_grouped_count_from_value_counts(
     // counts and the residual scan see the same ones.
     let provider = &provider.reading_tombstones_once();
     let column = group_column.name.as_str();
+    let keyword = is_keyword_column(provider.manifest(), column);
+    // Counts read for this statement are taken whichever way it is
+    // answered, so their budget is released with the rewrite.
+    let term_counts = match keyword && !requests.quiet {
+        true => provider.take_term_counts(column),
+        false => None,
+    };
+    let from_terms = |requests: &mut StatsRequests| match requests.quiet {
+        true => {
+            if keyword {
+                requests.terms.push(column.to_string());
+            }
+            Ok(None)
+        }
+        false => grouping_from_terms(aggregate, provider, counted, nulls_filtered, term_counts),
+    };
+    // The statistics count values but list none without their counts: a
+    // distinct grouping is answered from the term counts alone.
+    if !counted {
+        return from_terms(requests);
+    }
     let Some(counts_split) =
         split_value_counts(provider, column, !nulls_filtered, "grouped count", requests)
     else {
-        return Ok(None);
+        return from_terms(requests);
     };
     let Some(counts) = answered_counts(provider, column, &counts_split) else {
         counts_split
             .split
             .decline("the column has no exact value counts");
-        return Ok(None);
+        return from_terms(requests);
     };
     let CountsSplit { split, nulls, .. } = counts_split;
 
@@ -1553,7 +1794,7 @@ fn rewrite_grouped_count_from_value_counts(
         Ok(rows) => rows,
         Err(why) => {
             split.decline(why);
-            return Ok(None);
+            return from_terms(requests);
         }
     };
 
@@ -1578,6 +1819,11 @@ fn rewrite_grouped_count_from_value_counts(
         ));
     }
 
+    // The term counts answer every superfile; the statistics leave some to
+    // the scan.
+    if let Some(plan) = from_terms(requests)? {
+        return Ok(Some(plan));
+    }
     split.log();
     let restricted = split.restrict(provider);
     union_with_scanned_groups(
@@ -1589,6 +1835,86 @@ fn rewrite_grouped_count_from_value_counts(
         rows,
     )
     .map(Some)
+}
+
+/// The single grouping column of `aggregate`, under an alias or not (as
+/// DataFusion names the column of a distinct count it turns into a
+/// grouping).
+fn grouping_column(aggregate: &Aggregate) -> Option<&Column> {
+    match aggregate.group_expr.as_slice() {
+        [expr] => match unaliased(expr) {
+            Expr::Column(column) => Some(column),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `aggregate`, a grouping of a `keyword` column with `COUNT(*)`
+/// (`counted`) or with no aggregate, answered from `term_counts`, the
+/// column's live value counts read before the statement was optimized:
+///
+/// ```text
+/// Projection(the aggregate's names)
+///   └─ TableScan(a memory table of (value, count), or of value alone)
+/// ```
+///
+/// `None`, leaving the grouping to the scan, when there are no counts (the
+/// term path declined, or the column is not `keyword`), when the provider
+/// now sees other rows deleted than the counts left out, or when a value or
+/// a count does not fit the aggregate's output.
+pub(super) fn grouping_from_terms(
+    aggregate: &Aggregate,
+    provider: &SupertableProvider,
+    counted: bool,
+    nulls_filtered: bool,
+    term_counts: Option<LiveTermCounts>,
+) -> DfResult<Option<LogicalPlan>> {
+    let Some(live) = term_counts else {
+        return Ok(None);
+    };
+    let unchanged = live.deleted_rows.iter().all(|&(superfile_id, deleted)| {
+        provider
+            .deleted_rows(superfile_id, Instant::now())
+            .is_ok_and(|rows| rows.len() == deleted)
+    });
+    if !unchanged {
+        debug!("term counts set aside: rows were deleted since they were read");
+        return Ok(None);
+    }
+    let value = aggregate.schema.field(0).as_ref().clone();
+    let schema = Arc::new(Schema::new(vec![
+        value.with_name(GROUP_VALUE),
+        Field::new(GROUP_COUNT, DataType::Int64, false),
+    ]));
+    let nulls = if nulls_filtered { 0 } else { live.nulls };
+    let Some(batch) = term_counts_batch(&schema, live.counts.counts(), nulls)? else {
+        debug!("term counts set aside: a value or a count does not fit");
+        return Ok(None);
+    };
+    // The budget held the counts; the rows built from them leave it. The
+    // memory table is not charged: it holds one row per distinct value, which
+    // the cost check keeps to at most one per
+    // `TERM_COUNTS_MIN_ROWS_PER_TERM` rows, and is about the size of the
+    // counts just released.
+    drop(live);
+    let (batch, columns) = match counted {
+        true => (batch, vec![col(GROUP_VALUE), col(GROUP_COUNT)]),
+        false => (batch.project(&[0])?, vec![col(GROUP_VALUE)]),
+    };
+    debug!(
+        groups = batch.num_rows(),
+        "grouping answered from the term index"
+    );
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+    let plan = LogicalPlanBuilder::scan(
+        TERM_COUNTS_TABLE,
+        provider_as_source(Arc::new(table) as Arc<dyn TableProvider>),
+        None,
+    )?
+    .project(as_output(&aggregate.schema, columns))?
+    .build()?;
+    Ok(Some(plan))
 }
 
 /// One row of `(value, count)` per value of `counts`, cast to the grouping
@@ -1624,7 +1950,7 @@ fn union_with_scanned_groups(
     aggregate: &Aggregate,
     scan: &TableScan,
     restricted: SupertableProvider,
-    group_column: &datafusion::common::Column,
+    group_column: &Column,
     nulls_filtered: bool,
     rows: Vec<Vec<Expr>>,
 ) -> DfResult<LogicalPlan> {
@@ -1868,6 +2194,161 @@ pub(crate) fn value_counts_from_statistics(
     let counts = answered_counts(provider, column, &counts_split)?;
     let values = counts.iter().map(|(v, n)| (v.clone(), n)).collect();
     Some((values, counts_split.nulls))
+}
+
+/// What the statistics must give to sum a `keyword` column's term counts:
+/// the superfiles holding a live value, the values their deleted rows held
+/// (term counts include them, so they are subtracted), and the live nulls.
+pub(crate) struct TermCountInputs {
+    pub(crate) files: Vec<Arc<SuperfileEntry>>,
+    pub(crate) deleted: Vec<(ScalarValue, u64)>,
+    pub(crate) nulls: u64,
+    /// How many rows of each superfile were deleted when they were counted.
+    pub(crate) deleted_rows: Vec<(Uuid, u64)>,
+}
+
+/// [`TermCountInputs`] for `column`, reading the deleted rows' statistics
+/// where needed, as [`non_null_count`] does. `None` when one is
+/// not known exactly (a manifest not fully loaded, a column mid-retype,
+/// deleted rows too many to read or holding too many values), or when a
+/// superfile's index of the column does not hold one term per value.
+pub(crate) async fn term_count_inputs(
+    provider: &SupertableProvider,
+    state: &SessionState,
+    column: &str,
+) -> Option<TermCountInputs> {
+    let manifest = provider.manifest();
+    let superfiles = manifest.complete_flat_superfiles()?;
+    if !counts_describe_column(manifest, column, superfiles) {
+        return None;
+    }
+    let stats_column = StatsColumn::new(manifest, column)?;
+    load_section_groups(superfiles, &[stats_column.id]).await;
+    let mut requests = Vec::new();
+    let mut inputs = term_count_pass(provider, superfiles, &stats_column, &mut requests)?;
+    if !requests.is_empty() {
+        read_requested(
+            provider,
+            state,
+            provider.deleted_stats(),
+            mem::take(&mut requests),
+        )
+        .await;
+        inputs = term_count_pass(provider, superfiles, &stats_column, &mut requests)?;
+    }
+    requests.is_empty().then_some(inputs)
+}
+
+/// Whether reading `column`'s live value counts from its term counts costs
+/// less than scanning and grouping its rows (see [`term_counts_pay`]): what
+/// `value_counts` and the covered-aggregate rewrite each ask before taking
+/// the term path. `false` when the manifest is not fully loaded or does not
+/// know the column.
+pub(crate) async fn term_counts_worth_reading(manifest: &ManifestSnapshot, column: &str) -> bool {
+    let Some(superfiles) = manifest.complete_flat_superfiles() else {
+        return false;
+    };
+    let Some(id) = manifest.field_id(column) else {
+        return false;
+    };
+    load_section_groups(superfiles, &[id]).await;
+    let pays = term_counts_pay(superfiles, id);
+    if !pays {
+        debug!(column, "term counts not read: too few rows per value");
+    }
+    pays
+}
+
+/// Whether summing `id`'s term counts over `superfiles` costs less than
+/// scanning and grouping their rows: whether the rows are at least
+/// [`TERM_COUNTS_MIN_ROWS_PER_TERM`] times the terms the sum walks. The sum
+/// walks one entry per term and superfile, so the terms are each
+/// superfile's distinct terms added up, as its summary records them; a
+/// value held in several superfiles counts once in each, as it is walked.
+/// `false` when a superfile holding values records no term count.
+///
+/// The rows are each superfile's `n_docs`, which include its deleted rows
+/// and the rows of superfiles that lack the column. On a table that is
+/// mostly deleted this can choose the term counts when scanning the few
+/// live rows would cost less; the answer is exact either way.
+fn term_counts_pay(superfiles: &[Arc<SuperfileEntry>], id: FieldId) -> bool {
+    let mut rows: u64 = 0;
+    let mut terms: u64 = 0;
+    for entry in superfiles {
+        rows = rows.saturating_add(entry.n_docs);
+        if file_lacks_column(entry, id) {
+            continue;
+        }
+        let Some(summary) = entry.fts_summary.get(&id) else {
+            return false;
+        };
+        let holds_values = summary
+            .length_stats
+            .is_some_and(|lengths| lengths.n_scored_docs > 0);
+        if holds_values && summary.n_terms_distinct == 0 {
+            return false;
+        }
+        terms = terms.saturating_add(summary.n_terms_distinct);
+    }
+    rows >= terms.saturating_mul(TERM_COUNTS_MIN_ROWS_PER_TERM)
+}
+
+/// One pass of [`term_count_inputs`]: a superfile whose deleted rows'
+/// statistics are not read yet is added to `requests` instead.
+fn term_count_pass(
+    provider: &SupertableProvider,
+    superfiles: &[Arc<SuperfileEntry>],
+    column: &StatsColumn,
+    requests: &mut Vec<DeletedRowStatsRequest>,
+) -> Option<TermCountInputs> {
+    let data_type = column.data_type.as_ref()?;
+    let mut inputs = TermCountInputs {
+        files: Vec::new(),
+        deleted: Vec::new(),
+        nulls: 0,
+        deleted_rows: Vec::with_capacity(superfiles.len()),
+    };
+    for entry in superfiles {
+        let deleted = provider
+            .deleted_rows(entry.superfile_id, Instant::now())
+            .ok()?;
+        inputs
+            .deleted_rows
+            .push((entry.superfile_id, deleted.len()));
+        // No live row: no value and no null, and no deleted rows to read.
+        if deleted.len() >= entry.n_docs {
+            continue;
+        }
+        let live = live_column(provider, entry, column.id, data_type, &deleted);
+        let answer = live
+            .live_nulls()
+            .and_then(|nulls| Ok((nulls, live.deleted_counts()?)));
+        let (nulls, deleted_counts) = match answer {
+            Ok(answer) => answer,
+            Err(Unknown::Unread) => {
+                requests.push(DeletedRowStatsRequest {
+                    entry: Arc::clone(entry),
+                    deleted,
+                    columns: [column.requests()].into_iter().collect(),
+                });
+                continue;
+            }
+            Err(Unknown::Scan) => return None,
+        };
+        inputs.nulls = inputs.nulls.checked_add(nulls)?;
+        if file_lacks_column(entry, column.id) {
+            continue;
+        }
+        // Every document with a token has exactly one: the file's index
+        // holds one term per value.
+        let lengths = entry.fts_summary.get(&column.id)?.length_stats?;
+        if lengths.total_tokens != lengths.n_scored_docs {
+            return None;
+        }
+        inputs.deleted.extend(deleted_counts);
+        inputs.files.push(Arc::clone(entry));
+    }
+    Some(inputs)
 }
 
 fn count_range_from_value_counts<'a>(

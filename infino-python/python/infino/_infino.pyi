@@ -145,9 +145,11 @@ class IndexSpec:
     # text is never kept, so it cannot be selected, projected, or filtered on.
     # `k1` / `b` are the column's BM25 similarity parameters (defaults 1.2 and
     # 0.75); pass both or neither. The stored score bounds are built with them.
-    # `analyzer` names the base tokenizer; `"standard"`, the default, is the
-    # only one. The three analysis options are keyword-only and come after
-    # `b`, so existing positional calls keep their meaning.
+    # `analyzer` names the base tokenizer: `"standard"` (the default) splits
+    # the text into lowercased words; `"keyword"` keeps each value as one
+    # whole term, case and all, and takes no stopwords or stemmer. The three
+    # analysis options are keyword-only and come after `b`, so existing
+    # positional calls keep their meaning.
     def fts(
         self,
         column: str,

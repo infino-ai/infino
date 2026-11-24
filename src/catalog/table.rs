@@ -724,8 +724,19 @@ impl Supertable {
     /// the column's value table (a file keeps its value tables while they fit
     /// 128 KiB together), at most 1024 distinct values across the table, and
     /// the column not in the middle of a type change. A file whose column holds only nulls
-    /// counts as its nulls. Otherwise the grouped count runs. An unknown
-    /// column is an error, as is a column itself named `count(*)`.
+    /// counts as its nulls.
+    ///
+    /// Else, on a column indexed by the `keyword` analyzer (see
+    /// [`FtsField::analyzer`](crate::FtsField::analyzer)), from its full-text
+    /// index, reading no row. Each term there is one whole value, so the
+    /// documents holding a term are the rows holding that value. The
+    /// statistics give the deleted rows' values, which are subtracted, and
+    /// the nulls. So this path also needs exact statistics (few enough
+    /// deleted rows and values to read), and the distinct values must fit
+    /// the connection memory budget.
+    ///
+    /// Otherwise the grouped count runs, budgeted and able to spill. An
+    /// unknown column is an error, as is a column itself named `count(*)`.
     pub fn value_counts(&self, column: &str) -> Result<RecordBatch, InfinoError> {
         self.inner.value_counts(column)
     }

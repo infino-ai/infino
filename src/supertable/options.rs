@@ -277,14 +277,19 @@ const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = u32::MAX;
 /// seventeen; what each open fetches is a few hundred kilobytes at most once
 /// a superfile's arrays are cached, and a few megabytes on first touch.
 const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 256;
-/// Most superfiles a query works on at once by default (see
-/// [`default_superfiles_in_flight`]). A query over this many superfiles or
-/// fewer runs as it would with no limit. Past it, a superfile's setup (a few
-/// small, round-trip-bound reads and the buffers they fill) waits for a
-/// slot, so a table of thousands of superfiles neither sends thousands of
-/// requests together, which an object store slows until they time out, nor
-/// holds thousands of opens' buffers at once.
+/// Superfiles a query works on at once where the host's memory cannot be
+/// read (see [`default_superfiles_in_flight`]). A query over this many
+/// superfiles or fewer runs as it would with no limit. Past it, a
+/// superfile's setup (a few small, round-trip-bound reads and the buffers
+/// they fill) waits for a slot, so a table of thousands of superfiles
+/// neither sends thousands of requests together, which an object store
+/// slows until they time out, nor holds thousands of opens' buffers at once.
 pub(crate) const DEFAULT_SUPERFILES_IN_FLIGHT: usize = 256;
+/// Most superfiles a query works on at once by default, however much memory
+/// the host has. On a 1T-row table of 26,579 hourly superfiles, a filtered
+/// match over one year (1,565 superfiles) took 40 s at this limit and 60 s
+/// at 256; 2048 and 4096 were no faster.
+const MAX_SUPERFILES_IN_FLIGHT: usize = 1024;
 /// Fewest superfiles a query works on at once by default, however little
 /// memory the host has: below this a table of thousands of superfiles pays
 /// a round trip per handful of them.
@@ -302,8 +307,9 @@ const IN_FLIGHT_MEMORY_SHARE: u64 = 4;
 /// The default for [`SupertableOptions::superfiles_in_flight`]: as many
 /// superfiles as a quarter of the host's memory holds at
 /// [`BYTES_PER_SUPERFILE_IN_FLIGHT`] each, between
-/// [`MIN_SUPERFILES_IN_FLIGHT`] and [`DEFAULT_SUPERFILES_IN_FLIGHT`]. The
-/// ceiling where memory cannot be read. Measured once per process.
+/// [`MIN_SUPERFILES_IN_FLIGHT`] and [`MAX_SUPERFILES_IN_FLIGHT`];
+/// [`DEFAULT_SUPERFILES_IN_FLIGHT`] where memory cannot be read. Measured
+/// once per process.
 pub(crate) fn default_superfiles_in_flight() -> usize {
     static IN_FLIGHT: OnceLock<usize> = OnceLock::new();
     *IN_FLIGHT.get_or_init(|| {
@@ -316,7 +322,7 @@ fn superfiles_in_flight_for(total_bytes: u64) -> usize {
     let fits = total_bytes / IN_FLIGHT_MEMORY_SHARE / BYTES_PER_SUPERFILE_IN_FLIGHT;
     usize::try_from(fits)
         .unwrap_or(usize::MAX)
-        .clamp(MIN_SUPERFILES_IN_FLIGHT, DEFAULT_SUPERFILES_IN_FLIGHT)
+        .clamp(MIN_SUPERFILES_IN_FLIGHT, MAX_SUPERFILES_IN_FLIGHT)
 }
 /// Subdirectory under the disk-cache root that holds the
 /// content-addressed manifest-part byte cache. Kept separate from the
@@ -1739,11 +1745,11 @@ mod tests {
         );
         assert_eq!(
             superfiles_in_flight_for(700 * GIB),
-            DEFAULT_SUPERFILES_IN_FLIGHT,
+            MAX_SUPERFILES_IN_FLIGHT,
             "a large host stops at the ceiling"
         );
         let auto = default_superfiles_in_flight();
-        assert!((MIN_SUPERFILES_IN_FLIGHT..=DEFAULT_SUPERFILES_IN_FLIGHT).contains(&auto));
+        assert!((MIN_SUPERFILES_IN_FLIGHT..=MAX_SUPERFILES_IN_FLIGHT).contains(&auto));
     }
     use crate::{
         superfile::vector::{distance::Metric, rerank_codec::RerankCodec},

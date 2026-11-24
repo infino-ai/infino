@@ -20,8 +20,8 @@
 //!     superfile reader and runs the kernel, so superfile opens and cold
 //!     object-store range GETs across hundreds of superfiles are all in
 //!     flight at once on the shared multi-thread query runtime. The one
-//!     ceiling is `SupertableOptions::superfiles_in_flight` (256 by
-//!     default), so a table of thousands of superfiles does not start
+//!     ceiling is `SupertableOptions::superfiles_in_flight` (sized from
+//!     the host's memory, at most 1024), so a table of thousands of superfiles does not start
 //!     thousands of opens together. Never cap the fan-out's task count at
 //!     the reader pool's width — `tokio::spawn` dispatches a task, not an
 //!     OS thread, and object-store GETs are latency-bound, so narrowing
@@ -826,11 +826,15 @@ pub(crate) type ReplanFuture<'a, P, R> =
 /// the units are issued in the order given, `window` at a time, and when
 /// `replan` resolves the units not yet issued are handed to it and replaced
 /// by what it returns. A plan still unresolved when the last open finishes
-/// is dropped unawaited.
+/// is dropped unawaited. With `floor_first`, at most [`FLOOR_WINDOW`] units
+/// are in flight until that many have answered, so a running floor forms
+/// before the window opens wide; a caller whose window is already the one it
+/// wants from the start passes `false`.
 pub(crate) async fn fanout_with_ordered<'a, P, R, B, Fut, S, W>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
     window: W,
+    floor_first: bool,
     skip_before_open: S,
     body: B,
     mut on_result: impl FnMut(&R),
@@ -891,7 +895,7 @@ where
         let window = window(out.len());
         let issue = match (
             replan.is_some() && cap_ahead_of_plan,
-            out.len() < FLOOR_WINDOW,
+            floor_first && out.len() < FLOOR_WINDOW,
         ) {
             (true, _) => PENDING_PLAN_WINDOW
                 .saturating_sub(opened as usize)
@@ -1003,6 +1007,7 @@ where
         reader,
         units,
         |_| window,
+        true,
         skip_before_open,
         local_hits_body(kernel),
         on_result,
@@ -1222,29 +1227,100 @@ mod fanout_tier_tests {
         let running = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let body = {
-            let running = Arc::clone(&running);
             let peak = Arc::clone(&peak);
-            move |_, _, _, _, ()| {
-                let running = Arc::clone(&running);
-                let peak = Arc::clone(&peak);
-                async move {
-                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(now, Ordering::SeqCst);
-                    sleep(UNIT_TIME).await;
-                    let deadline = Instant::now() + OVERLAP_WAIT;
-                    while peak.load(Ordering::SeqCst) < expected && Instant::now() < deadline {
-                        sleep(OVERLAP_POLL).await;
-                    }
-                    running.fetch_sub(1, Ordering::SeqCst);
-                    Ok::<(), QueryError>(())
-                }
-            }
+            move |_, _, _, _, ()| hold_until_peak(Arc::clone(&running), Arc::clone(&peak), expected)
         };
         let out = fanout_with(&reader, units, false, ReadIntent::Warm, body)
             .await
             .expect("fan-out");
         assert_eq!(out.len(), CAPPED_COMMITS, "every unit ran");
         peak.load(Ordering::SeqCst)
+    }
+
+    /// One unit of a peak fixture: counts itself into `running` and `peak`,
+    /// then holds its slot until `expected` units have run at once.
+    async fn hold_until_peak(
+        running: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        expected: usize,
+    ) -> Result<(), QueryError> {
+        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(now, Ordering::SeqCst);
+        sleep(UNIT_TIME).await;
+        let deadline = Instant::now() + OVERLAP_WAIT;
+        while peak.load(Ordering::SeqCst) < expected && Instant::now() < deadline {
+            sleep(OVERLAP_POLL).await;
+        }
+        running.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Superfiles past [`FLOOR_WINDOW`] in the startup fixture, so a fan-out
+    /// held to the floor window starts fewer units than the fixture holds.
+    const PAST_FLOOR: usize = 8;
+    /// Superfiles in the startup fixture, one unit each.
+    const STARTUP_COMMITS: usize = FLOOR_WINDOW + PAST_FLOOR;
+
+    /// The most units of an ordered fan-out over every superfile of `table`
+    /// running at once, its window as wide as the table, with or without
+    /// `floor_first`. Each unit holds its slot until `expected` run at once.
+    async fn ordered_peak(table: &Supertable, floor_first: bool, expected: usize) -> usize {
+        let reader = table.reader().expect("reader");
+        let units: Vec<(Arc<SuperfileEntry>, ())> = reader
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|entry| (Arc::clone(entry), ()))
+            .collect();
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let body = {
+            let peak = Arc::clone(&peak);
+            move |_, _, _, _, ()| hold_until_peak(Arc::clone(&running), Arc::clone(&peak), expected)
+        };
+        let out = fanout_with_ordered(
+            &reader,
+            units,
+            |_| STARTUP_COMMITS,
+            floor_first,
+            |_: &()| false,
+            body,
+            |_: &()| {},
+            None::<ReplanFuture<'_, (), ()>>,
+        )
+        .await
+        .expect("fan-out");
+        assert_eq!(out.len(), STARTUP_COMMITS, "every unit ran");
+        peak.load(Ordering::SeqCst)
+    }
+
+    /// An ordered fan-out holds its first opens to [`FLOOR_WINDOW`] only when
+    /// asked to: without `floor_first` a window wider than it is open from
+    /// the start.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ordered_fanout_holds_its_start_to_the_floor_window_only_when_asked() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let table =
+            Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
+        for i in 0..STARTUP_COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_title_batch(&[&format!("title {i}")]))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        assert_eq!(
+            ordered_peak(&table, false, STARTUP_COMMITS).await,
+            STARTUP_COMMITS,
+            "without the floor window every unit starts at once"
+        );
+        assert_eq!(
+            ordered_peak(&table, true, FLOOR_WINDOW).await,
+            FLOOR_WINDOW,
+            "with it, no more than the floor window start before they answer"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1357,6 +1433,7 @@ mod fanout_tier_tests {
             &reader,
             units,
             |_| WIDE_WINDOW,
+            true,
             |_: &()| false,
             body,
             |_: &()| {},

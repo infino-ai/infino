@@ -894,7 +894,8 @@ struct FtsDecl {
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct FtsOptions {
-    /// Base tokenizer: `"standard"`, the default, is the only one.
+    /// Base tokenizer: `"standard"` (the default) or `"keyword"`, which
+    /// keeps each value as one whole term.
     pub analyzer: Option<String>,
     /// Remove this column's stopwords — the very common words whose
     /// presence says almost nothing about what a document is about.

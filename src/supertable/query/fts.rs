@@ -117,7 +117,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError, config,
-    memory::ConnectionMemoryBudget,
+    memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::run_on_pool_unless_blocking,
     runtime_metrics::op_stats,
     superfile::{
@@ -127,12 +127,12 @@ use crate::{
             bm25,
             bm25::Bm25Params,
             reader::{
-                Bm25SearchOptions, CANDIDATE_MAX_POSTINGS, CANDIDATE_MAX_TERMS, CandidateNorms,
+                Bm25SearchOptions, CANDIDATE_MAX_CELLS, CANDIDATE_MAX_POSTINGS, CandidateNorms,
                 ClauseLists, ColumnLengthStats, ColumnNorms, FEW_NORMS_MAX_DOCS, FetchedTermMemo,
                 GlobalTermIdf, LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet,
                 PreparedClauses, QueryDict, QueryIdf, ScoringView,
             },
-            tokenize::Phrase,
+            tokenize::{KEYWORD_TOKENIZER, Phrase},
         },
         id_space::{FtsDocId, RowId, row_bitmap},
     },
@@ -311,6 +311,25 @@ struct MatchKernel {
     budget: Arc<ConnectionMemoryBudget>,
 }
 
+/// The distinct terms a match resolves in each superfile: its bare terms and
+/// its phrases' members, on both sides of the negation.
+fn located_terms<'a>(
+    match_set: &'a UnrankedMatchSet,
+    negatives: &'a UnrankedNegatives,
+) -> Vec<&'a str> {
+    let mut terms: Vec<&str> = match_set
+        .terms
+        .iter()
+        .chain(&negatives.terms)
+        .chain(match_set.phrases.iter().flat_map(|p| &p.terms))
+        .chain(negatives.phrases.iter().flat_map(|p| &p.terms))
+        .map(String::as_str)
+        .collect();
+    terms.sort_unstable();
+    terms.dedup();
+    terms
+}
+
 /// The dictionary copy a file's match walks share: kept only when the positive walk and the negated
 /// walk both read the dictionary, i.e. the memo answers neither; otherwise it keeps nothing.
 fn walk_dict(
@@ -387,8 +406,14 @@ impl MatchKernel {
         // plain-token queries keep the optimized token_match path.
         let (docs, mut work) = match self.phrase_involved {
             true => {
-                r.atoms_match_ids(&column, &refs, &self.phrases, self.mode)
-                    .await?
+                r.atoms_match_ids_prefetched(
+                    &column,
+                    &refs,
+                    &self.phrases,
+                    self.mode,
+                    memo.as_deref(),
+                )
+                .await?
             }
             false => {
                 r.token_match_prefetched(&column, &refs, self.mode, memo.as_deref(), &dict)
@@ -411,8 +436,14 @@ impl MatchKernel {
                     .await?
                 }
                 false => {
-                    r.atoms_match_ids(&column, &neg_refs, &self.negative_phrases, BoolMode::Or)
-                        .await?
+                    r.atoms_match_ids_prefetched(
+                        &column,
+                        &neg_refs,
+                        &self.negative_phrases,
+                        BoolMode::Or,
+                        memo.as_deref(),
+                    )
+                    .await?
                 }
             };
             work.merge(neg_work);
@@ -874,6 +905,14 @@ impl SharedTopK {
             let last = top[self.k - 1];
             last.score == floor && last.id_max < id_min
         }
+    }
+
+    /// The floor for a unit [`Self::tie_skippable`] judged at `tied`: only
+    /// scores above `tied` can enter, since its ties lose. A floor raised
+    /// past `tied` since then is kept as is, ties included: the scores that
+    /// raised it came from `_id`s this unit was never compared against.
+    fn strict_floor(&self, tied: f32) -> f32 {
+        self.floor().max(tied.next_up())
     }
 }
 
@@ -2064,14 +2103,28 @@ impl SupertableReader {
                 // A resident superfile has every byte in memory: nothing to
                 // prewarm, and on a warm table a future per superfile is
                 // measurable against a query of a millisecond.
-                // One bare term with a block or less of postings here scores
-                // from those documents' buckets alone (see `few_norms`), so
-                // prewarming the whole length array would only add its bytes.
-                let few_postings = must_arc.len() + should_arc.len() == 1
+                // A unit whose documents can only tie the floor and lose the
+                // tie (k scores already hold it from lower `_id`s, see
+                // `tie_skippable`) keeps only scores above it. Then few of a
+                // lone term's documents can reach the floor (those that beat
+                // the tied score), so it scores from candidate norms too
+                // rather than reading the whole length array. Not under a
+                // score tolerance, whose floor is not the k-th score.
+                // The floor the tie was judged at: one that rises before
+                // scoring has ties this unit's `_id`s were never compared to.
+                let tied_floor = shared.floor();
+                let ties_lose = !exact_count
+                    && score_tolerance <= 0.0
+                    && shared.tie_skippable(tied_floor, params.id_min);
+                let lone_term = must_arc.len() + should_arc.len() == 1
                     && neg_arc.is_empty()
                     && must_ph_arc.is_empty()
                     && should_ph_arc.is_empty()
-                    && neg_ph_arc.is_empty()
+                    && neg_ph_arc.is_empty();
+                // One bare term with a block or less of postings here scores
+                // from those documents' buckets alone (see `few_norms`), so
+                // prewarming the whole length array would only add its bytes.
+                let few_postings = lone_term
                     && must_arc
                         .iter()
                         .chain(should_arc.iter())
@@ -2084,7 +2137,7 @@ impl SupertableReader {
                 // few terms. Only those terms go on: a prefix's other
                 // expansions, thousands of them, are absent here. Elsewhere
                 // the length array is prewarmed and read as before.
-                let candidate_terms = candidate_shape
+                let candidate_terms = (candidate_shape || (ties_lose && lone_term))
                     .then(|| index_locations.held(suid))
                     .flatten()
                     .and_then(|held| {
@@ -2117,8 +2170,8 @@ impl SupertableReader {
                             _ => work + phrases.iter().flat_map(|(_, dfs)| dfs).sum::<u64>(),
                         };
                         let cheap = !distinct.is_empty()
-                            && distinct.len() <= CANDIDATE_MAX_TERMS
-                            && work <= CANDIDATE_MAX_POSTINGS;
+                            && work <= CANDIDATE_MAX_POSTINGS
+                            && work.saturating_mul(distinct.len() as u64) <= CANDIDATE_MAX_CELLS;
                         cheap.then(|| {
                             let phrases: Vec<&[String]> =
                                 phrases.into_iter().map(|(terms, _)| terms).collect();
@@ -2156,9 +2209,10 @@ impl SupertableReader {
                 // included — matches an uncoordinated run; only the amount
                 // of skipped work depends on segment completion order.
                 // An exact count prunes nothing, so it takes no floor.
-                let floor = match exact_count {
-                    true => f32::NEG_INFINITY,
-                    false => shared.floor(),
+                let floor = match (exact_count, ties_lose) {
+                    (true, _) => f32::NEG_INFINITY,
+                    (false, true) => shared.strict_floor(tied_floor),
+                    (false, false) => shared.floor(),
                 };
                 // Few documents of a multi-term or phrase query can reach the
                 // floor: scoring reads only their length buckets (see
@@ -2221,6 +2275,9 @@ impl SupertableReader {
                     // never contradict. The sidecars were warmed by the
                     // dispatcher, so this lookup is an in-memory hit; on a
                     // miss/error the unit just keeps the snapshot floor.
+                    // A strict unit takes it too: the walk keeps the larger
+                    // of its strict snapshot and the live floor, whose ties
+                    // came from `_id`s this unit was never compared against.
                     let live_floor = if exact_count {
                         None
                     } else {
@@ -3034,17 +3091,22 @@ impl SupertableReader {
         // As in `bm25_search_async`: a prefix query over a column with no
         // full-text index would otherwise fail deep in the scan with an opaque
         // missing-metadata error. Reject up front, naming the searchable set.
-        if manifest.try_fts_tokenizer_for(column).is_none() {
+        let Some(tokenizer) = manifest.try_fts_tokenizer_for(column) else {
             return Err(QueryError::InvalidQuery(no_fts_index_message(
                 column,
                 &manifest.fts_configs(),
             )));
-        }
-        // Expansion matches the dictionary's lowercased bytes, and the
-        // term-range prune compares the same bytes, so both see one prefix.
+        };
+        // Expansion matches the dictionary's bytes, and the term-range
+        // prune compares the same bytes, so both see one prefix: lowercased,
+        // except on a keyword column, whose terms keep their case.
+        let prefix = match tokenizer.name() {
+            KEYWORD_TOKENIZER => prefix.as_bytes().to_vec(),
+            _ => prefix.to_ascii_lowercase().into_bytes(),
+        };
         let prune_leaf = PruneLeaf::Prefix {
             column: column.to_owned(),
-            prefix: prefix.to_ascii_lowercase().into_bytes(),
+            prefix,
         };
         let kept = self.select_scored(column, &prune_leaf, None).await?;
         let shoulds = self
@@ -3141,6 +3203,130 @@ impl SupertableReader {
             .into_iter()
             .filter_map(|t| String::from_utf8(t).ok())
             .collect())
+    }
+
+    /// Every term of `column` with its document count, summed over `files`,
+    /// deleted rows included. The term index answers for the superfiles it
+    /// covers; the dictionaries answer for the rest.
+    ///
+    /// The map holds every distinct value of the column, and each file
+    /// outside the index hands back its whole term list, so both are charged
+    /// to the connection memory budget as they are built. `None` when a
+    /// charge is refused: the caller then counts another way, budgeted and
+    /// able to spill. What was charged is released when the returned
+    /// [`TermCounts`] is dropped.
+    pub(crate) async fn term_doc_counts(
+        &self,
+        column: &str,
+        files: Vec<Arc<SuperfileEntry>>,
+    ) -> Result<Option<TermCounts>, QueryError> {
+        let field = self.manifest().field_id(column);
+        let budget = Arc::clone(&self.manifest().options.connection_memory_budget);
+        let Some(mut counts) = TermCounts::new(&budget) else {
+            return Ok(None);
+        };
+        let index = self
+            .manifest()
+            .term_index()
+            .await
+            .map_err(QueryError::from)?;
+        let rest: Vec<Arc<SuperfileEntry>> = match (&index, field) {
+            (Some(index), Some(field)) => {
+                let (covered, rest): (Vec<_>, Vec<_>) = files
+                    .into_iter()
+                    .partition(|entry| index.is_indexed(&entry.superfile_id));
+                let live: HashSet<Uuid> = covered.iter().map(|e| e.superfile_id).collect();
+                if !live.is_empty() {
+                    let head = field.term_key("").len();
+                    // Whether each superfile ordinal of the index is live, so a
+                    // posting is checked without a lookup by id.
+                    let live_ordinals: Vec<bool> = (0..index.root().superfiles.len() as u32)
+                        .map(|o| index.superfile_id(o).is_some_and(|id| live.contains(&id)))
+                        .collect();
+                    let mut fits = true;
+                    index
+                        .for_each_prefix(field, "", |key, run| {
+                            let held: u64 = run
+                                .iter()
+                                .filter(|p| live_ordinals.get(p.superfile as usize) == Some(&true))
+                                .map(|p| p.df)
+                                .sum();
+                            fits = held == 0 || counts.add(&key[head..], held);
+                            fits
+                        })
+                        .await
+                        .map_err(QueryError::from)?;
+                    if !fits {
+                        return Ok(None);
+                    }
+                }
+                rest
+            }
+            _ => files,
+        };
+        let column_arc: Arc<str> = Arc::from(column);
+        let pool = Arc::clone(&self.manifest().options.reader_pool);
+        let units = rest.into_iter().map(|entry| (entry, ())).collect();
+        // Set once any file's list is refused by the budget. The answer is
+        // then thrown away, so the other files check it and stop before
+        // reading or charging anything more.
+        let refused = Arc::new(AtomicBool::new(false));
+        let per_superfile: Vec<Option<(Vec<(Vec<u8>, u64)>, Reservation)>> = dispatch::fanout_with(
+            self,
+            units,
+            false,
+            self.open_intent(),
+            move |r, _entry, _sidecars, _now, ()| {
+                let column_arc = Arc::clone(&column_arc);
+                let pool = Arc::clone(&pool);
+                let budget = Arc::clone(&budget);
+                let refused = Arc::clone(&refused);
+                async move {
+                    if refused.load(AtomicOrdering::Relaxed) {
+                        return Ok(None);
+                    }
+                    let fts = r
+                        .fts()
+                        .ok_or_else(|| QueryError::Internal("superfile has no FTS index".into()))?;
+                    let column = r.column_alias(field, &column_arc);
+                    let terms = fts.terms_with_prefix(column, b"", Some(&pool)).await?;
+                    if refused.load(AtomicOrdering::Relaxed) {
+                        return Ok(None);
+                    }
+                    // Each file's list is held until the merge below takes
+                    // it.
+                    let bytes = terms.iter().map(|t| term_entry_bytes(t.len())).sum();
+                    let Ok(held) = budget.try_reserve(bytes) else {
+                        refused.store(true, AtomicOrdering::Relaxed);
+                        return Ok(None);
+                    };
+                    let texts = terms
+                        .iter()
+                        .map(|t| str::from_utf8(t))
+                        .collect::<Result<Vec<&str>, _>>()
+                        .map_err(|_| QueryError::Internal("a term is not UTF-8".into()))?;
+                    let (dfs, _) = fts.term_dfs(column, &texts).await?;
+                    Ok(Some((terms.into_iter().zip(dfs).collect(), held)))
+                }
+            },
+        )
+        .await?;
+        let mut lists = Vec::with_capacity(per_superfile.len());
+        for list in per_superfile {
+            let Some(list) = list else {
+                return Ok(None);
+            };
+            lists.push(list);
+        }
+        for (terms, held) in lists {
+            for (term, df) in terms {
+                if df > 0 && !counts.add(&term, df) {
+                    return Ok(None);
+                }
+            }
+            drop(held);
+        }
+        Ok(Some(counts))
     }
 
     /// Parse `query` into positive and negated tokens, then select the
@@ -3353,7 +3539,10 @@ impl SupertableReader {
         dispatch::fanout_with_ordered(
             self,
             units,
-            |answered| MatchOrder::window(answered, widest),
+            |answered| order.walk_window(answered, widest),
+            // The walk's window is the one it wants from the start: a walk
+            // that cannot pass superfiles opens them all at once.
+            false,
             |(best, _): &(u64, P)| order.passed(*best),
             ordered,
             |_| {},
@@ -3641,14 +3830,10 @@ impl SupertableReader {
         if kept.is_empty() {
             return Ok(None);
         }
-        // Every plain term the kernel resolves, positive and negated: the
-        // index's locations for them let each superfile skip its dictionary.
-        let all_terms: Vec<&str> = match_set
-            .terms
-            .iter()
-            .chain(negatives.terms.iter())
-            .map(String::as_str)
-            .collect();
+        // Every term the kernel resolves, positive and negated, phrase
+        // members included: the index's locations for them let each
+        // superfile skip its dictionary.
+        let all_terms = located_terms(&match_set, &negatives);
         // The match's and the filter's index lookups run side by side.
         let (locations, row_filter) = join(
             self.index_locations(column, &all_terms, &kept)
@@ -3792,12 +3977,7 @@ impl SupertableReader {
         let single_term = match_set.terms.len() == 1 && !match_set.has_phrases();
         let has_negatives = !negatives.is_empty();
         let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
-        let all_terms: Vec<&str> = match_set
-            .terms
-            .iter()
-            .chain(negatives.terms.iter())
-            .map(String::as_str)
-            .collect();
+        let all_terms = located_terms(&match_set, &negatives);
         let locations = self.index_locations(column, &all_terms, &kept).await?;
         let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column.to_owned());
@@ -3858,8 +4038,14 @@ impl SupertableReader {
                             walk_dict(phrase_involved, memo.as_deref(), &refs, &neg_refs, &budget);
                         let (docs, mut work) = match phrase_involved {
                             true => {
-                                r.atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
-                                    .await?
+                                r.atoms_match_ids_prefetched(
+                                    &column_arc,
+                                    &refs,
+                                    &phrase_arc,
+                                    match_mode,
+                                    memo.as_deref(),
+                                )
+                                .await?
                             }
                             false => {
                                 r.token_match_prefetched(
@@ -3885,11 +4071,12 @@ impl SupertableReader {
                                     .await?
                                 }
                                 false => {
-                                    r.atoms_match_ids(
+                                    r.atoms_match_ids_prefetched(
                                         &column_arc,
                                         &neg_refs,
                                         &neg_ph_arc,
                                         BoolMode::Or,
+                                        memo.as_deref(),
                                     )
                                     .await?
                                 }
@@ -3921,21 +4108,30 @@ impl SupertableReader {
                         // never materialized. Covers term-only and phrase
                         // positives alike.
                         let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                        r.atoms_match_count(
+                        r.atoms_match_count_prefetched(
                             &column_arc,
                             &refs,
                             &phrase_arc,
                             match_mode,
                             &neg_refs,
                             &neg_ph_arc,
+                            memo.as_deref(),
                         )
                         .await?
                     } else if single_term {
                         // A single token resolves O(1) from the stored df.
                         r.term_df(&column_arc, &term_arc[0]).await?
                     } else if phrase_involved {
-                        r.atoms_match_count(&column_arc, &refs, &phrase_arc, match_mode, &[], &[])
-                            .await?
+                        r.atoms_match_count_prefetched(
+                            &column_arc,
+                            &refs,
+                            &phrase_arc,
+                            match_mode,
+                            &[],
+                            &[],
+                            memo.as_deref(),
+                        )
+                        .await?
                     } else {
                         // Multi-token AND/OR tallies through the counting sink.
                         r.token_match_count_prefetched(
@@ -4038,11 +4234,13 @@ impl SupertableReader {
         let op_stats = self.op_stats.clone();
         let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
         let budget = Arc::clone(&self.manifest().options.connection_memory_budget);
+        let walk = order.cloned();
         let body = move |r: Arc<SuperfileReader>,
                          entry: Arc<SuperfileEntry>,
                          tombstone_cache: Option<Arc<SidecarCache>>,
                          now: Instant,
                          _: ()| {
+            let walk = walk.clone();
             let column_arc = Arc::clone(&column_arc);
             let value_arc = Arc::clone(&value_arc);
             let tokens_arc = Arc::clone(&tokens_arc);
@@ -4089,6 +4287,14 @@ impl SupertableReader {
                     if let Some(rows) = filter.rows(&r, entry.superfile_id, hits, false).await? {
                         candidates.retain(|d| rows.contains(*d));
                     }
+                }
+                // Under an ORDER BY walk, a candidate whose key cannot place
+                // is dropped before its value is read: the sort key is a
+                // fixed-width column, the value a string.
+                if let Some(walk) = &walk
+                    && !candidates.is_empty()
+                {
+                    candidates = walk.prefilter(&r, candidates).await?;
                 }
                 if candidates.is_empty() {
                     return Ok(Vec::new());
@@ -4927,6 +5133,76 @@ impl Supertable {
     }
 }
 
+/// Bytes charged for one term held as a map key or a list entry: its own
+/// bytes, the `Vec` that owns them, its count, and the map slot around them.
+fn term_entry_bytes(term_len: usize) -> usize {
+    term_len + size_of::<Vec<u8>>() + size_of::<u64>() + TERM_SLOT_OVERHEAD
+}
+
+/// A hash map slot's share beyond its pair: the control byte and the empty
+/// slots its load factor keeps, rounded up.
+const TERM_SLOT_OVERHEAD: usize = 16;
+
+/// Bytes [`TermCounts`] charges the budget at once, so many small terms do
+/// not each make their own charge.
+const TERM_COUNTS_CHARGE: usize = 64 << 10;
+
+/// Each term of a column with its document count. Its bytes are charged to
+/// the connection memory budget as it grows, and released when it is
+/// dropped.
+#[derive(Debug)]
+pub(crate) struct TermCounts {
+    counts: HashMap<Vec<u8>, u64>,
+    /// Bytes the map holds by [`term_entry_bytes`]; the reservation stays at
+    /// or above it.
+    held: usize,
+    reservation: Reservation,
+}
+
+impl TermCounts {
+    /// An empty map, or `None` when the budget has no room left at all.
+    fn new(budget: &Arc<ConnectionMemoryBudget>) -> Option<Self> {
+        Some(Self {
+            counts: HashMap::new(),
+            held: 0,
+            reservation: budget.try_reserve(0).ok()?,
+        })
+    }
+
+    /// Add `n` documents to `term`. `false` when a new term does not fit the
+    /// budget; the map is then left without it.
+    fn add(&mut self, term: &[u8], n: u64) -> bool {
+        if let Some(count) = self.counts.get_mut(term) {
+            *count += n;
+            return true;
+        }
+        let bytes = term_entry_bytes(term.len());
+        let short = (self.held + bytes).saturating_sub(self.reservation.size());
+        let fits = short == 0
+            || self
+                .reservation
+                .try_grow(short.max(TERM_COUNTS_CHARGE))
+                .is_ok()
+            || self.reservation.try_grow(short).is_ok();
+        if !fits {
+            return false;
+        }
+        self.held += bytes;
+        self.counts.insert(term.to_vec(), n);
+        true
+    }
+
+    /// The count of `term`, to adjust in place.
+    pub(crate) fn get_mut(&mut self, term: &[u8]) -> Option<&mut u64> {
+        self.counts.get_mut(term)
+    }
+
+    /// The terms and their counts.
+    pub(crate) fn counts(&self) -> &HashMap<Vec<u8>, u64> {
+        &self.counts
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -5262,6 +5538,25 @@ mod tests {
     }
 
     #[test]
+    fn a_strict_floor_keeps_ties_at_a_floor_raised_after_the_tie_check() {
+        let shared = SharedTopK::new(1);
+        shared.merge(50, [1.0]);
+        let tied = shared.floor();
+        assert!(shared.tie_skippable(tied, 100));
+        assert!(
+            shared.strict_floor(tied) > tied,
+            "a tie at the checked floor loses"
+        );
+        // A unit at id 200 raises the floor before the one at 100 scores.
+        shared.merge(200, [2.0]);
+        assert_eq!(
+            shared.strict_floor(tied),
+            2.0,
+            "id 100 wins a tie at the raised floor, so a score of 2 is kept"
+        );
+    }
+
+    #[test]
     fn a_tolerance_raises_the_bar() {
         let floor = 100.0f32;
         assert!(
@@ -5319,7 +5614,7 @@ mod tests {
         );
     }
 
-    use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
+    use arrow_array::{ArrayRef, Decimal128Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -5330,10 +5625,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BoolMode, FanOut, LocatedTerms, SharedTopK, SuperfileHit, SupertableReader,
-        build_work_units, ceilings_at_table_avgdl, fanout_for, walk_dict,
+        BoolMode, FEW_NORMS_MAX_DOCS, FanOut, LocatedTerms, SharedTopK, SuperfileHit,
+        SupertableReader, build_work_units, ceilings_at_table_avgdl, fanout_for, walk_dict,
     };
     use crate::{
+        Analyzer,
         config::{CompactionSettings, OptimizeOptions},
         memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
@@ -6032,6 +6328,84 @@ mod tests {
             "the short match ranks first: {every:?}"
         );
         assert_eq!(top_k_scored(&st, "zeta", 1), every[..1]);
+    }
+
+    /// The `k` of the tie tests: the strong commit's three matches fill it,
+    /// the last at the score [`STRONG_TIED`] and [`BULK_TIED`] share.
+    const TIE_K: usize = 3;
+    /// The strong commit's best `alpha` match, above every bulk match, so
+    /// that commit opens first.
+    const STRONG_BEST: &str = "alpha alpha alpha";
+    /// The strong commit's two other matches: the floor once it is merged.
+    const STRONG_TIED: &str = "alpha beta";
+    /// The bulk commit's best match: above the floor, below [`STRONG_BEST`],
+    /// so the bulk superfile still opens.
+    const BULK_BEST: &str = "alpha alpha gamma";
+    /// The bulk commit's other matches, scoring exactly [`STRONG_TIED`]'s.
+    const BULK_TIED: &str = "alpha gamma";
+
+    /// Ranks `alpha` at [`TIE_K`] over a strong commit and a bulk one with
+    /// more than [`FEW_NORMS_MAX_DOCS`] matches, in the order `bulk_first`
+    /// says, one superfile open at a time. Returns the ranked titles and
+    /// whether the bulk superfile read its whole length array.
+    fn rank_beside_a_bulk_superfile(bulk_first: bool) -> (Vec<String>, bool) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let strong = [STRONG_BEST, STRONG_TIED, STRONG_TIED];
+        let mut bulk = vec![BULK_TIED; FEW_NORMS_MAX_DOCS + 1];
+        bulk.push(BULK_BEST);
+        match bulk_first {
+            true => commit_each(&storage, &[&bulk, &strong]),
+            false => commit_each(&storage, &[&strong, &bulk]),
+        }
+        let st = Supertable::open(
+            eager_options(&storage)
+                .with_bound_ordered_open_window(SEQUENTIAL_OPENS)
+                .with_term_tier_entries_per_term(0),
+        )
+        .expect("open");
+        let titles = top_k_scored(&st, "alpha", TIE_K)
+            .into_iter()
+            .map(|(title, _)| title)
+            .collect();
+        let reader = st.reader().expect("reader");
+        let entry = reader
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .find(|e| e.n_docs as usize == bulk.len())
+            .cloned()
+            .expect("the bulk superfile");
+        let superfile = reader.open_superfile(&entry).expect("open superfile");
+        assert!(
+            superfile.parquet_bytes().is_none(),
+            "the bulk superfile is read from storage"
+        );
+        let loaded = superfile.fts().expect("fts index").norms_loaded("title");
+        (titles, loaded)
+    }
+
+    /// A lone term whose `k` scores are held at the floor by lower `_id`s
+    /// scores the superfile past them from its candidates' length buckets:
+    /// its ties lose, so only its documents above the floor can enter, and
+    /// it reads no whole length array though its term has more postings
+    /// than `few_norms` covers.
+    #[test]
+    fn a_lone_term_whose_ties_lose_reads_no_length_array() {
+        let (titles, loaded) = rank_beside_a_bulk_superfile(false);
+        assert_eq!(titles, [STRONG_BEST, BULK_BEST, STRONG_TIED]);
+        assert!(!loaded, "the bulk superfile read its whole length array");
+    }
+
+    /// The same superfiles with the bulk one first: its ties win, so its
+    /// tied document takes the last place, and scoring every tie reads its
+    /// whole length array.
+    #[test]
+    fn a_lone_term_whose_ties_win_keeps_its_tied_row() {
+        let (titles, loaded) = rank_beside_a_bulk_superfile(true);
+        assert_eq!(titles, [STRONG_BEST, BULK_BEST, BULK_TIED]);
+        assert!(loaded, "the bulk superfile scores every tie from its array");
     }
 
     /// Largest allowed gap between an engine score and the brute-force
@@ -7273,6 +7647,59 @@ mod tests {
         let r = st.reader().expect("reader");
         let hits = r.bm25_search_prefix("title", "RUST", 5).expect("query");
         assert_eq!(hits.len(), 1);
+    }
+
+    /// An empty prefix finds the `''` values of a keyword column in a part
+    /// that holds no other value, with and without a term index. The empty
+    /// string is a real term there, but the part's term range reads as
+    /// empty, so the part-level prune must not drop the part for that.
+    #[test]
+    fn empty_prefix_keeps_a_part_whose_keyword_values_are_all_empty() {
+        for term_index in [true, false] {
+            let dir = TempDir::new().expect("tempdir");
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "tag",
+                DataType::LargeUtf8,
+                true,
+            )]));
+            // A one-byte part threshold puts each commit in a part of its
+            // own, and opening with no eager load leaves the parts unloaded,
+            // so a query chooses parts by their summaries.
+            let options = || {
+                SupertableOptions::new(
+                    Arc::clone(&schema),
+                    vec![FtsConfig::new("tag").analyzer(Analyzer::Keyword)],
+                    vec![],
+                )
+                .expect("options")
+                .with_storage(Arc::clone(&storage))
+                .with_part_size_threshold_bytes(1)
+                .with_eager_load_threshold(0)
+                .with_term_index(term_index)
+            };
+            let table = Supertable::create(options()).expect("create");
+            for values in [vec![Some("a"), None], vec![Some(""), Some(""), None]] {
+                let column: ArrayRef = Arc::new(LargeStringArray::from(values));
+                let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).expect("batch");
+                let mut w = table.writer().expect("writer");
+                w.append(&batch).expect("append");
+                w.commit().expect("commit");
+            }
+            drop(table);
+            let table = Supertable::open(options()).expect("open");
+            let hits = table
+                .reader()
+                .expect("reader")
+                .bm25_search_prefix("tag", "", 10)
+                .expect("prefix");
+            assert_eq!(
+                hits.len(),
+                3,
+                "`a` and both `''` rows, term index {term_index}"
+            );
+        }
     }
 
     #[test]

@@ -204,7 +204,7 @@ pub use superfile::VectorSearchOptions;
 /// Value types named by the public method signatures.
 pub use superfile::{
     fts::{
-        analysis::{Stemmer, Stopwords},
+        analysis::{Analyzer, Stemmer, Stopwords},
         bm25::Bm25Params,
         reader::{Bm25SearchOptions, BoolMode},
     },

@@ -221,7 +221,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Stemmer, Stopwords,
+        Analyzer, Stemmer, Stopwords,
         superfile::{
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
@@ -742,10 +742,12 @@ mod tests {
                 .stopwords(Stopwords::English)
                 .stemmer(Stemmer::English),
         );
+        let keyword = hash_of(FtsConfig::new("title").analyzer(Analyzer::Keyword));
         for (label, h) in [
             ("stopwords", &stopped),
             ("stemmer", &stemmed),
             ("both", &both),
+            ("keyword", &keyword),
         ] {
             assert_ne!(
                 &plain, h,
@@ -763,13 +765,28 @@ mod tests {
             plain,
             hash_of(
                 FtsConfig::new("title")
+                    .analyzer(Analyzer::Standard)
                     .stopwords(Stopwords::None)
                     .stemmer(Stemmer::None)
             ),
             "a filterless column must hash exactly as it did before \
              filters existed"
         );
+        // Pinned, so a change to the byte stream fails here even if it moves
+        // every hash above together. A `standard` column with no filter must
+        // hash as it did before the stream carried analyzers and filters, so
+        // an existing table's stored hash still verifies.
+        assert_eq!(
+            plain.to_hex(),
+            PINNED_STANDARD_COLUMN_HASH,
+            "the hash of a standard column moved"
+        );
     }
+
+    /// `creation_record_hash` of a one-column `standard` table under
+    /// [`time_range`], computed before the keyword analyzer existed.
+    const PINNED_STANDARD_COLUMN_HASH: &str =
+        "f98420f6fa02140eb28a7e6999dfd0066b7452d2fef3b3d3a3136311f1e364bb";
 
     #[test]
     fn options_hash_mismatch_is_error_impl() {

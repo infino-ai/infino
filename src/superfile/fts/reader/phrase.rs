@@ -962,7 +962,10 @@ impl AnyCursor {
 #[cfg(test)]
 mod tests {
 
-    use std::{slice, sync::Arc};
+    use std::{
+        slice,
+        sync::{Arc, OnceLock},
+    };
 
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use roaring::RoaringBitmap;
@@ -972,10 +975,14 @@ mod tests {
         superfile::{
             fts::{
                 builder::FtsBuilder,
-                reader::{BoolMode, FtsReader, QueryIdf, core::ClauseLists, cursor::CursorUse},
+                reader::{
+                    BoolMode, FtsReader, OpenOptions, QueryIdf, core::ClauseLists,
+                    cursor::CursorUse,
+                },
                 tokenize::Phrase,
             },
             id_space::{FtsDocId, RowId},
+            lazy_source::LazyByteSource,
         },
         test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
     };
@@ -1568,15 +1575,23 @@ mod tests {
         }
     }
 
-    fn open_positional(docs: impl Iterator<Item = String>) -> FtsReader {
+    /// The column config of [`positional_blob`]'s one positional column.
+    const POSITIONAL_JSON: &str =
+        r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+
+    /// A blob with one positional column, `title`, doc `i` the `i`th of
+    /// `docs`.
+    fn positional_blob(docs: impl Iterator<Item = String>) -> Bytes {
         let mut b = FtsBuilder::new();
         b.register_column("title".into(), true).expect("register");
         for (i, text) in docs.enumerate() {
             b.add_doc(0, i as u32, &text).expect("add doc");
         }
-        let json =
-            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
-        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+        Bytes::from(b.finish().expect("finish"))
+    }
+
+    fn open_positional(docs: impl Iterator<Item = String>) -> FtsReader {
+        FtsReader::open(positional_blob(docs), POSITIONAL_JSON).expect("open")
     }
 
     /// Phrases whose matching occurrence lies deep in a common member's run,
@@ -1786,7 +1801,8 @@ mod tests {
                 d
             })
             .collect();
-        let r = open_positional(docs.iter().map(|d| d.join(" ")));
+        let blob = positional_blob(docs.iter().map(|d| d.join(" ")));
+        let r = FtsReader::open(blob.clone(), POSITIONAL_JSON).expect("open");
         let norms = r.columns[0].dl_norm_k1();
         let gapped = |terms: &[&str], offsets: &[u32]| Phrase {
             terms: terms.iter().map(|t| t.to_string()).collect(),
@@ -1860,6 +1876,58 @@ mod tests {
                 .await
                 .expect("count");
             assert_eq!(count, expected.len() as u64, "count, {label}");
+
+            // Members served from a memo match what the dictionary finds,
+            // on a lazy reader that may not read the dictionary once the
+            // memo is built.
+            let source = Arc::new(RefusingSource {
+                blob: blob.clone(),
+                refused: OnceLock::new(),
+            });
+            let lazy = FtsReader::open_lazy(
+                Arc::clone(&source) as Arc<dyn LazyByteSource>,
+                POSITIONAL_JSON,
+                OpenOptions::for_object_store(),
+            )
+            .await
+            .expect("open lazy");
+            let memo = lazy
+                .fetch_scored_terms("title", &distinct)
+                .await
+                .expect("memo");
+            let (_, from_dict) = lazy
+                .atoms_match_ids("title", &[], one, BoolMode::And)
+                .await
+                .expect("dictionary match ids");
+            source
+                .refused
+                .set(lazy.dict_range.clone())
+                .expect("refused once");
+            let (ids, from_memo) = lazy
+                .atoms_match_ids_prefetched("title", &[], one, BoolMode::And, Some(&memo))
+                .await
+                .expect("memo match ids");
+            // The memo spares the one dictionary read the plan counts.
+            assert_eq!(
+                from_memo.planned_ranges + 1,
+                from_dict.planned_ranges,
+                "memo planned ranges, {label}"
+            );
+            let ids: Vec<u32> = ids.iter().map(|d| d.get()).collect();
+            assert_eq!(ids, expected_ids, "memo match ids, {label}");
+            let (count, _) = lazy
+                .atoms_match_count_prefetched(
+                    "title",
+                    &[],
+                    one,
+                    BoolMode::And,
+                    &[],
+                    &[],
+                    Some(&memo),
+                )
+                .await
+                .expect("memo count");
+            assert_eq!(count, expected.len() as u64, "memo count, {label}");
 
             // The phrase idf, from each query position's own term cursor.
             let mut idf = 0.0f32;

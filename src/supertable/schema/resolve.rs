@@ -17,14 +17,17 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, cast::AsArray};
 use arrow_schema::{DataType, Field, Schema};
 
 use super::{
     ColumnIndex, IDENTITY_META_KEY, INDEX_META_KEY, TableSchema, change::SchemaChange,
     error::SchemaError, index_from_json, user_metadata,
 };
-use crate::utils::nulls::SharedNulls;
+use crate::{
+    superfile::fts::{analysis::Analyzer, tokenize::KEYWORD_TERM_MAX_BYTES},
+    utils::nulls::SharedNulls,
+};
 
 /// A column a batch adds to the table.
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +119,7 @@ pub fn resolve_batch(
                     });
                 }
                 check_identity(input.field(i), field.metadata.get(IDENTITY_META_KEY))?;
+                check_keyword_lengths(&field.name, field.index.as_ref(), array)?;
                 columns.push(Arc::clone(array));
             }
             Err(_) if field.nullable => {
@@ -138,10 +142,12 @@ pub fn resolve_batch(
         if schema.id_of(field.name()).is_some() {
             continue;
         }
+        let index = requested_index(field)?;
+        check_keyword_lengths(field.name(), index.as_ref(), batch.column(i))?;
         added.push(AddColumn {
             name: field.name().clone(),
             data_type: field.data_type().clone(),
-            index: requested_index(field)?,
+            index,
             metadata: user_metadata(field),
         });
         columns.push(Arc::clone(batch.column(i)));
@@ -161,6 +167,48 @@ pub fn resolve_batch(
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .expect("columns were taken from one batch and share its row count");
     Ok(ResolvedBatch { batch, added })
+}
+
+/// Refuses a `keyword` column value longer than [`KEYWORD_TERM_MAX_BYTES`],
+/// before any of the batch is written. Other columns and nulls pass.
+fn check_keyword_lengths(
+    column: &str,
+    index: Option<&ColumnIndex>,
+    array: &ArrayRef,
+) -> Result<(), SchemaError> {
+    if !matches!(
+        index,
+        Some(ColumnIndex::Fts {
+            analyzer: Analyzer::Keyword,
+            ..
+        })
+    ) {
+        return Ok(());
+    }
+    let longest = match array.data_type() {
+        DataType::Utf8 => array
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .map(str::len)
+            .max(),
+        DataType::LargeUtf8 => array
+            .as_string::<i64>()
+            .iter()
+            .flatten()
+            .map(str::len)
+            .max(),
+        DataType::Utf8View => array.as_string_view().iter().flatten().map(str::len).max(),
+        _ => None,
+    };
+    match longest {
+        Some(len) if len > KEYWORD_TERM_MAX_BYTES => Err(SchemaError::KeywordTooLong {
+            column: column.to_owned(),
+            len,
+            max: KEYWORD_TERM_MAX_BYTES,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// The schema a commit of `batches` publishes over `current`: `current`

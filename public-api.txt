@@ -2,6 +2,27 @@ pub mod infino
 pub use infino::arrow_array
 pub use infino::arrow_schema
 pub use infino::serde_json
+#[non_exhaustive] pub enum infino::Analyzer
+pub infino::Analyzer::Keyword
+pub infino::Analyzer::Standard
+impl core::clone::Clone for infino::Analyzer
+pub fn infino::Analyzer::clone(&self) -> Self
+impl core::cmp::Eq for infino::Analyzer
+impl core::cmp::PartialEq for infino::Analyzer
+pub fn infino::Analyzer::eq(&self, &Self) -> bool
+impl core::default::Default for infino::Analyzer
+pub fn infino::Analyzer::default() -> Self
+impl core::fmt::Debug for infino::Analyzer
+pub fn infino::Analyzer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::Analyzer
+impl core::marker::StructuralPartialEq for infino::Analyzer
+impl core::marker::Freeze for infino::Analyzer
+impl core::marker::Send for infino::Analyzer
+impl core::marker::Sync for infino::Analyzer
+impl core::marker::Unpin for infino::Analyzer
+impl core::marker::UnsafeUnpin for infino::Analyzer
+impl core::panic::unwind_safe::RefUnwindSafe for infino::Analyzer
+impl core::panic::unwind_safe::UnwindSafe for infino::Analyzer
 pub enum infino::BoolMode
 pub infino::BoolMode::And
 pub infino::BoolMode::Or
@@ -48,7 +69,8 @@ impl core::marker::UnsafeUnpin for infino::ColdFetchMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
 #[non_exhaustive] pub enum infino::ColumnIndex
-pub infino::ColumnIndex::Fts
+#[non_exhaustive] pub infino::ColumnIndex::Fts
+pub infino::ColumnIndex::Fts::analyzer: infino::Analyzer
 pub infino::ColumnIndex::Fts::bm25: infino::Bm25Params
 pub infino::ColumnIndex::Fts::positions: bool
 pub infino::ColumnIndex::Fts::stemmer: infino::Stemmer
@@ -59,6 +81,8 @@ pub infino::ColumnIndex::Vector
 pub infino::ColumnIndex::Vector::metric: infino::Metric
 pub infino::ColumnIndex::Vector::rerank_codec: infino::RerankCodec
 pub infino::ColumnIndex::Vector::rot_seed: u64
+impl infino::ColumnIndex
+pub fn infino::ColumnIndex::fts(infino::Analyzer) -> Self
 impl core::clone::Clone for infino::ColumnIndex
 pub fn infino::ColumnIndex::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::ColumnIndex
@@ -386,6 +410,10 @@ pub infino::SchemaError::InvalidRow::row: usize
 pub infino::SchemaError::InvalidType
 pub infino::SchemaError::InvalidType::column: alloc::string::String
 pub infino::SchemaError::InvalidType::reason: alloc::string::String
+pub infino::SchemaError::KeywordTooLong
+pub infino::SchemaError::KeywordTooLong::column: alloc::string::String
+pub infino::SchemaError::KeywordTooLong::len: usize
+pub infino::SchemaError::KeywordTooLong::max: usize
 pub infino::SchemaError::MissingColumn
 pub infino::SchemaError::MissingColumn::column: alloc::string::String
 pub infino::SchemaError::MixedArray

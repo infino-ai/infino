@@ -3047,11 +3047,12 @@ impl SuperfileReader {
     }
 
     /// For each of `terms`, the rows of `column` that hold the term as one
-    /// of their tokens, from the postings alone: every row proven, none
-    /// doubtful. Delegates to [`FtsReader::term_rows`].
+    /// of their tokens under `analyzer`, from the postings alone: every row
+    /// proven, none doubtful. Delegates to [`FtsReader::term_rows`].
     pub(crate) async fn term_rows(
         &self,
         column: &str,
+        analyzer: &'static str,
         terms: &[&str],
         prefetched: Option<&FetchedTermMemo>,
         dict: &QueryDict,
@@ -3059,7 +3060,9 @@ impl SuperfileReader {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.term_rows(column, terms, prefetched, dict).await?)
+        Ok(fts
+            .term_rows(column, analyzer, terms, prefetched, dict)
+            .await?)
     }
 
     /// Unranked token-match **count**: the number of `local_doc_id`s
@@ -3107,10 +3110,26 @@ impl SuperfileReader {
         phrases: &[Phrase<String>],
         mode: BoolMode,
     ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
+        self.atoms_match_ids_prefetched(column, terms, phrases, mode, None)
+            .await
+    }
+
+    /// [`Self::atoms_match_ids`] with a memo of located postings: a term or
+    /// phrase member the memo holds is not looked up in the dictionary.
+    pub(crate) async fn atoms_match_ids_prefetched(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Phrase<String>],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.atoms_match_ids(column, terms, phrases, mode).await?)
+        Ok(fts
+            .atoms_match_ids_prefetched(column, terms, phrases, mode, prefetched)
+            .await?)
     }
 
     /// Phrase-aware unranked match **count** — the phrase sibling of
@@ -3127,11 +3146,44 @@ impl SuperfileReader {
         neg_terms: &[&str],
         neg_phrases: &[Phrase<String>],
     ) -> Result<(u64, MatchWork), ReadError> {
+        self.atoms_match_count_prefetched(
+            column,
+            terms,
+            phrases,
+            mode,
+            neg_terms,
+            neg_phrases,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::atoms_match_count`] with a memo of located postings: a term or
+    /// phrase member the memo holds is not looked up in the dictionary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn atoms_match_count_prefetched(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Phrase<String>],
+        mode: BoolMode,
+        neg_terms: &[&str],
+        neg_phrases: &[Phrase<String>],
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .atoms_match_count(column, terms, phrases, mode, neg_terms, neg_phrases)
+            .atoms_match_count_prefetched(
+                column,
+                terms,
+                phrases,
+                mode,
+                neg_terms,
+                neg_phrases,
+                prefetched,
+            )
             .await?)
     }
 

@@ -28,9 +28,11 @@ use std::{
     time::Instant,
 };
 
-use arrow::compute::{concat_batches, filter_record_batch, interleave_record_batch, take};
+use arrow::compute::{
+    concat_batches, filter_record_batch, interleave, interleave_record_batch, take,
+};
 use arrow_array::{
-    ArrayRef, BooleanArray, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions,
+    Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -58,14 +60,15 @@ use parquet::{
         ProjectionMask,
         arrow_reader::{
             ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-            RowSelectionPolicy,
+            RowSelectionPolicy, statistics::StatisticsConverter,
         },
         async_reader::{AsyncFileReader, ParquetObjectReader, ParquetRecordBatchStreamBuilder},
     },
     errors::{ParquetError, Result as ParquetResult},
     file::{
-        metadata::ParquetMetaData,
+        metadata::{ParquetMetaData, RowGroupMetaData},
         reader::{ChunkReader, Length},
+        statistics::Statistics as ParquetStatistics,
     },
 };
 use rayon::{ThreadPool, prelude::*};
@@ -160,6 +163,30 @@ static SEARCH_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 /// total work at about twice the final round's, whatever the predicate's
 /// selectivity turns out to be.
 pub(crate) const OVER_FETCH_GROWTH: usize = 2;
+
+/// How many times a fill grows `want` after a round in which no row passed
+/// the predicate: with no pass rate to size the next round by, it looks
+/// much deeper than [`OVER_FETCH_GROWTH`] would.
+const OVER_FETCH_GROWTH_NONE_PASSED: usize = 16;
+
+/// The `want` of a fill's next round after `want` hits left `kept` rows
+/// standing: enough hits to find `k` at the pass rate seen, twice over,
+/// never less than [`OVER_FETCH_GROWTH`] times `want` and never past
+/// `ceiling`. Past the depth an index can answer from, a round costs about
+/// the same whatever its `want`, so a round sized to the pass rate saves the
+/// rounds doubling would spend getting there.
+fn next_want(k: usize, want: usize, kept: usize, ceiling: usize) -> usize {
+    let sized = match kept {
+        0 => want.saturating_mul(OVER_FETCH_GROWTH_NONE_PASSED),
+        kept => want
+            .saturating_mul(k)
+            .div_ceil(kept)
+            .saturating_mul(OVER_FETCH_GROWTH),
+    };
+    sized
+        .max(want.saturating_mul(OVER_FETCH_GROWTH))
+        .min(ceiling)
+}
 
 /// How many times `k` a fill may grow to before it gives up and returns
 /// what it has (see [`over_fetch_ceiling`]). Without a ceiling the growth
@@ -674,9 +701,10 @@ pub(crate) fn unqualified(expr: Expr) -> DfResult<Expr> {
 /// whatever the index could bound. Without a predicate that is the whole
 /// job: search `k`, resolve, done. With one, the resolved rows are
 /// checked against the exact predicate; when fewer than `k` survive and
-/// the kernel had more to give, the search is rerun for
-/// [`OVER_FETCH_GROWTH`] times as many hits, until `k` survive, the
-/// kernel runs dry, or the fill hits its ceiling. The survivors, in
+/// the kernel had more to give, the search is rerun for enough hits to find
+/// `k` at the pass rate seen so far, twice over and at least
+/// [`OVER_FETCH_GROWTH`] times as many ([`next_want`]), until `k` survive,
+/// the kernel runs dry, or the fill hits its ceiling. The survivors, in
 /// kernel rank order and cut to `k`, are the result — the `FilterExec`
 /// above re-checks them and drops nothing. Cost scales with the
 /// predicate's selectivity: an exact pushdown pays one round, a bare
@@ -802,7 +830,7 @@ where
                 .project(&requested_positions)
                 .map_err(|e| QueryError::internal(e).into());
         }
-        want = want.saturating_mul(OVER_FETCH_GROWTH).min(ceiling);
+        want = next_want(k, want, kept.num_rows(), ceiling);
     }
 }
 
@@ -897,6 +925,7 @@ pub(crate) async fn exact_scope(
         reader,
         units,
         |_| window,
+        true,
         |_| false,
         body,
         |_| {},
@@ -2160,6 +2189,11 @@ pub(crate) async fn take_rows_byte_source(
         .await
         .map_err(QueryError::from)?;
     let source = Source::Lazy(reader.byte_source());
+    if let Some(batch) =
+        take_with_constant_chunks(reader, &metadata, local_doc_ids, names, pool, budget).await?
+    {
+        return Ok(batch);
+    }
     // Fetch the take's column chunks at once rather than letting the decode
     // fetch them a row group at a time: a hit set spread over hundreds of
     // row groups otherwise costs that many round trips one after another.
@@ -2188,6 +2222,253 @@ pub(crate) async fn take_rows_byte_source(
         budget,
     )
     .await
+}
+
+/// Per row group, whether every row of `name` holds one value the footer
+/// records exactly (min == max, both exact, no nulls), with the row groups'
+/// minimums. `None` for a float, nested or dictionary column or unreadable
+/// statistics: Parquet's converter reads a dictionary's statistics as its
+/// values' without the checks [`decimal_statistics_fit`] makes, and their
+/// minimums would not have the column's type anyway.
+fn constant_row_groups(
+    metadata: &ParquetMetaData,
+    schema: &Schema,
+    name: &str,
+) -> Option<(ArrayRef, Vec<bool>)> {
+    let field = schema.field_with_name(name).ok()?;
+    if field.data_type().is_floating()
+        || field.data_type().is_nested()
+        || matches!(field.data_type(), DataType::Dictionary(..))
+    {
+        return None;
+    }
+    let converter =
+        StatisticsConverter::try_new(name, schema, metadata.file_metadata().schema_descr()).ok()?;
+    let column = converter.parquet_column_index()?;
+    let row_groups = metadata.row_groups();
+    if !decimal_statistics_fit(field.data_type(), row_groups, column) {
+        return None;
+    }
+    let mins = converter.row_group_mins(row_groups.iter()).ok()?;
+    let maxes = converter.row_group_maxes(row_groups.iter()).ok()?;
+    if mins.data_type() != field.data_type() {
+        return None;
+    }
+    let constant = row_groups
+        .iter()
+        .enumerate()
+        .map(|(i, rg)| {
+            rg.column(column).statistics().is_some_and(|s| {
+                s.null_count_opt() == Some(0) && s.min_is_exact() && s.max_is_exact()
+            }) && mins.is_valid(i)
+                && maxes.is_valid(i)
+                && matches!(
+                    (ScalarValue::try_from_array(&mins, i), ScalarValue::try_from_array(&maxes, i)),
+                    (Ok(min), Ok(max)) if min == max
+                )
+        })
+        .collect();
+    Some((mins, constant))
+}
+
+/// Whether every byte-array minimum and maximum of decimal `column` is
+/// 1 to the decimal's width in bytes long. Parquet's statistics converter
+/// panics on any other length (it indexes the first byte and asserts the
+/// width), and a footer that holds one still parses and decodes. `true` for
+/// a column that is not a decimal.
+fn decimal_statistics_fit(
+    data_type: &DataType,
+    row_groups: &[RowGroupMetaData],
+    column: usize,
+) -> bool {
+    let width = match data_type {
+        DataType::Decimal32(..)
+        | DataType::Decimal64(..)
+        | DataType::Decimal128(..)
+        | DataType::Decimal256(..) => data_type.primitive_width().unwrap_or(0),
+        _ => return true,
+    };
+    row_groups
+        .iter()
+        .all(|rg| match rg.column(column).statistics() {
+            Some(
+                s @ (ParquetStatistics::ByteArray(_) | ParquetStatistics::FixedLenByteArray(_)),
+            ) => [s.min_bytes_opt(), s.max_bytes_opt()]
+                .into_iter()
+                .flatten()
+                .all(|b| (1..=width).contains(&b.len())),
+            _ => true,
+        })
+}
+
+/// Whether `rg` is a row group the column of `constant` holds one value in.
+fn constant_in(constant: &Option<(ArrayRef, Vec<bool>)>, rg: usize) -> bool {
+    constant
+        .as_ref()
+        .is_some_and(|(_, flags)| flags.get(rg).copied().unwrap_or(false))
+}
+
+/// A take where some projected column is constant in some of the hit row
+/// groups: those rows come from the footer, and each column reads only its
+/// other rows. A filtered take over hour-long superfiles otherwise spends
+/// one small GET per row group on a column (such as `time`) whose value the
+/// footer already holds. Columns reading the same rows read them in one
+/// take, so their ranges coalesce as in a take without constants. `None`
+/// when no column has such a row group.
+async fn take_with_constant_chunks(
+    reader: &SuperfileReader,
+    metadata: &Arc<ParquetMetaData>,
+    local_doc_ids: &[u32],
+    names: &[&str],
+    pool: Option<&ThreadPool>,
+    budget: Option<&Arc<ConnectionMemoryBudget>>,
+) -> DfResult<Option<RecordBatch>> {
+    let schema = reader.schema();
+    let starts: Vec<u64> = metadata
+        .row_groups()
+        .iter()
+        .scan(0u64, |next, rg| {
+            let start = *next;
+            *next += rg.num_rows() as u64;
+            Some(start)
+        })
+        .collect();
+    let n_rows = metadata.file_metadata().num_rows().max(0) as u64;
+    if starts.is_empty() || local_doc_ids.iter().any(|&d| u64::from(d) >= n_rows) {
+        return Ok(None);
+    }
+    let doc_rgs: Vec<usize> = local_doc_ids
+        .iter()
+        .map(|&d| {
+            starts
+                .partition_point(|&s| s <= u64::from(d))
+                .saturating_sub(1)
+        })
+        .collect();
+    let constants: Vec<Option<(ArrayRef, Vec<bool>)>> = names
+        .iter()
+        .map(|name| constant_row_groups(metadata, schema, name))
+        .collect();
+    if !constants
+        .iter()
+        .any(|c| doc_rgs.iter().any(|&rg| constant_in(c, rg)))
+    {
+        return Ok(None);
+    }
+    // Columns grouped by the hit rows they read, in first-seen order, with
+    // each column's group.
+    let mut groups: Vec<(Vec<u32>, Vec<&str>)> = Vec::new();
+    let mut slots: Vec<Option<usize>> = Vec::with_capacity(names.len());
+    for (name, c) in names.iter().zip(&constants) {
+        let read_ids: Vec<u32> = local_doc_ids
+            .iter()
+            .zip(&doc_rgs)
+            .filter(|(_, rg)| !constant_in(c, **rg))
+            .map(|(d, _)| *d)
+            .collect();
+        if read_ids.is_empty() {
+            slots.push(None);
+            continue;
+        }
+        let group = match groups.iter().position(|(ids, _)| *ids == read_ids) {
+            Some(group) => group,
+            None => {
+                groups.push((read_ids, Vec::new()));
+                groups.len() - 1
+            }
+        };
+        slots.push(Some(group));
+        groups[group].1.push(name);
+    }
+    let reads = groups.iter().map(|(read_ids, group_names)| async move {
+        let mut sorted = read_ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let roots: Vec<usize> = group_names
+            .iter()
+            .filter_map(|name| schema.index_of(name).ok())
+            .collect();
+        let spans = take_prefetch_spans(
+            metadata,
+            &sorted,
+            &roots,
+            TAKE_PREFETCH_MAX_BYTES,
+            EXACT_MERGE_GAP_BYTES,
+        );
+        take_prefetched(
+            reader,
+            Source::Lazy(reader.byte_source()),
+            Arc::clone(metadata),
+            spans,
+            read_ids,
+            group_names,
+            pool,
+            budget,
+        )
+        .await
+    });
+    let read = futures::future::try_join_all(reads).await?;
+    let mut fields = Vec::with_capacity(names.len());
+    let mut columns = Vec::with_capacity(names.len());
+    for ((name, c), slot) in names.iter().zip(constants).zip(slots) {
+        // A column constant in none of the hit row groups is its read as is.
+        let c = match doc_rgs.iter().any(|&rg| constant_in(&c, rg)) {
+            true => c,
+            false => None,
+        };
+        fields.push(
+            schema
+                .field_with_name(name)
+                .map_err(QueryError::internal)?
+                .clone(),
+        );
+        let read = match slot {
+            Some(group) => Some(Arc::clone(read[group].column_by_name(name).ok_or_else(
+                || QueryError::Internal(format!("take read no column {name}")),
+            )?)),
+            None => None,
+        };
+        columns.push((c, read));
+    }
+    let n_hits = local_doc_ids.len();
+    // Assembling the rows is CPU over every hit, so it runs on the reader
+    // pool as the column decodes do.
+    let assembled = run_on_pool_unless_blocking(pool, "take assembly", move || {
+        let mut assembled = Vec::with_capacity(columns.len());
+        for (constant, read) in columns {
+            assembled.push(match (constant, read) {
+                (None, Some(read)) => read,
+                (Some((mins, flags)), read) => {
+                    let mut k = 0;
+                    let picks: Vec<(usize, usize)> = doc_rgs
+                        .iter()
+                        .map(|&rg| match flags.get(rg).copied().unwrap_or(false) {
+                            true => (0, rg),
+                            false => {
+                                k += 1;
+                                (1, k - 1)
+                            }
+                        })
+                        .collect();
+                    let mut sources: Vec<&dyn Array> = vec![mins.as_ref()];
+                    if let Some(read) = &read {
+                        sources.push(read.as_ref());
+                    }
+                    interleave(&sources, &picks)?
+                }
+                (None, None) => return Ok(None),
+            });
+        }
+        RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(fields)),
+            assembled,
+            &RecordBatchOptions::new().with_row_count(Some(n_hits)),
+        )
+        .map(Some)
+    })
+    .await
+    .map_err(QueryError::internal)?;
+    assembled.map_err(|e| QueryError::internal(e).into())
 }
 
 /// Takes whose decode read outside their prefetch and decoded again through
@@ -2680,9 +2961,10 @@ mod tests {
     use datafusion::prelude::{col, lit};
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory, path::Path as ObjPath};
     use parquet::{
-        arrow::ArrowWriter,
+        arrow::{ArrowSchemaConverter, ArrowWriter},
+        data_type::FixedLenByteArray,
         file::{
-            metadata::{FileMetaData, PageIndexPolicy, ParquetMetaDataReader},
+            metadata::{ColumnChunkMetaData, FileMetaData, PageIndexPolicy, ParquetMetaDataReader},
             properties::WriterProperties,
         },
         schema::types::{SchemaDescriptor, Type},
@@ -3308,6 +3590,21 @@ mod tests {
 
     /// A `k` below every cap.
     const SMALL_K: usize = 10;
+
+    /// A round sized from its pass rate asks for enough hits to find `k`
+    /// twice over, never less than double the last and never past the
+    /// ceiling; a round where nothing passed grows sixteenfold.
+    #[test]
+    fn the_next_round_is_sized_from_the_pass_rate() {
+        // 2 of 160 passed: 10 need 800 at that rate, 1,600 twice over.
+        assert_eq!(next_want(10, 160, 2, 10_000), 1_600);
+        // 9 of 10 passed: 12 at that rate, 24 twice over.
+        assert_eq!(next_want(10, 10, 9, 10_000), 24);
+        // All passed but fewer than k came back: doubling is the least.
+        assert_eq!(next_want(10, 100, 100, 10_000), 200);
+        assert_eq!(next_want(10, 160, 0, 10_000), 2_560);
+        assert_eq!(next_want(10, 1_000, 1, 10_000), 10_000);
+    }
 
     /// The over-fetch ceiling is bounded from above in every direction a
     /// caller can push it, and never below the `k` that was asked for.
@@ -3991,6 +4288,232 @@ mod tests {
             take_prefetch_fallbacks() > before,
             "the fallback is counted"
         );
+    }
+
+    /// The row of `rating` that holds its only null.
+    const RATING_NULL_ROW: i64 = 1;
+
+    /// A take reads a column only in the row groups where it varies: in the
+    /// others the footer's exact min == max is every row's value. The rows,
+    /// in request order and with repeats, match the column's own.
+    #[tokio::test]
+    async fn a_take_serves_constant_row_groups_from_statistics() {
+        let schema: Arc<Schema> = Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("day", DataType::Int64, false),
+            Field::new("views", DataType::Int64, false),
+            Field::new("rating", DataType::Int64, true),
+        ]));
+        let mut opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
+        opts.row_group_size = 1000;
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        // `day` is constant in the first and last row groups only.
+        let day = |i: i64| match i {
+            0..1000 => 7,
+            1000..2000 => i % 3,
+            _ => 9,
+        };
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(decimal128_ids(0..3000)),
+                Arc::new(Int64Array::from_iter_values((0..3000).map(day))),
+                Arc::new(Int64Array::from_iter_values((0..3000).map(|i| i * 10))),
+                // Equal minimum and maximum everywhere, with a null in the
+                // first row group.
+                Arc::new(Int64Array::from_iter(
+                    (0..3000).map(|i| (i != RATING_NULL_ROW).then_some(7)),
+                )),
+            ],
+        )
+        .expect("build batch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = Bytes::from(b.finish().expect("finish"));
+        // A reader over its own recording source, with its footer and page
+        // index loaded, and the ranges it has read so far.
+        let open = || async {
+            let source = Arc::new(RecordingSource::new(bytes.clone()));
+            let reader = SuperfileReader::open_lazy(Arc::clone(&source) as Arc<dyn LazyByteSource>)
+                .await
+                .expect("open lazy");
+            let metadata = reader
+                .parquet_metadata_with_page_index()
+                .await
+                .expect("metadata");
+            let read = source.ranges().len();
+            (source, reader, metadata, read)
+        };
+        let (source, reader, metadata, _) = open().await;
+        let (_, constant) =
+            constant_row_groups(&metadata, reader.schema(), "day").expect("statistics");
+        assert_eq!(constant, vec![true, false, true]);
+        assert!(
+            constant_row_groups(&metadata, reader.schema(), "views")
+                .expect("statistics")
+                .1
+                .iter()
+                .all(|c| !c)
+        );
+
+        let ids = [2500u32, 10, 1500, 10, 1001];
+        let batch = take_rows_byte_source(&reader, &ids, &["day", "views"], None, None)
+            .await
+            .expect("take");
+        let column = |name: &str| -> Vec<i64> {
+            batch
+                .column_by_name(name)
+                .expect("column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64")
+                .values()
+                .to_vec()
+        };
+        let want_day: Vec<i64> = ids.iter().map(|&i| day(i64::from(i))).collect();
+        let want_views: Vec<i64> = ids.iter().map(|&i| i64::from(i) * 10).collect();
+        assert_eq!(column("day"), want_day);
+        assert_eq!(column("views"), want_views);
+        assert_eq!(
+            batch
+                .schema()
+                .field_with_name("day")
+                .expect("day")
+                .data_type(),
+            &DataType::Int64
+        );
+
+        // `day` alone in its constant row groups reads nothing past the
+        // footer and page index.
+        let read = source.ranges().len();
+        let constant_ids = [2500u32, 10, 999];
+        let days = take_rows_byte_source(&reader, &constant_ids, &["day"], None, None)
+            .await
+            .expect("take");
+        assert_eq!(
+            days.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64")
+                .values()
+                .to_vec(),
+            vec![9, 7, 7]
+        );
+        assert_eq!(
+            source.ranges().len(),
+            read,
+            "a constant take reads no column"
+        );
+
+        // Columns reading the same rows read them together: with `day`
+        // served from the footer, `views` and `doc_id` read the same ranges
+        // as a take of those two alone.
+        let ranges_of = |names: &'static [&'static str]| {
+            let open = &open;
+            async move {
+                let (source, reader, _, read) = open().await;
+                take_rows_byte_source(&reader, &constant_ids, names, None, None)
+                    .await
+                    .expect("take");
+                source.ranges().split_off(read)
+            }
+        };
+        let together = ranges_of(&["views", "doc_id"]).await;
+        assert!(!together.is_empty());
+        assert_eq!(ranges_of(&["day", "views", "doc_id"]).await, together);
+
+        // A row group holding a null is not constant though its minimum
+        // and maximum agree: its null row stays null, read from the column.
+        let rating = |ids: &[u32]| {
+            let open = &open;
+            let ids = ids.to_vec();
+            async move {
+                let (source, reader, _, read) = open().await;
+                let batch = take_rows_byte_source(&reader, &ids, &["rating"], None, None)
+                    .await
+                    .expect("take");
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64")
+                    .iter()
+                    .collect::<Vec<_>>();
+                (column, source.ranges().len() - read)
+            }
+        };
+        let (null_row, reads) = rating(&[RATING_NULL_ROW as u32]).await;
+        assert_eq!(null_row, vec![None]);
+        assert!(reads > 0, "the null row's row group is read");
+        let (constant_row, reads) = rating(&[1500]).await;
+        assert_eq!(constant_row, vec![Some(7)]);
+        assert_eq!(
+            reads, 0,
+            "a row group without nulls is served from statistics"
+        );
+    }
+
+    /// The bytes of a `Decimal128` value.
+    const DECIMAL128_BYTES: usize = 16;
+
+    /// A footer whose decimal minimum or maximum is empty, or wider than the
+    /// decimal, leaves the column without constant row groups rather than
+    /// panicking in Parquet's statistics converter, as a column that reads
+    /// it as a dictionary of decimals does; one of the decimal's width still
+    /// reads.
+    #[test]
+    fn malformed_decimal_statistics_are_not_constant() {
+        let schema = Schema::new(vec![decimal128_id_field("doc_id")]);
+        let dictionary = Schema::new(vec![Field::new(
+            "doc_id",
+            DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Decimal128(38, 0)),
+            ),
+            false,
+        )]);
+        let descr = Arc::new(
+            ArrowSchemaConverter::new()
+                .convert(&schema)
+                .expect("parquet schema"),
+        );
+        let metadata = |min: Vec<u8>| {
+            let stats = ParquetStatistics::fixed_len_byte_array(
+                Some(FixedLenByteArray::from(min)),
+                Some(FixedLenByteArray::from(vec![0u8; DECIMAL128_BYTES])),
+                None,
+                Some(0),
+                false,
+            );
+            let column = ColumnChunkMetaData::builder(descr.column(0))
+                .set_statistics(stats)
+                .build()
+                .expect("column");
+            let row_group = RowGroupMetaData::builder(Arc::clone(&descr))
+                .set_num_rows(1)
+                .set_column_metadata(vec![column])
+                .build()
+                .expect("row group");
+            ParquetMetaData::new(
+                FileMetaData::new(0, 1, None, None, Arc::clone(&descr), None),
+                vec![row_group],
+            )
+        };
+        for min in [Vec::new(), vec![0u8; DECIMAL128_BYTES + 1]] {
+            let len = min.len();
+            let metadata = metadata(min);
+            assert!(
+                constant_row_groups(&metadata, &schema, "doc_id").is_none(),
+                "a {len}-byte minimum"
+            );
+            assert!(
+                constant_row_groups(&metadata, &dictionary, "doc_id").is_none(),
+                "a {len}-byte minimum of a dictionary"
+            );
+        }
+        let (_, constant) =
+            constant_row_groups(&metadata(vec![0u8; DECIMAL128_BYTES]), &schema, "doc_id")
+                .expect("statistics");
+        assert_eq!(constant, vec![true]);
     }
 
     /// A take reserves its prefetch from the connection's budget and gives it

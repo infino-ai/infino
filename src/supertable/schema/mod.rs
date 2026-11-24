@@ -45,9 +45,11 @@ use crate::{
         builder::FtsConfig,
         format::fts::REPAIR_RELEASE,
         fts::{
-            analysis::{Stemmer, Stopwords, chain_tokenizer},
+            analysis::{
+                Analyzer, REMOVED_ANALYZER, Stemmer, Stopwords, chain_tokenizer, check_chain,
+            },
             bm25::Bm25Params,
-            tokenize::{STANDARD_TOKENIZER, Tokenizer},
+            tokenize::Tokenizer,
         },
         vector::{builder::VectorConfig, distance::Metric, rerank_codec::RerankCodec},
     },
@@ -150,8 +152,13 @@ impl fmt::Display for FieldId {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum ColumnIndex {
-    /// A full-text index over a string column.
+    /// A full-text index over a string column. `#[non_exhaustive]`, so the
+    /// index can gain a setting without breaking a caller: build one with
+    /// [`ColumnIndex::fts`], and match it with `..`.
+    #[non_exhaustive]
     Fts {
+        /// The base tokenizer.
+        analyzer: Analyzer,
         /// The stopword filter applied after tokenizing.
         stopwords: Stopwords,
         /// The stemmer applied after tokenizing.
@@ -178,6 +185,31 @@ pub enum ColumnIndex {
     /// equality predicate on the column reads only the rows it matches,
     /// however the values are spread across the table.
     Range,
+}
+
+impl ColumnIndex {
+    /// A full-text index with `analyzer` and the defaults a new full-text
+    /// column takes: no stopwords, no stemmer, no positions, the text stored,
+    /// and the standard BM25 parameters. Set any other value on the fields:
+    ///
+    /// ```
+    /// use infino::{Analyzer, ColumnIndex};
+    ///
+    /// let mut index = ColumnIndex::fts(Analyzer::Standard);
+    /// if let ColumnIndex::Fts { positions, .. } = &mut index {
+    ///     *positions = true;
+    /// }
+    /// ```
+    pub fn fts(analyzer: Analyzer) -> Self {
+        Self::Fts {
+            analyzer,
+            stopwords: Stopwords::None,
+            stemmer: Stemmer::None,
+            positions: false,
+            stored: true,
+            bm25: Bm25Params::STANDARD,
+        }
+    }
 }
 
 /// One live user column: its identity, label, physical type and index.
@@ -395,6 +427,7 @@ impl TableSchema {
             .iter()
             .filter_map(|f| match &f.index {
                 Some(ColumnIndex::Fts {
+                    analyzer,
                     stopwords,
                     stemmer,
                     positions,
@@ -402,6 +435,7 @@ impl TableSchema {
                     bm25,
                 }) => Some(FtsConfig {
                     column: f.name.clone(),
+                    analyzer: *analyzer,
                     stopwords: *stopwords,
                     stemmer: *stemmer,
                     positions: *positions,
@@ -466,8 +500,11 @@ impl TableSchema {
         let field = self.fields.iter().find(|f| f.name == column)?;
         match &field.index {
             Some(ColumnIndex::Fts {
-                stopwords, stemmer, ..
-            }) => Some(chain_tokenizer(*stopwords, *stemmer)),
+                analyzer,
+                stopwords,
+                stemmer,
+                ..
+            }) => Some(chain_tokenizer(*analyzer, *stopwords, *stemmer)),
             _ => None,
         }
     }
@@ -646,6 +683,7 @@ impl TableSchema {
 fn column_index(name: &str, fts: &[FtsConfig], vectors: &[VectorConfig]) -> Option<ColumnIndex> {
     if let Some(fc) = fts.iter().find(|fc| fc.column == name) {
         return Some(ColumnIndex::Fts {
+            analyzer: fc.analyzer,
             stopwords: fc.stopwords,
             stemmer: fc.stemmer,
             positions: fc.positions,
@@ -667,6 +705,7 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
     let mut out = Map::new();
     match index {
         ColumnIndex::Fts {
+            analyzer,
             stopwords,
             stemmer,
             positions,
@@ -674,8 +713,7 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
             bm25,
         } => {
             out.insert("kind".into(), Value::from("fts"));
-            // Recorded so a future tokenizer needs no format change.
-            out.insert("analyzer".into(), Value::from(STANDARD_TOKENIZER));
+            out.insert("analyzer".into(), Value::from(analyzer.as_str()));
             if let Some(name) = stopwords.as_str() {
                 out.insert("stopwords".into(), Value::from(name));
             }
@@ -746,21 +784,35 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
     match str_of("kind")? {
         "fts" => {
             let defaults = FtsConfig::new("");
-            // Only `standard` is reproducible; a list naming another base
-            // refuses rather than query an index split another way.
-            if let Some(name) = obj.get("analyzer").and_then(Value::as_str)
-                && name != STANDARD_TOKENIZER
-            {
-                return Err(format!(
-                    "index uses the removed analyzer '{name}'; copy the table's rows out \
-                     with infino {REPAIR_RELEASE} before upgrading, then re-create it \
-                     under \"standard\""
-                ));
-            }
+            // Only a known analyzer can be rebuilt. Any other name is
+            // refused, so no index is queried with terms split another way.
+            let analyzer = match obj.get("analyzer").and_then(Value::as_str) {
+                None => defaults.analyzer,
+                Some(name) => Analyzer::from_name(name).ok_or_else(|| {
+                    if name == REMOVED_ANALYZER {
+                        format!(
+                            "index uses the removed analyzer '{name}'; copy the table's rows \
+                             out with infino {REPAIR_RELEASE} before upgrading, then re-create \
+                             it under \"standard\""
+                        )
+                    } else {
+                        // A name no release ever shipped: a newer engine
+                        // wrote this document.
+                        format!(
+                            "index uses the analyzer '{name}', which this version of infino \
+                             does not know; open the table with the newer version that wrote it"
+                        )
+                    }
+                })?,
+            };
+            let stopwords =
+                named(obj, "stopwords", Stopwords::from_name)?.unwrap_or(defaults.stopwords);
+            let stemmer = named(obj, "stemmer", Stemmer::from_name)?.unwrap_or(defaults.stemmer);
+            check_chain(analyzer, stopwords, stemmer)?;
             Ok(ColumnIndex::Fts {
-                stopwords: named(obj, "stopwords", Stopwords::from_name)?
-                    .unwrap_or(defaults.stopwords),
-                stemmer: named(obj, "stemmer", Stemmer::from_name)?.unwrap_or(defaults.stemmer),
+                analyzer,
+                stopwords,
+                stemmer,
                 positions: bool_or("positions", defaults.positions)?,
                 stored: bool_or("stored", defaults.stored)?,
                 bm25: Bm25Params::new(
@@ -1147,6 +1199,34 @@ mod tests {
             TableSchema::from_json(&json).expect("decode").max_fields(),
             DEFAULT_MAX_FIELDS,
             "the cap defaults when a document predates it"
+        );
+    }
+
+    /// A removed analyzer and a name no release shipped are both refused,
+    /// each with its own fix: copy the first out with the repair release;
+    /// open the second with the newer engine that wrote it.
+    #[test]
+    fn an_unknown_analyzer_names_a_newer_engine_and_a_removed_one_the_repair() {
+        let (user, fts, vectors) = indexed();
+        let ts = TableSchema::from_options(&user, &fts, &vectors);
+        let refusal = |name: &str| {
+            let mut json = ts.to_json();
+            json["fields"][0]["index"]["analyzer"] = Value::from(name);
+            TableSchema::from_json(&json).expect_err("refused")
+        };
+        let removed = refusal(REMOVED_ANALYZER);
+        assert!(
+            removed.contains("removed analyzer")
+                && removed.contains(REPAIR_RELEASE)
+                && !removed.contains("newer"),
+            "{removed}"
+        );
+        let unknown = refusal("icu");
+        assert!(
+            unknown.contains("'icu'")
+                && unknown.contains("newer version")
+                && !unknown.contains("removed"),
+            "{unknown}"
         );
     }
 

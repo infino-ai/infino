@@ -112,7 +112,7 @@ impl FtsReader {
             .filter_map(|c| {
                 // Compare against the revision of *this column's own*
                 // chain: a stemmer bump stales only the columns that stem.
-                let current = chain_revision(c.stopwords, c.stemmer);
+                let current = chain_revision(c.analyzer, c.stopwords, c.stemmer);
                 let recorded = c.analysis_revision.unwrap_or(UNKNOWN_ANALYSIS_REVISION);
                 (recorded < current).then(|| StaleColumn {
                     name: c.name.clone(),

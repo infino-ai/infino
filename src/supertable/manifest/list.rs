@@ -1998,11 +1998,16 @@ impl FtsSummaryAgg {
 
     /// Whether this summary's lex term range *could* contain a term starting
     /// with `prefix` (i.e. `[prefix, prefix_upper_bound)` overlaps the range).
-    /// A `None` range means the term dictionary was empty for this column —
-    /// nothing matches, so this returns `false` (prune). The per-term-range
-    /// primitive both the superfile-level (`fts_prefix_skip`) and list-level
+    /// A `None` range means no term, except possibly the empty one: a keyword
+    /// column whose values are all `''` records no range. So a non-empty
+    /// prefix returns `false` (prune). An empty prefix matches every term,
+    /// the empty one included, so it returns `true`. The check both the
+    /// superfile-level (`fts_prefix_skip`) and list-level
     /// (`part_overlaps_prefix`) prefix skips build on.
     pub fn may_match_prefix(&self, prefix: &[u8]) -> bool {
+        if prefix.is_empty() {
+            return true;
+        }
         match self.term_range.as_ref() {
             Some((min, max)) => prefix_overlaps_range(prefix, min, max),
             None => false,
@@ -5523,8 +5528,12 @@ mod tests {
         );
         assert!(!agg.may_match_prefix(b"zulu"), "above max → no overlap");
         assert!(!agg.may_match_prefix(b"alpha"), "below min → no overlap");
-        // No range (empty dictionary) → nothing matches → prune.
+        // No range (no term but possibly the empty one) → a non-empty
+        // prefix matches nothing → prune.
         assert!(!FtsSummaryAgg::default().may_match_prefix(b"echo"));
+        // An empty prefix matches every term, the empty one included.
+        assert!(FtsSummaryAgg::default().may_match_prefix(b""));
+        assert!(agg.may_match_prefix(b""));
     }
 
     #[test]

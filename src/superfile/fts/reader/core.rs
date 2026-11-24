@@ -63,7 +63,7 @@ use crate::{
             },
         },
         fts::{
-            analysis::{chain_tokenizer, check_recorded_tokenizer},
+            analysis::{chain_tokenizer, check_chain, check_recorded_tokenizer},
             bm25,
             builder::doc_lengths_entry_size,
             positions::GroupIndex,
@@ -752,9 +752,14 @@ const FEW_NORMS_GAP_BYTES: usize = 4096;
 /// superfile reads its whole array, as it would have anyway.
 pub(crate) const CANDIDATE_MAX_POSTINGS: u64 = 1 << 16;
 
-/// Most of a query's terms one superfile may hold for its candidates to be
-/// bounded term by term.
-pub(crate) const CANDIDATE_MAX_TERMS: usize = 64;
+/// Held terms a walk of [`CANDIDATE_MAX_POSTINGS`] postings may count.
+const CANDIDATE_TERMS_AT_MAX_POSTINGS: u64 = 64;
+
+/// Most (posting, held term) cells one superfile's candidate walk may fill:
+/// each decoded document keeps a count per held term, so a prefix's hundreds
+/// of rare expansions fit where many terms over many postings do not.
+pub(crate) const CANDIDATE_MAX_CELLS: u64 =
+    CANDIDATE_MAX_POSTINGS * CANDIDATE_TERMS_AT_MAX_POSTINGS;
 
 /// Most candidates one superfile may have for its buckets to be read alone.
 const CANDIDATE_MAX_DOCS: usize = 8192;
@@ -811,7 +816,10 @@ fn candidate_docs(
             tfs.insert(doc, row);
         }
     } else {
-        if df.iter().sum::<u64>() > CANDIDATE_MAX_POSTINGS {
+        let postings = df.iter().sum::<u64>();
+        if postings > CANDIDATE_MAX_POSTINGS
+            || postings.saturating_mul(nt as u64) > CANDIDATE_MAX_CELLS
+        {
             return None;
         }
         for (t, cursor) in cursors.iter_mut().enumerate() {
@@ -1322,7 +1330,7 @@ impl FtsReader {
             };
             let baked_avgdl = (avgdl_x1000 as f32) / format::fts::AVGDL_FIXED_POINT_SCALE;
             let params = col_cfg.params();
-            check_recorded_tokenizer(&col_cfg.name, col_cfg.tokenizer.as_deref())
+            let analyzer = check_recorded_tokenizer(&col_cfg.name, col_cfg.tokenizer.as_deref())
                 .map_err(FtsError::Read)?;
             let (stopwords, stemmer) = col_cfg.filters().map_err(|(field, value)| {
                 FtsError::Read(ReadError::Malformed(format!(
@@ -1330,7 +1338,13 @@ impl FtsReader {
                     col_cfg.name
                 )))
             })?;
-            let tokenizer = chain_tokenizer(stopwords, stemmer);
+            check_chain(analyzer, stopwords, stemmer).map_err(|reason| {
+                FtsError::Read(ReadError::Malformed(format!(
+                    "inf.fts.columns: column {:?}: {reason}",
+                    col_cfg.name
+                )))
+            })?;
+            let tokenizer = chain_tokenizer(analyzer, stopwords, stemmer);
             // The length array is not decoded here: the norms scoring
             // needs from it are built on first scored use
             // (`ColumnMeta::norms`), so a match-only query, or one a
@@ -1349,6 +1363,7 @@ impl FtsReader {
                 params,
                 positions: col_cfg.positions,
                 tokenizer,
+                analyzer,
                 stopwords,
                 stemmer,
                 stored: col_cfg.stored,
@@ -1578,6 +1593,13 @@ impl FtsReader {
     #[cfg(test)]
     pub(crate) fn doc_map_is_read(&self) -> bool {
         self.doc_map.initialized()
+    }
+
+    /// Whether `column`'s whole length array has been read into its norms.
+    #[cfg(test)]
+    pub(crate) fn norms_loaded(&self, column: &str) -> bool {
+        self.resolve_column_id(column)
+            .is_ok_and(|id| self.columns[id as usize].norms_loaded())
     }
 
     /// Whether this blob stores its documents under an ordering of its
@@ -2020,7 +2042,7 @@ impl FtsReader {
         // about hundreds of expansions, of which one superfile holds a few. A
         // phrase missing a word here cannot match here.
         let held: Vec<usize> = (0..terms.len()).filter(|&t| built[t].is_some()).collect();
-        if held.is_empty() || held.len() > CANDIDATE_MAX_TERMS {
+        if held.is_empty() {
             return Ok(None);
         }
         let mut at = vec![usize::MAX; terms.len()];
@@ -2207,9 +2229,10 @@ impl FtsReader {
     /// Multi-token phrases require the column to be positional;
     /// otherwise [`FtsError::PositionsUnavailable`].
     /// The second element counts the term-dictionary ranges the builds
-    /// requested (one per `build_term_cursors` call plus one per inline
-    /// phrase member's position recovery) — real byte-source ranges on
-    /// every query, tallied by the caller into the planned count.
+    /// requested (one per `build_term_cursors` call the memo does not cover,
+    /// plus one per inline phrase member's position recovery) — real
+    /// byte-source ranges on every query, tallied by the caller into the
+    /// planned count.
     pub(super) async fn build_atom_cursors(
         &self,
         column_id: u32,
@@ -2241,7 +2264,7 @@ impl FtsReader {
             let term_cursors = self
                 .build_term_cursors_opt(column_id, terms, idf, purpose, None, prefetched, None)
                 .await?;
-            dict_ranges += 1;
+            dict_ranges += super::count::dictionary_fetches(terms, prefetched);
             for cursor in term_cursors {
                 out.push(cursor.map(AnyCursor::Term));
             }
@@ -2255,7 +2278,7 @@ impl FtsReader {
             let cursors = self
                 .build_term_cursors(column_id, &member_refs, idf, purpose, None, prefetched)
                 .await?;
-            dict_ranges += 1;
+            dict_ranges += super::count::dictionary_fetches(&member_refs, prefetched);
             if cursors.len() != member_refs.len() {
                 // A member is absent — the phrase can never match.
                 out.push(None);
@@ -2301,13 +2324,14 @@ impl FtsReader {
                         let dict_bytes = self.dict_bytes_async().await?;
                         let dict = Self::open_dict(&dict_bytes)?;
                         let key = make_key(&col_meta.name, term);
-                        let packed = dict
-                            .lookup(&key)
-                            .expect("inline member cursor was built from this dict");
-                        let position = match packed {
-                            DictEntry::Inline { tf: slot, .. } => slot,
-                            DictEntry::Pfor { .. } => {
-                                unreachable!("inline cursor from a PFOR dictionary entry")
+                        // The cursor may come from the term index, so the
+                        // dictionary disagreeing with it is a read error.
+                        let position = match dict.lookup(&key) {
+                            Some(DictEntry::Inline { tf: slot, .. }) => slot,
+                            _ => {
+                                return Err(FtsError::Read(ReadError::Malformed(format!(
+                                    "phrase member {term:?} is not inline in the dictionary"
+                                ))));
                             }
                         };
                         positional.push((None, Some(position)));
@@ -3884,7 +3908,7 @@ mod tests {
             bm25,
             builder::FtsBuilder,
             reader::{BoolMode, ContainsRows},
-            tokenize::StandardTokenizer,
+            tokenize::{STANDARD_TOKENIZER, StandardTokenizer},
         },
     };
 
@@ -5686,7 +5710,13 @@ mod tests {
 
         let opened = recording.0.len();
         let (shared, _) = r
-            .term_rows("body", &terms, None, &QueryDict::with_budget(&budget))
+            .term_rows(
+                "body",
+                STANDARD_TOKENIZER,
+                &terms,
+                None,
+                &QueryDict::with_budget(&budget),
+            )
             .await
             .expect("terms through a kept dictionary");
         assert_eq!(
@@ -5697,7 +5727,13 @@ mod tests {
 
         let opened = recording.0.len();
         let (each, _) = r
-            .term_rows("body", &terms, None, &QueryDict::default())
+            .term_rows(
+                "body",
+                STANDARD_TOKENIZER,
+                &terms,
+                None,
+                &QueryDict::default(),
+            )
             .await
             .expect("terms without a kept dictionary");
         assert_eq!(
@@ -7154,6 +7190,65 @@ mod tests {
                 "{name}: the length array was never read"
             );
         }
+    }
+
+    /// An `Or` over more held terms than a small query has, as a prefix
+    /// expands to, still scores from its candidates' buckets alone.
+    #[tokio::test]
+    async fn candidate_norms_serve_many_rare_terms() {
+        const TERMS: u32 = 100;
+        const TERM_EVERY: u32 = 30;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), true).expect("register");
+        let mut next = xorshift(0x5eed_cafe);
+        for doc in 0..CANDIDATE_CORPUS_DOCS {
+            let mut text = vec!["red"; (1 + next() % 8) as usize].join(" ");
+            if doc % TERM_EVERY == 0 && doc / TERM_EVERY < TERMS {
+                text.push_str(&format!(" einst{}", doc / TERM_EVERY));
+            }
+            b.add_doc(0, doc, &text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        let names: Vec<String> = (0..TERMS).map(|i| format!("einst{i}")).collect();
+        let terms: Vec<&str> = names.iter().map(String::as_str).collect();
+        let idf: GlobalTermIdf = names
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.clone(), 5.0 + i as f32 * 0.01))
+            .collect();
+        let lists = || ClauseLists {
+            shoulds: &terms,
+            idf: QueryIdf::Table(&idf),
+            ..ClauseLists::default()
+        };
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let whole = ranked(&eager, lists(), f32::NEG_INFINITY).await;
+        assert_eq!(whole.len(), CANDIDATE_K);
+        let floor = whole[CANDIDATE_K - 1].1;
+        let lazy = bucket_reader(&blob, json).await;
+        let bare: Vec<(&str, u32)> = terms.iter().map(|&t| (t, 1)).collect();
+        let no_view = ScoringView {
+            norms: None,
+            params: None,
+            avgdl: None,
+        };
+        let norms = lazy
+            .candidate_norms("body", &bare, &[], &idf, &no_view, floor, None, None)
+            .await
+            .expect("candidate norms")
+            .expect("the candidates are read alone");
+        let view = lazy
+            .with_scoring(&ScoringView {
+                norms: Some(CandidateNorms {
+                    column: "body",
+                    norms: &norms,
+                }),
+                ..no_view
+            })
+            .expect("a view over the candidate norms");
+        assert_eq!(ranked(&view, lists(), floor).await, whole);
+        assert!(!lazy.columns[0].norms_loaded());
     }
 
     /// Candidate norms are not built where they cannot help: no floor, a

@@ -51,7 +51,7 @@ const LEN_BUCKETS: usize = 1 << u8::BITS;
 
 /// Planned dictionary reads for a cursor build over `tokens`: none when a
 /// memo already resolves every token, one otherwise.
-fn dictionary_fetches(tokens: &[&str], prefetched: Option<&FetchedTermMemo>) -> u64 {
+pub(super) fn dictionary_fetches(tokens: &[&str], prefetched: Option<&FetchedTermMemo>) -> u64 {
     match prefetched.is_some_and(|m| m.covers(tokens)) {
         true => 0,
         false => 1,
@@ -237,12 +237,27 @@ impl FtsReader {
     /// terms + phrases under `mode`, ascending — the atoms sibling of
     /// [`Self::token_match`], used whenever the match set contains a
     /// phrase. Under `And`, a missing atom empties the set.
+    #[cfg(test)]
     pub(crate) async fn atoms_match_ids(
         &self,
         column: &str,
         terms: &[&str],
         phrases: &[Phrase<String>],
         mode: BoolMode,
+    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
+        self.atoms_match_ids_prefetched(column, terms, phrases, mode, None)
+            .await
+    }
+
+    /// [`Self::atoms_match_ids`] with a memo of located postings: a term or
+    /// phrase member the memo holds is not looked up in the dictionary.
+    pub(crate) async fn atoms_match_ids_prefetched(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Phrase<String>],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
     ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: built to match, so no global idf and no norms; the
@@ -253,7 +268,7 @@ impl FtsReader {
                 terms,
                 phrases,
                 QueryIdf::ThisFile,
-                None,
+                prefetched,
                 CursorUse::Match,
             )
             .await?;
@@ -278,6 +293,7 @@ impl FtsReader {
 
     /// Phrase-aware unranked match **count** — the atoms sibling of
     /// [`Self::token_match_count`].
+    #[cfg(test)]
     pub(crate) async fn atoms_match_count(
         &self,
         column: &str,
@@ -286,6 +302,31 @@ impl FtsReader {
         mode: BoolMode,
         neg_terms: &[&str],
         neg_phrases: &[Phrase<String>],
+    ) -> Result<(u64, MatchWork), FtsError> {
+        self.atoms_match_count_prefetched(
+            column,
+            terms,
+            phrases,
+            mode,
+            neg_terms,
+            neg_phrases,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::atoms_match_count`] with a memo of located postings: a term or
+    /// phrase member the memo holds is not looked up in the dictionary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn atoms_match_count_prefetched(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Phrase<String>],
+        mode: BoolMode,
+        neg_terms: &[&str],
+        neg_phrases: &[Phrase<String>],
+        prefetched: Option<&FetchedTermMemo>,
     ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Plain terms on both sides: count by probing or folding, whichever
@@ -298,7 +339,7 @@ impl FtsReader {
                     QueryIdf::ThisFile,
                     CursorUse::Count,
                     None,
-                    None,
+                    prefetched,
                 )
                 .await?;
             let mut work = MatchWork::for_cursors(&pos);
@@ -312,7 +353,7 @@ impl FtsReader {
                     QueryIdf::ThisFile,
                     CursorUse::Count,
                     None,
-                    None,
+                    prefetched,
                 )
                 .await?;
             work.postings_bytes += MatchWork::for_cursors(&neg).postings_bytes;
@@ -328,7 +369,7 @@ impl FtsReader {
                 terms,
                 phrases,
                 QueryIdf::ThisFile,
-                None,
+                prefetched,
                 CursorUse::Match,
             )
             .await?;
@@ -352,7 +393,7 @@ impl FtsReader {
                     neg_terms,
                     neg_phrases,
                     QueryIdf::ThisFile,
-                    None,
+                    prefetched,
                     CursorUse::Match,
                 )
                 .await?;
@@ -522,7 +563,7 @@ impl FtsReader {
         let (docs, walk_ns) = timed_section(|| self.collect_and_intersect(cursors));
         work.kernel_cpu_ns = walk_ns;
         let col = &self.columns[column_id as usize];
-        let current = chain_revision(col.stopwords, col.stemmer);
+        let current = chain_revision(col.analyzer, col.stopwords, col.stemmer);
         let docs = match col.analysis_revision.is_some_and(|r| r >= current) && !docs.is_empty() {
             true => {
                 // The writer caps a stored length before bucketing it.
@@ -1112,7 +1153,7 @@ mod tests {
         superfile::{
             BytesLazyByteSource,
             fts::{
-                analysis::{Stemmer, Stopwords},
+                analysis::{Analyzer, Stemmer, Stopwords},
                 builder::FtsBuilder,
                 posting::{self, BLOCK_LEN, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
             },
@@ -2173,7 +2214,7 @@ mod tests {
         ]);
         let current = format!(
             r#"[{{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":{}}}]"#,
-            chain_revision(Stopwords::None, Stemmer::None)
+            chain_revision(Analyzer::Standard, Stopwords::None, Stemmer::None)
         );
         let open_lazy = |json: String| {
             let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob.clone()));
@@ -2223,7 +2264,7 @@ mod tests {
         let (blob, _) = build_standard_blob(&[&value, "x"]);
         let json = format!(
             r#"[{{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":{}}}]"#,
-            chain_revision(Stopwords::None, Stemmer::None)
+            chain_revision(Analyzer::Standard, Stopwords::None, Stemmer::None)
         );
         let r = FtsReader::open(blob, &json).expect("open");
         let tokens = vec!["x"; len];

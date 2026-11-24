@@ -135,6 +135,12 @@ const TIER_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// practice.
 const CEILING_SLACK: f32 = 1.0 + BOUND_ROUNDING_SLACK;
 
+/// Relative error, in units of `f32::EPSILON` per summed term, by which two
+/// sums of the same non-negative terms in different orders can differ. A
+/// ceiling adds its terms in index order while a kernel adds the scores in
+/// cursor order, so the ceiling widens by this much per term it sums.
+const REASSOCIATION_ULPS_PER_TERM: f32 = 2.0;
+
 /// Decoded posting runs kept per loaded index, keyed by `column \x1F term`.
 /// A ranked query asks for the same term's postings several times — to
 /// choose parts, to select superfiles, for ceilings, for locations — and
@@ -2984,14 +2990,39 @@ impl TermIndex {
                         .unwrap_or(e.n_docs)
                 })
         };
-        // Per term: superfile → the key of its best document there.
+        // Per phrase member: superfile → the key of its best document there.
         let mut per_term: HashMap<&str, HashMap<Uuid, f32>> = HashMap::new();
+        let members: HashSet<&str> = phrases.iter().flatten().copied().collect();
         let mut all_terms: Vec<&str> = terms.to_vec();
-        all_terms.extend(phrases.iter().flatten().copied());
+        all_terms.extend(members.iter().copied());
         all_terms.sort_unstable();
         all_terms.dedup();
+        // A bare term repeated in the query weighs as many times as it appears.
+        let mut bare: HashMap<&str, f32> = HashMap::new();
+        for term in terms {
+            *bare.entry(term).or_insert(0.0) += 1.0;
+        }
+        // A superfile the root lists more than once sums under its first
+        // ordinal, so a posting at any of its listings reaches its ceiling.
+        let mut ordinal: HashMap<Uuid, usize> = HashMap::with_capacity(self.root.superfiles.len());
+        let canonical: Vec<usize> = self
+            .root
+            .superfiles
+            .iter()
+            .enumerate()
+            .map(|(i, id)| *ordinal.entry(*id).or_insert(i))
+            .collect();
+        // Bare terms sum straight into a per-ordinal ceiling, so the work is
+        // one pass over their postings rather than a lookup per term per
+        // superfile, which a prefix's thousands of expansions make large.
+        let n = self.root.superfiles.len();
+        let mut term_ceiling = vec![0.0f32; n];
+        let mut last_term = vec![usize::MAX; n];
+        let mut before = vec![0.0f32; n];
         let runs = self.runs_many(column_id, &all_terms).await?;
-        for (term, runs) in all_terms.into_iter().zip(runs) {
+        for (ti, (term, runs)) in all_terms.into_iter().zip(runs).enumerate() {
+            let is_member = members.contains(term);
+            let idf = bare.get(term).map(|count| idf_used(term) * count);
             let mut by_sf = HashMap::new();
             for slice_run in runs.iter() {
                 for p in &slice_run.run.postings {
@@ -3002,11 +3033,27 @@ impl TermIndex {
                         true => legacy_bound_as_key(p.bound, p.df, scored_docs(id)),
                         false => p.bound,
                     };
-                    by_sf.insert(id, key);
+                    if let Some(idf) = idf {
+                        let o = canonical[p.superfile as usize];
+                        // A later posting for the superfile replaces an
+                        // earlier one's.
+                        if last_term[o] != ti {
+                            last_term[o] = ti;
+                            before[o] = term_ceiling[o];
+                        }
+                        term_ceiling[o] = before[o] + key * idf;
+                    }
+                    if is_member {
+                        by_sf.insert(id, key);
+                    }
                 }
             }
-            per_term.insert(term, by_sf);
+            if is_member {
+                per_term.insert(term, by_sf);
+            }
         }
+        let summed = terms.len() + phrases.len();
+        let reassociation = 1.0 + REASSOCIATION_ULPS_PER_TERM * summed as f32 * f32::EPSILON;
         let mut out: HashMap<Uuid, f32> = HashMap::with_capacity(entries.len());
         for e in entries {
             let id = e.superfile_id;
@@ -3014,12 +3061,7 @@ impl TermIndex {
                 out.insert(id, f32::INFINITY);
                 continue;
             }
-            let mut ceiling = 0.0f32;
-            for term in terms {
-                if let Some(bound) = per_term.get(term).and_then(|m| m.get(&id)) {
-                    ceiling += bound * idf_used(term);
-                }
-            }
+            let mut ceiling = ordinal.get(&id).map_or(0.0, |&o| term_ceiling[o]);
             for phrase in phrases {
                 let mut idf_sum = 0.0f32;
                 let mut min_scaled = f32::INFINITY;
@@ -3045,7 +3087,7 @@ impl TermIndex {
                     };
                 }
             }
-            out.insert(id, ceiling * CEILING_SLACK);
+            out.insert(id, ceiling * CEILING_SLACK * reassociation);
         }
         Ok(out)
     }
@@ -4858,6 +4900,64 @@ mod tests {
         assert!(runs.len() == 1 && runs[0].run.legacy_bound && runs[0].tier_object.is_none());
     }
 
+    /// A superfile the root lists twice keeps the bound posted at either
+    /// listing: one posted only at its first ordinal is not lost to the
+    /// second, which holds none.
+    #[test]
+    fn a_superfile_listed_twice_keeps_the_ceiling_of_its_first_listing() {
+        let (_dir, storage, st) = fresh_table();
+        commit_layer(&st, 0);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let reader = st.reader().expect("reader");
+        let entries: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        let key = title_id().term_key("shared");
+        let (df, bound) = (5u64, 2.5f32);
+        let slice =
+            format::encode_legacy_slice(&[(key.clone(), vec![(0, df, bound, Location::None)])]);
+        let hash = ContentHash::of(&slice);
+        rt.block_on(put_content_addressed(
+            storage.as_ref(),
+            "slice",
+            slice.clone(),
+        ))
+        .expect("slice stored");
+        let root = Root {
+            superfiles: vec![e.superfile_id, e.superfile_id],
+            id_mins: vec![e.id_min, e.id_min],
+            layers: vec![Layer {
+                base: 0,
+                ordinals: None,
+                slices: vec![format::SliceRef {
+                    first_key: key.clone(),
+                    last_key: key.clone(),
+                    content_hash: hash,
+                    tier: None,
+                    len: 0,
+                }],
+            }],
+        };
+        let root = Root::decode(&format::encode_legacy_root(&root, &[slice.len() as u64]))
+            .expect("a legacy root decodes");
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let idf_used = |_: &str| 1.7f32;
+        let ceilings = rt
+            .block_on(index.query_ceilings(title_id(), &["shared"], &[], &entries, &idf_used))
+            .expect("ceilings");
+        let n = e
+            .fts_summary
+            .get(&title_id())
+            .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
+            .unwrap_or(e.n_docs);
+        let expected = bound / bm25::idf(n, df.min(n)) * 1.7 * CEILING_SLACK;
+        let got = ceilings[&e.superfile_id];
+        assert!(
+            (got - expected).abs() <= expected * 1e-5,
+            "ceiling {got}, expected {expected}"
+        );
+    }
+
     /// A merge cursor's decoded batch stays within the memory a fold plans
     /// per cursor, however many superfiles each of its terms spans.
     #[test]
@@ -6391,6 +6491,37 @@ mod tests {
     /// document actually receives — for single terms, multi-term unions
     /// and phrases under table-wide statistics, where the stored bound is
     /// rescaled from the superfile's own idf to the query's.
+    /// A ceiling sums its terms in index order and a kernel sums the same
+    /// scores in cursor order: the reassociation slack keeps the ceiling at
+    /// or above the score for any order, up to a hundred terms and more.
+    #[test]
+    fn ceiling_slack_covers_summing_in_another_order() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let n = 2 + (next() % 100) as usize;
+            let terms: Vec<f32> = (0..n)
+                .map(|_| (next() % 1_000_000) as f32 / 37_000.0 * (1 + next() % 3) as f32)
+                .collect();
+            let mut shuffled = terms.clone();
+            for i in (1..n).rev() {
+                shuffled.swap(i, (next() % (i as u64 + 1)) as usize);
+            }
+            let ceiling = terms.iter().sum::<f32>()
+                * (1.0 + REASSOCIATION_ULPS_PER_TERM * n as f32 * f32::EPSILON);
+            let score: f32 = shuffled.iter().sum();
+            assert!(
+                ceiling >= score,
+                "{n} terms: ceiling {ceiling} under score {score}"
+            );
+        }
+    }
+
     #[test]
     fn query_ceilings_bound_real_scores_for_terms_and_phrases() {
         use crate::Bm25SearchOptions;
@@ -6441,8 +6572,10 @@ mod tests {
             })
             .collect();
         // (query, plain terms, phrases)
-        let queries: [(&str, &[&str], &[&[&str]]); 5] = [
+        let queries: [(&str, &[&str], &[&[&str]]); 6] = [
             ("alpha", &["alpha"], &[]),
+            // A repeated term scores once per occurrence.
+            ("alpha alpha", &["alpha", "alpha"], &[]),
             ("alpha shared", &["alpha", "shared"], &[]),
             ("\"alpha shared\"", &[], &[&["alpha", "shared"]]),
             (
