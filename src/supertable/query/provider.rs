@@ -3369,10 +3369,10 @@ impl TableProvider for SupertableProvider {
                             // vocabulary; judged per column from the manifest's
                             // term count and the Parquet footer's column size,
                             // neither of which costs a read.
-                            let footer = Some(ScanFooter::new(
-                                Arc::clone(&prepared.footer),
-                                &prepared.shape.leaf_bytes,
-                            ));
+                            let footer = self
+                                .scan_footers
+                                .get(&prepared.path)
+                                .map(|f| Arc::clone(f.value()));
                             let full_walk_pays = |column: &str| {
                                 let terms = self
                                     .manifest
