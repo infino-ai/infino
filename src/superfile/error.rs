@@ -321,16 +321,21 @@ pub enum FtsError {
     #[error("{0} did not finish (it panicked)")]
     TaskDropped(&'static str),
 
-    /// An exact substring answer was asked of a column this superfile
-    /// indexed with an analyzer other than `standard`. The answer rests on
-    /// the standard analyzer's token rules, and the plan that asked for it
-    /// promised an exact answer, so the query fails rather than answer
-    /// from terms that could miss a row.
+    /// An exact answer from a column's terms was asked of a column this
+    /// superfile indexed with another analyzer than the one the answer rests
+    /// on (`expected`): `standard`'s token rules for a substring or a
+    /// `text_match`, `keyword`'s whole values for an equality. The plan that
+    /// asked for it promised an exact answer, so the query fails rather
+    /// than answer from terms that could miss a row.
     #[error(
         "column {column:?} is indexed with the {analyzer:?} analyzer in this superfile; \
-         an exact substring answer needs the standard analyzer"
+         an exact answer from its terms needs the {expected:?} analyzer"
     )]
-    ExactNeedsStandard { column: String, analyzer: String },
+    ExactNeedsAnalyzer {
+        column: String,
+        analyzer: String,
+        expected: &'static str,
+    },
 
     /// An exact substring answer's term values, postings or row bitsets
     /// would cross the connection memory budget; the query is refused

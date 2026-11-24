@@ -55,7 +55,7 @@ use std::{
     fmt,
     future::Future,
     slice,
-    sync::{Arc, atomic},
+    sync::{Arc, Mutex, PoisonError, atomic},
     time::Instant,
 };
 
@@ -115,7 +115,7 @@ use crate::{
         error::FtsError,
         fts::{
             reader::{BoolMode, ContainsRows, MatchWork, QueryDict},
-            tokenize::{Tokenizer, unique_tokens},
+            tokenize::{STANDARD_TOKENIZER, Tokenizer, unique_tokens},
         },
         reader::ScanShape,
     },
@@ -125,7 +125,7 @@ use crate::{
         handle::WeakReader,
         manifest::{
             ColumnStats, ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts,
-            load_section_groups, load_section_groups_blocking,
+            load_section_groups, load_section_groups_blocking, term_index::postings_of,
         },
         query::{
             SuperfileHit,
@@ -133,7 +133,7 @@ use crate::{
                 CandidatePlan, ExactFilter, PoolFile, Resolved, SelectionGate, TermMemos,
                 exact_filter, exact_range, like_prune_leaves, single_range,
             },
-            covered_agg::not_null_column,
+            covered_agg::{LiveTermCounts, is_keyword_column, not_null_column},
             deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
             dispatch::tag_hits,
@@ -450,6 +450,29 @@ fn pushdown_rows(n_docs: u64) -> u64 {
 /// count passes (nothing to judge by).
 const LIKE_WALK_MIN_BYTES_PER_TERM: u64 = 128;
 
+/// A `keyword` equality or `IN` list is read from the postings only while
+/// its values hold at most one row in this many, as the term index counts
+/// them; past that it stays a row filter. Turning a value's postings into
+/// rows costs per row it holds, while the filter costs about one pass over
+/// the column whatever it keeps. Measured on 16 warm superfiles of 1M rows,
+/// counting a value held by 90% of rows: 97 ms from the postings against
+/// 18 ms through the filter; a value held by 800 rows: 0.56 ms from the
+/// postings against 5 ms through the filter.
+const POSTINGS_MAX_ROW_SHARE: u64 = 16;
+
+/// How many rows hold a `keyword` value, as the term index counts them
+/// before a statement is optimized (see
+/// [`SupertableProvider::read_value_frequencies`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct ValueFrequency {
+    /// The value's document frequency in the indexed superfiles, deleted
+    /// rows included.
+    rows: u64,
+    /// The rows of the superfiles the index lists; zero when the value was
+    /// not read, which leaves its equality on the postings.
+    out_of: u64,
+}
+
 /// A [`TableProvider`] over a pinned supertable snapshot.
 ///
 /// Cheap to build (just `Arc` clones); all real work happens in
@@ -514,6 +537,11 @@ pub(crate) struct SupertableProvider {
     /// Exact table-level low-cardinality frequencies, merged lazily per
     /// column from this provider's immutable manifest snapshot.
     scalar_value_counts: Arc<DashMap<String, Option<Arc<ScalarValueCounts>>>>,
+    /// How many rows hold each `keyword` value an equality names, by
+    /// column and value, read before a statement is optimized: what decides
+    /// whether the equality is read from the postings (see
+    /// [`Self::exact_filter`]). An entry, once in, never changes.
+    value_frequencies: Arc<DashMap<(String, String), ValueFrequency>>,
     /// The table's value counts carried across snapshots, which the merge
     /// above brings to this snapshot. A provider built without the table's
     /// carries its own, and merges every superfile.
@@ -536,6 +564,10 @@ pub(crate) struct SupertableProvider {
     /// The statistics of superfiles' deleted rows, kept for the table (see
     /// [`DeletedStatsCache`]).
     deleted_stats: Arc<DeletedStatsCache>,
+    /// `keyword` columns' live value counts, read from the term index
+    /// before a statement is optimized and taken by the covered-aggregate
+    /// rewrite (see [`LiveTermCounts`]), by column.
+    term_counts: Arc<Mutex<HashMap<String, LiveTermCounts>>>,
 }
 
 /// What [`SupertableProvider::count_range`] carries: the column, its id
@@ -635,12 +667,14 @@ impl SupertableProvider {
             scan_store: Arc::new(SuperfileObjectStore::new()),
             scan_footers: Arc::new(DashMap::new()),
             scalar_value_counts: Arc::new(DashMap::new()),
+            value_frequencies: Arc::default(),
             value_count_carry: Arc::default(),
             top_k: None,
             walk_reader: WeakReader::from_reader(reader),
             count_range: None,
             read_rows: None,
             deleted_stats: Arc::default(),
+            term_counts: Arc::default(),
         }
     }
 
@@ -661,6 +695,33 @@ impl SupertableProvider {
     /// The statistics of superfiles' deleted rows kept for the table.
     pub(crate) fn deleted_stats(&self) -> &DeletedStatsCache {
         &self.deleted_stats
+    }
+
+    /// Keep `column`'s live term counts for the covered-aggregate rewrite,
+    /// in place of any kept before.
+    pub(crate) fn keep_term_counts(&self, column: &str, counts: LiveTermCounts) {
+        self.term_counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(column.to_string(), counts);
+    }
+
+    /// Whether `other` keeps its term counts where this provider does.
+    pub(crate) fn shares_term_counts(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.term_counts, &other.term_counts)
+    }
+
+    /// Take `column`'s kept term counts, if any.
+    pub(crate) fn take_term_counts(&self, column: &str) -> Option<LiveTermCounts> {
+        self.term_counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(column)
+    }
+
+    /// The reader over this provider's snapshot, while its table is open.
+    pub(crate) fn reader(&self) -> Option<Arc<SupertableReader>> {
+        self.walk_reader.upgrade()
     }
 
     /// Clone of this provider whose scan reads `rows` of superfile `entry`
@@ -823,12 +884,14 @@ impl SupertableProvider {
             scan_store: Arc::clone(&self.scan_store),
             scan_footers: Arc::clone(&self.scan_footers),
             scalar_value_counts: Arc::clone(&self.scalar_value_counts),
+            value_frequencies: Arc::clone(&self.value_frequencies),
             value_count_carry: Arc::clone(&self.value_count_carry),
             top_k: self.top_k.clone(),
             walk_reader: self.walk_reader.clone(),
             count_range: self.count_range.clone(),
             read_rows: self.read_rows.clone(),
             deleted_stats: Arc::clone(&self.deleted_stats),
+            term_counts: Arc::clone(&self.term_counts),
         }
     }
 
@@ -849,6 +912,8 @@ impl SupertableProvider {
             }),
             scan_store: Arc::new(SuperfileObjectStore::new()),
             scan_footers: Arc::default(),
+            // Counts read over another snapshot are not this one's.
+            term_counts: Arc::default(),
             ..self.sibling()
         }
     }
@@ -893,9 +958,14 @@ impl SupertableProvider {
                     .sum(id, data_type, entries)
                     .map(Arc::new)
             });
+        // The first answer stored wins, so every caller on this snapshot sees
+        // the same one: whether a `keyword` equality is exact depends on it
+        // (see [`Self::exact_filter`]).
         self.scalar_value_counts
-            .insert(column.to_string(), merged.clone());
-        merged
+            .entry(column.to_string())
+            .or_insert(merged)
+            .value()
+            .clone()
     }
 
     // Lower `filters` to prune leaves and select the superfiles that
@@ -935,11 +1005,147 @@ impl SupertableProvider {
     /// [`supports_filters_pushdown`](TableProvider::supports_filters_pushdown),
     /// [`scan`](TableProvider::scan) and the covered-aggregate rewrite
     /// share, so what DataFusion is told is exact is what the scan answers
-    /// exactly. It reads only the expression and the table options, so a
-    /// cached plan stays valid.
+    /// exactly. It reads the expression, the table options and, for a
+    /// `keyword` equality, the snapshot's value counts; a cached plan is
+    /// kept only for the snapshot it was planned on, so it stays valid.
+    ///
+    /// An equality or `IN` on a `keyword` column is not exact here, and
+    /// stays a row filter, in two cases:
+    ///
+    ///   * the statistics hold the column's exact table-wide value counts
+    ///     (see [`Self::exact_value_counts`]): a count under it is then
+    ///     answered from those counts with no scan;
+    ///   * its values hold more than one row in [`POSTINGS_MAX_ROW_SHARE`]
+    ///     (see [`Self::read_value_frequencies`]): their postings then cost
+    ///     more to turn into rows than the filter costs.
+    ///
+    /// Both read only what this snapshot keeps and never changes once read
+    /// (a value whose frequency was not read is recorded as unread on first
+    /// sight), so the pushdown and the scan always decide the same way.
     fn exact_filter(&self, filter: &Expr, fts_cols: &HashSet<&str>) -> Option<ExactFilter> {
         let manifest = &self.manifest;
-        exact_filter(filter, fts_cols, &|col| manifest.try_fts_tokenizer_for(col))
+        let exact = exact_filter(filter, fts_cols, &|col| manifest.try_fts_tokenizer_for(col))?;
+        let keyword: Vec<_> = exact
+            .leaves()
+            .into_iter()
+            .filter(|leaf| leaf.whole && is_keyword_column(manifest, &leaf.column))
+            .collect();
+        if keyword.is_empty() {
+            return Some(exact);
+        }
+        if keyword
+            .iter()
+            .any(|leaf| self.exact_value_counts(&leaf.column).is_some())
+        {
+            return None;
+        }
+        let mut rows: u64 = 0;
+        let mut out_of: u64 = 0;
+        for leaf in keyword {
+            let frequency = *self
+                .value_frequencies
+                .entry((leaf.column.clone(), leaf.needle.clone()))
+                .or_default()
+                .value();
+            rows = rows.saturating_add(frequency.rows);
+            out_of = out_of.max(frequency.out_of);
+        }
+        let common = rows.saturating_mul(POSTINGS_MAX_ROW_SHARE) > out_of && out_of > 0;
+        (!common).then_some(exact)
+    }
+
+    /// Read from the term index how many rows hold each `keyword` value an
+    /// equality or `IN` list among `filters` names, for [`Self::exact_filter`]
+    /// to decide by. Run before the statement is optimized, as that decides
+    /// the pushdown. A value read already, by this statement or another on
+    /// the same snapshot, is not read again and keeps what was read first.
+    /// Nothing is read without a term index; superfiles the index does not
+    /// list are left out of both the value's rows and the rows it is
+    /// measured against.
+    pub(crate) async fn read_value_frequencies(&self, filters: &[Expr]) {
+        let manifest = &self.manifest;
+        let fts_cols = self.fts_cols_set();
+        let mut wanted: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let exact: Vec<ExactFilter> = filters
+            .iter()
+            .filter_map(|filter| {
+                exact_filter(filter, &fts_cols, &|col| {
+                    manifest.try_fts_tokenizer_for(col)
+                })
+            })
+            .collect();
+        for leaf in exact.iter().flat_map(ExactFilter::leaves) {
+            let key = (leaf.column.clone(), leaf.needle.clone());
+            if !leaf.whole
+                || !is_keyword_column(manifest, &leaf.column)
+                || self.value_frequencies.contains_key(&key)
+            {
+                continue;
+            }
+            let needles = wanted.entry(leaf.column.as_str()).or_default();
+            if !needles.contains(&leaf.needle.as_str()) {
+                needles.push(&leaf.needle);
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        let Some(superfiles) = manifest.complete_flat_superfiles() else {
+            return;
+        };
+        let index = match manifest.term_index().await {
+            Ok(Some(index)) => index,
+            Ok(None) => return,
+            Err(error) => {
+                debug!(%error, "value frequencies unread: equalities read the postings");
+                return;
+            }
+        };
+        let live: HashSet<Uuid> = superfiles
+            .iter()
+            .filter(|entry| index.is_indexed(&entry.superfile_id))
+            .map(|entry| entry.superfile_id)
+            .collect();
+        let out_of: u64 = superfiles
+            .iter()
+            .filter(|entry| live.contains(&entry.superfile_id))
+            .map(|entry| entry.n_docs)
+            .sum();
+        for (column, needles) in wanted {
+            let Some(field) = manifest.field_id(column) else {
+                continue;
+            };
+            let runs = match index.runs_many(field, &needles).await {
+                Ok(runs) => runs,
+                Err(error) => {
+                    debug!(%error, column, "value frequencies unread");
+                    continue;
+                }
+            };
+            for (needle, runs) in needles.into_iter().zip(runs) {
+                let rows = postings_of(&runs)
+                    .filter(|posting| {
+                        index
+                            .superfile_id(posting.superfile)
+                            .is_some_and(|id| live.contains(&id))
+                    })
+                    .map(|posting| posting.df)
+                    .sum();
+                self.value_frequencies
+                    .entry((column.to_string(), needle.to_string()))
+                    .or_insert(ValueFrequency { rows, out_of });
+            }
+        }
+    }
+
+    /// The analyzer whose terms a whole-term leaf on `column` names: the
+    /// column's own, `standard` for a `text_match` and `keyword` for an
+    /// equality (see [`ExactFilter`]). A leaf is built only on a column the
+    /// table indexes; `standard`, the function's analyzer, otherwise.
+    fn whole_term_analyzer(&self, column: &str) -> &'static str {
+        self.manifest
+            .try_fts_tokenizer_for(column)
+            .map_or(STANDARD_TOKENIZER, |tokenizer| tokenizer.name())
     }
 
     /// Whether this provider answers any of `filters` exactly
@@ -1036,6 +1242,7 @@ impl SupertableProvider {
                     .reader
                     .term_rows(
                         file_column,
+                        self.whole_term_analyzer(&leaf.column),
                         &[leaf.needle.as_str()],
                         memos.get(&leaf.column).map(Arc::as_ref),
                         &dict,
@@ -1092,6 +1299,7 @@ impl SupertableProvider {
                     .reader
                     .term_rows(
                         file_column,
+                        self.whole_term_analyzer(column),
                         &needles,
                         memos.get(column).map(Arc::as_ref),
                         &dict,
@@ -1107,10 +1315,11 @@ impl SupertableProvider {
             };
             let (rows, column_work) = match read {
                 Ok(read) => read,
-                // A `text_match` column this superfile holds no `standard`
-                // postings for (it was written before the column's index,
-                // or under another analyzer): every live row is doubtful,
-                // so each is checked against its text below.
+                // A whole-term column this superfile holds no postings of
+                // the column's analyzer for (it was written before the
+                // column's index, or under another analyzer): every live
+                // row is doubtful, so each is checked against its text
+                // below.
                 Err(e) if whole && holds_no_postings(&e) => {
                     let total: u64 = prepared
                         .shape
@@ -2307,7 +2516,7 @@ pub(crate) fn holds_no_postings(e: &ReadError) -> bool {
         ReadError::MissingKv(_) => true,
         ReadError::Fts(f) => matches!(
             f.as_ref(),
-            FtsError::UnknownColumn(_) | FtsError::ExactNeedsStandard { .. }
+            FtsError::UnknownColumn(_) | FtsError::ExactNeedsAnalyzer { .. }
         ),
         _ => false,
     }

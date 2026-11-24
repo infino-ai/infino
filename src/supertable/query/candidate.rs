@@ -81,6 +81,10 @@
 //! gaps), a literal with a separator in it (a phrase), a non-ASCII literal,
 //! and a column with a stopword set or stemmer.
 //!
+//! An equality or an `IN` list on a `keyword` column is exact too (see
+//! [`exact_keyword_equality`]): that analyzer indexes each whole value as
+//! one term, so the term's postings are exactly the rows equal to it.
+//!
 //! Why a tree of exact leaves is exact. Each leaf splits a superfile's rows
 //! into proven, doubtful and false; `AND` and `OR` combine those splits row
 //! by row, and a row the combination leaves doubtful is checked against the
@@ -122,7 +126,7 @@ use crate::{
                 BoolMode, ContainsRows, FetchedTermMemo, LONG_S_ASCII, MatchWork, QueryDict,
                 TermPattern,
             },
-            tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER, Tokenizer},
+            tokenize::{KEYWORD_TOKENIZER, MAX_TOKEN_CHARS, STANDARD_TOKENIZER, Tokenizer},
         },
         id_space::row_bitmap,
         range::{KeyKind, float_key, signed_key, unsigned_key},
@@ -1615,13 +1619,16 @@ fn like_parts<'a>(
 /// A `WHERE` conjunct the term dictionary answers exactly, with the rows it
 /// matches read from the postings rather than the text: `column ILIKE
 /// '%needle%'` (see [`exact_contains`]), the rows of every indexed term
-/// that contains `needle`, or one token of a `text_match` (`whole`), the
-/// rows of the indexed term that is `needle`.
+/// that contains `needle`, or (`whole`) the rows of the indexed term that is
+/// `needle`: one token of a `text_match`, or the value a `keyword` column is
+/// compared to (see [`exact_keyword_equality`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ExactContains {
     /// The FTS column.
     pub(crate) column: String,
-    /// The pattern's literal, lowercased: one whole `standard` token.
+    /// The pattern's literal, lowercased, or a `text_match` token: one whole
+    /// `standard` token. On a `keyword` column, the value compared to, byte
+    /// for byte.
     pub(crate) needle: String,
     /// Whether the rows are the term `needle`'s own (`text_match`) rather
     /// than those of every term containing it (`ILIKE`).
@@ -1705,6 +1712,66 @@ fn exact_text_match(
             crate::supertable::query::text_match::TextMatchMode::All => ExactFilter::And(leaves),
             crate::supertable::query::text_match::TextMatchMode::Any => ExactFilter::Or(leaves),
         }),
+    }
+}
+
+/// `filter` as the [`ExactFilter`] of `column = 'value'` or `column IN
+/// ('a', 'b', ...)` on a column indexed by `keyword`: one whole-term leaf per
+/// value, under `OR` for a list. A `keyword` column indexes each value as
+/// one term, byte for byte, so the rows of the term that is the value are
+/// exactly the rows equal to it, and a NULL holds no term, as `=` holds for
+/// no NULL. `None` for any other shape, a negated list, a value that is not
+/// a string literal, or a column under another analyzer.
+///
+/// A superfile with no `keyword` postings for the column (written before
+/// its index, or under another analyzer) has its rows checked against their
+/// values instead (see the provider's `exact_rows`).
+fn exact_keyword_equality(
+    filter: &Expr,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
+) -> Option<ExactFilter> {
+    let (column, values) = match filter {
+        Expr::BinaryExpr(be) if be.op == Operator::Eq => {
+            match (be.left.as_ref(), be.right.as_ref()) {
+                (Expr::Column(c), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(c)) => {
+                    (&c.name, vec![scalar_str(v)?])
+                }
+                _ => return None,
+            }
+        }
+        Expr::InList(il) if !il.negated => {
+            let Expr::Column(c) = il.expr.as_ref() else {
+                return None;
+            };
+            let values = il
+                .list
+                .iter()
+                .map(|item| match item {
+                    Expr::Literal(v, _) => scalar_str(v),
+                    _ => None,
+                })
+                .collect::<Option<Vec<&str>>>()?;
+            (&c.name, values)
+        }
+        _ => return None,
+    };
+    if resolve(column)?.name() != KEYWORD_TOKENIZER {
+        return None;
+    }
+    let mut leaves: Vec<ExactFilter> = values
+        .into_iter()
+        .map(|value| {
+            ExactFilter::Contains(ExactContains {
+                column: column.clone(),
+                needle: value.to_owned(),
+                whole: true,
+            })
+        })
+        .collect();
+    match leaves.len() {
+        0 => None,
+        1 => leaves.pop(),
+        _ => Some(ExactFilter::Or(leaves)),
     }
 }
 
@@ -1810,6 +1877,7 @@ pub(crate) fn exact_filter(
             })
         }
         _ => exact_text_match(filter, resolve)
+            .or_else(|| exact_keyword_equality(filter, resolve))
             .or_else(|| exact_contains(filter, fts_cols, resolve).map(ExactFilter::Contains)),
     }
 }

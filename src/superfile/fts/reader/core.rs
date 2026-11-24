@@ -3901,7 +3901,7 @@ mod tests {
             bm25,
             builder::FtsBuilder,
             reader::{BoolMode, ContainsRows},
-            tokenize::StandardTokenizer,
+            tokenize::{STANDARD_TOKENIZER, StandardTokenizer},
         },
     };
 
@@ -5703,7 +5703,13 @@ mod tests {
 
         let opened = recording.0.len();
         let (shared, _) = r
-            .term_rows("body", &terms, None, &QueryDict::with_budget(&budget))
+            .term_rows(
+                "body",
+                STANDARD_TOKENIZER,
+                &terms,
+                None,
+                &QueryDict::with_budget(&budget),
+            )
             .await
             .expect("terms through a kept dictionary");
         assert_eq!(
@@ -5714,7 +5720,13 @@ mod tests {
 
         let opened = recording.0.len();
         let (each, _) = r
-            .term_rows("body", &terms, None, &QueryDict::default())
+            .term_rows(
+                "body",
+                STANDARD_TOKENIZER,
+                &terms,
+                None,
+                &QueryDict::default(),
+            )
             .await
             .expect("terms without a kept dictionary");
         assert_eq!(

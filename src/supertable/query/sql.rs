@@ -101,15 +101,15 @@ use crate::{
     InfinoError,
     memory::{ConnectionMemoryBudget, Reclaim, Reservation, SqlSpill, budgeted_session_context},
     runtime_metrics::op_stats::{self, OpStatsCollector},
-    superfile::fts::tokenize::KEYWORD_TOKENIZER,
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
         manifest::ManifestSnapshot,
         query::{
             covered_agg::{
-                CoveredAggregateRewrite, lone_not_null_column, non_null_count,
-                prepare_aggregate_inputs, term_count_inputs, value_counts_from_statistics,
+                CoveredAggregateRewrite, LiveTermCounts, is_keyword_column, lone_not_null_column,
+                non_null_count, prepare_aggregate_inputs, term_count_inputs,
+                term_counts_worth_reading, value_counts_from_statistics,
             },
             exec::{
                 common::{collect_plan_metered, run_within_process_limit},
@@ -245,7 +245,7 @@ fn value_counts_batch(
 /// value, which is slow with many distinct values.
 /// `None` when a value is not UTF-8 or a count is past what the count column
 /// holds.
-fn term_counts_batch(
+pub(crate) fn term_counts_batch(
     schema: &SchemaRef,
     counts: &HashMap<Vec<u8>, u64>,
     nulls: u64,
@@ -822,9 +822,11 @@ impl SupertableReader {
     ///
     /// Read from the manifest's per-file value counts with no statement
     /// planned when those describe every live row
-    /// ([`Self::value_counts_from_stats`]), else, on a `keyword` column, from
-    /// the term index ([`Self::value_counts_from_terms`]); otherwise the
-    /// grouped count runs, built as a plan.
+    /// ([`Self::value_counts_from_stats`]), else, on a `keyword` column with
+    /// enough rows per value for its term counts to cost less than a scan
+    /// ([`term_counts_worth_reading`]), from the term index
+    /// ([`Self::value_counts_from_terms`]); otherwise the grouped count runs,
+    /// built as a plan.
     pub(crate) fn value_counts(&self, column: &str) -> Result<RecordBatch, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
         let schemas = self.sql_schemas();
@@ -836,7 +838,9 @@ impl SupertableReader {
         if let Some(batch) = self.value_counts_from_stats(column, &schema)? {
             return Ok(batch);
         }
-        if let Some(batch) = self.value_counts_from_terms(column, &schema)? {
+        if self.block_on(term_counts_worth_reading(self.manifest(), column))
+            && let Some(batch) = self.value_counts_from_terms(column, &schema)?
+        {
             return Ok(batch);
         }
         let ctx = self.sql_session_context()?;
@@ -892,19 +896,39 @@ impl SupertableReader {
         column: &str,
         schema: &SchemaRef,
     ) -> Result<Option<RecordBatch>, QueryError> {
-        let keyword = self
-            .manifest()
-            .try_fts_tokenizer_for(column)
-            .is_some_and(|tokenizer| tokenizer.name() == KEYWORD_TOKENIZER);
-        if !keyword {
+        if !is_keyword_column(self.manifest(), column) {
             return Ok(None);
         }
         let provider = op_stats::suppressed(|| self.sql_provider());
         let state = self.sql_session_context()?.state();
-        let Some(inputs) = self.block_on(term_count_inputs(&provider, &state, column)) else {
+        let Some(live) = self.block_on(self.live_term_counts(&provider, &state, column))? else {
             return Ok(None);
         };
-        let Some(mut counts) = self.block_on(self.term_doc_counts(column, inputs.files))? else {
+        // The counts stay charged to the budget until the rows are built.
+        term_counts_batch(schema, live.counts.counts(), live.nulls)
+    }
+
+    /// A `keyword` column's live rows by value, from the term index, read
+    /// through `provider`: each term's document count, less what the deleted
+    /// rows held, and the live nulls from the statistics. What
+    /// [`Self::value_counts_from_terms`] and the covered-aggregate rewrite
+    /// answer from (see [`prepare_aggregate_inputs`]). `None` on another
+    /// analyzer, when the statistics are not exact (see
+    /// [`term_count_inputs`]), or when the terms do not fit the connection
+    /// memory budget (see [`Self::term_doc_counts`]).
+    pub(crate) async fn live_term_counts(
+        &self,
+        provider: &SupertableProvider,
+        state: &SessionState,
+        column: &str,
+    ) -> Result<Option<LiveTermCounts>, QueryError> {
+        if !is_keyword_column(self.manifest(), column) {
+            return Ok(None);
+        }
+        let Some(inputs) = term_count_inputs(provider, state, column).await else {
+            return Ok(None);
+        };
+        let Some(mut counts) = self.term_doc_counts(column, inputs.files).await? else {
             return Ok(None);
         };
         for (value, deleted) in inputs.deleted {
@@ -917,8 +941,11 @@ impl SupertableReader {
             };
             *count = live;
         }
-        // `counts` stays charged to the budget until the rows are built.
-        term_counts_batch(schema, counts.counts(), inputs.nulls)
+        Ok(Some(LiveTermCounts {
+            counts,
+            nulls: inputs.nulls,
+            deleted_rows: inputs.deleted_rows,
+        }))
     }
 
     /// The live rows each of `predicates` holds, in order, exactly as
