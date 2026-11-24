@@ -24,11 +24,15 @@
 //!
 //! The sort and the filter stay where they are, so the answer is the one
 //! they give over the rows the walk returns; the walk only leaves out
-//! superfiles and rows that cannot place. Each superfile returns only the
-//! rows whose key is at least the `n`-th best found so far, so a column whose
-//! ranges overlap in every superfile (a count, a size) still materializes a
-//! few rows per superfile rather than every match; such a walk opens every
-//! superfile at the fan-out's width, since none can be passed early. It applies to a single sort column
+//! superfiles and rows that cannot place. Each superfile returns at most `n`
+//! rows, its best, and only those whose key is at least the `n`-th best found
+//! so far. Rows tied at the cut are as good as each other, since the sort
+//! orders by this one column only, so a key most rows share (a small count,
+//! a year) does not hand up every tied row. A column whose ranges overlap in
+//! every superfile (a count, a size) so materializes at most `n` rows per
+//! superfile rather than every match; such a walk opens every superfile at
+//! the fan-out's width, since none can be passed early, and is not built for
+//! a `LIMIT` above [`MAX_OVERLAPPING_FETCH`]. It applies to a single sort column
 //! of integer, date or timestamp type that every candidate superfile holds
 //! current statistics for and no nulls in (a null sorts first under a
 //! descending sort, outside every range), under a `WHERE` it can evaluate
@@ -77,6 +81,14 @@ pub(crate) const ORDERED_WINDOW: usize = 2;
 /// superfile spans the column's values separates none.
 const SEPARATED_SHARE_DENOMINATOR: usize = 2;
 
+/// The largest `LIMIT` a walk that cannot stop early is built for. Such a
+/// walk reads the key of every match and folds up to `n` ranks per chunk
+/// into one heap under a lock; past a few thousand that costs more than the
+/// rows it leaves out, so the match runs as it would without an order. The
+/// same cap as the scan's top-k walk
+/// ([`MAX_WALKED_ROWS`](crate::supertable::query::sorted::MAX_WALKED_ROWS)).
+pub(crate) const MAX_OVERLAPPING_FETCH: usize = 4096;
+
 /// An `ORDER BY column LIMIT n` a match walk honours: the column, its
 /// direction, the limit, and the `WHERE` it checks to know which rows count.
 pub(crate) struct MatchOrder {
@@ -123,7 +135,8 @@ impl MatchOrder {
     /// under `filters`, the `WHERE` pushed to the match. `None` when the
     /// walk cannot honour it: the column is not one [`Self::sort_key`]
     /// takes, or the `WHERE` is one the walk cannot evaluate from stored
-    /// columns, so it could not tell which rows count.
+    /// columns, so it could not tell which rows count, or the walk cannot
+    /// stop early and `fetch` is above [`MAX_OVERLAPPING_FETCH`].
     pub(crate) fn new(
         reader: &SupertableReader,
         column: &str,
@@ -172,6 +185,9 @@ impl MatchOrder {
             found: Mutex::new(BinaryHeap::new()),
         };
         order.stops_early = order.ranges_separate();
+        if !order.stops_early && fetch > MAX_OVERLAPPING_FETCH {
+            return Ok(None);
+        }
         Ok(Some(order))
     }
 
@@ -331,9 +347,11 @@ impl MatchOrder {
         }
     }
 
-    /// Of `hits`, the matches of one superfile read through `r`, those the
-    /// `WHERE` keeps and whose key is at least the walk's `fetch`-th best
-    /// once theirs are folded in: a row below it can never place.
+    /// Of `hits`, the matches of one superfile read through `r`, at most
+    /// `fetch` of those the `WHERE` keeps and whose key is at least the
+    /// walk's `fetch`-th best once theirs are folded in: a row below it can
+    /// never place, and the superfile's best `fetch` rows are all it can add
+    /// to the answer.
     pub(crate) async fn keep(
         &self,
         r: &Arc<SuperfileReader>,
@@ -352,7 +370,7 @@ impl MatchOrder {
         }
         // The keys are read in chunks: a chunk's best `fetch` ranks are all
         // the walk's best can take from it, so only those reach the lock.
-        let mut placing = RoaringBitmap::new();
+        let mut placing: Vec<(u32, u64)> = Vec::new();
         let mut remaining = kept.iter();
         loop {
             let chunk: Vec<u32> = remaining.by_ref().take(EXACT_SCOPE_TAKE_ROWS).collect();
@@ -370,13 +388,29 @@ impl MatchOrder {
                     false => None,
                 }
             };
-            // A tie with the `fetch`-th best is kept: the sort above breaks it.
-            placing.extend(self.ranked_at_least(chunk, ranks, worst).await?);
+            let fetch = self.fetch;
+            placing = run_on_pool(
+                Some(&self.manifest.options.reader_pool),
+                "ordered match pruning",
+                move || {
+                    placing.extend(
+                        chunk
+                            .into_iter()
+                            .zip(ranks)
+                            .filter(|(_, rank)| worst.is_none_or(|worst| *rank >= worst)),
+                    );
+                    keep_best_rows(&mut placing, fetch);
+                    placing
+                },
+            )
+            .await
+            .map_err(QueryError::internal)?;
         }
         run_on_pool(
             Some(&self.manifest.options.reader_pool),
             "ordered match pruning",
             move || {
+                let placing: RoaringBitmap = placing.into_iter().map(|(row, _)| row).collect();
                 hits.into_iter()
                     .filter(|h| placing.contains(h.local_doc_id))
                     .collect()
@@ -421,7 +455,8 @@ fn rank_of(key: u64, descending: bool) -> u64 {
 }
 
 /// Each row's rank in `batch`'s first column, and the best `fetch` of them. A
-/// row without a key ranks best, so it is never left out.
+/// row without a key ranks best; the walk runs only over superfiles with no
+/// nulls in the column, so it meets none.
 fn ranks_of_chunk(
     batch: &RecordBatch,
     kind: KeyKind,
@@ -438,6 +473,16 @@ fn ranks_of_chunk(
     })
     .map_err(QueryError::internal)?;
     Ok((ranks, best.into_iter().map(|Reverse(rank)| rank).collect()))
+}
+
+/// Keep only the best `fetch` of `rows`, each a row and its rank. Which of
+/// the rows tied at the cut stay does not matter: the sort above orders by
+/// this one column only, so any of them is a right answer.
+fn keep_best_rows(rows: &mut Vec<(u32, u64)>, fetch: usize) {
+    if fetch > 0 && rows.len() > fetch {
+        rows.select_nth_unstable_by_key(fetch - 1, |&(_, rank)| Reverse(rank));
+        rows.truncate(fetch);
+    }
 }
 
 /// Take `rank` into `best`, the `fetch` best ranks so far with the worst on
@@ -584,6 +629,25 @@ mod tests {
         let kept: Vec<u32> = kept.iter().map(|h| h.local_doc_id).collect();
         assert_eq!(kept, rows_where(|hour| hour == THRESHOLD_HOUR));
         assert_eq!(threshold(&order), rank(&order, THRESHOLD_HOUR));
+    }
+
+    /// A superfile hands up at most `FETCH` rows, its best: here the top row
+    /// and one of the two tied at the `FETCH`-th best, not both.
+    #[test]
+    fn keep_hands_up_at_most_fetch_rows_of_ties() {
+        let (order, reader, entry, r) = fixture();
+        let kept = reader
+            .block_on(order.keep(&r, hits(&entry, &rows_where(|_| true))))
+            .expect("keep");
+        let kept: Vec<i64> = kept
+            .iter()
+            .map(|h| HOURS[h.local_doc_id as usize])
+            .collect();
+        assert_eq!(kept.len(), FETCH);
+        assert!(
+            kept.contains(&60) && kept.contains(&THRESHOLD_HOUR),
+            "{kept:?}"
+        );
     }
 
     /// Until `FETCH` matches are in hand nothing is dropped: a hit worse
