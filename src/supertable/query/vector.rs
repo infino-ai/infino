@@ -64,6 +64,8 @@
 //! object-store-native engine never issues. For cold queries
 //! this is the difference between seconds and milliseconds.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::{
     borrow::Cow,
     cmp::Ordering,
@@ -202,6 +204,13 @@ const CHECK_HITS_SLACK: f64 = 1.5;
 /// the vectors, keeping few rows near the query, and more rounds would only
 /// add cost.
 const CHECK_HITS_GIVE_UP_FACTOR: f64 = 4.0;
+
+#[cfg(test)]
+thread_local! {
+    /// The hits each delete-refill round asked for, in order. A sync search drives its future on
+    /// the caller's thread, so a test reads back exactly its own searches' refill sizes.
+    static REFILL_REQUESTS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Rounds of checking before the filter's rows are mapped instead.
 const CHECK_HITS_MAX_ROUNDS: usize = 3;
@@ -8559,6 +8568,8 @@ impl SupertableReader {
             // buried under deletes refills in a round or two. It always
             // grows, so the loop reaches the cap.
             requested = next_want(k, requested, live, refill_cap);
+            #[cfg(test)]
+            REFILL_REQUESTS.with_borrow_mut(|requests| requests.push(requested));
             let hidden_retry = async {
                 if hidden_entries.is_empty() {
                     Ok(Vec::new())
@@ -9138,7 +9149,7 @@ mod tests {
     use std::{
         borrow::Cow,
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-        fs,
+        fs, mem,
         ops::Range,
         path::Path,
         sync::{
@@ -9191,9 +9202,9 @@ mod tests {
 
     use super::{
         CellLayout, CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN,
-        ReadIntent, SCORE_COLUMN, ScanCandidate, VectorFilter, VectorSearchOptions,
-        admit_extension_round, admit_shortlist_window, allowed_cells, apply_width_pin,
-        assemble_flat_sections, assemble_hnsw_sections, build_centroid_router,
+        REFILL_REQUESTS, ReadIntent, SCORE_COLUMN, ScanCandidate, VectorFilter,
+        VectorSearchOptions, admit_extension_round, admit_shortlist_window, allowed_cells,
+        apply_width_pin, assemble_flat_sections, assemble_hnsw_sections, build_centroid_router,
         calibrated_query_for, cell_layout, cell_passes, cell_row_ranges,
         cells_ranked_by_fine_score, centroid_router_from_stored, centroid_router_walk,
         decode_centroid_router_section, dispatch, encode_centroid_router_section, filtered_k,
@@ -15788,9 +15799,9 @@ mod tests {
 
     /// When deleted rows crowd a vector search's top `k`, the search refills
     /// with more hits until `k` live rows stand or it has asked for `k` plus
-    /// every deleted row. Sized from the live rate, a refill must still end:
-    /// with enough live rows it returns `k` of them, and with too few it runs
-    /// to the cap and returns every live row.
+    /// every deleted row. Sized from the live rate, a refill reaches that cap
+    /// in one round here, and must still end: with enough live rows it returns
+    /// `k` of them, and with too few it returns every live row.
     #[test]
     fn a_refill_past_deletes_returns_k_live_rows_or_every_live_row() {
         let dim = 16;
@@ -15832,7 +15843,15 @@ mod tests {
         let every_live = search(REFILL_ROWS);
         let live = ids(&every_live);
         assert_eq!(live.len(), REFILL_ROWS - REFILL_FIRST_DELETES);
+        REFILL_REQUESTS.with_borrow_mut(mem::take);
         let top_k = search(REFILL_K);
+        // Sized from the live rate, one refill asks for the cap of `k` plus every
+        // deleted row; doubling from `k` takes two (20, then 40).
+        assert_eq!(
+            REFILL_REQUESTS.with_borrow_mut(mem::take),
+            [REFILL_K + REFILL_FIRST_DELETES],
+            "the refill was not sized from the live rate"
+        );
         assert_eq!(top_k.len(), REFILL_K, "k live rows exist, so k come back");
         assert!(
             ids(&top_k).is_subset(&live),
@@ -15850,7 +15869,13 @@ mod tests {
             stats.n_tombstoned(),
             REFILL_ROWS - REFILL_LAST_LIVE - REFILL_FIRST_DELETES
         );
+        REFILL_REQUESTS.with_borrow_mut(mem::take);
         let top_k = search(REFILL_K);
+        assert_eq!(
+            REFILL_REQUESTS.with_borrow_mut(mem::take),
+            [REFILL_K + REFILL_ROWS - REFILL_LAST_LIVE],
+            "the refill was not sized from the live rate"
+        );
         assert_eq!(
             top_k.len(),
             REFILL_LAST_LIVE,
