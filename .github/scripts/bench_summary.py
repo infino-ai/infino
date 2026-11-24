@@ -127,6 +127,20 @@ DEFAULT_INFO_FILE = "/tmp/bench-gate.info"
 GATE_REL_PCT = 50.0
 GATE_ABS_NS = 5_000_000.0
 
+# Rows gated on `warm p50` instead of the run's gate metric, as
+# (report, anchor, label). Post-compact `token_match (all rows)` lands its
+# warm p90 at about 45 ms or about 75 ms on the same commit: 1 to 4 of its
+# 30 reps run 75 to 115 ms, and p90 is the 4th slowest. It failed the gate
+# on a main push benchmarking main against main. Its p90 still reports as
+# an informational mover. Remove the entry once that tail is fixed.
+P50_GATED_ROWS = {
+    (
+        "supertable_sql",
+        "bench/sql/supertable/queries/post-compact",
+        "token_match (all rows)",
+    ),
+}
+
 
 @dataclass
 class Diff:
@@ -284,7 +298,7 @@ def diff(reports, baseline_dir, current_dir, threshold, gate_header):
             parts = key.split("|")
             if len(parts) != KEY_PARTS:
                 continue
-            _anchor, _subtitle, label, header = parts
+            anchor, _subtitle, label, header = parts
             if is_text_only(header):
                 continue
             if is_cost(header):
@@ -301,7 +315,8 @@ def diff(reports, baseline_dir, current_dir, threshold, gate_header):
             # Gate pass. Every time-valued metric is measured against the gate
             # thresholds; only the designated gate metric may block on it.
             if latency:
-                gating = is_gating(header, gate_header)
+                row_gate = "warm p50" if (report, anchor, label) in P50_GATED_ROWS else gate_header
+                gating = is_gating(header, row_gate)
                 gate_metric_seen |= gating
                 if delta > GATE_ABS_NS and pct > GATE_REL_PCT:
                     verdict = "blocking" if gating else "informational"

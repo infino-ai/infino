@@ -153,6 +153,31 @@ class GateClassification(unittest.TestCase):
         self.assertEqual(self.metrics(r, "blocking"), set())
         self.assertEqual(self.metrics(r, "informational"), {"point lookup / warm p50"})
 
+    def test_p50_gated_row_blocks_on_p50_not_p90(self):
+        """A row in `P50_GATED_ROWS` gates on warm p50; its p90 only reports."""
+        anchor, label = "bench/sql/supertable/queries/post-compact", "token_match (all rows)"
+        with tempfile.TemporaryDirectory() as tmp:
+            arms = (("baseline", (SMALL_NS, SMALL_NS)), ("current", (BIG_NS, BIG_NS)))
+            for arm, (p50, p90) in arms:
+                os.mkdir(os.path.join(tmp, arm))
+                with open(os.path.join(tmp, arm, f"{REPORT}.json"), "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            f"{anchor}|sub|{label}|warm p50": p50,
+                            f"{anchor}|sub|{label}|warm p90": p90,
+                        },
+                        fh,
+                    )
+            r = bs.diff(
+                [REPORT],
+                os.path.join(tmp, "baseline"),
+                os.path.join(tmp, "current"),
+                bs.DEFAULT_THRESHOLD,
+                "warm p90",
+            )
+        self.assertEqual(self.metrics(r, "blocking"), {f"{label} / warm p50"})
+        self.assertEqual(self.metrics(r, "informational"), {f"{label} / warm p90"})
+
     def test_transition_wall_never_blocks(self):
         """A one-shot mutation wall against a real object store reports only."""
         r = self.diff({("delta commit", "Wall"): (SMALL_NS, BIG_NS)})
