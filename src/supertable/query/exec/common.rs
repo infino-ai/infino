@@ -164,6 +164,30 @@ static SEARCH_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 /// selectivity turns out to be.
 pub(crate) const OVER_FETCH_GROWTH: usize = 2;
 
+/// How many times a fill grows `want` after a round in which no row passed
+/// the predicate: with no pass rate to size the next round by, it looks
+/// much deeper than [`OVER_FETCH_GROWTH`] would.
+const OVER_FETCH_GROWTH_NONE_PASSED: usize = 16;
+
+/// The `want` of a fill's next round after `want` hits left `kept` rows
+/// standing: enough hits to find `k` at the pass rate seen, twice over,
+/// never less than [`OVER_FETCH_GROWTH`] times `want` and never past
+/// `ceiling`. Past the depth an index can answer from, a round costs about
+/// the same whatever its `want`, so a round sized to the pass rate saves the
+/// rounds doubling would spend getting there.
+fn next_want(k: usize, want: usize, kept: usize, ceiling: usize) -> usize {
+    let sized = match kept {
+        0 => want.saturating_mul(OVER_FETCH_GROWTH_NONE_PASSED),
+        kept => want
+            .saturating_mul(k)
+            .div_ceil(kept)
+            .saturating_mul(OVER_FETCH_GROWTH),
+    };
+    sized
+        .max(want.saturating_mul(OVER_FETCH_GROWTH))
+        .min(ceiling)
+}
+
 /// How many times `k` a fill may grow to before it gives up and returns
 /// what it has (see [`over_fetch_ceiling`]). Without a ceiling the growth
 /// runs to the table's row count, so a predicate the index cannot bound
@@ -677,9 +701,10 @@ pub(crate) fn unqualified(expr: Expr) -> DfResult<Expr> {
 /// whatever the index could bound. Without a predicate that is the whole
 /// job: search `k`, resolve, done. With one, the resolved rows are
 /// checked against the exact predicate; when fewer than `k` survive and
-/// the kernel had more to give, the search is rerun for
-/// [`OVER_FETCH_GROWTH`] times as many hits, until `k` survive, the
-/// kernel runs dry, or the fill hits its ceiling. The survivors, in
+/// the kernel had more to give, the search is rerun for enough hits to find
+/// `k` at the pass rate seen so far, twice over and at least
+/// [`OVER_FETCH_GROWTH`] times as many ([`next_want`]), until `k` survive,
+/// the kernel runs dry, or the fill hits its ceiling. The survivors, in
 /// kernel rank order and cut to `k`, are the result — the `FilterExec`
 /// above re-checks them and drops nothing. Cost scales with the
 /// predicate's selectivity: an exact pushdown pays one round, a bare
@@ -805,7 +830,7 @@ where
                 .project(&requested_positions)
                 .map_err(|e| QueryError::internal(e).into());
         }
-        want = want.saturating_mul(OVER_FETCH_GROWTH).min(ceiling);
+        want = next_want(k, want, kept.num_rows(), ceiling);
     }
 }
 
@@ -3565,6 +3590,21 @@ mod tests {
 
     /// A `k` below every cap.
     const SMALL_K: usize = 10;
+
+    /// A round sized from its pass rate asks for enough hits to find `k`
+    /// twice over, never less than double the last and never past the
+    /// ceiling; a round where nothing passed grows sixteenfold.
+    #[test]
+    fn the_next_round_is_sized_from_the_pass_rate() {
+        // 2 of 160 passed: 10 need 800 at that rate, 1,600 twice over.
+        assert_eq!(next_want(10, 160, 2, 10_000), 1_600);
+        // 9 of 10 passed: 12 at that rate, 24 twice over.
+        assert_eq!(next_want(10, 10, 9, 10_000), 24);
+        // All passed but fewer than k came back: doubling is the least.
+        assert_eq!(next_want(10, 100, 100, 10_000), 200);
+        assert_eq!(next_want(10, 160, 0, 10_000), 2_560);
+        assert_eq!(next_want(10, 1_000, 1, 10_000), 10_000);
+    }
 
     /// The over-fetch ceiling is bounded from above in every direction a
     /// caller can push it, and never below the `k` that was asked for.
