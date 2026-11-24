@@ -429,6 +429,7 @@ impl FieldsCall<'_> {
             self.output_schema,
             self.projection,
             ceiling,
+            false,
             |want: usize| self.hits(want, scope),
         )
         .await

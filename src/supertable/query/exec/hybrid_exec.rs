@@ -854,6 +854,7 @@ impl FusedCall<'_> {
             self.output_schema,
             self.projection,
             ceiling,
+            false,
             move |want| async move {
                 let fused = self.fused(want, scope).await?;
                 // Cell-packed user hits can be boundary stubs whose IVF

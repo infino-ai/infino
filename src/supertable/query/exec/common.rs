@@ -758,6 +758,7 @@ where
         output_schema,
         projection,
         fill_ceiling(reader, k),
+        false,
         search,
     )
     .await
@@ -769,6 +770,10 @@ where
 /// many survive — what a caller wants when it has a better move than
 /// widening, or when its scope already admits only rows the predicate keeps
 /// (see [`exact_scope`]).
+///
+/// With `checked_when_short` the caller checks the predicate exactly when
+/// the fill comes back short, so a fill stops once a round in which no row
+/// passed says the rest of its rounds, up to the ceiling, would find none.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fill_top_k_within<F, Fut>(
     reader: &SupertableReader,
@@ -778,6 +783,7 @@ pub(crate) async fn fill_top_k_within<F, Fut>(
     output_schema: &SchemaRef,
     projection: Option<&[usize]>,
     ceiling: usize,
+    checked_when_short: bool,
     search: F,
 ) -> DfResult<RecordBatch>
 where
@@ -823,7 +829,10 @@ where
         // round that returned no more than the last one is evidence, and
         // treating either as exhaustion under-returns.
         let exhausted = want >= ceiling;
-        if kept.num_rows() >= k || exhausted {
+        let hopeless = checked_when_short
+            && kept.num_rows() == 0
+            && want.saturating_mul(OVER_FETCH_GROWTH_NONE_PASSED) > ceiling;
+        if kept.num_rows() >= k || exhausted || hopeless {
             let rows = kept.num_rows().min(k);
             return kept
                 .slice(0, rows)

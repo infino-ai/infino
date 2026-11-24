@@ -504,6 +504,7 @@ impl ExecutionPlan for VectorSearchExec {
                 &output_schema,
                 projection.as_deref(),
                 k,
+                false,
                 within,
             )
             .await
