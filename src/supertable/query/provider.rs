@@ -954,6 +954,41 @@ impl SupertableProvider {
         self.sibling()
     }
 
+    /// Whether a pass over `files` superfiles keeps none of them opened. Such
+    /// a pass marks the statement, so its end lets go of what the pass opened.
+    fn passes_many_files(&self, files: usize) -> bool {
+        let many = files >= self.streamed_scan_min_files;
+        if many {
+            self.prepared_scan_files
+                .fallback_prepared
+                .store(true, atomic::Ordering::Release);
+        }
+        many
+    }
+
+    /// Lets `prepared`, a file of a pass over many files, go: its footer entry
+    /// keeps the file's column sizes, the provider forgets the opened file, and
+    /// every [`STREAMED_SCAN_RELEASE_EVERY`] files of the pass (`done` counts
+    /// them) the cache drops the footers nothing holds. A caller still holding
+    /// `prepared` keeps its file open until it drops it.
+    fn let_go(
+        &self,
+        entry: &SuperfileEntry,
+        prepared: &PreparedScanFile,
+        done: &atomic::AtomicUsize,
+    ) {
+        if let Some(mut footer) = self.scan_footers.get_mut(&prepared.path) {
+            *footer = Arc::new(footer.sizes_only());
+        }
+        self.prepared_scan_files.files.remove(&entry.superfile_id);
+        let done = done.fetch_add(1, atomic::Ordering::Relaxed) + 1;
+        if done.is_multiple_of(STREAMED_SCAN_RELEASE_EVERY)
+            && let Some(cache) = &self.disk_cache
+        {
+            cache.heap_budget().release_over_budget();
+        }
+    }
+
     /// `true` when this provider is a covered/residual residual scan —
     /// the rewrite's idempotency guard.
     pub(crate) fn is_segment_restricted(&self) -> bool {
@@ -1610,6 +1645,9 @@ impl SupertableProvider {
         range: &CountedRange,
         now: Instant,
     ) -> DfResult<(u64, HashSet<Uuid>)> {
+        let many = self.passes_many_files(survivors.len());
+        let done = atomic::AtomicUsize::new(0);
+        let done = &done;
         let in_flight = self.manifest.options.superfiles_in_flight;
         let pool: &ThreadPool = &self.manifest.options.reader_pool;
         let counts = try_join_bounded(
@@ -1617,6 +1655,9 @@ impl SupertableProvider {
                 let prepared = self.prepared_scan_file(Arc::clone(&entry));
                 async move {
                     let prepared = prepared.await?;
+                    if many {
+                        self.let_go(&entry, &prepared, done);
+                    }
                     let reader = &prepared.reader;
                     let tombstones = self.deleted_rows(entry.superfile_id, now)?;
                     let (field, data_type, lo, hi) =
@@ -1705,6 +1746,9 @@ impl SupertableProvider {
             .collect();
         let now = Instant::now();
         self.prefetch_tombstones(&survivors, now).await;
+        let many = self.passes_many_files(survivors.len());
+        let done = atomic::AtomicUsize::new(0);
+        let done = &done;
         let in_flight = self.manifest.options.superfiles_in_flight;
         let pool: &ThreadPool = &self.manifest.options.reader_pool;
         let ranges = &ranges;
@@ -1714,6 +1758,9 @@ impl SupertableProvider {
                 async move {
                     let counts = async {
                         let prepared = prepared.await?;
+                        if many {
+                            self.let_go(&entry, &prepared, done);
+                        }
                         let reader = &prepared.reader;
                         let tombstones = self.deleted_rows(entry.superfile_id, now)?;
                         let (field, data_type) = (first.field, &first.data_type);
@@ -1824,12 +1871,18 @@ impl SupertableProvider {
             return Ok(None);
         };
         let data_type = &data_type;
+        let many = self.passes_many_files(survivors.len());
+        let done = atomic::AtomicUsize::new(0);
+        let done = &done;
         let in_flight = self.manifest.options.superfiles_in_flight;
         let ends = try_join_bounded(
             survivors.iter().cloned().map(|entry| {
                 let prepared = self.prepared_scan_file(Arc::clone(&entry));
                 async move {
                     let prepared = prepared.await?;
+                    if many {
+                        self.let_go(&entry, &prepared, done);
+                    }
                     let tombstones = self.deleted_rows(entry.superfile_id, now)?;
                     let ends = prepared
                         .reader
@@ -2097,6 +2150,9 @@ impl SupertableProvider {
         (lo, hi): (u64, u64),
         now: Instant,
     ) -> DfResult<HashMap<Uuid, RoaringBitmap>> {
+        let many = self.passes_many_files(survivors.len());
+        let done = atomic::AtomicUsize::new(0);
+        let done = &done;
         let in_flight = self.manifest.options.superfiles_in_flight;
         let pool: &ThreadPool = &self.manifest.options.reader_pool;
         let rows = try_join_bounded(
@@ -2104,6 +2160,9 @@ impl SupertableProvider {
                 let prepared = self.prepared_scan_file(Arc::clone(&entry));
                 async move {
                     let prepared = prepared.await?;
+                    if many {
+                        self.let_go(&entry, &prepared, done);
+                    }
                     let tombstones = self.deleted_rows(entry.superfile_id, now)?;
                     let rows = prepared
                         .reader
@@ -3101,12 +3160,7 @@ impl TableProvider for SupertableProvider {
         // keeps only what the plan needs of it, so its footers leave the cache
         // as the scan moves on rather than all staying until the statement ends.
         let streamed = self.manifest.options.decoded_columns.is_none()
-            && survivor_entries.len() >= self.streamed_scan_min_files;
-        if streamed {
-            self.prepared_scan_files
-                .fallback_prepared
-                .store(true, atomic::Ordering::Release);
-        }
+            && self.passes_many_files(survivor_entries.len());
         let open_span = tiered_span!("scan.open_files", files = survivor_entries.len());
         let prepared_files = match streamed {
             true => Vec::new(),
@@ -3257,18 +3311,7 @@ impl TableProvider for SupertableProvider {
                         };
                         let summary = |prepared: &Arc<PreparedScanFile>| {
                             if streamed {
-                                if let Some(mut footer) = self.scan_footers.get_mut(&prepared.path)
-                                {
-                                    *footer = Arc::new(footer.sizes_only());
-                                }
-                                self.prepared_scan_files.files.remove(&entry.superfile_id);
-                                let done =
-                                    streamed_done.fetch_add(1, atomic::Ordering::Relaxed) + 1;
-                                if done.is_multiple_of(STREAMED_SCAN_RELEASE_EVERY)
-                                    && let Some(cache) = &self.disk_cache
-                                {
-                                    cache.heap_budget().release_over_budget();
-                                }
+                                self.let_go(&entry, prepared, streamed_done);
                             }
                             (
                                 prepared.path.clone(),
@@ -7771,8 +7814,130 @@ pub(crate) mod tests {
             provider
                 .scan_footers
                 .iter()
-                .all(|footer| footer.meta.is_none()),
-            "nor a parsed footer"
+                .all(|footer| footer.meta.is_none() && footer.columns().next().is_some()),
+            "nor a parsed footer, only the column sizes a top-k's row filter reads"
+        );
+
+        // A provider sharing these maps with a scan over few files finds the
+        // footers let go, and reopens them with the same NaN-safe bounds.
+        let mut few = provider.share();
+        few.streamed_scan_min_files = STREAMED_SCAN_MIN_FILES;
+        let ctx = sql_session_context(&st.options().connection_memory_budget, None).expect("ctx");
+        ctx.register_table(TABLE_NAME, Arc::new(few) as Arc<dyn TableProvider>)
+            .expect("register");
+        for sql in [
+            format!("SELECT count(*) FROM {TABLE_NAME} WHERE lo < -1.0"),
+            format!("SELECT count(*) FROM {TABLE_NAME} WHERE hi > 1.0"),
+        ] {
+            let batches = ctx
+                .sql(&sql)
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("run");
+            let count = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("a count")
+                .value(0);
+            assert_eq!(count, count_of(&st, &sql).await, "sharing: {sql}");
+        }
+    }
+
+    /// A file whose reopen fails reports why on every read, not only the first.
+    #[tokio::test]
+    async fn a_file_that_fails_to_reopen_says_why_on_every_read() {
+        let open: FooterOpen = Arc::new(|path: ObjPath| {
+            async move { Err(DataFusionError::Internal(format!("{path} is unreadable"))) }.boxed()
+        });
+        let mut reader = OpenOnFirstRead {
+            read_ahead: Arc::new(ScanReadAhead::new(
+                Arc::new(SuperfileObjectStore::new()),
+                ConnectionMemoryBudget::measured(),
+                Arc::new(Schema::empty()),
+            )),
+            file: PartitionedFile::new("t/gone.parquet", FOOTERLESS_FILE_BYTES),
+            open,
+            opened: None,
+        };
+        for _ in 0..2 {
+            let error = reader.get_metadata(None).await.expect_err("no file");
+            assert!(error.to_string().contains("is unreadable"), "{error}");
+        }
+    }
+
+    /// Range-index counts and a top-k over many files keep none of them
+    /// opened, and answer as they do over few, a deleted row included.
+    #[test]
+    fn range_index_passes_over_many_files_keep_none_opened() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            time_hits_opts()
+                .with_storage(storage)
+                .with_range_indexes(&["time".to_string()]),
+        )
+        .expect("create");
+        let mut w = st.writer().expect("writer");
+        for hours in [[0, 1], [2, 3], [4, 5]] {
+            w.append(&time_hits_batch(&hours)).expect("append");
+            w.commit().expect("commit");
+        }
+        drop(w);
+        st.delete(col("time").eq(at_hour(3))).expect("delete");
+        let rt = query_runtime();
+        let many = || {
+            let mut provider = provider_of(&st);
+            provider.streamed_scan_min_files = 1;
+            Arc::new(provider)
+        };
+        let rows = |provider: Arc<SupertableProvider>, sql: &str| -> String {
+            rt.block_on(async {
+                let ctx =
+                    sql_session_context(&st.options().connection_memory_budget, None).expect("ctx");
+                ctx.register_table(TABLE_NAME, provider as Arc<dyn TableProvider>)
+                    .expect("register");
+                let batches = ctx
+                    .sql(sql)
+                    .await
+                    .expect("plan")
+                    .collect()
+                    .await
+                    .expect("run");
+                datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+                    .expect("format")
+                    .to_string()
+            })
+        };
+        for sql in [
+            format!(
+                "SELECT count(*) FROM {TABLE_NAME} WHERE time >= TIMESTAMP '1970-01-01 01:00:00' \
+                 AND time < TIMESTAMP '1970-01-01 05:00:00'"
+            ),
+            format!("SELECT time FROM {TABLE_NAME} ORDER BY time DESC LIMIT 3"),
+        ] {
+            let provider = many();
+            let streamed = rows(Arc::clone(&provider), &sql);
+            assert_eq!(streamed, rows(Arc::new(provider_of(&st)), &sql), "{sql}");
+            assert_eq!(opened_superfiles(&provider), 0, "{sql}: none kept opened");
+        }
+        let provider = many();
+        let buckets: Vec<RangeBucket> = [(1, 2), (2, 4), (10, 11)]
+            .iter()
+            .map(|&(lo, hi)| histogram_bucket(&provider, "time", at_hour(lo), at_hour(hi)))
+            .collect();
+        let counts = rt
+            .block_on(provider.batched_range_counts(&buckets))
+            .expect("count")
+            .expect("the buckets are counted in one pass");
+        assert_eq!(counts, vec![1, 1, 0]);
+        assert_eq!(
+            opened_superfiles(&provider),
+            0,
+            "the histogram kept none opened"
         );
     }
 
