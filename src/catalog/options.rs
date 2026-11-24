@@ -89,6 +89,9 @@ pub struct ConnectOptions {
     /// which amortizes the per-query manifest-pointer re-check. Set
     /// [`Consistency::Strong`] for a pointer re-check on every query.
     pub(crate) read_consistency: Consistency,
+    /// Load each table's manifest parts when a commit or read first needs
+    /// them, rather than all of them when the table opens. Default `false`.
+    pub(crate) lazy_manifest: bool,
     /// Probe the backend at `connect`. Default `false`; opt in for
     /// fail-fast on bad credentials.
     pub(crate) validate: bool,
@@ -216,6 +219,30 @@ impl ConnectOptions {
     /// re-check the manifest pointer on every query. Chainable.
     pub fn with_read_consistency(mut self, consistency: Consistency) -> Self {
         self.read_consistency = consistency;
+        self
+    }
+
+    /// Load each table's manifest parts on demand instead of all at open
+    /// (default `false`: every part is loaded at open and held for the life
+    /// of the handle). Suits a connection that mostly appends to large
+    /// tables.
+    ///
+    /// Commits never keep a part they read. An append reads none of the
+    /// older parts. A delete or update finds its rows with a read of its
+    /// predicate, which keeps the parts that read touches as any read does;
+    /// it then reads the parts whose id ranges may hold those rows. An update
+    /// also checks every part once for an earlier attempt of itself, and a
+    /// delete that meets a superfile sealed by a running compaction lists
+    /// every part on each retry. Those commit-side reads are transient, so an
+    /// appending handle stays small however large the manifest grows.
+    ///
+    /// A read (a search, a scan, a count) fetches each part it first touches
+    /// and keeps it for the life of the handle, so a connection that both
+    /// writes and reads a whole large table ends up holding its whole
+    /// manifest. `optimize` and the handle's statistics see only the parts
+    /// already loaded: run maintenance from a default connection. Chainable.
+    pub fn with_lazy_manifest(mut self, lazy: bool) -> Self {
+        self.lazy_manifest = lazy;
         self
     }
 

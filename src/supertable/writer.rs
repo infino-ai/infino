@@ -3115,7 +3115,7 @@ impl SupertableWriter {
             // The appends are flushed by now; rows a buffered update will
             // add still count, since they land under whatever schema the
             // table has when they commit.
-            table_empty: manifest.get_all_superfiles().is_empty()
+            table_empty: manifest.holds_no_superfiles()
                 && self.buffer.is_empty()
                 && self.pending_updates.is_empty(),
             vector_index_column: vector_index_column.as_deref(),
@@ -3618,6 +3618,7 @@ impl SupertableWriter {
         // buffer itself.
         drop(self.live.take());
         let taken = self.take_buffer();
+        let staged_after = self.inner.manifest.load().get_manifest_id();
         match self.stage_buffer(&taken.batches, stem.as_deref(), taken.scratch()) {
             Ok((batch, built_against)) => Ok(StagedAppend {
                 batch,
@@ -3625,6 +3626,7 @@ impl SupertableWriter {
                 payload_bytes: buffered_payload_bytes(&taken.batches),
                 ingest: taken.ingest,
                 staged_on: self.inner.handle_id,
+                staged_after,
                 state: AtomicU8::new(STAGED_FREE),
             }),
             Err(error) => {
@@ -3742,10 +3744,15 @@ impl SupertableWriter {
                 .iter()
                 .flat_map(|one| one.batch.new_entries.iter().map(|e| e.superfile_id))
                 .collect();
+            let published_after = claim.held.iter().map(|one| one.staged_after).min();
             let listed = bridge_on_runtime(
                 async move {
                     inner.refresh().await?;
-                    inner.manifest.load_full().listed_of(held).await
+                    inner
+                        .manifest
+                        .load_full()
+                        .listed_of(held, published_after)
+                        .await
                 },
                 &inner.query_runtime(),
             )
@@ -5617,6 +5624,11 @@ pub struct StagedAppend {
     ingest: IngestTally,
     /// The handle that staged it; another one refuses to commit it.
     staged_on: SupertableHandleId,
+    /// The id of the handle's manifest when staging began, before its
+    /// superfiles were minted: no manifest at or before it lists them, so a
+    /// commit settling whether a failed one landed reads only the manifest
+    /// parts written since (see [`ManifestSnapshot::listed_of`]).
+    staged_after: u64,
     /// [`STAGED_FREE`], [`STAGED_COMMITTING`] while a commit holds it,
     /// [`STAGED_COMMITTED`] once that commit lands, or [`STAGED_UNCERTAIN`]
     /// after a commit that may have landed, so the batch's superfiles are
@@ -14800,7 +14812,7 @@ impl CommitListMetadata {
             }
         }
         if let Some(next) = &self.schema
-            && !base.get_all_superfiles().is_empty()
+            && !base.holds_no_superfiles()
             && let Some(column) = column_that_starts_requiring_a_value(&base.table_schema(), next)
         {
             return Err(SupertableCommitError::Build(BuildError::Schema(
@@ -14887,8 +14899,13 @@ async fn persist_commit_with_layer_async(
     let contributions: &[TermContribution] = &term_contributions;
     let drive = async move {
         let mut next_id_floor: u64 = 0;
+        // The manifest the first attempt read: none of `new_entries` is
+        // published at or before it, so the check for an earlier attempt that
+        // landed reads only the parts written since.
+        let mut published_after: Option<u64> = None;
         for attempt in 0..max_retries {
             let old = inner.manifest.load_full();
+            published_after.get_or_insert(old.get_manifest_id());
             // A prior attempt found its id occupied by a crash-orphaned
             // manifest list — derive this attempt's successor past it.
             let old = if next_id_floor > 0 {
@@ -14950,7 +14967,7 @@ async fn persist_commit_with_layer_async(
                     // Nothing is recorded for the deferred sweep here: the attempt that landed was
                     // an earlier one, whose base this loop no longer holds, and `published` may be
                     // several commits past it. What that commit replaced is left to the listing sweep.
-                    match published_by_earlier_attempt(inner, &new_entries).await {
+                    match published_by_earlier_attempt(inner, &new_entries, published_after).await {
                         Ok(Some(published)) => return Ok(published),
                         Ok(None) => {}
                         Err(e) => {
@@ -14995,14 +15012,23 @@ async fn persist_commit_with_layer_async(
 ///    write, and reports `PreconditionFailed`.
 ///  - the commit sees `WriteContentionExhausted`, as for a real lost race.
 ///
+/// `published_after` is the id of a manifest read before the first attempt
+/// (see [`ManifestSnapshot::listed_of`]): only the parts written since are
+/// read, so on a lazily loaded table the check costs the parts the racing
+/// commits wrote, not the whole list.
+///
 /// Always `None` for a commit that adds no superfiles.
 async fn published_by_earlier_attempt(
     inner: &SupertableInner,
     new_entries: &[Arc<SuperfileEntry>],
+    published_after: Option<u64>,
 ) -> Result<Option<Arc<ManifestSnapshot>>, SupertableCommitError> {
     let refreshed = inner.manifest.load_full();
     let listed = refreshed
-        .listed_of(new_entries.iter().map(|e| e.superfile_id).collect())
+        .listed_of(
+            new_entries.iter().map(|e| e.superfile_id).collect(),
+            published_after,
+        )
         .await
         .map_err(|e| SupertableCommitError::ManifestError(ManifestError::ManifestLoadError(e)))?;
     let (listed_ids, unlisted_ids): (Vec<Uuid>, Vec<Uuid>) = new_entries
@@ -20011,7 +20037,7 @@ mod tests {
 
         let attempt = |entries: &[Arc<SuperfileEntry>]| {
             bridge_on_runtime(
-                published_by_earlier_attempt(st.inner(), entries),
+                published_by_earlier_attempt(st.inner(), entries, None),
                 &st.inner().query_runtime(),
             )
         };
@@ -20051,13 +20077,214 @@ mod tests {
             "no part is read yet"
         );
         let published = bridge_on_runtime(
-            published_by_earlier_attempt(lazy.inner(), &[listed]),
+            published_by_earlier_attempt(lazy.inner(), &[listed], None),
             &lazy.inner().query_runtime(),
         )
         .expect("the parts load");
         assert!(
             published.is_some(),
             "listed in a part not yet read: published"
+        );
+    }
+
+    #[test]
+    fn an_earlier_attempt_is_looked_for_only_in_parts_written_since() {
+        // A part whose superfiles were all born at or before the manifest the
+        // commit first read cannot list the commit's superfiles, so a lazily
+        // opened table settles the question from the parts written since and
+        // leaves the older ones unread: here the older part is gone from
+        // storage, so a lookup that reads it fails.
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let options = || {
+            options_id_title_serial()
+                .with_storage(Arc::clone(&storage))
+                .with_part_size_threshold_bytes(1)
+        };
+        let st = Supertable::create(options()).expect("create");
+        st.append(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+            .expect("append");
+        let published_after = st.inner().manifest.load().get_manifest_id();
+        st.append(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+            .expect("append");
+        let manifest = st.inner().manifest.load_full();
+        let parts = manifest.get_all_list_entries();
+        assert_eq!(parts.len(), 2, "each commit writes its own part");
+        let (older_uri, newer) = (parts[0].uri.clone(), parts[1].part_id);
+        let listed = Arc::clone(
+            manifest
+                .get_cached_part_by_id(&newer)
+                .expect("the committing handle holds its part")
+                .superfiles
+                .first()
+                .expect("a superfile"),
+        );
+
+        let lazy = Supertable::open(options().with_eager_load_threshold(0)).expect("open lazily");
+        std::fs::remove_file(directory.path().join(&older_uri)).expect("drop the older part");
+        let runtime = lazy.inner().query_runtime();
+        let published = bridge_on_runtime(
+            published_by_earlier_attempt(
+                lazy.inner(),
+                std::slice::from_ref(&listed),
+                Some(published_after),
+            ),
+            &runtime,
+        )
+        .expect("only the part written since is read");
+        assert!(published.is_some(), "listed in the newer part: published");
+        assert!(
+            lazy.inner()
+                .manifest
+                .load()
+                .get_cached_part_by_id(&newer)
+                .is_none(),
+            "the part read is not kept on the handle"
+        );
+        // A superfile no part lists sends the lookup through every part it
+        // may read: within scope that is the newer part alone.
+        let unlisted = Arc::new(SuperfileEntry {
+            superfile_id: Uuid::new_v4(),
+            ..(*listed).clone()
+        });
+        let missed = bridge_on_runtime(
+            published_by_earlier_attempt(
+                lazy.inner(),
+                std::slice::from_ref(&unlisted),
+                Some(published_after),
+            ),
+            &runtime,
+        )
+        .expect("only the part written since is read");
+        assert!(missed.is_none(), "listed nowhere: not published");
+        assert!(
+            bridge_on_runtime(
+                published_by_earlier_attempt(lazy.inner(), &[unlisted], None),
+                &runtime,
+            )
+            .is_err(),
+            "an unscoped lookup goes on to the older part"
+        );
+    }
+
+    /// Options for a table at `directory` whose every commit writes its own
+    /// manifest part.
+    fn part_per_commit_options(directory: &TempDir) -> SupertableOptions {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        options_id_title_serial()
+            .with_storage(storage)
+            .with_part_size_threshold_bytes(1)
+    }
+
+    /// A table at `directory` holding one row per title, one part per row,
+    /// opened afresh with no part loaded. Returns the handle and the parts
+    /// written before it opened.
+    fn lazily_reopened(directory: &TempDir, titles: &[&str]) -> (Supertable, Vec<PartId>) {
+        let st = Supertable::create(part_per_commit_options(directory)).expect("create");
+        for title in titles {
+            st.append(&row(title)).expect("append");
+        }
+        let parts: Vec<PartId> = st
+            .inner()
+            .manifest
+            .load()
+            .get_all_list_entries()
+            .iter()
+            .map(|entry| entry.part_id)
+            .collect();
+        assert_eq!(parts.len(), titles.len(), "each commit writes its own part");
+        drop(st);
+        let lazy =
+            Supertable::open(part_per_commit_options(directory).with_eager_load_threshold(0))
+                .expect("open lazily");
+        assert!(
+            parts.iter().all(|part| lazy
+                .inner()
+                .manifest
+                .load()
+                .get_cached_part_by_id(part)
+                .is_none()),
+            "no part is loaded at open"
+        );
+        (lazy, parts)
+    }
+
+    #[test]
+    fn a_lazily_opened_table_appends_without_loading_older_parts() {
+        let directory = TempDir::new().expect("tempdir");
+        let (lazy, older) = lazily_reopened(&directory, &["a", "b", "c"]);
+        lazy.append(&row("d")).expect("append");
+        lazy.append(&row("e")).expect("append");
+        let manifest = lazy.inner().manifest.load_full();
+        assert_eq!(manifest.get_all_list_entries().len(), 5, "two more parts");
+        for part in &older {
+            assert!(
+                manifest.get_cached_part_by_id(part).is_none(),
+                "an append leaves the parts written before it unloaded"
+            );
+        }
+        drop(lazy);
+        let eager = Supertable::open(part_per_commit_options(&directory)).expect("open");
+        assert_eq!(
+            eager.inner().manifest.load().get_all_superfiles().len(),
+            5,
+            "every row is listed"
+        );
+    }
+
+    #[test]
+    fn a_lazily_opened_table_mutates_rows_in_parts_it_never_loaded() {
+        use datafusion::prelude::{col, lit};
+        let directory = TempDir::new().expect("tempdir");
+        let (lazy, older) = lazily_reopened(&directory, &["a", "b", "c"]);
+        let deleted = lazy.delete(col("title").eq(lit("a"))).expect("delete");
+        assert_eq!(
+            (deleted.matched(), deleted.n_tombstoned()),
+            (1, 1),
+            "the row in the oldest part is found and tombstoned"
+        );
+        let updated = lazy
+            .update(col("title").eq(lit("b")), &row("bee"))
+            .expect("update");
+        assert_eq!(
+            (updated.matched(), updated.n_tombstoned()),
+            (1, 1),
+            "the row in a middle part is found and replaced"
+        );
+        // Each predicate is a read, so the one part its statistics leave in
+        // play stays loaded; the commits behind them keep nothing.
+        let manifest = lazy.inner().manifest.load_full();
+        let loaded: Vec<bool> = older
+            .iter()
+            .map(|part| manifest.get_cached_part_by_id(part).is_some())
+            .collect();
+        assert_eq!(
+            loaded,
+            [true, true, false],
+            "only the parts holding \"a\" and \"b\" are loaded"
+        );
+    }
+
+    #[test]
+    fn a_lazily_opened_table_with_rows_refuses_a_column_that_needs_an_empty_table() {
+        use crate::supertable::schema::change::FieldPatch;
+        let directory = TempDir::new().expect("tempdir");
+        let (lazy, _) = lazily_reopened(&directory, &["a"]);
+        let err = lazy
+            .apply_schema(
+                &SchemaPatch::new(vec![
+                    FieldPatch::named("score")
+                        .with_type(arrow_schema::DataType::Int64)
+                        .with_nullable(false),
+                ]),
+                None,
+            )
+            .expect_err("the unloaded part holds a row");
+        assert!(
+            matches!(&err, InfinoError::Schema(SchemaError::NotEmpty { column }) if column == "score"),
+            "{err}"
         );
     }
 
