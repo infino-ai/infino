@@ -362,10 +362,11 @@ const REISSUE_WITHIN: Duration = Duration::from_secs(60);
 /// Most second requests for reads' headers out at once across the process. Each holds its permit
 /// until it or its read's first request answers. One as stuck as its first holds it until
 /// `object_store`'s own retries end one of them: usually the first request's retry after the
-/// client's timeout, at worst [`RETRY_TIMEOUT`]. Reads waiting for a permit keep racing their first
-/// request, so they are never slower than without hedging. A healthy store answers headers far
-/// below [`STUCK_AFTER`] and sends none; one so slow that every read passes it gets this many at a
-/// time instead of one per read.
+/// client's timeout, at worst about six minutes, as `object_store` checks [`RETRY_TIMEOUT`] only
+/// after a try fails, so its last try can start just inside it and run a full client timeout.
+/// Reads waiting for a permit keep racing their first request, so they are never slower than
+/// without hedging. A healthy store answers headers far below [`STUCK_AFTER`] and sends none; one
+/// so slow that every read passes it gets this many at a time instead of one per read.
 const READ_HEDGES_IN_FLIGHT: usize = 16;
 
 /// The permits [`READ_HEDGES_IN_FLIGHT`] counts.
@@ -831,6 +832,7 @@ mod tests {
         Error as ObjError, ObjectStore, ObjectStoreExt, PutPayload, memory::InMemory,
         path::Path as ObjPath,
     };
+    use tokio::spawn;
 
     use super::*;
 
@@ -1340,10 +1342,12 @@ mod tests {
     const STUCK_READS: usize = 3;
     /// How long the hedge-bound test keeps its reads stuck.
     const STUCK_FOR: Duration = Duration::from_secs(30);
-    /// A store answer slower than `STUCK_AFTER`: a hedge cut short at `STUCK_AFTER` never gets it.
+    /// A store answer slower than `STUCK_AFTER`: only a hedge that runs until it answers gets it.
     const SLOW_ANSWER: Duration = Duration::from_secs(3);
     /// How long a failing hedge takes to fail.
     const HEDGE_FAILS_AFTER: Duration = Duration::from_secs(1);
+    /// How long past a deadline a test's request fails or answers: inside every other delay.
+    const PAST_DEADLINE: Duration = Duration::from_secs(1);
 
     /// Slow frames the cut-timing test sends before its body goes quiet: enough to move the body's
     /// timer more than once.
@@ -1809,7 +1813,7 @@ mod tests {
         let permits = bound(1);
         let held = permits.acquire().await.expect("permit");
         let freed_at = STUCK_AFTER * 2;
-        tokio::spawn(async move {
+        spawn(async move {
             time::sleep(freed_at).await;
             drop(held);
         });
@@ -1928,7 +1932,7 @@ mod tests {
     async fn the_first_requests_failure_ends_the_race() {
         let hedges = UsageMeter::new();
         let opens = Opens::new();
-        let fails_at = STUCK_AFTER + Duration::from_secs(1);
+        let fails_at = STUCK_AFTER + PAST_DEADLINE;
         let started = time::Instant::now();
         let r = read(0..3, &hedges, |range| {
             let first = opens.note(&range) == 0;
@@ -1975,7 +1979,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dead_read_gives_up_as_soon_as_without_hedging() {
         let hedges = UsageMeter::new();
-        let fails_after = STUCK_AFTER + Duration::from_secs(1);
+        let fails_after = STUCK_AFTER + PAST_DEADLINE;
         let started = time::Instant::now();
         let r = read(0..3, &hedges, |_| async move {
             time::sleep(fails_after).await;
@@ -2443,7 +2447,7 @@ mod tests {
         let hedges = UsageMeter::new();
         let opens = Opens::new();
         let answered = Cell::new(false);
-        let late = REISSUE_WITHIN + Duration::from_secs(1);
+        let late = REISSUE_WITHIN + PAST_DEADLINE;
         let r = read(0..3, &hedges, |range| {
             let first = opens.note(&range) == 0;
             let answered = &answered;

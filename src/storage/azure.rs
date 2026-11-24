@@ -529,7 +529,7 @@ mod tests {
         Endpoint, Read, Stall, assert_stalled_read_recovers, stalling_endpoint,
     };
 
-    /// The account and container the stalled-read tests reads from (the stalling endpoint serves
+    /// The account and container the stalled-read tests read from (the stalling endpoint serves
     /// any path).
     const STALL_ACCOUNT: &str = "acct";
     const STALL_CONTAINER: &str = "container";

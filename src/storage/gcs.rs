@@ -587,7 +587,7 @@ mod tests {
         Endpoint, Read, Stall, assert_stalled_read_recovers, stalling_endpoint,
     };
 
-    /// The bucket the stalled-read tests reads from (the stalling endpoint serves any path).
+    /// The bucket the stalled-read tests read from (the stalling endpoint serves any path).
     const STALL_BUCKET: &str = "bucket";
 
     fn test_provider() -> GcsStorageProvider {
