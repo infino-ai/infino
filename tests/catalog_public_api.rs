@@ -153,13 +153,12 @@ fn public_surface_search_maintain_query_and_drop() {
 
     // Two appends == two commits == two superfiles, so optimize below has
     // real work and gc has real orphans afterwards.
-    docs.append(&build_batch(schema.clone(), FIRST_BATCH, 0))
+    docs.append(&build_batch(schema.clone(), FIRST_BATCH, 0), None)
         .expect("append 1");
-    docs.append(&build_batch(
-        schema.clone(),
-        SECOND_BATCH,
-        FIRST_BATCH.len(),
-    ))
+    docs.append(
+        &build_batch(schema.clone(), SECOND_BATCH, FIRST_BATCH.len()),
+        None,
+    )
     .expect("append 2");
 
     // Schema round-trips through the wrapper: exactly the declared payload
@@ -278,7 +277,7 @@ fn open_table_returns_a_live_handle_on_a_fresh_connection() {
                     .vector("emb", EMB_DIM, Metric::Cosine),
             )
             .expect("create_table");
-        docs.append(&build_batch(schema, FIRST_BATCH, 0))
+        docs.append(&build_batch(schema, FIRST_BATCH, 0), None)
             .expect("append");
     }
 
@@ -523,7 +522,7 @@ fn a_companion_is_hidden_reopened_and_purged_with_its_table() {
             .create_table("docs", title_schema(), docs_with_ledger())
             .expect("create_table with a companion");
         let ledger = ledger_of(&docs);
-        ledger.append(&ledger_batch(&ledger)).expect("append");
+        ledger.append(&ledger_batch(&ledger), None).expect("append");
         assert_eq!(rows_for(&ledger, LEDGER_KEYS[0]), vec![LEDGER_ROWS[0]]);
         assert_eq!(db.list_tables().expect("list"), vec!["docs".to_string()]);
     }
@@ -594,7 +593,7 @@ fn a_window_ordered_by_a_time_difference_is_unsupported_not_a_fault() {
         ],
     )
     .expect("events batch");
-    events.append(&batch).expect("append");
+    events.append(&batch, None).expect("append");
     let err = db
         .query_sql(
             "WITH e AS (SELECT h, t, LAG(t) OVER (PARTITION BY h ORDER BY t) prev FROM events) \
@@ -619,7 +618,8 @@ fn a_table_without_companions_has_none_and_an_unchanged_list() {
     let docs = db
         .create_table("docs", title_schema(), IndexSpec::new().fts("title"))
         .expect("create_table");
-    docs.append(&title_batch(FIRST_BATCH)).expect("append");
+    docs.append(&title_batch(FIRST_BATCH), None)
+        .expect("append");
     assert!(docs.companion(LEDGER).expect("no error").is_none());
     let reopened = connect(&uri)
         .expect("reconnect")
@@ -650,7 +650,7 @@ fn two_companions_each_keep_their_own_schema_and_index() {
             .expect("create_table with two companions");
         let ledger = ledger_of(&docs);
         ledger
-            .append(&ledger_batch(&ledger))
+            .append(&ledger_batch(&ledger), None)
             .expect("append ledger");
         let audit = docs
             .companion(AUDIT)
@@ -663,6 +663,7 @@ fn two_companions_each_keep_their_own_schema_and_index() {
                     vec![Arc::new(LargeStringArray::from(AUDIT_EVENTS.to_vec()))],
                 )
                 .expect("audit rows"),
+                None,
             )
             .expect("append audit");
         assert_eq!(db.list_tables().expect("list"), vec!["docs".to_string()]);
@@ -746,9 +747,10 @@ fn a_companion_that_fails_to_open_leaves_its_table_usable() {
         let docs = db
             .create_table("docs", title_schema(), docs_with_ledger())
             .expect("create_table");
-        docs.append(&title_batch(FIRST_BATCH)).expect("append");
+        docs.append(&title_batch(FIRST_BATCH), None)
+            .expect("append");
         let ledger = ledger_of(&docs);
-        ledger.append(&ledger_batch(&ledger)).expect("append");
+        ledger.append(&ledger_batch(&ledger), None).expect("append");
     }
     let ledger_dir = hidden_dirs(dir.path(), &companion_suffix(LEDGER)).remove(0);
     fs::remove_file(ledger_dir.join(POINTER_DIR).join(POINTER_FILE)).expect("remove pointer");
@@ -765,7 +767,7 @@ fn a_companion_that_fails_to_open_leaves_its_table_usable() {
         "names the companion: {err}"
     );
     assert_eq!(matches(&docs, "title", "fox"), 1);
-    docs.append(&title_batch(SECOND_BATCH))
+    docs.append(&title_batch(SECOND_BATCH), None)
         .expect("the table still takes writes");
     assert_eq!(matches(&docs, "title", "fox"), 2);
     // The table's commits keep the record, so a repaired companion is found
@@ -787,7 +789,7 @@ fn a_lost_companion_record_is_reattached_and_written_back() {
             .create_table("docs", title_schema(), docs_with_ledger())
             .expect("create_table");
         let ledger = ledger_of(&docs);
-        ledger.append(&ledger_batch(&ledger)).expect("append");
+        ledger.append(&ledger_batch(&ledger), None).expect("append");
     }
     drop_companions_from_list(dir.path());
     assert!(recorded_companion(dir.path(), LEDGER).is_none());
@@ -800,7 +802,8 @@ fn a_lost_companion_record_is_reattached_and_written_back() {
     assert_eq!(rows_for(&ledger, LEDGER_KEYS[0]), vec![LEDGER_ROWS[0]]);
     assert_eq!(rows_for(&ledger, LEDGER_KEYS[1]), vec![LEDGER_ROWS[1]]);
 
-    docs.append(&title_batch(FIRST_BATCH)).expect("append");
+    docs.append(&title_batch(FIRST_BATCH), None)
+        .expect("append");
     let recorded = recorded_companion(dir.path(), LEDGER).expect("the commit records it");
     assert!(hidden_dirs(dir.path(), &companion_suffix(LEDGER))[0].ends_with(&recorded));
 }
@@ -849,7 +852,7 @@ fn a_companion_schema_evolves_through_its_handle() {
             .create_table("docs", title_schema(), docs_with_ledger())
             .expect("create_table");
         let ledger = ledger_of(&docs);
-        ledger.append(&ledger_batch(&ledger)).expect("append");
+        ledger.append(&ledger_batch(&ledger), None).expect("append");
         let patch = SchemaPatch::new(vec![
             FieldPatch::named(NOTE)
                 .with_type(DataType::LargeUtf8)
@@ -870,7 +873,7 @@ fn a_companion_schema_evolves_through_its_handle() {
             ],
         )
         .expect("a row in the evolved schema");
-        ledger.append(&row).expect("append evolved");
+        ledger.append(&row, None).expect("append evolved");
     }
 
     let docs = connect(&uri)
@@ -913,10 +916,10 @@ fn a_table_with_vectors_and_a_companion_has_both_hidden_tables() {
                 .companion(LEDGER, ledger_schema(), ledger_indexes()),
         )
         .expect("create_table");
-    docs.append(&build_batch(schema, FIRST_BATCH, 0))
+    docs.append(&build_batch(schema, FIRST_BATCH, 0), None)
         .expect("append");
     let ledger = ledger_of(&docs);
-    ledger.append(&ledger_batch(&ledger)).expect("append");
+    ledger.append(&ledger_batch(&ledger), None).expect("append");
     assert_eq!(hidden_dirs(dir.path(), &companion_suffix(LEDGER)).len(), 1);
     assert_eq!(hidden_dirs(dir.path(), VECTOR_INDEX_DIR_SUFFIX).len(), 1);
     let hits = docs

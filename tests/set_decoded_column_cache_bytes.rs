@@ -49,6 +49,7 @@ fn table_with_rows(conn: &infino::Connection, name: &str) {
         .append(
             &RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![3, 1, 2]))])
                 .expect("batch"),
+            None,
         )
         .unwrap_or_else(|e| panic!("append {name}: {e}"));
 }

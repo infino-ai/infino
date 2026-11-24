@@ -152,6 +152,7 @@ fn a_top_k_the_index_answers_reads_a_wide_column_for_its_rows_alone() {
                 ],
             )
             .expect("batch"),
+            None,
         )
         .expect("append");
     }

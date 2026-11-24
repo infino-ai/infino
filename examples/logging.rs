@@ -75,10 +75,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let docs = db.create_table("docs", schema.clone(), IndexSpec::new().fts("title"))?;
 
     let titles = ["the quick brown fox", "a lazy sleeping dog"];
-    docs.append(&RecordBatch::try_new(
-        schema,
-        vec![Arc::new(LargeStringArray::from(titles.to_vec()))],
-    )?)?;
+    docs.append(
+        &RecordBatch::try_new(
+            schema,
+            vec![Arc::new(LargeStringArray::from(titles.to_vec()))],
+        )?,
+        None,
+    )?;
 
     let _ = docs.bm25_search(
         "title",

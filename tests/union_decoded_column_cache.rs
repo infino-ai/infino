@@ -91,6 +91,7 @@ fn a_union_feeding_count_distinct_answers_the_same_from_kept_decoded_columns() {
             ],
         )
         .expect("a batch"),
+        None,
     )
     .expect("append a");
     b.append(
@@ -103,6 +104,7 @@ fn a_union_feeding_count_distinct_answers_the_same_from_kept_decoded_columns() {
             ],
         )
         .expect("b batch"),
+        None,
     )
     .expect("append b");
 

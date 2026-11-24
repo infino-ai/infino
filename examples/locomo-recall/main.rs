@@ -240,10 +240,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(Float32Array::from(flat)) as Arc<dyn Array>,
         None,
     )?;
-    table.append(&RecordBatch::try_new(
-        schema,
-        vec![Arc::new(ids), Arc::new(texts), Arc::new(vectors)],
-    )?)?;
+    table.append(
+        &RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ids), Arc::new(texts), Arc::new(vectors)],
+        )?,
+        None,
+    )?;
 
     let corpus_ids: HashSet<&str> = fx.corpus.iter().map(|m| m.id.as_str()).collect();
     let text_of: HashMap<&str, &str> = fx

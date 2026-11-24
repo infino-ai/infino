@@ -176,6 +176,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
         tombstone_seqs: Default::default(),
         superseded_cells: Default::default(),
         split_checks: Default::default(),
+        idempotency: Default::default(),
         format_version: LIST_FORMAT_VERSION.into(),
         manifest_id,
         options_hash: ContentHash([0u8; 32]),

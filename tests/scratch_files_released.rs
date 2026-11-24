@@ -118,7 +118,7 @@ fn run_child(data: &Path) {
             vec![Arc::new(LargeStringArray::from(titles))],
         )
         .expect("batch");
-        table.append(&batch).expect("append");
+        table.append(&batch, None).expect("append");
     }
     assert_eq!(
         entries(&scratch),

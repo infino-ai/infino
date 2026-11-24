@@ -164,7 +164,7 @@ fn a_write_stores_only_the_columns_its_rows_fill() {
     let dir = TempDir::new().expect("tempdir");
     let (db, t) = table(&dir, WIDTH);
     let filled: Vec<usize> = (0..FILLED).map(|i| i * (WIDTH / FILLED)).collect();
-    t.append(&rows_setting(&t.schema(), &filled, "x"))
+    t.append(&rows_setting(&t.schema(), &filled, "x"), None)
         .expect("append");
 
     let want: HashSet<String> = filled.iter().map(|&i| column(i)).collect();
@@ -207,9 +207,9 @@ fn files_of_disjoint_columns_answer_and_merge_into_their_union() {
     let (db, t) = table(&dir, WIDTH);
     let schema = t.schema();
     let (a, b) = (column(10), column(20));
-    t.append(&rows_setting(&schema, &[10], "a"))
+    t.append(&rows_setting(&schema, &[10], "a"), None)
         .expect("append a");
-    t.append(&rows_setting(&schema, &[20], "b"))
+    t.append(&rows_setting(&schema, &[20], "b"), None)
         .expect("append b");
 
     let answers = |db: &Connection| {
@@ -262,11 +262,11 @@ fn what_a_write_records_follows_its_columns_not_the_width() {
         let dir = TempDir::new().expect("tempdir");
         let (_db, t) = table(&dir, width);
         let schema = t.schema();
-        t.append(&rows_setting(&schema, &filled, "x"))
+        t.append(&rows_setting(&schema, &filled, "x"), None)
             .expect("first append");
         let (records, superfiles) = per_superfile_bytes(dir.path());
         for _ in 0..GROWTH_WRITES {
-            t.append(&rows_setting(&schema, &filled, "x"))
+            t.append(&rows_setting(&schema, &filled, "x"), None)
                 .expect("append");
         }
         let (records_after, superfiles_after) = per_superfile_bytes(dir.path());
@@ -354,7 +354,7 @@ fn a_vector_table_write_stores_only_the_columns_its_rows_fill() {
     let filled: Vec<usize> = (0..FILLED)
         .map(|i| i * (VECTOR_TABLE_WIDTH / FILLED))
         .collect();
-    t.append(&vector_rows_setting(&t.schema(), &filled, "x"))
+    t.append(&vector_rows_setting(&t.schema(), &filled, "x"), None)
         .expect("append");
 
     let want: HashSet<String> = filled.iter().map(|&i| column(i)).collect();
@@ -437,7 +437,7 @@ fn an_update_stores_only_the_columns_its_rows_fill() {
     let dir = TempDir::new().expect("tempdir");
     let (db, t) = table(&dir, WIDTH);
     let schema = t.schema();
-    t.append(&rows_setting(&schema, &[0, 1, 2], "x"))
+    t.append(&rows_setting(&schema, &[0, 1, 2], "x"), None)
         .expect("append");
     let stats = t
         .update(

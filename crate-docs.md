@@ -75,7 +75,7 @@ docs.append(&RecordBatch::try_new(
         ])),
         Arc::new(FixedSizeListArray::new(item, 16, Arc::new(Float32Array::from(flat)), None)),
     ],
-)?)?;
+)?, None)?;
 
 // Retrieve context to ground the agent's next answer:
 let keyword =

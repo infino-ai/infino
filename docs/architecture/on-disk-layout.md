@@ -32,7 +32,9 @@ mydb/                                     database root (the connect() path)
 │   │       │          section's uri + hash + size, and the part's rollups:
 │   │       │          inline when small, else the rollups object's uri + hash
 │   │       │          + size), schema, fts/vector column specs, partition
-│   │       │          strategy; format 4.0 (majors 1 to 3 still read)
+│   │       │          strategy, the idempotency tokens commits recorded;
+│   │       │          format 4.0, or 5.0 while it records a token (majors
+│   │       │          1 to 3 still read)
 │   │       └ used   : one written per commit (NNNNNN bumps); names the live parts.
 │   │                  The first commit by an engine of a newer major, a no-data
 │   │                  maintenance publish or the hidden index's sibling

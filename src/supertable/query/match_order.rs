@@ -575,7 +575,7 @@ mod tests {
             ],
         )
         .expect("batch");
-        table.append(&batch).expect("append");
+        table.append(&batch, None).expect("append");
         let reader = table.local_handle().reader().expect("reader");
         let entry = Arc::clone(&reader.manifest().superfiles[0]);
         let r = reader.open_superfile(&entry).expect("open");

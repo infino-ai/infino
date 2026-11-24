@@ -67,8 +67,8 @@ fn corpus(dir: &TempDir) -> Connection {
     let docs = db
         .create_table("docs", schema(), IndexSpec::new().fts("title"))
         .expect("create_table");
-    docs.append(&batch(FIRST)).expect("append 1");
-    docs.append(&batch(SECOND)).expect("append 2");
+    docs.append(&batch(FIRST), None).expect("append 1");
+    docs.append(&batch(SECOND), None).expect("append 2");
     db
 }
 

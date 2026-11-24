@@ -96,6 +96,7 @@ fn the_blocks_of_a_row_group_the_cache_refuses_decode_it_once() {
             vec![Arc::new(Int64Array::from((0..ROWS).collect::<Vec<_>>()))],
         )
         .expect("batch"),
+        None,
     )
     .expect("append");
 

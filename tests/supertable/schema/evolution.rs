@@ -123,12 +123,15 @@ fn an_unseen_column_joins_the_schema_and_earlier_rows_read_null() {
     let before = db.schema(TABLE).expect("schema");
     assert_eq!(names(&before), vec![("title", FieldId(1))]);
 
-    docs.append(&batch(vec![("title", titles(&["a"]))]))
+    docs.append(&batch(vec![("title", titles(&["a"]))]), None)
         .expect("first append");
-    docs.append(&batch(vec![
-        ("title", titles(&["b"])),
-        ("score", ints(vec![Some(7)])),
-    ]))
+    docs.append(
+        &batch(vec![
+            ("title", titles(&["b"])),
+            ("score", ints(vec![Some(7)])),
+        ]),
+        None,
+    )
     .expect("append with a new column");
 
     let after = db.schema(TABLE).expect("schema");
@@ -154,22 +157,25 @@ fn an_absent_nullable_column_is_null_filled_and_a_missing_required_one_refused()
     let docs = db
         .create_table(TABLE, title_score_schema(), IndexSpec::new().fts("title"))
         .expect("create");
-    docs.append(&batch(vec![("title", titles(&["a"]))]))
+    docs.append(&batch(vec![("title", titles(&["a"]))]), None)
         .expect("score may be omitted");
     assert_eq!(rows(&db, "SELECT title, score FROM docs"), vec!["a|null"]);
 
     let err = docs
-        .append(&batch(vec![("score", ints(vec![Some(1)]))]))
+        .append(&batch(vec![("score", ints(vec![Some(1)]))]), None)
         .expect_err("title is required");
     assert!(
         matches!(&err, InfinoError::Schema(SchemaError::MissingColumn { column }) if column == "title"),
         "{err}"
     );
     let err = docs
-        .append(&batch(vec![(
-            "title",
-            Arc::new(LargeStringArray::from(vec![None::<&str>])) as ArrayRef,
-        )]))
+        .append(
+            &batch(vec![(
+                "title",
+                Arc::new(LargeStringArray::from(vec![None::<&str>])) as ArrayRef,
+            )]),
+            None,
+        )
         .expect_err("a null in a required column");
     assert!(
         matches!(
@@ -284,7 +290,7 @@ fn narrow_batches_on_a_wide_vector_table(commits: Commits) {
         );
         match writer.as_mut() {
             None => {
-                docs.append(&narrow).expect("append a narrow batch");
+                docs.append(&narrow, None).expect("append a narrow batch");
             }
             Some(writer) => {
                 writer.append(&narrow).expect("buffer a narrow batch");
@@ -342,10 +348,13 @@ fn a_type_that_disagrees_with_the_frozen_one_is_refused() {
         .create_table(TABLE, title_score_schema(), IndexSpec::new().fts("title"))
         .expect("create");
     let err = docs
-        .append(&batch(vec![
-            ("title", titles(&["a"])),
-            ("score", Arc::new(StringArray::from(vec!["7"])) as ArrayRef),
-        ]))
+        .append(
+            &batch(vec![
+                ("title", titles(&["a"])),
+                ("score", Arc::new(StringArray::from(vec!["7"])) as ArrayRef),
+            ]),
+            None,
+        )
         .expect_err("score is frozen at Int64");
     assert!(
         matches!(&err, InfinoError::Schema(SchemaError::TypeMismatch { column, .. }) if column == "score"),
@@ -478,10 +487,10 @@ fn a_column_cannot_stop_admitting_nulls_over_rows_a_peer_committed() {
     let peer = connect(path).expect("connect");
     peer.open_table(TABLE)
         .expect("open")
-        .append(&batch(vec![
-            ("title", titles(&["a"])),
-            ("score", ints(vec![None])),
-        ]))
+        .append(
+            &batch(vec![("title", titles(&["a"])), ("score", ints(vec![None]))]),
+            None,
+        )
         .expect("the peer commits a null score");
 
     // An append over known columns leaves `schema_id` where it was, so the
@@ -518,10 +527,13 @@ fn the_schema_write_adds_renames_and_drops_and_reads_follow() {
     let docs = db
         .create_table(TABLE, title_score_schema(), IndexSpec::new().fts("title"))
         .expect("create");
-    docs.append(&batch(vec![
-        ("title", titles(&["a"])),
-        ("score", ints(vec![Some(1)])),
-    ]))
+    docs.append(
+        &batch(vec![
+            ("title", titles(&["a"])),
+            ("score", ints(vec![Some(1)])),
+        ]),
+        None,
+    )
     .expect("append");
 
     let doc = db
@@ -535,11 +547,14 @@ fn the_schema_write_adds_renames_and_drops_and_reads_follow() {
             ("tag", FieldId(3))
         ]
     );
-    docs.append(&batch(vec![
-        ("title", titles(&["b"])),
-        ("score", ints(vec![Some(2)])),
-        ("tag", titles(&["t"])),
-    ]))
+    docs.append(
+        &batch(vec![
+            ("title", titles(&["b"])),
+            ("score", ints(vec![Some(2)])),
+            ("tag", titles(&["t"])),
+        ]),
+        None,
+    )
     .expect("append with tag");
 
     let renamed = db
@@ -616,11 +631,14 @@ fn a_where_on_full_text_columns_follows_a_name_swap() {
             IndexSpec::new().fts("title").fts("a").fts("b"),
         )
         .expect("create");
-    docs.append(&batch(vec![
-        ("title", titles(&["rust one", "rust two", "rust three"])),
-        ("a", titles(&["p", "q", "p"])),
-        ("b", titles(&["v", "w", "w"])),
-    ]))
+    docs.append(
+        &batch(vec![
+            ("title", titles(&["rust one", "rust two", "rust three"])),
+            ("a", titles(&["p", "q", "p"])),
+            ("b", titles(&["v", "w", "w"])),
+        ]),
+        None,
+    )
     .expect("append");
 
     swap_a_and_b(&db);
@@ -719,12 +737,15 @@ fn vector_filter_after_name_swap(drain: bool) {
     let b: Vec<&str> = (0..ROWS)
         .map(|i| if i == 0 { "match shared" } else { "other" })
         .collect();
-    docs.append(&batch(vec![
-        ("title", Arc::new(LargeStringArray::from(names))),
-        ("a", titles(&a)),
-        ("b", titles(&b)),
-        ("emb", Arc::new(vectors)),
-    ]))
+    docs.append(
+        &batch(vec![
+            ("title", Arc::new(LargeStringArray::from(names))),
+            ("a", titles(&a)),
+            ("b", titles(&b)),
+            ("emb", Arc::new(vectors)),
+        ]),
+        None,
+    )
     .expect("append old names");
     if drain {
         docs.local_handle()
@@ -748,12 +769,15 @@ fn vector_filter_after_name_swap(drain: bool) {
         None,
     )
     .expect("new vector");
-    docs.append(&batch(vec![
-        ("title", titles(&["new"])),
-        ("a", titles(&["match shared"])),
-        ("b", titles(&["wrong"])),
-        ("emb", Arc::new(new_vector)),
-    ]))
+    docs.append(
+        &batch(vec![
+            ("title", titles(&["new"])),
+            ("a", titles(&["match shared"])),
+            ("b", titles(&["wrong"])),
+            ("emb", Arc::new(new_vector)),
+        ]),
+        None,
+    )
     .expect("append current names");
     for (column, expected) in [("a", vec!["new", "row0"]), ("b", vec!["row1"])] {
         for mode in [BoolMode::Or, BoolMode::And] {
@@ -802,20 +826,26 @@ fn an_exact_where_checks_rows_by_id_after_a_name_swap() {
             IndexSpec::new().fts("title").fts("a").fts("b"),
         )
         .expect("create");
-    docs.append(&batch(vec![
-        (
-            "title",
-            titles(&["one", "two", "three", "four", "five", "six"]),
-        ),
-        ("a", titles(&["qx", "p", "p", "p", "p", "p"])),
-        ("b", titles(&["v", "w", "w", "w", "w", "w"])),
-    ]))
+    docs.append(
+        &batch(vec![
+            (
+                "title",
+                titles(&["one", "two", "three", "four", "five", "six"]),
+            ),
+            ("a", titles(&["qx", "p", "p", "p", "p", "p"])),
+            ("b", titles(&["v", "w", "w", "w", "w", "w"])),
+        ]),
+        None,
+    )
     .expect("append");
-    docs.append(&batch(vec![
-        ("title", titles(&["seven"])),
-        ("a", titles(&["x\u{130}"])),
-        ("b", titles(&["xi"])),
-    ]))
+    docs.append(
+        &batch(vec![
+            ("title", titles(&["seven"])),
+            ("a", titles(&["x\u{130}"])),
+            ("b", titles(&["xi"])),
+        ]),
+        None,
+    )
     .expect("append");
     swap_a_and_b(&db);
 
@@ -931,10 +961,13 @@ fn updates_obey_the_append_rules() {
     let docs = db
         .create_table(TABLE, title_score_schema(), IndexSpec::new().fts("title"))
         .expect("create");
-    docs.append(&batch(vec![
-        ("title", titles(&["a", "b"])),
-        ("score", ints(vec![Some(1), Some(2)])),
-    ]))
+    docs.append(
+        &batch(vec![
+            ("title", titles(&["a", "b"])),
+            ("score", ints(vec![Some(1), Some(2)])),
+        ]),
+        None,
+    )
     .expect("append");
 
     // An omitted nullable column is null for the replaced row: replacement
@@ -996,17 +1029,17 @@ fn two_writers_adding_different_columns_both_land() {
     // Both handles hold the table at schema 1.
     assert_eq!(b.schema().fields().len(), 1);
 
-    a.append(&batch(vec![
-        ("title", titles(&["a"])),
-        ("x", ints(vec![Some(1)])),
-    ]))
+    a.append(
+        &batch(vec![("title", titles(&["a"])), ("x", ints(vec![Some(1)]))]),
+        None,
+    )
     .expect("first writer adds x");
     // The second handle still believes the schema is at 1: its commit
     // loses the pointer race, reloads the winner's schema, and rebuilds.
-    b.append(&batch(vec![
-        ("title", titles(&["b"])),
-        ("y", ints(vec![Some(2)])),
-    ]))
+    b.append(
+        &batch(vec![("title", titles(&["b"])), ("y", ints(vec![Some(2)]))]),
+        None,
+    )
     .expect("second writer adds y");
 
     let fresh = connect(path).expect("connect");
@@ -1023,16 +1056,16 @@ fn two_writers_adding_different_columns_both_land() {
 
     // The same unseen name in two types: the loser is refused by the
     // winner's schema, after its own append had validated.
-    a.append(&batch(vec![
-        ("title", titles(&["c"])),
-        ("z", ints(vec![Some(3)])),
-    ]))
+    a.append(
+        &batch(vec![("title", titles(&["c"])), ("z", ints(vec![Some(3)]))]),
+        None,
+    )
     .expect("first writer adds z as Int64");
     let err = b
-        .append(&batch(vec![
-            ("title", titles(&["d"])),
-            ("z", titles(&["three"])),
-        ]))
+        .append(
+            &batch(vec![("title", titles(&["d"])), ("z", titles(&["three"]))]),
+            None,
+        )
         .expect_err("z is frozen at Int64 by the winner");
     assert!(
         matches!(&err, InfinoError::Schema(SchemaError::TypeMismatch { column, .. }) if column == "z"),
@@ -1065,12 +1098,15 @@ fn compaction_merges_the_generations_growth_leaves_behind() {
         values.extend(std::iter::repeat_n(None, FILLER_ROWS));
         Arc::new(Int64Array::from(values))
     };
-    docs.append(&batch(vec![("title", with_fillers("a"))]))
+    docs.append(&batch(vec![("title", with_fillers("a"))]), None)
         .expect("generation one");
-    docs.append(&batch(vec![
-        ("title", with_fillers("b")),
-        ("score", marker_then_nulls(2)),
-    ]))
+    docs.append(
+        &batch(vec![
+            ("title", with_fillers("b")),
+            ("score", marker_then_nulls(2)),
+        ]),
+        None,
+    )
     .expect("generation two");
     db.apply_schema(
         TABLE,
@@ -1078,11 +1114,14 @@ fn compaction_merges_the_generations_growth_leaves_behind() {
         None,
     )
     .expect("rename");
-    docs.append(&batch(vec![
-        ("title", with_fillers("c")),
-        ("points", marker_then_nulls(3)),
-        ("note", with_fillers("n")),
-    ]))
+    docs.append(
+        &batch(vec![
+            ("title", with_fillers("c")),
+            ("points", marker_then_nulls(3)),
+            ("note", with_fillers("n")),
+        ]),
+        None,
+    )
     .expect("generation three");
     let before = rows(
         &db,
@@ -1176,7 +1215,7 @@ fn compaction_of_a_wide_sparse_table_keeps_every_value() {
         .create_table(TABLE, first, IndexSpec::new())
         .expect("create");
     for g in 0..WIDE_GENERATIONS {
-        wide.append(&wide_generation(g)).expect("append");
+        wide.append(&wide_generation(g), None).expect("append");
     }
     let projection: Vec<String> = (0..WIDE_COLUMNS)
         .map(|i| wide_field(i).name().clone())
@@ -1224,10 +1263,13 @@ fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
     let docs = db.open_table(TABLE).expect("open");
 
     // ---- 2. The documents define the columns -----------------------------
-    docs.append_rows(&[
-        serde_json::json!({"title": "first", "views": 10, "ratio": 1.5, "live": true}),
-        serde_json::json!({"title": "second", "views": 20}),
-    ])
+    docs.append_rows(
+        &[
+            serde_json::json!({"title": "first", "views": 10, "ratio": 1.5, "live": true}),
+            serde_json::json!({"title": "second", "views": 20}),
+        ],
+        None,
+    )
     .expect("the first documents define the table");
 
     let grown = db.schema(TABLE).expect("schema");
@@ -1271,7 +1313,10 @@ fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
 
     // ---- 3. The columns are frozen once seen -----------------------------
     let err = docs
-        .append_rows(&[serde_json::json!({"title": "third", "views": "many"})])
+        .append_rows(
+            &[serde_json::json!({"title": "third", "views": "many"})],
+            None,
+        )
         .expect_err("a string does not belong in an integer column");
     assert!(
         matches!(
@@ -1285,7 +1330,7 @@ fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
 
     // A float where the column is an integer is refused on the same rule.
     let err = docs
-        .append_rows(&[serde_json::json!({"title": "third", "views": 1.5})])
+        .append_rows(&[serde_json::json!({"title": "third", "views": 1.5})], None)
         .expect_err("nor does a float");
     assert!(
         matches!(&err, InfinoError::Schema(SchemaError::TypeMismatch { .. })),
@@ -1308,8 +1353,11 @@ fn a_table_with_no_schema_grows_from_its_documents_and_changes_by_hand() {
     assert_eq!(by_name(&with_body, "body"), Some(DataType::LargeUtf8));
     assert_eq!(with_body.schema_id(), grown.schema_id() + 1);
 
-    docs.append_rows(&[serde_json::json!({"title": "third", "body": "the quick fox"})])
-        .expect("append into the indexed column");
+    docs.append_rows(
+        &[serde_json::json!({"title": "third", "body": "the quick fox"})],
+        None,
+    )
+    .expect("append into the indexed column");
     let hits = docs
         .bm25_search("body", "fox", 10, Default::default(), None)
         .expect("the new column is searchable");
@@ -1459,7 +1507,7 @@ fn a_search_projecting_only_a_newer_column_reads_it_as_null() {
         .expect("create");
 
     // This file predates `title` entirely.
-    docs.append_rows(&[serde_json::json!({"body": "the quick fox"})])
+    docs.append_rows(&[serde_json::json!({"body": "the quick fox"})], None)
         .expect("append");
 
     db.apply_schema(
@@ -1526,10 +1574,13 @@ fn a_reader_running_while_the_schema_grows_sees_only_coherent_snapshots() {
             // together.
             let column = format!("c{generation}");
             table
-                .append(&batch(vec![
-                    ("title", titles(&["row"])),
-                    (column.as_str(), ints(vec![Some(generation as i64)])),
-                ]))
+                .append(
+                    &batch(vec![
+                        ("title", titles(&["row"])),
+                        (column.as_str(), ints(vec![Some(generation as i64)])),
+                    ]),
+                    None,
+                )
                 .expect("the writer's append");
         }
         writer_done.store(false, Ordering::SeqCst);
@@ -1619,8 +1670,11 @@ fn a_text_match_on_a_text_column_added_later_answers_as_token_match_does() {
     let docs = db
         .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
         .expect("create");
-    docs.append(&batch(vec![("title", titles(&["rust one", "go two"]))]))
-        .expect("append before the column");
+    docs.append(
+        &batch(vec![("title", titles(&["rust one", "go two"]))]),
+        None,
+    )
+    .expect("append before the column");
     let mut positional = ColumnIndex::fts(Analyzer::Standard);
     if let ColumnIndex::Fts { positions, .. } = &mut positional {
         *positions = true;
@@ -1635,10 +1689,13 @@ fn a_text_match_on_a_text_column_added_later_answers_as_token_match_does() {
         None,
     )
     .expect("add an indexed text column");
-    docs.append_rows(&[
-        serde_json::json!({"title": "three", "body": "rust and Go"}),
-        serde_json::json!({"title": "four", "body": "nothing here"}),
-    ])
+    docs.append_rows(
+        &[
+            serde_json::json!({"title": "three", "body": "rust and Go"}),
+            serde_json::json!({"title": "four", "body": "nothing here"}),
+        ],
+        None,
+    )
     .expect("append with the column");
 
     for (query, mode, want) in [
