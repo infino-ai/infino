@@ -247,6 +247,13 @@ pub(crate) fn head_options() -> GetOptions {
 /// that wrote the same bytes. The HEAD carries no body, so it costs one
 /// request whatever the object's size, and only on the precondition path.
 ///
+/// A store can also refuse a create against a held key by closing the
+/// connection before it has read the body, which arrives as a transient
+/// failure on every issue. So a transient failure is settled by the same
+/// HEAD before it is re-issued: a held key answers now, as created when the
+/// object is this call's and as `PreconditionFailed` otherwise, and only a
+/// free key is re-issued.
+///
 /// `create` performs one create-only PUT built with [`CreateId::put_options`];
 /// `head` one HEAD built with [`head_options`], answering the object's
 /// attributes and CAS token. Both are already translated to `StorageError`.
@@ -262,11 +269,27 @@ where
     H: FnMut() -> HFut,
     HFut: Future<Output = Result<(Attributes, Option<String>), StorageError>>,
 {
-    let lost = match with_reissue(create).await {
-        Err(lost @ StorageError::PreconditionFailed { .. }) => lost,
-        other => return other,
+    let mut create = create;
+    let mut head = head;
+    let mut attempt = 0u32;
+    let lost = loop {
+        match create().await {
+            Ok(token) => return Ok(token),
+            Err(lost @ StorageError::PreconditionFailed { .. }) => break lost,
+            Err(e) if is_retryable(&e) && attempt < MAX_TRANSIENT_RETRIES => {
+                match head().await {
+                    Ok((attributes, token)) if id.stamped_on(&attributes) => return Ok(token),
+                    Ok(_) => return Err(StorageError::PreconditionFailed { uri: uri.into() }),
+                    Err(_) => {}
+                }
+                warn!(attempt, error = %e, "transient object-store error; re-issuing");
+                time::sleep(backoff(attempt)).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
     };
-    match with_reissue(head).await {
+    match with_reissue(&mut head).await {
         Ok((attributes, token)) if id.stamped_on(&attributes) => Ok(token),
         Ok(_) => Err(lost),
         Err(e) => {
@@ -570,6 +593,8 @@ mod tests {
         /// It lands, then the store client retries it after a 5xx, and the
         /// retry meets the landed object.
         RetriedAfterLanding,
+        /// It fails before reaching the store, which holds nothing.
+        LostBeforeLanding,
     }
 
     /// The in-memory store's errors, translated as the providers translate.
@@ -598,6 +623,9 @@ mod tests {
         puts: Cell<u32>,
         heads: Cell<u32>,
         head_fails: Cell<bool>,
+        /// A create against a held key fails as a dropped connection does,
+        /// on every issue, instead of answering the precondition.
+        drops_creates_on_held_key: Cell<bool>,
     }
 
     impl Store {
@@ -608,6 +636,7 @@ mod tests {
                 puts: Cell::new(0),
                 heads: Cell::new(0),
                 head_fails: Cell::new(false),
+                drops_creates_on_held_key: Cell::new(false),
             }
         }
 
@@ -634,6 +663,14 @@ mod tests {
                     let issue = self.puts.get();
                     self.puts.set(issue + 1);
                     async move {
+                        if self.drops_creates_on_held_key.get()
+                            && self.inner.head(&self.path).await.is_ok()
+                        {
+                            return Err(transient());
+                        }
+                        if matches!((issue, first), (0, FirstIssue::LostBeforeLanding)) {
+                            return Err(transient());
+                        }
                         let answered = self.put(id).await;
                         match (issue, first) {
                             (0, FirstIssue::TimedOutAfterLanding) => Err(transient()),
@@ -728,7 +765,40 @@ mod tests {
             .await
             .expect("the landed write is ours");
         assert_eq!(token, store.token().await, "the landed object's token");
+        assert_eq!((store.puts.get(), store.heads.get()), (1, 1));
+    }
+
+    /// A store that drops the connection of a create against a held key is
+    /// settled by one HEAD, not re-issued through the whole budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_create_against_a_held_key_is_a_lost_race_after_one_issue() {
+        let store = Store::new();
+        let peer = CreateId::new();
+        store
+            .create(&peer, FirstIssue::Answered)
+            .await
+            .expect("the peer's create");
+        store.puts.set(0);
+        store.drops_creates_on_held_key.set(true);
+        assert_lost_race(store.create(&CreateId::new(), FirstIssue::Answered).await);
+        assert_eq!((store.puts.get(), store.heads.get()), (1, 1));
+        assert!(store.stamped_with(&peer).await, "the peer's object stands");
+    }
+
+    /// A create that failed before reaching the store finds the key free
+    /// and is re-issued.
+    #[tokio::test(start_paused = true)]
+    async fn a_create_lost_before_landing_is_reissued() {
+        let store = Store::new();
+        store.head_fails.set(true);
+        let id = CreateId::new();
+        let token = store
+            .create(&id, FirstIssue::LostBeforeLanding)
+            .await
+            .expect("created on the second issue");
+        assert_eq!(token, store.token().await);
         assert_eq!((store.puts.get(), store.heads.get()), (2, 1));
+        assert!(store.stamped_with(&id).await);
     }
 
     /// A first issue the store client retried after it landed meets its own
@@ -782,7 +852,7 @@ mod tests {
                 .create(&CreateId::new(), FirstIssue::TimedOutAfterLanding)
                 .await,
         );
-        assert_eq!(store.heads.get(), 1);
+        assert_eq!(store.heads.get(), 2);
     }
 
     // ---- delete_with_reissue ---------------------------------------------
