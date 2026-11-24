@@ -148,8 +148,8 @@ use crate::{
             candidate::{CandidatePlan, CandidateScope, TermMemos},
             dispatch,
             exec::common::{
-                EXACT_SCOPE_TAKE_ROWS, RowCheck, candidate_plan_for_filters, hit_output_schema,
-                resolve_hits_named, take_file_columns, take_rows_byte_source,
+                RowCheck, candidate_plan_for_filters, hit_output_schema, resolve_hits_named,
+                take_file_columns, take_rows_byte_source,
             },
             heads,
             match_order::MatchOrder,
@@ -2556,6 +2556,14 @@ impl SupertableReader {
                             }
                             let mut rest = admitted.as_ref().clone();
                             rest -= &fresh - &kept;
+                            // Past the bounded round, each round would walk the
+                            // postings again: check every row left once and rank
+                            // within the ones that pass.
+                            if want >= CHECKED_UNIT_MAX_ROWS.max(k) {
+                                let mut passed = check.keep(&r, &(&rest - &passing)).await?;
+                                passed |= &passing;
+                                break prepare_and_run(k, None, Some(Arc::new(passed))).await?;
+                            }
                             admitted = Arc::new(rest);
                             want = next_checked_want(want, k);
                         }
@@ -4661,10 +4669,14 @@ const SUBRANGE_MIN_DOCS: u32 = 50_000;
 const CHECKED_UNIT_GROWTH: usize = 4;
 
 /// The most rows a checked unit scores in one round, unless `k` is more:
-/// the growth stops here, so a predicate rejecting nearly every match
-/// costs more rounds of this many rather than a collector sized to every
-/// match. The same bound as one chunk of the check itself.
-const CHECKED_UNIT_MAX_ROWS: usize = EXACT_SCOPE_TAKE_ROWS;
+/// the growth stops here, so the collector stays bounded, and a unit still
+/// short after a round this size checks the rest of its rows at once. The
+/// same bound as one chunk of the check itself; small in tests, so they
+/// reach that check.
+#[cfg(not(test))]
+const CHECKED_UNIT_MAX_ROWS: usize = super::exec::common::EXACT_SCOPE_TAKE_ROWS;
+#[cfg(test)]
+const CHECKED_UNIT_MAX_ROWS: usize = 64;
 
 /// The rows a checked unit scores in the round after one that scored
 /// `want` and found fewer than `k` passing: [`CHECKED_UNIT_GROWTH`] times
