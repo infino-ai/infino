@@ -133,7 +133,7 @@ use crate::{
                 CandidatePlan, ExactFilter, PoolFile, Resolved, SelectionGate, TermMemos,
                 exact_filter, exact_range, like_prune_leaves, single_range,
             },
-            covered_agg::{LiveTermCounts, not_null_column},
+            covered_agg::{LiveTermCounts, is_keyword_column, not_null_column},
             deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
             dispatch::tag_hits,
@@ -928,9 +928,14 @@ impl SupertableProvider {
                     .sum(id, data_type, entries)
                     .map(Arc::new)
             });
+        // The first answer stored wins, so every caller on this snapshot sees
+        // the same one: whether a `keyword` equality is exact depends on it
+        // (see [`Self::exact_filter`]).
         self.scalar_value_counts
-            .insert(column.to_string(), merged.clone());
-        merged
+            .entry(column.to_string())
+            .or_insert(merged)
+            .value()
+            .clone()
     }
 
     // Lower `filters` to prune leaves and select the superfiles that
@@ -970,11 +975,25 @@ impl SupertableProvider {
     /// [`supports_filters_pushdown`](TableProvider::supports_filters_pushdown),
     /// [`scan`](TableProvider::scan) and the covered-aggregate rewrite
     /// share, so what DataFusion is told is exact is what the scan answers
-    /// exactly. It reads only the expression and the table options, so a
-    /// cached plan stays valid.
+    /// exactly. It reads the expression, the table options and, for a
+    /// `keyword` equality, the snapshot's value counts; a cached plan is
+    /// kept only for the snapshot it was planned on, so it stays valid.
+    ///
+    /// An equality or `IN` on a `keyword` column whose exact table-wide value
+    /// counts the statistics hold (see [`Self::exact_value_counts`]) is not
+    /// exact here: a count under it is then answered from those counts with
+    /// no scan, where reading the postings of a value most rows hold costs
+    /// far more. The counts come from the snapshot's manifest alone, so the
+    /// pushdown and the scan always decide the same way.
     fn exact_filter(&self, filter: &Expr, fts_cols: &HashSet<&str>) -> Option<ExactFilter> {
         let manifest = &self.manifest;
-        exact_filter(filter, fts_cols, &|col| manifest.try_fts_tokenizer_for(col))
+        let exact = exact_filter(filter, fts_cols, &|col| manifest.try_fts_tokenizer_for(col))?;
+        let counted = exact.leaves().iter().any(|leaf| {
+            leaf.whole
+                && is_keyword_column(manifest, &leaf.column)
+                && self.exact_value_counts(&leaf.column).is_some()
+        });
+        (!counted).then_some(exact)
     }
 
     /// The analyzer whose terms a whole-term leaf on `column` names: the

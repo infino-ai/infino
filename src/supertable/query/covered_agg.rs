@@ -96,8 +96,8 @@ use datafusion::{
     functions::core::expr_fn::{coalesce, greatest, least},
     functions_aggregate::expr_fn::{count, max, min, sum},
     logical_expr::{
-        Aggregate, EmptyRelation, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator,
-        TableScan, TableSource, lit,
+        Aggregate, Distinct, EmptyRelation, Expr, Filter, LogicalPlan, LogicalPlanBuilder,
+        Operator, TableScan, TableSource, lit,
         utils::{conjunction, split_conjunction},
     },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
@@ -288,18 +288,21 @@ pub(crate) async fn prepare_aggregate_inputs(
 ) -> Result<(), QueryError> {
     let mut sources: Vec<Arc<dyn TableSource>> = Vec::new();
     let mut aggregated: Vec<Arc<dyn TableSource>> = Vec::new();
-    // Whether the plan groups (`SELECT DISTINCT` is planned as a grouping
-    // only once optimized) and reads a table with a `keyword` column.
-    let mut groups = false;
-    let mut reads_keywords = false;
+    // The columns the plan groups by alone, and the `keyword` columns of the
+    // tables it reads: term counts can answer only a grouping of one of
+    // those, so only such a plan pays for the dry run below.
+    let mut grouped: Vec<String> = Vec::new();
+    let mut keywords: Vec<(SupertableProvider, String)> = Vec::new();
     plan.apply_with_subqueries(|node| {
-        match node {
-            LogicalPlan::Aggregate(_) | LogicalPlan::Distinct(_) => groups = true,
-            LogicalPlan::TableScan(scan) => {
-                reads_keywords |= supertable_provider(&scan.source)
-                    .is_some_and(|provider| has_keyword_column(provider.manifest()));
+        if let Some(column) = single_grouped_column(node) {
+            grouped.push(column.to_string());
+        }
+        if let LogicalPlan::TableScan(scan) = node
+            && let Some(provider) = supertable_provider(&scan.source)
+        {
+            for column in keyword_columns(provider.manifest()) {
+                keywords.push((provider.share(), column));
             }
-            _ => {}
         }
         if let LogicalPlan::Aggregate(agg) = node
             && let Some(scan) = aggregated_scan(agg)
@@ -314,7 +317,15 @@ pub(crate) async fn prepare_aggregate_inputs(
         Ok(TreeNodeRecursion::Continue)
     })
     .map_err(QueryError::DataFusion)?;
-    let over_keywords = groups && reads_keywords;
+    // The dry run costs about what a small grouping does, so it runs for
+    // term counts only when a grouped `keyword` column would read them.
+    let mut over_keywords = false;
+    for (provider, column) in &keywords {
+        if grouped.contains(column) && term_counts_wanted(provider, column).await {
+            over_keywords = true;
+            break;
+        }
+    }
     try_join_all(
         sources
             .iter()
@@ -382,7 +393,10 @@ pub(crate) async fn prepare_aggregate_inputs(
 /// A `keyword` column's live value counts read from its term index before
 /// the statement is optimized, for the rewrite to answer a grouping of the
 /// column from (see [`prepare_aggregate_inputs`]). The counts stay charged
-/// to the connection memory budget until the rewrite takes them.
+/// to the connection memory budget until the rewrite takes them. Counts the
+/// rewrite never takes (planning failed between the read and the rewrite)
+/// stay charged until a later statement grouping the same column replaces
+/// them or the session context is dropped: at most one entry per column.
 pub(crate) struct LiveTermCounts {
     pub(crate) counts: TermCounts,
     /// The live rows that hold no value.
@@ -395,16 +409,20 @@ pub(crate) struct LiveTermCounts {
 
 /// Read `column`'s term counts through `provider` and keep them on it for
 /// the rewrite, unless the statistics answer the column without them. What
-/// the provider kept from an earlier statement is dropped first, so the
-/// rewrite never finds counts this statement did not read. A failed read
-/// keeps nothing: the grouping then runs as planned, which reports a fault
-/// the scan shares.
+/// the provider kept from an earlier statement is dropped first.
+///
+/// The provider lives in the cached session context and keeps one entry per
+/// column, not per statement, so two statements running at once on the same
+/// reader can drop or take each other's counts: one of them then scans, and
+/// both hold budget for a moment. The answer stays exact either way, since
+/// both read the same snapshot and the rewrite checks the deleted rows
+/// again before it uses any counts (see [`grouping_from_terms`]).
+///
+/// A failed read keeps nothing: the grouping then runs as planned, which
+/// reports a fault the scan shares.
 async fn keep_term_counts(provider: &SupertableProvider, state: &SessionState, column: &str) {
     drop(provider.take_term_counts(column));
-    if value_counts_from_statistics(provider, column).is_some() {
-        return;
-    }
-    if !term_counts_worth_reading(provider.manifest(), column).await {
+    if !term_counts_wanted(provider, column).await {
         return;
     }
     let Some(reader) = provider.reader() else {
@@ -417,6 +435,14 @@ async fn keep_term_counts(provider: &SupertableProvider, state: &SessionState, c
     }
 }
 
+/// Whether a grouping of `column` would be answered from its term counts:
+/// the statistics do not answer it, and the counts cost less than a scan
+/// (see [`term_counts_worth_reading`]).
+async fn term_counts_wanted(provider: &SupertableProvider, column: &str) -> bool {
+    value_counts_from_statistics(provider, column).is_none()
+        && term_counts_worth_reading(provider.manifest(), column).await
+}
+
 /// Whether `column` is indexed by the `keyword` analyzer, which holds each
 /// whole value as one term.
 pub(crate) fn is_keyword_column(manifest: &ManifestSnapshot, column: &str) -> bool {
@@ -425,12 +451,52 @@ pub(crate) fn is_keyword_column(manifest: &ManifestSnapshot, column: &str) -> bo
         .is_some_and(|tokenizer| tokenizer.name() == KEYWORD_TOKENIZER)
 }
 
-/// Whether any column of `manifest`'s table is a `keyword` column.
-fn has_keyword_column(manifest: &ManifestSnapshot) -> bool {
+/// The `keyword` columns of `manifest`'s table.
+fn keyword_columns(manifest: &ManifestSnapshot) -> Vec<String> {
     manifest
         .fts_configs()
         .iter()
-        .any(|config| is_keyword_column(manifest, &config.column))
+        .filter(|config| is_keyword_column(manifest, &config.column))
+        .map(|config| config.column.clone())
+        .collect()
+}
+
+/// The one column `node` groups by, as the statement is written, before
+/// the optimizer has turned a distinct listing or a distinct count into a
+/// grouping: `GROUP BY column` (under an alias or not), `SELECT DISTINCT
+/// column`, or `COUNT(DISTINCT column)` with no `GROUP BY`. These are the
+/// shapes term counts can answer (see
+/// [`rewrite_grouped_count_from_value_counts`]); `None` for any other node.
+/// A column renamed by a subquery is missed, and its grouping is then
+/// scanned, as it would be without term counts.
+fn single_grouped_column(node: &LogicalPlan) -> Option<&str> {
+    match node {
+        LogicalPlan::Aggregate(aggregate) => {
+            if let Some(column) = grouping_column(aggregate) {
+                return Some(column.name.as_str());
+            }
+            let ([], [expr]) = (
+                aggregate.group_expr.as_slice(),
+                aggregate.aggr_expr.as_slice(),
+            ) else {
+                return None;
+            };
+            let Expr::AggregateFunction(func) = unaliased(expr) else {
+                return None;
+            };
+            match func.params.args.as_slice() {
+                [Expr::Column(column)] if func.params.distinct && func.func.name() == "count" => {
+                    Some(column.name.as_str())
+                }
+                _ => None,
+            }
+        }
+        LogicalPlan::Distinct(Distinct::All(input)) => match input.schema().fields().as_ref() {
+            [field] => Some(field.name().as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Our provider behind `source`, when it is one.
@@ -1759,7 +1825,7 @@ fn grouping_column(aggregate: &Aggregate) -> Option<&Column> {
 /// term path declined, or the column is not `keyword`), when the provider
 /// now sees other rows deleted than the counts left out, or when a value or
 /// a count does not fit the aggregate's output.
-fn grouping_from_terms(
+pub(super) fn grouping_from_terms(
     aggregate: &Aggregate,
     provider: &SupertableProvider,
     counted: bool,
@@ -1788,7 +1854,11 @@ fn grouping_from_terms(
         debug!("term counts set aside: a value or a count does not fit");
         return Ok(None);
     };
-    // The budget held the counts; the rows built from them leave it.
+    // The budget held the counts; the rows built from them leave it. The
+    // memory table is not charged: it holds one row per distinct value, which
+    // the cost check keeps to at most one per
+    // `TERM_COUNTS_MIN_ROWS_PER_TERM` rows, and is about the size of the
+    // counts just released.
     drop(live);
     let (batch, columns) = match counted {
         true => (batch, vec![col(GROUP_VALUE), col(GROUP_COUNT)]),
@@ -2158,6 +2228,11 @@ pub(crate) async fn term_counts_worth_reading(manifest: &ManifestSnapshot, colum
 /// superfile's distinct terms added up, as its summary records them; a
 /// value held in several superfiles counts once in each, as it is walked.
 /// `false` when a superfile holding values records no term count.
+///
+/// The rows are each superfile's `n_docs`, which include its deleted rows
+/// and the rows of superfiles that lack the column. On a table that is
+/// mostly deleted this can choose the term counts when scanning the few
+/// live rows would cost less; the answer is exact either way.
 fn term_counts_pay(superfiles: &[Arc<SuperfileEntry>], id: FieldId) -> bool {
     let mut rows: u64 = 0;
     let mut terms: u64 = 0;

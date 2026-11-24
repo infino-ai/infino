@@ -677,7 +677,10 @@ mod tests {
 
     use arrow_array::{ArrayRef, Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
-    use datafusion::prelude::{col, lit};
+    use datafusion::{
+        logical_expr::{Aggregate, LogicalPlan},
+        prelude::{col, lit},
+    };
     use roaring::RoaringBitmap;
     use tempfile::TempDir;
 
@@ -691,7 +694,10 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions, SupertableReader,
             query::{
-                covered_agg::{TERM_COUNTS_MIN_ROWS_PER_TERM, TERM_COUNTS_TABLE},
+                covered_agg::{
+                    TERM_COUNTS_MIN_ROWS_PER_TERM, TERM_COUNTS_TABLE, grouping_from_terms,
+                },
+                provider::SupertableProvider,
                 sql::value_count_schema,
                 value_count_carry::MAX_TABLE_VALUE_COUNTS,
             },
@@ -1099,6 +1105,18 @@ mod tests {
         term_index: bool,
         shape: &KeywordShape,
     ) -> (TempDir, TempDir, Supertable, SchemaRef) {
+        keyword_table_indexing_first(term_index, shape.files + 1, shape)
+    }
+
+    /// [`keyword_value_table`], with only the first `indexed` files written
+    /// while the table keeps its term index: the later files and the delete
+    /// come from a handle that keeps none, so the index lists only those
+    /// first files and the rest are read from their dictionaries.
+    fn keyword_table_indexing_first(
+        term_index: bool,
+        indexed: usize,
+        shape: &KeywordShape,
+    ) -> (TempDir, TempDir, Supertable, SchemaRef) {
         let dir = TempDir::new().expect("tempdir");
         let cache_dir = TempDir::new().expect("cache dir");
         let storage: Arc<dyn StorageProvider> =
@@ -1108,22 +1126,29 @@ mod tests {
             Field::new("tag", DataType::LargeUtf8, true),
             Field::new("plain", DataType::LargeUtf8, true),
         ]));
-        let fts = vec![
-            FtsConfig::new("tag").analyzer(Analyzer::Keyword),
-            FtsConfig::new("plain"),
-        ];
-        let mut options = SupertableOptions::new(Arc::clone(&schema), fts, vec![])
-            .expect("options")
-            .with_storage(Arc::clone(&storage))
-            .with_disk_cache(default_disk_cache(storage, cache_dir.path()))
-            .with_term_index(term_index);
-        // Bounded, so a test can fill it.
-        options.connection_memory_budget = ConnectionMemoryBudget::with_room();
-        let table = Supertable::create(options).expect("create");
+        let options = |keeps_index: bool| {
+            let fts = vec![
+                FtsConfig::new("tag").analyzer(Analyzer::Keyword),
+                FtsConfig::new("plain"),
+            ];
+            let mut options = SupertableOptions::new(Arc::clone(&schema), fts, vec![])
+                .expect("options")
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(default_disk_cache(Arc::clone(&storage), cache_dir.path()))
+                .with_term_index(keeps_index);
+            // Bounded, so a test can fill it.
+            options.connection_memory_budget = ConnectionMemoryBudget::with_room();
+            options
+        };
+        let mut table = Supertable::create(options(term_index)).expect("create");
         let mut next = xorshift(0x5EED);
         // The last file's rows are all deleted: it holds no live value,
         // and its deleted rows are not read.
         for file in 0..=shape.files {
+            if file == indexed {
+                drop(table);
+                table = Supertable::open(options(false)).expect("open without the index");
+            }
             let n: Vec<i64> = (0..shape.rows)
                 .map(|_| match file == shape.files {
                     true => KEYWORD_N_RANGE as i64,
@@ -1163,6 +1188,10 @@ mod tests {
                     .or(col("n").eq(lit(KEYWORD_N_RANGE as i64))),
             )
             .expect("delete");
+        if indexed <= shape.files {
+            drop(table);
+            table = Supertable::open(options(term_index)).expect("reopen");
+        }
         (dir, cache_dir, table, schema)
     }
 
@@ -1342,7 +1371,7 @@ mod tests {
     /// Groupings of a keyword column that SQL answers from its term counts
     /// once the statistics decline, each beside the same query forced to the
     /// scan by a `random() >= 0` every row passes.
-    const KEYWORD_GROUPINGS: [(&str, &str); 5] = [
+    const KEYWORD_GROUPINGS: [(&str, &str); 7] = [
         (
             "SELECT tag, COUNT(*) FROM supertable GROUP BY tag",
             "SELECT tag, COUNT(*) FROM supertable WHERE random() >= 0 GROUP BY tag",
@@ -1364,6 +1393,18 @@ mod tests {
         (
             "SELECT DISTINCT tag FROM supertable",
             "SELECT DISTINCT tag FROM supertable WHERE random() >= 0",
+        ),
+        (
+            "SELECT tag AS t, COUNT(*) AS c FROM supertable GROUP BY tag",
+            "SELECT tag AS t, COUNT(*) AS c FROM supertable WHERE random() >= 0 GROUP BY tag",
+        ),
+        // About 80 rows hold each `tag {v}` value of the dense fixture, and
+        // about 16 each other value: the `HAVING` keeps only the former,
+        // the empty string and the null group.
+        (
+            "SELECT tag, COUNT(*) FROM supertable GROUP BY tag HAVING COUNT(*) > 50",
+            "SELECT tag, COUNT(*) FROM supertable WHERE random() >= 0 GROUP BY tag \
+             HAVING COUNT(*) > 50",
         ),
     ];
 
@@ -1485,5 +1526,197 @@ mod tests {
                 assert!(!plan.contains("FilterExec"), "{label}: {plan}");
             }
         }
+    }
+
+    /// Filters on a keyword column, `{c}` standing for it, that the postings
+    /// do not answer exactly: each row is still checked by a filter.
+    const KEYWORD_ROW_CHECKS: [&str; 4] = [
+        "{c} NOT IN ('tag 7', '')",
+        "{c} <> 'tag 7'",
+        "{c} = 'tag 7' OR {c} IS NULL",
+        "{c} = 'tag 7' OR n > 900",
+    ];
+
+    /// `<>`, `NOT IN`, and an `OR` with a leaf the postings do not answer
+    /// keep their filter, and return what a per-row check returns.
+    #[test]
+    fn keyword_filters_the_postings_do_not_answer_keep_their_filter() {
+        for term_index in [true, false] {
+            let (_dir, _cache_dir, table, _schema) = keyword_value_table(term_index, &SPARSE);
+            let reader = table.reader().expect("reader");
+            for filter in KEYWORD_ROW_CHECKS {
+                let checked = filter.replace("{c}", "(tag || '')");
+                let filter = filter.replace("{c}", "tag");
+                let label = format!("{filter}, term index {term_index}");
+                for select in ["n, tag", "COUNT(*)"] {
+                    let sql = format!("SELECT {select} FROM supertable WHERE {filter}");
+                    let forced = format!("SELECT {select} FROM supertable WHERE {checked}");
+                    assert_eq!(rows(&reader, &sql), rows(&reader, &forced), "{label}");
+                }
+                let plan = explain(&reader, &format!("SELECT n FROM supertable WHERE {filter}"));
+                assert!(plan.contains("FilterExec"), "{label}: {plan}");
+            }
+        }
+    }
+
+    /// Few distinct values: the statistics hold the column's exact
+    /// table-wide value counts.
+    const FEW_VALUES: KeywordShape = KeywordShape {
+        files: 2,
+        rows: 2_000,
+        pool: 50,
+        deleted_below: 100,
+    };
+
+    /// On a keyword column whose exact value counts the statistics hold,
+    /// `=` and `IN` are left to the filter, so a count under them is
+    /// answered from those counts rather than from the postings, and the
+    /// rows are what a per-row check returns.
+    #[test]
+    fn keyword_equalities_the_statistics_count_keep_their_filter() {
+        const { assert!(FEW_VALUES.pool * KEYWORD_SPELLINGS < MAX_TABLE_VALUE_COUNTS as u64) };
+        for term_index in [true, false] {
+            let (_dir, _cache_dir, table, _schema) = keyword_value_table(term_index, &FEW_VALUES);
+            let reader = table.reader().expect("reader");
+            for filter in KEYWORD_EQUALITIES {
+                let checked = filter.replace("{c}", "(tag || '')");
+                let filter = filter.replace("{c}", "tag");
+                let label = format!("{filter}, term index {term_index}");
+                for select in ["n, tag", "COUNT(*)"] {
+                    let sql = format!("SELECT {select} FROM supertable WHERE {filter}");
+                    let forced = format!("SELECT {select} FROM supertable WHERE {checked}");
+                    assert_eq!(rows(&reader, &sql), rows(&reader, &forced), "{label}");
+                }
+                let plan = explain(&reader, &format!("SELECT n FROM supertable WHERE {filter}"));
+                assert!(plan.contains("FilterExec"), "{label}: {plan}");
+            }
+        }
+    }
+
+    /// A grouping of a column that is not `keyword`, on a table with a
+    /// keyword column, is not answered from term counts and returns what
+    /// the scan does.
+    #[test]
+    fn groupings_of_other_columns_do_not_read_the_terms() {
+        let (_dir, _cache_dir, table, _schema) = keyword_value_table(true, &DENSE);
+        let reader = table.reader().expect("reader");
+        for (sql, forced) in [
+            (
+                "SELECT n, COUNT(*) FROM supertable GROUP BY n",
+                "SELECT n, COUNT(*) FROM supertable WHERE random() >= 0 GROUP BY n",
+            ),
+            (
+                "SELECT DISTINCT n FROM supertable",
+                "SELECT DISTINCT n FROM supertable WHERE random() >= 0",
+            ),
+        ] {
+            assert_eq!(rows(&reader, sql), rows(&reader, forced), "{sql}");
+            let plan = explain(&reader, sql);
+            assert!(!plan.contains(TERM_COUNTS_TABLE), "{sql}: {plan}");
+        }
+    }
+
+    /// On a table whose term index lists only some files, the term counts
+    /// add the index's counts for those to the other files' dictionary
+    /// counts: groupings and `value_counts` answer as the scan does and read
+    /// no row, and `=` / `IN` select the same rows as a per-row check.
+    #[test]
+    fn keyword_term_counts_mix_the_index_and_the_dictionaries() {
+        let (_dir, _cache_dir, table, _schema) = keyword_table_indexing_first(true, 1, &DENSE);
+        let reader = table.reader().expect("reader");
+        let manifest = reader.manifest();
+        let index = reader
+            .block_on(manifest.term_index())
+            .expect("index")
+            .expect("the table keeps an index");
+        let listed: Vec<bool> = manifest
+            .get_all_superfiles()
+            .iter()
+            .map(|entry| index.is_indexed(&entry.superfile_id))
+            .collect();
+        assert!(
+            listed.contains(&true) && listed.contains(&false),
+            "the index lists some files and not others: {listed:?}"
+        );
+        let (counted, stats) = with_op_stats(|| reader.value_counts("tag").expect("value counts"));
+        assert_eq!(
+            sorted_rows(from_ref(&counted)),
+            rows(&reader, KEYWORD_GROUPINGS[0].1)
+        );
+        assert_eq!(stats.rows_materialized, 0, "value_counts: {stats:?}");
+        for (sql, forced) in KEYWORD_GROUPINGS {
+            let (answered, stats) = with_op_stats(|| rows(&reader, sql));
+            assert_eq!(answered, rows(&reader, forced), "{sql}");
+            assert_eq!(stats.rows_materialized, 0, "{sql}: {stats:?}");
+            assert!(explain(&reader, sql).contains(TERM_COUNTS_TABLE), "{sql}");
+        }
+        for filter in KEYWORD_EQUALITIES {
+            let checked = filter.replace("{c}", "(tag || '')");
+            let filter = filter.replace("{c}", "tag");
+            let sql = format!("SELECT n, tag FROM supertable WHERE {filter}");
+            let forced = format!("SELECT n, tag FROM supertable WHERE {checked}");
+            assert_eq!(rows(&reader, &sql), rows(&reader, &forced), "{filter}");
+        }
+    }
+
+    /// The first aggregate in `plan`, depth first.
+    fn first_aggregate(plan: &LogicalPlan) -> Option<Aggregate> {
+        if let LogicalPlan::Aggregate(aggregate) = plan {
+            return Some(aggregate.clone());
+        }
+        plan.inputs().into_iter().find_map(first_aggregate)
+    }
+
+    /// The provider `reader`'s SQL session reads the table through.
+    fn session_provider(reader: &SupertableReader) -> SupertableProvider {
+        let ctx = reader.sql_session_context().expect("session");
+        let table = reader
+            .block_on(ctx.table_provider("supertable"))
+            .expect("table");
+        table
+            .downcast_ref::<SupertableProvider>()
+            .expect("our provider")
+            .share()
+    }
+
+    /// Term counts read before a delete was committed are not used once the
+    /// provider sees the delete: the grouping declines to the scan, while
+    /// counts read on the same snapshot answer it.
+    #[test]
+    fn term_counts_read_before_a_delete_are_set_aside() {
+        let (_dir, _cache_dir, table, _schema) = keyword_value_table(true, &DENSE);
+        let sql = "SELECT tag, COUNT(*) FROM supertable GROUP BY tag";
+        let before = table.reader().expect("reader");
+        let provider = session_provider(&before);
+        let state = before.sql_session_context().expect("session").state();
+        let aggregate = first_aggregate(
+            &before
+                .block_on(state.create_logical_plan(sql))
+                .expect("plan"),
+        )
+        .expect("an aggregate");
+        let read = || {
+            before
+                .block_on(before.live_term_counts(&provider, &state, "tag"))
+                .expect("read")
+                .expect("term counts")
+        };
+        let fresh = grouping_from_terms(&aggregate, &provider, true, false, Some(read()));
+        assert!(
+            fresh.expect("rewrite").is_some(),
+            "counts of this snapshot answer"
+        );
+
+        let stale = read();
+        table
+            .delete(col("n").eq(lit(KEYWORD_N_RANGE as i64 / 2)))
+            .expect("delete");
+        let after = table.reader().expect("reader");
+        let provider = session_provider(&after);
+        let declined = grouping_from_terms(&aggregate, &provider, true, false, Some(stale));
+        assert!(
+            declined.expect("rewrite").is_none(),
+            "counts read before the delete are set aside"
+        );
     }
 }

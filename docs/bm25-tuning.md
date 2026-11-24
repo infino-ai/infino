@@ -343,10 +343,19 @@ matched whole: host names, paths, status codes, user ids, tags. On a
   all return the rows whose value equals the query exactly. Each such row
   holds the term once, so BM25 gives them all the same score.
 - **Prefix search keeps case.** `Fo` finds `Foo` and not `foo`.
-- **`value_counts` reads the term index.** Each term is one whole value,
-  so `Table::value_counts` adds up the term counts, minus deleted rows,
-  instead of grouping the rows. When the terms do not fit the connection
-  memory budget, it groups the rows instead.
+- **`value_counts` and SQL groupings read the term index.** Each term is
+  one whole value, so `Table::value_counts`, and in SQL
+  `SELECT col, COUNT(*) ... GROUP BY col`, `COUNT(DISTINCT col)` and
+  `SELECT DISTINCT col`, add up the term counts, minus deleted rows,
+  instead of grouping the rows. They group the rows instead when the
+  column has few rows per value (adding up the terms would then cost about
+  as much as the scan), or when the terms do not fit the connection memory
+  budget. A grouping under any `WHERE` filter other than
+  `col IS NOT NULL` groups the rows.
+- **SQL `=` and `IN` read the postings.** `col = 'x'`, `col IN ('x', 'y')`
+  and an `OR` of them take their rows straight from the term index, with
+  no check of each row. `<>`, `NOT IN`, `LIKE` and other comparisons are
+  checked row by row.
 - **`text_match` still means words.** The SQL function always uses
   `standard` tokens, whatever the column's index. So a `keyword` index
   does not answer it, and does not narrow a `LIKE` scan either.
