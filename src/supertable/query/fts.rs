@@ -129,8 +129,8 @@ use crate::{
             reader::{
                 Bm25SearchOptions, CANDIDATE_MAX_CELLS, CANDIDATE_MAX_POSTINGS, CandidateNorms,
                 ClauseLists, ColumnLengthStats, ColumnNorms, FEW_NORMS_MAX_DOCS, FetchedTermMemo,
-                GlobalTermIdf, LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet,
-                PreparedClauses, QueryDict, QueryIdf, ScoringView,
+                GlobalTermIdf, LiveFloor, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses,
+                QueryDict, QueryIdf, ScoringView,
             },
             tokenize::{KEYWORD_TOKENIZER, Phrase},
         },
@@ -457,7 +457,7 @@ impl MatchKernel {
         // The row filter reads the dictionary on its own; the kept copy is not held through it.
         drop(dict);
         // One flush per superfile: positive + negation walks.
-        self.flush(&work);
+        work.add_to(self.op_stats.as_deref());
         let hits = docs.len() as u64;
         self.keep_filtered(r, suid, hits, false, docs).await
     }
@@ -476,7 +476,7 @@ impl MatchKernel {
     async fn cursor_set(&self, r: &SuperfileReader, suid: Uuid) -> Result<OrCursorSet, QueryError> {
         let (column, memo, refs) = self.file_inputs(r, suid).await;
         let (set, work) = r.match_cursor_set(&column, &refs, memo.as_deref()).await?;
-        self.flush(&work);
+        work.add_to(self.op_stats.as_deref());
         Ok(set)
     }
 
@@ -491,16 +491,11 @@ impl MatchKernel {
         end: u32,
     ) -> Result<SliceMatch, QueryError> {
         let (ids, work) = r.token_match_range_in_blob_ids(set, start, end)?;
-        self.flush(&work);
+        work.add_to(self.op_stats.as_deref());
         Ok(match r.held_ids_to_rows(&ids)? {
             Some(rows) => SliceMatch::Rows(rows),
             None => SliceMatch::Unmapped(ids),
         })
-    }
-
-    /// Adds a walk's work to the statement's statistics.
-    fn flush(&self, work: &MatchWork) {
-        add_match_work(&self.op_stats, work);
     }
 }
 
@@ -615,7 +610,7 @@ impl RowFilter {
             Err(e) if holds_no_postings(&e) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        self.flush(&work);
+        work.add_to(self.op_stats.as_deref());
         if estimate.saturating_mul(ROW_FILTER_MIN_HITS_RATIO) > hits {
             return Ok(None);
         }
@@ -631,22 +626,8 @@ impl RowFilter {
                 Arc::default(),
             )
             .await?;
-        self.flush(&work);
+        work.add_to(self.op_stats.as_deref());
         Ok(rows.map(Arc::new))
-    }
-
-    /// Adds the filter's index work to the statement's statistics.
-    fn flush(&self, work: &MatchWork) {
-        add_match_work(&self.op_stats, work);
-    }
-}
-
-/// Adds an index walk's work to the statement's statistics, if collected.
-fn add_match_work(op_stats: &Option<Arc<op_stats::OpStatsCollector>>, work: &MatchWork) {
-    if let Some(stats) = op_stats {
-        stats.add_fts_postings_bytes(work.postings_bytes);
-        stats.add_planned_read_ranges(work.planned_ranges);
-        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
     }
 }
 
@@ -3117,7 +3098,7 @@ impl SupertableReader {
                         // from scoring): df only, from the dictionary value
                         // + header hint — no postings body.
                         let (dfs, work) = r.term_dfs(&column_arc, &refs).await?;
-                        add_match_work(&op_stats, &work);
+                        work.add_to(op_stats.as_deref());
                         Ok((suid, dfs, None))
                     }
                 }
@@ -4168,11 +4149,7 @@ impl SupertableReader {
                         } else {
                             RoaringBitmap::new()
                         };
-                        if let Some(stats) = &op_stats {
-                            stats.add_fts_postings_bytes(work.postings_bytes);
-                            stats.add_planned_read_ranges(work.planned_ranges);
-                            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                        }
+                        work.add_to(op_stats.as_deref());
                         let n = docs
                             .iter()
                             .filter(|d| {
@@ -4224,11 +4201,7 @@ impl SupertableReader {
                         )
                         .await?
                     };
-                    if let Some(stats) = &op_stats {
-                        stats.add_fts_postings_bytes(work.postings_bytes);
-                        stats.add_planned_read_ranges(work.planned_ranges);
-                        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                    }
+                    work.add_to(op_stats.as_deref());
                     Ok(n)
                 }
             },
@@ -4355,11 +4328,7 @@ impl SupertableReader {
                     // byte and range legs are deliberately unpriced — both
                     // take paths report no planned ranges by design, so the
                     // counter stays identical warm or cold.
-                    if let Some(stats) = &op_stats {
-                        stats.add_fts_postings_bytes(work.postings_bytes);
-                        stats.add_planned_read_ranges(work.planned_ranges);
-                        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                    }
+                    work.add_to(op_stats.as_deref());
                     docs.into_iter().map(RowId::get).collect()
                 };
                 if let Some(filter) = &row_filter

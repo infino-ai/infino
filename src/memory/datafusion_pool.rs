@@ -347,7 +347,7 @@ mod tests {
         execution::memory_pool::MemoryConsumer,
         physical_plan::{ExecutionPlan, collect, displayable, metrics::MetricsSet},
     };
-    use tokio::runtime::Runtime;
+    use tokio::runtime::{Builder, Runtime};
 
     use super::*;
     use crate::{memory::tests::Holder, supertable::query::join_build_size::RIGHT_SIZED_BATCHES};
@@ -1023,7 +1023,14 @@ mod tests {
         let expected_count = (GROUPS * PROBE_REPEATS) as i64;
         let expected_sum = (PROBE_REPEATS * GROUPS * (GROUPS - 1) / 2) as i64;
 
-        let runtime = Runtime::new().expect("tokio runtime");
+        // One thread, so batches reach the aggregates in the same order on
+        // every run. The charge sums each build batch's buffer size, and
+        // those sizes change with that order; the partitioned case clears
+        // the gate by only about a megabyte.
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
         runtime.block_on(async {
             for mode in ["CollectLeft", "Partitioned"] {
                 let budget = ConnectionMemoryBudget::with_limit(CONFIGURED);

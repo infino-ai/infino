@@ -684,7 +684,7 @@ mod tests {
 
     use arrow::util::display::array_value_to_string;
     use arrow_array::{
-        Array, Date32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+        Array, Date32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
         TimestampNanosecondArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -1685,21 +1685,34 @@ mod tests {
         }
     }
     /// A `WHERE` on a range-indexed column retyped after its superfile was
-    /// written still finds the row it keeps, on every match path.
+    /// written still finds the row it keeps, on every match path. Only row
+    /// 0 holds the kept value. A float narrowed to `Float32` rounds
+    /// `1.00000001` to `1.0`, a key the file's range index never wrote.
     #[test]
     fn sql_where_on_a_retyped_range_column_keeps_its_rows() {
-        let cases: [(Arc<dyn Array>, DataType, &str, &str); 2] = [
+        /// `first` in row 0, `rest` in each of the other rows.
+        fn pick<T: Copy>(first: T, rest: T) -> impl Iterator<Item = T> {
+            (0..NARROWED_REPEAT).map(move |i| if i == 0 { first } else { rest })
+        }
+        let n = NARROWED_REPEAT;
+        let cases: [(Arc<dyn Array>, DataType, &str, &str); 3] = [
             (
-                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(Int64Array::from_iter_values(pick(1_i64, 2))),
                 DataType::Float64,
                 "1.0",
                 "7.0",
             ),
             (
-                Arc::new(Date32Array::from(vec![1, 2])),
+                Arc::new(Date32Array::from_iter_values(pick(1, 2))),
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 "TIMESTAMP '1970-01-02 00:00:00'",
                 "TIMESTAMP '1970-01-08 00:00:00'",
+            ),
+            (
+                Arc::new(Float64Array::from_iter_values(pick(1.000_000_01_f64, 2.0))),
+                DataType::Float32,
+                "CAST(1 AS REAL)",
+                "CAST(7 AS REAL)",
             ),
         ];
         for (values, new_type, kept, absent) in cases {
@@ -1707,7 +1720,7 @@ mod tests {
                 Field::new("title", DataType::LargeUtf8, false),
                 Field::new("bucket", values.data_type().clone(), false),
             ]));
-            let batch = titled_batch(&schema, &["rust", "rust one"], values);
+            let batch = titled_batch(&schema, &vec!["rust"; n], values);
             let conn = metered_table(
                 &schema,
                 IndexSpec::new().fts("title").range("bucket"),
