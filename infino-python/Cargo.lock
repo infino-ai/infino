@@ -1527,6 +1527,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
+name = "emeans"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2080fbab23836716a98a9c59782d754f2a95cf9731e8699ad05def2eeaf6c2ca"
+dependencies = [
+ "matrixmultiply",
+ "rayon",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2161,6 +2171,7 @@ dependencies = [
  "dashmap",
  "datafusion",
  "datafusion-functions-json",
+ "emeans",
  "ferroid",
  "figment",
  "fs4",
