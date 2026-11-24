@@ -349,7 +349,7 @@ impl MatchOrder {
 
     /// Of `hits`, the matches of one superfile read through `r`, at most
     /// `fetch` of those the `WHERE` keeps and whose key is at least the
-    /// walk's `fetch`-th best once theirs are folded in: a row below it can
+    /// walk's `fetch`-th best once the superfile is read: a row below it can
     /// never place, and the superfile's best `fetch` rows are all it can add
     /// to the answer.
     pub(crate) async fn keep(
@@ -406,11 +406,28 @@ impl MatchOrder {
             .await
             .map_err(QueryError::internal)?;
         }
+        self.hand_up(hits, placing).await
+    }
+
+    /// Of `hits`, those in `placing` (rows with their ranks) whose rank is
+    /// still at least the walk's `fetch`-th best. Other superfiles raise it
+    /// while this one is read, so rows kept against an earlier, lower one
+    /// may no longer place.
+    async fn hand_up(
+        &self,
+        hits: Vec<SuperfileHit>,
+        placing: Vec<(u32, u64)>,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let worst = self.worst();
         run_on_pool(
             Some(&self.manifest.options.reader_pool),
             "ordered match pruning",
             move || {
-                let placing: RoaringBitmap = placing.into_iter().map(|(row, _)| row).collect();
+                let placing: RoaringBitmap = placing
+                    .into_iter()
+                    .filter(|(_, rank)| worst.is_none_or(|worst| *rank >= worst))
+                    .map(|(row, _)| row)
+                    .collect();
                 hits.into_iter()
                     .filter(|h| placing.contains(h.local_doc_id))
                     .collect()
@@ -648,6 +665,24 @@ mod tests {
             kept.contains(&60) && kept.contains(&THRESHOLD_HOUR),
             "{kept:?}"
         );
+    }
+
+    /// Rows kept against a low `FETCH`-th best are dropped once another
+    /// superfile raises it before this one hands them up; a tie stays.
+    #[test]
+    fn hand_up_drops_rows_below_a_floor_raised_meanwhile() {
+        let (order, reader, entry, _) = fixture();
+        let every_row = rows_where(|_| true);
+        let placing: Vec<(u32, u64)> = every_row
+            .iter()
+            .map(|&row| (row, rank(&order, HOURS[row as usize])))
+            .collect();
+        seed(&order, &SEEDED);
+        let kept = reader
+            .block_on(order.hand_up(hits(&entry, &every_row), placing))
+            .expect("hand up");
+        let kept: Vec<u32> = kept.iter().map(|h| h.local_doc_id).collect();
+        assert_eq!(kept, rows_where(|hour| hour >= THRESHOLD_HOUR));
     }
 
     /// Until `FETCH` matches are in hand nothing is dropped: a hit worse
