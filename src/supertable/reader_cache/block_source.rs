@@ -2051,7 +2051,9 @@ impl BlockCachedSource {
         // one `pread`. A slice of the mapping takes its page faults later, in
         // the decoder: each takes the process's memory-map lock and reads
         // ahead pages nobody asked for, and with thousands of files read per
-        // query that cost more than the copy.
+        // query that cost more than the copy. The `pread` runs here, on the
+        // caller's thread (a tokio worker for a scan or a take), and reads
+        // from local disk only when the page cache does not hold the range.
         if len <= PREAD_MAX_BYTES && !self.read_touches_part(start, len) {
             let mut out = vec![0u8; len as usize];
             bf.file.read_exact_at(&mut out, start).ok()?;
