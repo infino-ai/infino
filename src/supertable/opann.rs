@@ -974,7 +974,7 @@ const PARITY_KNEE_SLACK: f64 = 0.01;
 /// fine clusters (the actual selection → scan → shortlist → rerank the reader
 /// serves, so within-path loss is captured — unlike the old centroid-coverage
 /// proxy). For each `k` this stamps the SMALLEST fanout whose measured recall
-/// clears `register_floor` (the configured graceful recall bar). When no
+/// clears `register_floor` (the table's `target_recall`). When no
 /// observed fanout clears it — the recall PLATEAUS below the floor even at the
 /// widest (full-fanout) rung — the point stays `0`, the "GFC can't reach the
 /// floor here" sentinel, which resolves to `None` in
@@ -984,13 +984,11 @@ const PARITY_KNEE_SLACK: f64 = 0.01;
 /// noise near the floor can otherwise invert two adjacent anchors). The ladder
 /// is expected ASCENDING in fanout; it is sorted defensively.
 ///
-/// The starting bar is `register_floor` (default 0.98), NOT the full
-/// `target_recall`: the global-fine path's recall ceiling sits around 0.99, so
-/// grading each rung against the full target would leave every fanout short of
-/// the bar and stamp the sentinel everywhere. But an absolute bar over-rejects
-/// on its own: the router reads the SAME Sq16 codes as the stamped grid, so it
-/// shares the grid's within-cell recall ceiling, and on hard/high-dim data that
-/// ceiling sits below 0.98 (measured laion-100M: the router plateaus ~0.973,
+/// The starting bar is the full `target_recall`, the same bar the stamped laws
+/// are calibrated to, so the two routers serve the same recall. An absolute
+/// bar over-rejects on its own: the router reads the SAME Sq16 codes as the
+/// stamped grid, so it shares the grid's within-cell recall ceiling, and on
+/// hard/high-dim data that ceiling sits below the target (measured laion-100M: the router plateaus ~0.973,
 /// the grid it replaces serves ~0.975). Grading the router against a bar its
 /// shared codec cannot reach would reject it AT PARITY with the grid. So the
 /// per-`k` bar relaxes toward that `k`'s OWN measured ceiling (its widest-rung
@@ -1335,6 +1333,25 @@ mod pool_hint_tests {
         assert_eq!(
             fanout_prior_for_k(&[1, 0, 0, 0], &[1, 0, 0, 0], 1),
             [1, 0, 0, 0]
+        );
+    }
+
+    /// The ladder holds the midpoint between each pair of powers of two, so a
+    /// knee between 128 and 256 can stamp 192 instead of jumping to 256.
+    #[test]
+    fn router_fanout_ladder_has_midpoint_rungs() {
+        assert_eq!(
+            router_fanout_ladder(0, 512),
+            [
+                1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512
+            ]
+        );
+        // The prior and its neighbours are added; the ceiling is the last rung.
+        assert_eq!(
+            router_fanout_ladder(80, 300),
+            [
+                1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192, 256, 300
+            ]
         );
     }
 
@@ -1711,8 +1728,8 @@ fn truncate_prefix_ascending(cand: &mut Vec<PrefixCand>, cap: usize) {
 }
 
 /// Ascending candidate fanouts to measure recall at, seeded around the grid's
-/// `width × fine` prior but NOT capped by it — a doubling ladder from 1 up to
-/// (and including) `max_fanout`, with the prior and its neighbours injected for
+/// `width × fine` prior but NOT capped by it — powers of two and the midpoints
+/// between them, from 1 up to (and including) `max_fanout`, with the prior and its neighbours injected for
 /// resolution near the expected knee. `max_fanout` (the calibration ceiling,
 /// `centroid_graph_max_fanout`, NOT the total cluster count) is the last rung:
 /// if recall does not clear the target by it, the calibration stamps the
@@ -1725,6 +1742,7 @@ fn router_fanout_ladder(prior_max: usize, max_fanout: usize) -> Vec<usize> {
     let mut f = 1usize;
     while f < total {
         rungs.push(f);
+        rungs.push(f + f / 2);
         f = f.saturating_mul(2);
     }
     rungs.push(total);
@@ -1798,7 +1816,7 @@ pub(crate) struct FanoutCalibCtx {
     /// Ladder ceiling (`centroid_graph_max_fanout`, clamped to `total_fine`) —
     /// the deepest fanout rung measured.
     pub(crate) max_fanout: usize,
-    /// Router acceptance floor (`hnsw_register_floor`).
+    /// Router acceptance floor (`target_recall`).
     pub(crate) register_floor: f64,
     /// Parity relaxation below the floor (`centroid_graph_parity_gap`).
     pub(crate) parity_gap: f64,

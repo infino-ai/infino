@@ -2145,7 +2145,7 @@ pub(crate) fn build_router_fanout_selection(
     (
         selected_by_si,
         max_fanout,
-        vcfg.hnsw_register_floor,
+        vcfg.target_recall,
         vcfg.centroid_graph_parity_gap,
     )
 }
