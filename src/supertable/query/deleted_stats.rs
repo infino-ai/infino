@@ -1506,7 +1506,9 @@ mod tests {
     /// `=` and `IN` on a keyword column select their rows from the postings,
     /// with no filter left to check each row, and return what a per-row
     /// check returns, deletes, case and the empty string included: from the
-    /// term index and from each file's dictionary.
+    /// term index and from each file's dictionary. A value the term index
+    /// counts in more rows than the postings are read for (the empty string
+    /// here) keeps its row filter instead, with the same rows.
     #[test]
     fn keyword_equalities_select_rows_from_the_postings() {
         for term_index in [true, false] {
@@ -1521,9 +1523,13 @@ mod tests {
                     let forced = format!("SELECT {select} FROM supertable WHERE {checked}");
                     assert_eq!(rows(&reader, &sql), rows(&reader, &forced), "{label}");
                 }
+                // The empty string holds about one row in ten, more than
+                // the postings are read for: with a term index to count it
+                // by, a filter naming it stays a row filter.
+                let common = term_index && filter.contains("''");
                 let sql = format!("SELECT n FROM supertable WHERE {filter}");
                 let plan = explain(&reader, &sql);
-                assert!(!plan.contains("FilterExec"), "{label}: {plan}");
+                assert_eq!(plan.contains("FilterExec"), common, "{label}: {plan}");
             }
         }
     }

@@ -286,6 +286,7 @@ pub(crate) async fn prepare_aggregate_inputs(
     plan: &LogicalPlan,
     state: &SessionState,
 ) -> Result<(), QueryError> {
+    read_value_frequencies(plan).await?;
     let mut sources: Vec<Arc<dyn TableSource>> = Vec::new();
     let mut aggregated: Vec<Arc<dyn TableSource>> = Vec::new();
     // The columns the plan groups by alone, and the `keyword` columns of the
@@ -387,6 +388,43 @@ pub(crate) async fn prepare_aggregate_inputs(
     for (provider, column) in terms {
         keep_term_counts(&provider, state, &column).await;
     }
+    Ok(())
+}
+
+/// For each table `plan` reads, how many rows hold the `keyword` values its
+/// filters compare to, read from the term index before the plan is
+/// optimized: the pushdown decides by them whether an equality is read from
+/// the postings (see [`SupertableProvider::read_value_frequencies`]).
+async fn read_value_frequencies(plan: &LogicalPlan) -> Result<(), QueryError> {
+    let mut providers: Vec<SupertableProvider> = Vec::new();
+    let mut filters: Vec<Expr> = Vec::new();
+    plan.apply_with_subqueries(|node| {
+        match node {
+            LogicalPlan::Filter(filter) => {
+                filters.extend(split_conjunction(&filter.predicate).into_iter().cloned());
+            }
+            LogicalPlan::TableScan(scan) => {
+                filters.extend(scan.filters.iter().cloned());
+                if let Some(provider) = supertable_provider(&scan.source)
+                    && !keyword_columns(provider.manifest()).is_empty()
+                {
+                    providers.push(provider.share());
+                }
+            }
+            _ => {}
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(QueryError::DataFusion)?;
+    if filters.is_empty() {
+        return Ok(());
+    }
+    join_all(
+        providers
+            .iter()
+            .map(|provider| provider.read_value_frequencies(&filters)),
+    )
+    .await;
     Ok(())
 }
 
