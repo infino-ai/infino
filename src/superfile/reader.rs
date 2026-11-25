@@ -1423,19 +1423,41 @@ impl SuperfileReader {
     }
 
     /// The name this file's FTS blob knows the column `id` by, for a caller
-    /// holding the table's current `name`; see [`file_label`]. A column the
-    /// file does not hold is the `UnknownColumn` error of a missing name.
-    pub(crate) fn fts_column<'a>(
-        &'a self,
-        id: Option<FieldId>,
-        name: &'a str,
-    ) -> Result<&'a str, FtsError> {
+    /// holding the table's current `name`, or `None` when the blob holds a
+    /// dropped column of that name, so none of the file's rows can match.
+    /// See [`file_label`].
+    pub(crate) fn fts_label<'a>(&'a self, id: Option<FieldId>, name: &'a str) -> Option<&'a str> {
         let labels = self
             .fts()
             .into_iter()
             .flat_map(|fts| fts.fts_columns_config())
             .map(|c| (c.name.as_str(), c.field_id));
-        file_label(labels, id, name).ok_or_else(|| FtsError::UnknownColumn(name.to_owned()))
+        file_label(labels, id, name)
+    }
+
+    /// [`Self::fts_label`] for a caller that only reads files the manifest
+    /// says hold the column, where a dropped column of that name is an error.
+    pub(crate) fn fts_column<'a>(
+        &'a self,
+        id: Option<FieldId>,
+        name: &'a str,
+    ) -> Result<&'a str, FtsError> {
+        self.fts_label(id, name)
+            .ok_or_else(|| FtsError::UnknownColumn(name.to_owned()))
+    }
+
+    /// [`Self::fts_label`] for the vector blob.
+    pub(crate) fn vector_label<'a>(
+        &'a self,
+        id: Option<FieldId>,
+        name: &'a str,
+    ) -> Option<&'a str> {
+        let labels = self
+            .vec()
+            .into_iter()
+            .flat_map(|vec| vec.vector_columns_config())
+            .map(|c| (c.name.as_str(), c.field_id));
+        file_label(labels, id, name)
     }
 
     /// [`Self::fts_column`] for the vector blob.
@@ -1444,14 +1466,11 @@ impl SuperfileReader {
         id: Option<FieldId>,
         name: &'a str,
     ) -> Result<&'a str, VectorError> {
-        let labels = self
-            .vec()
-            .into_iter()
-            .flat_map(|vec| vec.vector_columns_config())
-            .map(|c| (c.name.as_str(), c.field_id));
-        file_label(labels, id, name).ok_or_else(|| VectorError::UnknownColumn(name.to_owned()))
+        self.vector_label(id, name)
+            .ok_or_else(|| VectorError::UnknownColumn(name.to_owned()))
     }
 
+    /// FTS column names in declaration order, or empty.
     pub fn fts_columns(&self) -> Vec<&str> {
         match &self.fts {
             Some(r) => r.fts_columns().collect(),
@@ -4286,12 +4305,12 @@ impl fmt::Display for SuperfileSizeBreakdown {
     }
 }
 
-/// The label a file's blob gives the column `id` (`name` in the table now),
-/// or `None` when the file does not hold it.
-/// - The id finds the column under the old name of a rename.
-/// - A same-named column with another id was dropped before this one was
-///   added, so the file holds none of this one.
-/// - A file written before ids carries none, so `name` stands.
+/// The label a file's blob gives the column `id` (`name` in the table now).
+/// - A label with the id is the column, under its old name after a rename.
+/// - A label `name` with another id is another column, dropped or renamed
+///   away: `None`, as the file holds none of this one.
+/// - Otherwise `name`: a file written before ids, or one without the column,
+///   whose reads then fail as for a missing name.
 fn file_label<'a>(
     labels: impl Iterator<Item = (&'a str, Option<FieldId>)>,
     id: Option<FieldId>,
@@ -4360,7 +4379,8 @@ mod tests {
     /// A file's label for a column follows its id, not its name.
     /// - A rename keeps the id, so the old label is found.
     /// - A same-named column with another id is a dropped one: absent.
-    /// - A file without ids, or a caller without one, keeps the name.
+    /// - A file without ids, one without the column, or a caller without an
+    ///   id keeps the name.
     ///
     /// So only the dropped column is hidden.
     #[test]

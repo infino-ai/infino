@@ -135,6 +135,7 @@ use crate::{
         manifest::{SuperfileEntry, SuperfileUri},
         query::{
             fts::{IndexedSuperfile, PlanLocations, memos_from_plan_locations},
+            provider::holds_no_postings,
             prune::PruneLeaf,
             text_match::{TextMatchMode, TextQuery, text_match_call},
         },
@@ -284,7 +285,7 @@ pub(crate) type TermMemos = HashMap<String, Arc<FetchedTermMemo>>;
 /// table `field` id. A superfile written before a rename keys its
 /// dictionary by the old name, so each superfile lookup maps the column
 /// to that superfile's own name through the id
-/// ([`SuperfileReader::fts_column`]).
+/// ([`SuperfileReader::fts_label`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CandidatePlan {
     /// Rows whose `column` contains every one of `tokens` (term-AND).
@@ -473,16 +474,14 @@ impl CandidatePlan {
                     field,
                     tokens,
                 } => {
+                    // A file holding a dropped column of this name has no row.
+                    let Some(file_column) = reader.fts_label(*field, column) else {
+                        return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
+                    };
                     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
                     let memo = memos.get(column).map(Arc::as_ref);
                     let (docs, work) = reader
-                        .token_match_prefetched(
-                            reader.fts_column(*field, column)?,
-                            &refs,
-                            BoolMode::And,
-                            memo,
-                            dict,
-                        )
+                        .token_match_prefetched(file_column, &refs, BoolMode::And, memo, dict)
                         .await?;
                     Ok((Some(row_bitmap(&docs)), work))
                 }
@@ -496,16 +495,14 @@ impl CandidatePlan {
                     if terms.is_empty() {
                         return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
                     }
+                    // A file holding a dropped column of this name has no row.
+                    let Some(file_column) = reader.fts_label(*field, column) else {
+                        return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
+                    };
                     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
                     let memo = memos.get(column).map(Arc::as_ref);
                     let (docs, work) = reader
-                        .token_match_prefetched(
-                            reader.fts_column(*field, column)?,
-                            &refs,
-                            BoolMode::Or,
-                            memo,
-                            dict,
-                        )
+                        .token_match_prefetched(file_column, &refs, BoolMode::Or, memo, dict)
                         .await?;
                     Ok((Some(row_bitmap(&docs)), work))
                 }
@@ -759,19 +756,36 @@ impl CandidatePlan {
             locations,
             superfile,
         };
-        let (estimate, mut work) = self
+        // A file whose index cannot answer the plan (it has no full-text
+        // index, or none for a column) gets no bound: the scan reads it and
+        // the filter checks its rows, as the plan is only a superset.
+        let unbounded = || Resolved {
+            rows: None,
+            work: MatchWork::default(),
+        };
+        let (estimate, mut work) = match self
             .estimate(&reader, pool.map(|(pool, _)| pool), Some(located), &dict)
-            .await?;
+            .await
+        {
+            Ok(estimated) => estimated,
+            Err(e) if holds_no_postings(&e) => return Ok(unbounded()),
+            Err(e) => return Err(e),
+        };
         if !gate.pays(estimate) {
             return Ok(Resolved { rows: None, work });
         }
         let memos = memos_from_plan_locations(&reader, locations, superfile).await;
-        let (rows, matched) = match pool {
+        let matched = match pool {
             Some((pool, slots)) => {
                 self.evaluate_on_pool(reader, superfile, pool, slots, memos, dict)
-                    .await?
+                    .await
             }
-            None => self.evaluate(&reader, None, &memos, &dict).await?,
+            None => self.evaluate(&reader, None, &memos, &dict).await,
+        };
+        let (rows, matched) = match matched {
+            Ok(matched) => matched,
+            Err(e) if holds_no_postings(&e) => return Ok(unbounded()),
+            Err(e) => return Err(e),
         };
         work.merge(matched);
         Ok(Resolved { rows, work })
@@ -1047,10 +1061,15 @@ async fn fold_dfs(
     if let Some(folded) = indexed {
         return Ok((folded, MatchWork::default()));
     }
+    // A file holding a dropped column of this name holds none of the terms.
+    let Some(file_column) = reader.fts_label(field, column) else {
+        return Ok((
+            terms.iter().fold(init, |acc, _| fold(acc, 0)),
+            MatchWork::default(),
+        ));
+    };
     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-    let (dfs, work) = reader
-        .term_dfs_with_dict(reader.fts_column(field, column)?, &refs, dict)
-        .await?;
+    let (dfs, work) = reader.term_dfs_with_dict(file_column, &refs, dict).await?;
     Ok((dfs.into_iter().fold(init, fold), work))
 }
 
@@ -1195,11 +1214,20 @@ async fn expand_like(
     pool: Option<&ThreadPool>,
     dict: &QueryDict,
 ) -> Result<(CandidatePlan, MatchWork), ReadError> {
+    // A file holding a dropped column of this name has no row: no term.
+    let Some(file_column) = reader.fts_label(field, column) else {
+        let none = CandidatePlan::TermsAny {
+            column: column.to_owned(),
+            field,
+            terms: Vec::new(),
+        };
+        return Ok((none, MatchWork::default()));
+    };
     // One dictionary pass widens every token of the leaf.
     let patterns: Vec<TermPattern<'_>> = tokens.iter().map(LikeToken::pattern).collect();
     let (expansions, work) = reader
         .expand_terms(
-            reader.fts_column(field, column)?,
+            file_column,
             &patterns,
             fold,
             LIKE_MAX_TERMS,

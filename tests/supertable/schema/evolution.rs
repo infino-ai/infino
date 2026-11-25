@@ -1888,30 +1888,32 @@ fn a_text_match_on_a_text_column_added_later_answers_as_token_match_does() {
     );
 }
 
-/// The column's index as the table records it, for adding it again later.
-fn index_of(db: &Connection, column: &str) -> ColumnIndex {
-    db.schema(TABLE)
+/// Drop the text `column`, returning the index it had, to add it again with.
+fn drop_column(db: &Connection, column: &str) -> ColumnIndex {
+    let index = db
+        .schema(TABLE)
         .expect("schema")
         .fields()
         .iter()
         .find(|field| field.name == column)
         .and_then(|field| field.index.clone())
-        .expect("indexed column")
-}
-
-/// Drop `column` and add it again, of `data_type`, under `index`.
-fn drop_and_add_again(db: &Connection, column: &str, data_type: DataType, index: ColumnIndex) {
+        .expect("indexed column");
     db.apply_schema(
         TABLE,
         &SchemaPatch::new(vec![FieldPatch::named(column).dropped()]),
         None,
     )
     .expect("drop");
+    index
+}
+
+/// Add the text `column` again, under `index`.
+fn add_text_column(db: &Connection, column: &str, index: ColumnIndex) {
     db.apply_schema(
         TABLE,
         &SchemaPatch::new(vec![
             FieldPatch::named(column)
-                .with_type(data_type)
+                .with_type(DataType::LargeUtf8)
                 .with_index(index),
         ]),
         None,
@@ -1919,69 +1921,144 @@ fn drop_and_add_again(db: &Connection, column: &str, data_type: DataType, index:
     .expect("add again");
 }
 
-/// A word search on a column dropped and added again finds only rows
-/// written after.
-/// - Files written before the drop keep the dropped column's index under the
-///   same name; their rows hold no value for the new column.
-/// - `text_match`, `ILIKE` and the `token_match` table function all look for
-///   `pope`.
+/// A search on a column dropped and added again finds only rows written
+/// after, in every shape SQL asks it, in memory and on disk.
+/// - A file written before the drop keeps the dropped column's positional
+///   index under the same name; one written while it was dropped has no
+///   `title` at all. Both index `body`.
+/// - Neither file's rows hold a value for the new column.
 ///
-/// So only the row written after the drop comes back.
+/// So only the row written after matches `title`, and no shape fails.
 #[test]
-fn a_word_search_on_a_column_added_again_skips_the_dropped_columns_index() {
-    let db = connect("memory://").expect("connect");
-    let docs = db
-        .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
-        .expect("create");
-    docs.append(&batch(vec![("title", titles(&["pope one"]))]), None)
-        .expect("append before the drop");
-    let index = index_of(&db, "title");
-    drop_and_add_again(&db, "title", DataType::LargeUtf8, index);
-    docs.append_rows(&[serde_json::json!({"title": "pope two"})], None)
-        .expect("append after");
-    for sql in [
-        format!("SELECT title FROM {TABLE} WHERE text_match(title, 'pope')"),
-        format!("SELECT title FROM {TABLE} WHERE title ILIKE '%pope%'"),
-        format!(
-            "SELECT title FROM {TABLE} WHERE _id IN \
-             (SELECT _id FROM token_match('{TABLE}', 'title', 'pope'))"
-        ),
-    ] {
-        assert_eq!(rows(&db, &sql), ["pope two"], "{sql}");
+fn a_search_on_a_column_added_again_finds_only_rows_written_after() {
+    let dir = TempDir::new().expect("tempdir");
+    for uri in ["memory://", dir.path().to_str().expect("utf8 path")] {
+        let db = connect(uri).expect("connect");
+        // Not `score`, which the search table functions also return.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("body", DataType::LargeUtf8, false),
+            Field::new("n", DataType::Int64, true),
+        ]));
+        let docs = db
+            .create_table(
+                TABLE,
+                schema,
+                IndexSpec::new()
+                    .fts(FtsField::new("title").positions(true))
+                    .fts("body"),
+            )
+            .expect("create");
+        let append = |row: serde_json::Value| {
+            docs.append_rows(&[row], None).expect("append");
+        };
+        append(serde_json::json!({"title": "pope one", "body": "x", "n": 1}));
+        let index = drop_column(&db, "title");
+        append(serde_json::json!({"body": "x", "n": 2}));
+        add_text_column(&db, "title", index);
+        append(serde_json::json!({"title": "pope two", "body": "y", "n": 3}));
+        let token_match = |query: &str| {
+            format!("_id IN (SELECT _id FROM token_match('{TABLE}', 'title', '{query}'))")
+        };
+        for filter in [
+            "text_match(title, 'pope')".to_owned(),
+            "text_match(title, '\"pope two\"')".to_owned(),
+            "title ILIKE '%pope%'".to_owned(),
+            "title LIKE '%pope%'".to_owned(),
+            "title LIKE 'pope%'".to_owned(),
+            "title = 'pope two'".to_owned(),
+            "title IN ('pope one', 'pope two')".to_owned(),
+            token_match("pope"),
+            token_match("\"pope two\""),
+        ] {
+            let sql = format!("SELECT title FROM {TABLE} WHERE {filter}");
+            assert_eq!(rows(&db, &sql), ["pope two"], "{uri}: {sql}");
+        }
+        let sql = format!(
+            "SELECT title FROM bm25_search('{TABLE}', 'title', 'pope', 10) \
+             WHERE title LIKE 'pope%'"
+        );
+        assert_eq!(rows(&db, &sql), ["pope two"], "{uri}: {sql}");
+        // `body` keeps every file, so `title`'s bound meets each of them.
+        let sql =
+            format!("SELECT n FROM {TABLE} WHERE title = 'pope two' OR body = 'x' ORDER BY n");
+        assert_eq!(rows(&db, &sql), ["1", "2", "3"], "{uri}: {sql}");
     }
 }
 
-/// A phrase search on a column dropped and added again, both times with
-/// positions, finds only rows written after.
-/// - Files written before the drop keep the dropped column's positional
-///   index under the same name.
-/// - The `token_match` table function looks for the phrase `"pope leo"`.
+/// A vector search filtered by text on a column dropped and added again
+/// finds only rows written after.
+/// - A file written before the drop keeps the dropped column's index under
+///   the same name; one written while it was dropped has no `title`.
+/// - The search asks for every row whose `title` holds `pope`.
 ///
-/// So only the row written after the drop comes back.
+/// So only the rows written after come back.
 #[test]
-fn a_phrase_search_on_a_column_added_again_skips_the_dropped_columns_index() {
+fn a_vector_filter_on_a_column_added_again_finds_only_rows_written_after() {
+    /// The narrowest vector dimension supported by the index.
+    const DIM: usize = 16;
+    /// Rows in each append.
+    const ROWS: usize = 4;
     let db = connect("memory://").expect("connect");
-    let mut index = ColumnIndex::fts(Analyzer::Standard);
-    if let ColumnIndex::Fts { positions, .. } = &mut index {
-        *positions = true;
-    }
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
     let docs = db
         .create_table(
             TABLE,
-            title_schema(),
-            IndexSpec::new().fts(FtsField::new("title").positions(true)),
+            Arc::new(Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, false),
+                Field::new(
+                    "emb",
+                    DataType::FixedSizeList(Arc::clone(&item), DIM as i32),
+                    false,
+                ),
+            ])),
+            IndexSpec::new()
+                .fts("title")
+                .vector("emb", DIM, Metric::L2Sq),
         )
         .expect("create");
-    docs.append(&batch(vec![("title", titles(&["pope leo one"]))]), None)
-        .expect("append before the drop");
-    drop_and_add_again(&db, "title", DataType::LargeUtf8, index);
-    docs.append_rows(&[serde_json::json!({"title": "pope leo two"})], None)
-        .expect("append after");
-    let sql = format!(
-        "SELECT title FROM {TABLE} WHERE _id IN \
-         (SELECT _id FROM token_match('{TABLE}', 'title', '\"pope leo\"'))"
-    );
-    assert_eq!(rows(&db, &sql), ["pope leo two"], "{sql}");
+    let append = |label: &str, seed: u64, with_title: bool| {
+        let vectors = FixedSizeListArray::try_new(
+            Arc::clone(&item),
+            DIM as i32,
+            Arc::new(Float32Array::from(distinct_unit_vectors(ROWS, DIM, seed))),
+            None,
+        )
+        .expect("vectors");
+        let names: Vec<String> = (0..ROWS).map(|r| format!("pope {label} {r}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut columns: Vec<(&str, ArrayRef)> = vec![("emb", Arc::new(vectors))];
+        if with_title {
+            columns.push(("title", titles(&names)));
+        }
+        docs.append(&batch(columns), None).expect("append");
+    };
+    append("before", 1, true);
+    let index = drop_column(&db, "title");
+    append("dropped", 2, false);
+    add_text_column(&db, "title", index);
+    append("after", 3, true);
+    let filter = VectorFilter {
+        column: "title",
+        query: "pope",
+        mode: BoolMode::Or,
+    };
+    let hits = docs
+        .vector_search("emb", &[1.0; DIM], 3 * ROWS, Some(filter), Some(&["title"]))
+        .expect("search");
+    let mut found: Vec<String> = Vec::new();
+    for batch in &hits {
+        let title = batch
+            .column_by_name("title")
+            .expect("title")
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("titles");
+        found.extend((0..title.len()).map(|i| title.value(i).to_owned()));
+    }
+    found.sort();
+    let expected: Vec<String> = (0..ROWS).map(|r| format!("pope after {r}")).collect();
+    assert_eq!(found, expected);
 }
 
 /// A file written before field ids still answers `text_match` by the

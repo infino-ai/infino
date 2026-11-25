@@ -144,8 +144,9 @@ use crate::{
             fine_graph_follow, fine_graph_publish,
             fine_graph_store::{GraphHead, KeyedGraph},
             fts::{memo_from_locations, memos_from_plan_locations},
-            provider::prune_leaves_for_filters,
+            provider::{holds_no_postings, prune_leaves_for_filters},
             prune::{PruneLeaf, select_superfiles},
+            skip::file_lacks_column,
             superfile_reader::OpenTierCounts,
             widening::next_want,
         },
@@ -3324,9 +3325,7 @@ async fn collect_hnsw_plane(
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
-        // A file written before a rename labels its vector blob with the name
-        // the column had then; the id is what finds the column in either file.
-        let Some(file_column) = reader.vector_column(manifest.field_id(column), column).ok() else {
+        let Some(file_column) = reader.vector_label(manifest.field_id(column), column) else {
             continue;
         };
         let Some(rows) = vr
@@ -3392,10 +3391,10 @@ async fn count_hnsw_rows(manifest: &ManifestSnapshot, column: &str) -> Result<us
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
-        // The file's own label for the column; see the fan-out sites.
+        // The file's label for the column (see `vector_label`).
         if !reader
-            .vector_column(manifest.field_id(column), column)
-            .is_ok_and(|file_column| vr.has_index_column(file_column))
+            .vector_label(manifest.field_id(column), column)
+            .is_some_and(|file_column| vr.has_index_column(file_column))
         {
             continue;
         }
@@ -3733,9 +3732,7 @@ async fn gather_sq16_rows(
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
-        // A file written before a rename labels its vector blob with the name
-        // the column had then; the id is what finds the column in either file.
-        let Some(file_column) = reader.vector_column(manifest.field_id(column), column).ok() else {
+        let Some(file_column) = reader.vector_label(manifest.field_id(column), column) else {
             continue;
         };
         let Some(rows) = vr
@@ -4380,9 +4377,7 @@ pub(crate) async fn assemble_hnsw_incremental(
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
-        // A file written before a rename labels its vector blob with the name
-        // the column had then; the id is what finds the column in either file.
-        let Some(file_column) = reader.vector_column(manifest.field_id(column), column).ok() else {
+        let Some(file_column) = reader.vector_label(manifest.field_id(column), column) else {
             continue;
         };
         let Some(rows) = vr
@@ -5371,10 +5366,7 @@ impl SupertableReader {
             let Some(vr) = readers[si].as_ref().vec() else {
                 continue;
             };
-            let Some(file_column) = readers[si]
-                .as_ref()
-                .vector_column(column_field_id, column)
-                .ok()
+            let Some(file_column) = readers[si].as_ref().vector_label(column_field_id, column)
             else {
                 continue;
             };
@@ -7386,11 +7378,17 @@ impl SupertableReader {
             let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
             async move {
+                // A file written without the column (before it was added,
+                // or while it was dropped) has no row of it.
+                if filter_field.is_some_and(|id| file_lacks_column(&entry, id)) {
+                    return Ok(RoaringBitmap::new());
+                }
+                let file_column = r.fts_column(filter_field, &filter_col_arc)?;
                 let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                 let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                 let (docs, work) = r
                     .token_match_prefetched(
-                        r.fts_column(filter_field, &filter_col_arc)?,
+                        file_column,
                         &refs,
                         mode,
                         memo.as_deref(),
@@ -8396,15 +8394,25 @@ impl SupertableReader {
                 let memos = memos_from_plan_locations(&r, &locations, entry.superfile_id).await;
                 // A `LIKE` leaf's expansion and the match share one dictionary read while the
                 // budget has room.
-                let (bitmap, work) = plan
+                let evaluated = plan
                     .evaluate(
                         r.as_ref(),
                         Some(&reader_pool),
                         &memos,
                         &QueryDict::with_budget(&budget),
                     )
-                    .await
-                    .map_err(QueryError::from)?;
+                    .await;
+                let (bitmap, work) = match evaluated {
+                    Ok(evaluated) => evaluated,
+                    // A file whose index cannot answer the plan keeps every
+                    // row; the `WHERE` checks them, as the plan is a superset.
+                    Err(e) if holds_no_postings(&e) => {
+                        let mut all = RoaringBitmap::new();
+                        all.insert_range(0..r.n_docs() as u32);
+                        return Ok(all);
+                    }
+                    Err(e) => return Err(QueryError::from(e)),
+                };
                 // The SQL predicate's posting walks, summed across the
                 // plan tree — the pushdown leg of the vector TVF.
                 work.add_to(op_stats.as_deref());
