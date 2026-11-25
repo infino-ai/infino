@@ -4611,7 +4611,10 @@ pub(crate) mod tests {
         time::Duration,
     };
 
-    use arrow::util::display::{ArrayFormatter, FormatOptions};
+    use arrow::{
+        compute::{filter_record_batch, kernels::cmp::lt},
+        util::display::{ArrayFormatter, FormatOptions},
+    };
     use arrow_array::{
         Array, Date32Array, Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch,
         RecordBatchIterator, StringArray, TimestampNanosecondArray, TimestampSecondArray,
@@ -4621,12 +4624,15 @@ pub(crate) mod tests {
         common::DFSchema,
         datasource::physical_plan::FileGroup,
         execution::context::ExecutionProps,
-        physical_expr::create_physical_expr,
+        physical_expr::{
+            PhysicalExpr, create_physical_expr, expressions::DynamicFilterPhysicalExpr,
+        },
         physical_expr_adapter::PhysicalExprAdapterFactory,
-        physical_plan::collect,
+        physical_plan::{collect, execute_stream},
         prelude::{SessionContext, cast, col, lit},
         scalar::ScalarValue,
     };
+    use futures::StreamExt;
     use object_store::OBJECT_STORE_COALESCE_DEFAULT;
     use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
     use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -6557,6 +6563,12 @@ pub(crate) mod tests {
         plan: Option<ParquetAccessPlan>,
         partitions: u64,
         cached_row_groups: Vec<usize>,
+        /// Rows the scan stops after, as a pushed `LIMIT` stops it.
+        limit: Option<usize>,
+        /// A top-k on `a`: its filter starts as "every row", and after the
+        /// first batch tightens to `a <` this, as a top-k's does once its heap
+        /// is full. Run as a row filter.
+        top_k: Option<i64>,
     }
 
     /// What one scan returned and cost.
@@ -6633,6 +6645,14 @@ pub(crate) mod tests {
     /// How long each read from object storage takes, so reads in flight
     /// together overlap like GETs do.
     const GET_LATENCY: Duration = Duration::from_millis(20);
+    /// Row groups' worth of rows the LIMIT shapes stop after, in each
+    /// partition: enough to start reading ahead, and few enough that
+    /// fetching on to the end of the file would be more than twice the
+    /// read.
+    const LIMIT_ROW_GROUPS: usize = 2;
+    /// Row groups' worth of rows the top-k shape keeps once its filter
+    /// tightens.
+    const TOP_K_ROW_GROUPS: usize = 3;
     /// Random shapes the randomized contract test checks.
     const RANDOM_SHAPES: u64 = 48;
     /// Rows per row group and per page of the random test's files: row groups
@@ -6718,16 +6738,28 @@ pub(crate) mod tests {
         };
         let mut parquet = ParquetSource::new(Arc::clone(&schema))
             .with_parquet_file_reader_factory(Arc::new(factory));
-        if let Some(filter) = &shape.filter {
-            let df_schema = DFSchema::try_from(Arc::clone(&schema)).expect("schema");
-            let predicate = create_physical_expr(filter, &df_schema, &ExecutionProps::new())
-                .expect("predicate");
+        let df_schema = DFSchema::try_from(Arc::clone(&schema)).expect("schema");
+        let planned = |filter: &Expr| {
+            create_physical_expr(filter, &df_schema, &ExecutionProps::new()).expect("predicate")
+        };
+        let top_k = shape.top_k.map(|_| {
+            Arc::new(DynamicFilterPhysicalExpr::new(
+                vec![planned(&col("a"))],
+                planned(&lit(true)),
+            ))
+        });
+        let predicate = match (&shape.filter, &top_k) {
+            (Some(filter), _) => Some((planned(filter), shape.row_filter)),
+            (None, Some(top_k)) => Some((Arc::clone(top_k) as Arc<dyn PhysicalExpr>, true)),
+            (None, None) => None,
+        };
+        if let Some((predicate, row_filter)) = predicate {
             // The way the meter hands it over when the scan runs.
             read_ahead_state.set_predicate(Arc::clone(&predicate), None);
             parquet = parquet
                 .with_predicate(predicate)
-                .with_pushdown_filters(shape.row_filter)
-                .with_reorder_filters(shape.row_filter);
+                .with_pushdown_filters(row_filter)
+                .with_reorder_filters(row_filter);
         }
         let url = ObjectStoreUrl::parse("infino-test://t/").expect("url");
         let mut builder = FileScanConfigBuilder::new(url.clone(), Arc::new(parquet));
@@ -6745,11 +6777,36 @@ pub(crate) mod tests {
         }
         let builder = builder
             .with_projection_indices(shape.projection.clone())
-            .expect("projection");
+            .expect("projection")
+            .with_limit(shape.limit);
         let scan = DataSourceExec::from_data_source(builder.build());
         let ctx = SessionContext::new();
         ctx.runtime_env().register_object_store(url.as_ref(), store);
-        let batches = collect(scan, ctx.task_ctx()).await.expect("scan");
+        let batches = match (&top_k, shape.top_k) {
+            (Some(filter), Some(bound)) => {
+                let mut stream = execute_stream(scan, ctx.task_ctx()).expect("scan");
+                let mut batches = Vec::new();
+                while let Some(batch) = stream.next().await {
+                    batches.push(batch.expect("batch"));
+                    if batches.len() == 1 {
+                        filter
+                            .update(planned(&col("a").lt(lit(bound))))
+                            .expect("tighten");
+                    }
+                }
+                // How many rows got through before the filter tightened
+                // depends on timing; the rows it keeps must not.
+                batches
+                    .iter()
+                    .map(|batch| {
+                        let a = batch.column_by_name("a").expect("a");
+                        let kept = lt(a, &Int64Array::new_scalar(bound)).expect("compare");
+                        filter_record_batch(batch, &kept).expect("filter")
+                    })
+                    .collect()
+            }
+            _ => collect(scan, ctx.task_ctx()).await.expect("scan"),
+        };
 
         let run = ScanRun {
             rows: batches.iter().map(|b| b.num_rows()).sum(),
@@ -6793,6 +6850,8 @@ pub(crate) mod tests {
             plan: None,
             partitions: 1,
             cached_row_groups: Vec::new(),
+            limit: None,
+            top_k: None,
         };
         let shapes = [
             every("every column"),
@@ -6826,6 +6885,20 @@ pub(crate) mod tests {
                 cached_row_groups: vec![0, 1],
                 ..every("the first row groups already cached")
             },
+            ScanShape {
+                limit: Some(LIMIT_ROW_GROUPS * WIDE_ROWS_PER_GROUP),
+                ..every("a LIMIT that stops mid-file")
+            },
+            ScanShape {
+                limit: Some(LIMIT_ROW_GROUPS * WIDE_ROWS_PER_GROUP),
+                partitions: 2,
+                ..every("a LIMIT over two partitions")
+            },
+            ScanShape {
+                projection: Some(vec![0, 2]),
+                top_k: Some(TOP_K_ROW_GROUPS as i64 * group),
+                ..every("a top-k whose filter tightens mid-scan")
+            },
         ];
         for shape in &shapes {
             let (off, _) = scan_through_the_cache(false, shape, &file, GET_LATENCY).await;
@@ -6836,14 +6909,37 @@ pub(crate) mod tests {
                 (off.rows, off.answer),
                 "{name}: same rows"
             );
-            assert!(
-                on.fetched.abs_diff(off.fetched) <= partition_slack(shape.partitions),
-                "{name}: same bytes from storage: {on:?} vs {off:?}"
-            );
-            assert!(
-                on.gets <= off.gets + GET_SLACK,
-                "{name}: GETs: {on:?} vs {off:?}"
-            );
+            match (shape.limit, shape.top_k) {
+                // A scan that stops early may have fetched ahead what it never
+                // reads, but no more than it read.
+                (Some(_), _) => assert!(
+                    on.fetched <= 2 * off.fetched + partition_slack(shape.partitions),
+                    "{name}: at most twice the bytes from storage: {on:?} vs {off:?}"
+                ),
+                // Once the filter tightens the scan skips the rest of each row
+                // group, so a batch can move where the scan's next short miss
+                // places its window: one window more at most.
+                (None, Some(_)) => {
+                    assert!(
+                        on.fetched <= off.fetched + CACHE_MIN_GET,
+                        "{name}: the same bytes from storage, but one window: {on:?} vs {off:?}"
+                    );
+                    assert!(
+                        on.gets <= off.gets + GET_SLACK,
+                        "{name}: GETs: {on:?} vs {off:?}"
+                    );
+                }
+                (None, None) => {
+                    assert!(
+                        on.fetched.abs_diff(off.fetched) <= partition_slack(shape.partitions),
+                        "{name}: same bytes from storage: {on:?} vs {off:?}"
+                    );
+                    assert!(
+                        on.gets <= off.gets + GET_SLACK,
+                        "{name}: GETs: {on:?} vs {off:?}"
+                    );
+                }
+            }
             assert!(held > 0, "{name}: reads ahead");
         }
     }
@@ -6880,6 +6976,8 @@ pub(crate) mod tests {
             plan: None,
             partitions: 1,
             cached_row_groups: Vec::new(),
+            limit: None,
+            top_k: None,
         };
 
         let [first, last] = NEAR_PAGES;
@@ -6960,6 +7058,8 @@ pub(crate) mod tests {
             plan: None,
             partitions: 1,
             cached_row_groups: Vec::new(),
+            limit: None,
+            top_k: None,
         };
         let (run, _) = scan_through_the_cache(true, &shape, &file, GET_LATENCY).await;
         assert_eq!(run.rows, WIDE_PAGE_ROWS, "the kept page's rows");
@@ -7003,6 +7103,8 @@ pub(crate) mod tests {
             plan: None,
             partitions: 1,
             cached_row_groups: Vec::new(),
+            limit: None,
+            top_k: None,
         };
         // Without read-ahead every read is fetched on demand.
         let (run, _) = scan_through_the_cache(false, &shape, &file, GET_LATENCY).await;
@@ -7037,6 +7139,8 @@ pub(crate) mod tests {
             plan: None,
             partitions: 1,
             cached_row_groups: vec![1, 4],
+            limit: None,
+            top_k: None,
         };
         let (off, _) = scan_through_the_cache(false, &shape, &file, GET_LATENCY).await;
         let (on, held) = scan_through_the_cache(true, &shape, &file, GET_LATENCY).await;
@@ -7190,6 +7294,8 @@ pub(crate) mod tests {
             cached_row_groups: (0..fixture::GROUPS)
                 .filter(|_| rng.random_bool(RANDOM_CACHED_ODDS))
                 .collect(),
+            limit: None,
+            top_k: None,
         }
     }
 

@@ -91,7 +91,7 @@ impl CacheBlocks {
 
     /// `range` with each end rounded out to its block, or to its group inside
     /// `grouped`, the way the cache rounds a miss.
-    fn rounded(&self, range: &Range<u64>) -> Range<u64> {
+    pub fn rounded(&self, range: &Range<u64>) -> Range<u64> {
         let unit = |at: u64| {
             if (self.grouped.0..self.grouped.1).contains(&at) {
                 self.group_bytes
@@ -186,6 +186,18 @@ pub trait LazyByteSource: Send + Sync {
     /// [`Self::range_exact`].
     async fn range_uncached(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
         self.range_exact(start, len).await
+    }
+
+    /// [`Self::range_ahead`] for bytes the cache has no room to keep: what it
+    /// holds comes from it, a stretch another read is already downloading is
+    /// waited for, and the rest is downloaded and not kept. Not counted as a
+    /// read. Defaults to [`Self::range_uncached`].
+    async fn range_ahead_uncached(
+        &self,
+        start: u64,
+        len: u64,
+    ) -> Result<Bytes, LazyByteSourceError> {
+        self.range_uncached(start, len).await
     }
 
     /// Count `[start, start + len)` as read, for a reader served those bytes
@@ -741,6 +753,16 @@ impl LazyByteSource for LazySubSource {
             .await
     }
 
+    async fn range_ahead_uncached(
+        &self,
+        start: u64,
+        len: u64,
+    ) -> Result<Bytes, LazyByteSourceError> {
+        self.inner
+            .range_ahead_uncached(self.inner_offset(start, len)?, len)
+            .await
+    }
+
     fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         if start.saturating_add(len) > self.len {
             return None;
@@ -890,6 +912,17 @@ impl LazyByteSource for PrefetchedSource {
             return Ok(b);
         }
         self.inner.range_uncached(start, len).await
+    }
+
+    async fn range_ahead_uncached(
+        &self,
+        start: u64,
+        len: u64,
+    ) -> Result<Bytes, LazyByteSourceError> {
+        if let Some(b) = self.lookup(start, len) {
+            return Ok(b);
+        }
+        self.inner.range_ahead_uncached(start, len).await
     }
 
     fn note_read(&self, start: u64, len: u64) {
