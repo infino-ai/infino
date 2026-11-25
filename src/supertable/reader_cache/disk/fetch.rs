@@ -5533,7 +5533,8 @@ mod tests {
 
     /// A lazy open that adopts a `.blocks` file left on disk takes over the charge the file's
     /// record carried. Dropped before its entry is admitted (a cancelled query), it hands the file
-    /// back to a record, so the file stays charged and eviction can still reach it.
+    /// back to a record, so the file stays charged, eviction can still reach it, and the record
+    /// keeps the file's mtime.
     #[tokio::test]
     async fn a_lazy_open_dropped_after_adopting_a_block_file_keeps_the_file_charged() {
         let (_dir, store, recording) = store_over_recording();
@@ -5553,6 +5554,7 @@ mod tests {
             seeded,
             "the restart counted the file"
         );
+        let scanned_mtime_us = restarted.block_files.get(&uri).expect("a record").mtime_us;
 
         // With no size hints the open reads the tail first, then the vector header through its
         // block source, which adopts the file before it reads.
@@ -5583,6 +5585,11 @@ mod tests {
             "the file is still charged"
         );
         restarted.assert_budget_consistent();
+        assert_eq!(
+            restarted.block_files.get(&uri).expect("a record").mtime_us,
+            scanned_mtime_us,
+            "the record keeps the file's mtime"
+        );
         restarted.evict_at_least(seeded).await.expect("evict");
         assert!(
             !restarted.blocks_path(&uri).exists(),

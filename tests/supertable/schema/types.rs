@@ -126,10 +126,13 @@ fn a_widening_is_metadata_and_the_files_catch_up_on_optimize() {
     );
     let path = dir.path().to_str().expect("utf8");
     table
-        .append(&batch(vec![(
-            "n",
-            Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef,
-        )]))
+        .append(
+            &batch(vec![(
+                "n",
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef,
+            )]),
+            None,
+        )
         .expect("append");
 
     let doc = db
@@ -145,17 +148,20 @@ fn a_widening_is_metadata_and_the_files_catch_up_on_optimize() {
     assert_eq!(physical_types(path, n), vec![DataType::Int32]);
 
     let err = table
-        .append(&batch(vec![(
-            "n",
-            Arc::new(Int32Array::from(vec![Some(3)])) as ArrayRef,
-        )]))
+        .append(
+            &batch(vec![(
+                "n",
+                Arc::new(Int32Array::from(vec![Some(3)])) as ArrayRef,
+            )]),
+            None,
+        )
         .expect_err("the frozen type is now Int64");
     assert!(
         matches!(&err, InfinoError::Schema(SchemaError::TypeMismatch { .. })),
         "{err}"
     );
     table
-        .append(&batch(vec![("n", ints(vec![Some(3)]))]))
+        .append(&batch(vec![("n", ints(vec![Some(3)]))]), None)
         .expect("the new type is accepted");
     assert_eq!(column(&db, "n"), vec!["1", "2", "3"]);
 
@@ -181,10 +187,10 @@ fn a_rewrite_flips_at_once_and_compaction_converts_the_files() {
     );
     let path = dir.path().to_str().expect("utf8");
     table
-        .append(&batch(vec![(
-            "s",
-            strings(vec![Some("1"), Some("x"), Some("3")]),
-        )]))
+        .append(
+            &batch(vec![("s", strings(vec![Some("1"), Some("x"), Some("3")]))]),
+            None,
+        )
         .expect("append strings");
 
     let flipped = db
@@ -200,14 +206,14 @@ fn a_rewrite_flips_at_once_and_compaction_converts_the_files() {
     assert_eq!(column(&db, "s"), vec!["1", "null", "3"]);
 
     let err = table
-        .append(&batch(vec![("s", strings(vec![Some("4")]))]))
+        .append(&batch(vec![("s", strings(vec![Some("4")]))]), None)
         .expect_err("strings are refused from the flip");
     assert!(
         matches!(&err, InfinoError::Schema(SchemaError::TypeMismatch { .. })),
         "{err}"
     );
     table
-        .append(&batch(vec![("s", ints(vec![Some(7)]))]))
+        .append(&batch(vec![("s", ints(vec![Some(7)]))]), None)
         .expect("ints are accepted from the flip");
     assert_eq!(column(&db, "s"), vec!["1", "null", "3", "7"]);
     assert_eq!(
@@ -247,15 +253,15 @@ fn retyping_back_before_optimize_reads_the_originals() {
         IndexSpec::new(),
     );
     table
-        .append(&batch(vec![(
-            "s",
-            strings(vec![Some("1"), Some("x"), Some("3")]),
-        )]))
+        .append(
+            &batch(vec![("s", strings(vec![Some("1"), Some("x"), Some("3")]))]),
+            None,
+        )
         .expect("append strings");
     db.apply_schema(TABLE, &retype("s", DataType::Int64), None)
         .expect("flip");
     table
-        .append(&batch(vec![("s", ints(vec![Some(7)]))]))
+        .append(&batch(vec![("s", ints(vec![Some(7)]))]), None)
         .expect("an int file under the new type");
     assert_eq!(column(&db, "s"), vec!["1", "null", "3", "7"]);
 
@@ -287,10 +293,10 @@ fn a_file_converted_in_between_keeps_the_cast_result() {
         IndexSpec::new(),
     );
     table
-        .append(&batch(vec![(
-            "s",
-            strings(vec![Some("1"), Some("x"), Some("3")]),
-        )]))
+        .append(
+            &batch(vec![("s", strings(vec![Some("1"), Some("x"), Some("3")]))]),
+            None,
+        )
         .expect("append strings");
     db.apply_schema(TABLE, &retype("s", DataType::Int64), None)
         .expect("flip");
@@ -315,10 +321,10 @@ fn an_fts_column_retyped_to_integers_loses_its_index() {
         IndexSpec::new().fts("title"),
     );
     table
-        .append(&batch(vec![(
-            "title",
-            strings(vec![Some("alpha"), Some("42")]),
-        )]))
+        .append(
+            &batch(vec![("title", strings(vec![Some("alpha"), Some("42")]))]),
+            None,
+        )
         .expect("append");
     let hits = table
         .bm25_search("title", "alpha", 10, Default::default(), None)
@@ -356,7 +362,7 @@ fn the_column_behind_the_vector_index_cannot_be_retyped_or_dropped() {
     let emb = FixedSizeListArray::try_new(item, VECTOR_DIM as i32, Arc::new(values), None)
         .expect("vectors");
     table
-        .append(&batch(vec![("emb", Arc::new(emb) as ArrayRef)]))
+        .append(&batch(vec![("emb", Arc::new(emb) as ArrayRef)]), None)
         .expect("append vectors");
 
     let err = db
@@ -408,7 +414,7 @@ fn an_index_only_full_text_column_compacts() {
         values.extend((0..FILLER_ROWS).map(|i| format!("filler {i}")));
         let column: ArrayRef = Arc::new(LargeStringArray::from(values));
         table
-            .append(&batch(vec![("text", column)]))
+            .append(&batch(vec![("text", column)]), None)
             .expect("append");
     }
     table
@@ -461,7 +467,7 @@ fn an_index_only_column_keeps_its_postings_through_a_rename() {
             Arc::new(LargeStringArray::from(values)) as ArrayRef,
         )])
     };
-    table.append(&generation("alpha")).expect("append");
+    table.append(&generation("alpha"), None).expect("append");
     db.apply_schema(
         TABLE,
         &SchemaPatch::new(vec![
@@ -474,10 +480,10 @@ fn an_index_only_column_keeps_its_postings_through_a_rename() {
     )
     .expect("rename the index-only column");
     table
-        .append(&batch(vec![(
-            "body",
-            generation("gamma").column(0).clone(),
-        )]))
+        .append(
+            &batch(vec![("body", generation("gamma").column(0).clone())]),
+            None,
+        )
         .expect("append under the new name");
 
     let hits = |column: &str, term: &str| -> usize {
@@ -530,10 +536,13 @@ fn a_renamed_full_text_column_answers_every_query_shape() {
     ];
     values.extend((0..FILLER_ROWS * 4).map(|i| Some(format!("filler {i}"))));
     table
-        .append(&batch(vec![(
-            "text",
-            Arc::new(LargeStringArray::from(values)) as ArrayRef,
-        )]))
+        .append(
+            &batch(vec![(
+                "text",
+                Arc::new(LargeStringArray::from(values)) as ArrayRef,
+            )]),
+            None,
+        )
         .expect("append under the old name");
     db.apply_schema(
         TABLE,
@@ -607,10 +616,13 @@ fn a_query_after_a_schema_change_does_not_serve_the_previous_generation() {
         IndexSpec::new(),
     );
     table
-        .append(&batch(vec![(
-            "n",
-            Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef,
-        )]))
+        .append(
+            &batch(vec![(
+                "n",
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef,
+            )]),
+            None,
+        )
         .expect("append");
     // The first read decodes the rows and caches them; the second must see
     // the widened column rather than the cached arrays.
@@ -662,7 +674,10 @@ fn a_retyped_column_is_not_pruned_on_its_old_null_count() {
         IndexSpec::new(),
     );
     table
-        .append(&batch(vec![("s", strings(vec![Some("abc"), Some("def")]))]))
+        .append(
+            &batch(vec![("s", strings(vec![Some("abc"), Some("def")]))]),
+            None,
+        )
         .expect("append");
     assert_eq!(row_count(&db, "SELECT s FROM t WHERE s IS NULL"), 0);
 
@@ -684,10 +699,13 @@ fn a_retyped_column_is_not_pruned_on_its_old_bounds() {
         IndexSpec::new(),
     );
     table
-        .append(&batch(vec![(
-            "x",
-            Arc::new(Float64Array::from(vec![Some(1.5)])) as ArrayRef,
-        )]))
+        .append(
+            &batch(vec![(
+                "x",
+                Arc::new(Float64Array::from(vec![Some(1.5)])) as ArrayRef,
+            )]),
+            None,
+        )
         .expect("append");
 
     db.apply_schema(TABLE, &retype("x", DataType::Int64), None)
@@ -725,7 +743,7 @@ fn a_renamed_vector_column_answers_search_over_the_old_files() {
     let emb = FixedSizeListArray::try_new(item, VECTOR_DIM as i32, Arc::new(values), None)
         .expect("vectors");
     table
-        .append(&batch(vec![("emb", Arc::new(emb) as ArrayRef)]))
+        .append(&batch(vec![("emb", Arc::new(emb) as ArrayRef)]), None)
         .expect("append vectors");
 
     db.apply_schema(
@@ -800,10 +818,13 @@ fn a_fixed_size_type_needs_a_positive_size() {
     // And the table still appends, rather than aborting on the next null fill.
     db.open_table(TABLE)
         .expect("open")
-        .append(&batch(vec![(
-            "title",
-            Arc::new(LargeStringArray::from(vec!["a"])) as ArrayRef,
-        )]))
+        .append(
+            &batch(vec![(
+                "title",
+                Arc::new(LargeStringArray::from(vec!["a"])) as ArrayRef,
+            )]),
+            None,
+        )
         .expect("append after the refusal");
 }
 
@@ -826,8 +847,11 @@ fn an_aggregate_is_not_answered_from_a_column_s_abandoned_bounds() {
             IndexSpec::new(),
         )
         .expect("create");
-    t.append(&batch(vec![("n", strings(vec![Some("7"), Some("10")]))]))
-        .expect("append");
+    t.append(
+        &batch(vec![("n", strings(vec![Some("7"), Some("10")]))]),
+        None,
+    )
+    .expect("append");
 
     db.apply_schema(TABLE, &retype("n", DataType::Int64), None)
         .expect("retype to integers");
@@ -1005,17 +1029,20 @@ fn the_count_shortcuts_decline_while_a_column_is_converting() {
         IndexSpec::new(),
     );
     table
-        .append(&batch(vec![(
-            "tag",
-            Arc::new(StringArray::from(vec![
-                Some("7"),
-                Some("7"),
-                Some("7"),
-                Some("07"),
-                Some("07"),
-                Some("x"),
-            ])) as ArrayRef,
-        )]))
+        .append(
+            &batch(vec![(
+                "tag",
+                Arc::new(StringArray::from(vec![
+                    Some("7"),
+                    Some("7"),
+                    Some("7"),
+                    Some("07"),
+                    Some("07"),
+                    Some("x"),
+                ])) as ArrayRef,
+            )]),
+            None,
+        )
         .expect("append");
 
     db.apply_schema(TABLE, &retype("tag", DataType::Int64), None)

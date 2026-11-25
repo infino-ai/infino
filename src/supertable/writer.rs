@@ -186,6 +186,7 @@ use crate::{
             hidden_vector_cell_count, user_vector_cell_count,
         },
         hidden_deleted::{self, encode_deleted_ids},
+        idempotency::{self, IdempotencyToken, OwnedToken, TokenStatus},
         manifest::{
             CellVectorSummary, ClusterCentroids, FtsSummaryAgg, ManifestSnapshot,
             RabitqAdmitContext, RebuiltParts, RoutingRef, ScalarStatsAgg, SubsectionOffsets,
@@ -470,6 +471,11 @@ pub struct SupertableWriter {
     /// superfiles of the commit that publishes those rows and to nothing
     /// after.
     pending_stem: Option<String>,
+    /// The caller's idempotency token for the rows in `buffer`, or for the
+    /// staged appends a [`Self::commit_staged`] publishes. The commit that
+    /// publishes them records it in the same list (see
+    /// [`CommitListMetadata::idempotency_token`]).
+    idempotency_token: Option<OwnedToken>,
     /// Pending update entries, in buffer order. Each is
     /// fully-resolved at `update()` call time (predicate
     /// captured, `_id` range minted, IPC sidecar bytes encoded);
@@ -1168,7 +1174,7 @@ impl Supertable {
     ///     schema,
     ///     vec![Arc::new(LargeStringArray::from(vec!["hello world"]))],
     /// )?;
-    /// posts.append(&batch)?;
+    /// posts.append(&batch, None)?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[cfg_attr(
@@ -1176,13 +1182,41 @@ impl Supertable {
         tracing::instrument(skip_all, fields(rows = batch.num_rows(), role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
+        self.append_idempotent(batch, None, None)
+    }
+
+    /// [`Self::append`], or [`Self::append_named`] when `source_name` is
+    /// given, under the caller's idempotency token: the commit records the
+    /// token with the rows, and a call whose token the table records
+    /// publishes nothing and returns `Ok`. A batch with no rows publishes
+    /// nothing and records no token.
+    pub(crate) fn append_idempotent(
+        &self,
+        batch: &RecordBatch,
+        source_name: Option<&str>,
+        token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        let op = if source_name.is_some() {
+            "append_named"
+        } else {
+            "append"
+        };
+        let rows = batch.num_rows() as u64;
+        if self.idempotency_token_held(token, rows, op)? {
+            return Ok(());
+        }
         let mut w = self
             .append_writer(batch)
-            .map_err(|e| InfinoError::from(e).with_context("append", None))?;
-        w.append(batch)
-            .map_err(|e| InfinoError::from(e).with_context("append", None))?;
+            .map_err(|e| InfinoError::from(e).with_context(op, None))?;
+        w.set_idempotency_token(token, rows)
+            .map_err(|e| InfinoError::from(e).with_context(op, None))?;
+        match source_name {
+            Some(source_name) => w.append_named(batch, source_name),
+            None => w.append(batch),
+        }
+        .map_err(|e| InfinoError::from(e).with_context(op, None))?;
         w.commit()
-            .map_err(|e| InfinoError::from(e).with_context("append", None))?;
+            .map_err(|e| InfinoError::from(e).with_context(op, None))?;
         Ok(())
     }
 
@@ -1226,8 +1260,21 @@ impl Supertable {
     /// reclaimed meanwhile - and nothing in it was published: stage those
     /// rows again.
     pub fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
+        self.commit_staged_idempotent(staged, None)
+    }
+
+    /// [`Self::commit_staged`] under the caller's idempotency token, as
+    /// [`Self::append_idempotent`] takes one.
+    pub(crate) fn commit_staged_idempotent(
+        &self,
+        staged: &[StagedAppend],
+        token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        let rows = staged.iter().map(StagedAppend::rows).sum();
         let mut w = self
             .acquire_writer(true)
+            .map_err(|e| InfinoError::from(e).with_context("commit_staged", None))?;
+        w.set_idempotency_token(token, rows)
             .map_err(|e| InfinoError::from(e).with_context("commit_staged", None))?;
         w.commit_staged(staged)
             .map_err(|e| InfinoError::from(e).with_context("commit_staged", None))
@@ -1254,32 +1301,92 @@ impl Supertable {
         tracing::instrument(skip_all, fields(rows = batch.num_rows(), role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
-        let mut w = self
-            .append_writer(batch)
-            .map_err(|e| InfinoError::from(e).with_context("append_named", None))?;
-        w.append_named(batch, source_name)
-            .map_err(|e| InfinoError::from(e).with_context("append_named", None))?;
-        w.commit()
-            .map_err(|e| InfinoError::from(e).with_context("append_named", None))?;
-        Ok(())
+        self.append_idempotent(batch, Some(source_name), None)
     }
 
     /// Append rows given as JSON documents: mapped to a batch under the
     /// table's schema, then appended like any batch.
     pub fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
-        let batch = rows_to_batch(rows, &self.table_schema()).map_err(|e| {
-            InfinoError::from(BuildError::Schema(e)).with_context("append_rows", None)
-        })?;
-        self.append(&batch)
+        self.append_rows_idempotent(rows, None, None)
     }
 
     /// [`Self::append_rows`], naming the source the rows came from as
     /// [`Self::append_named`] does.
     pub fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
-        let batch = rows_to_batch(rows, &self.table_schema()).map_err(|e| {
-            InfinoError::from(BuildError::Schema(e)).with_context("append_rows_named", None)
-        })?;
-        self.append_named(&batch, source_name)
+        self.append_rows_idempotent(rows, Some(source_name), None)
+    }
+
+    /// [`Self::append_rows`] or [`Self::append_rows_named`] under the
+    /// caller's idempotency token, as [`Self::append_idempotent`] takes one.
+    pub(crate) fn append_rows_idempotent(
+        &self,
+        rows: &[Value],
+        source_name: Option<&str>,
+        token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        let op = if source_name.is_some() {
+            "append_rows_named"
+        } else {
+            "append_rows"
+        };
+        if self.idempotency_token_held(token, rows.len() as u64, op)? {
+            return Ok(());
+        }
+        let batch = rows_to_batch(rows, &self.table_schema())
+            .map_err(|e| InfinoError::from(BuildError::Schema(e)).with_context(op, None))?;
+        self.append_idempotent(&batch, source_name, token)
+    }
+
+    /// Whether this handle's table records `token` for a write of `rows`
+    /// rows, so the write is committed and nothing about the batch is
+    /// checked: a retry of a committed write succeeds even after the schema
+    /// moved past it. A table that recorded it where this handle has not
+    /// looked yet is found by the commit. Refused when the token names a
+    /// write of another row count. No token, or no rows, is never held.
+    fn idempotency_token_held(
+        &self,
+        token: Option<IdempotencyToken<'_>>,
+        rows: u64,
+        op: &'static str,
+    ) -> Result<bool, InfinoError> {
+        let Some(token) = token.filter(|_| rows > 0) else {
+            return Ok(false);
+        };
+        self.inner()
+            .manifest
+            .load()
+            .holds_idempotency_token(&token.to_owned_token(rows))
+            .map_err(|e| InfinoError::from(BuildError::from(e)).with_context(op, None))
+    }
+
+    /// What the table records about `token`, read from the list the
+    /// pointer names now; see [`TokenStatus`]. A table with no storage
+    /// records no tokens and refuses the question.
+    pub(crate) fn idempotency_token_status(
+        &self,
+        token: IdempotencyToken<'_>,
+        since_ms: u64,
+    ) -> Result<TokenStatus, InfinoError> {
+        let op = "idempotency_token_status";
+        if self.inner().options.storage.is_none() {
+            return Err(
+                InfinoError::from(BuildError::Unsupported(NO_STORAGE_FOR_TOKENS.into()))
+                    .with_context(op, None),
+            );
+        }
+        let inner = self.inner();
+        bridge_on_runtime(async move { inner.refresh().await }, &inner.query_runtime()).map_err(
+            |e| {
+                InfinoError::from(BuildError::from(SupertableCommitError::ManifestError(
+                    ManifestError::ManifestLoadError(e),
+                )))
+                .with_context(op, None)
+            },
+        )?;
+        Ok(inner
+            .manifest
+            .load()
+            .idempotency_token_status(token, since_ms))
     }
 
     /// Replace the rows `predicate` matches with `rows`, mapped as
@@ -1340,7 +1447,7 @@ impl Supertable {
     /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
     /// # let row = |s: &str| RecordBatch::try_new(
     /// #     schema.clone(), vec![Arc::new(LargeStringArray::from(vec![s]))]).expect("batch");
-    /// # posts.append(&row("draft"))?;
+    /// # posts.append(&row("draft"), None)?;
     /// let stats = posts.update(col("body").eq(lit("draft")), &row("published"))?;
     /// assert_eq!(stats.matched(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1387,7 +1494,7 @@ impl Supertable {
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
     /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
     /// # posts.append(&RecordBatch::try_new(
-    /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["spam"]))])?)?;
+    /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["spam"]))])?, None)?;
     /// let stats = posts.delete(col("body").eq(lit("spam")))?;
     /// assert_eq!(stats.n_tombstoned(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1464,6 +1571,7 @@ impl Supertable {
         }
         Ok(SupertableWriter {
             pending_stem: None,
+            idempotency_token: None,
             inner: Arc::clone(self.inner()),
             shared,
             buffer: Vec::new(),
@@ -1636,10 +1744,11 @@ impl AppendQueue {
     /// Record what the leading `ticket` published for the tickets it took
     /// on, and wake them. Each sees the leader's error of the same kind, so
     /// refused credentials or a lost race read the same to every append
-    /// the publish carried.
-    fn publish_followers(&self, ticket: &mut AppendTicket<'_>, result: &Result<(), BuildError>) {
+    /// the publish carried. A run that takes on followers carries no
+    /// idempotency token, so it published each one.
+    fn publish_followers(&self, ticket: &mut AppendTicket<'_>, result: &Result<bool, BuildError>) {
         answer_followers(self, ticket, |_| match result {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(error) => Err(error.for_follower()),
         });
     }
@@ -2620,13 +2729,13 @@ impl SupertableWriter {
         let taken = self.take_buffer();
 
         match self.commit_appends_rebuilding(&taken.batches, stem, live, taken.scratch()) {
-            Ok(()) => {
+            Ok(published) => {
                 self.live_disabled = false;
                 // Durable now, so the ingested work is real work. An
-                // all-empty-batch commit publishes nothing and reports
-                // nothing.
+                // all-empty-batch commit, or one whose token an earlier call
+                // already committed, publishes nothing and reports nothing.
                 let ingest = taken.ingest;
-                if let (Some(stats), true) = (&self.op_stats, ingest.rows > 0) {
+                if let (Some(stats), true) = (&self.op_stats, published && ingest.rows > 0) {
                     stats.add_ingested_write(
                         ingest.rows,
                         ingest.scalar_bytes,
@@ -2822,7 +2931,7 @@ impl SupertableWriter {
         buffer: &[BufferedBatch],
         stem: Option<&str>,
         built_against: u32,
-    ) -> Result<(), BuildError> {
+    ) -> Result<bool, BuildError> {
         let manifest = Arc::clone(&live.manifest);
         let sealing = Instant::now();
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
@@ -2853,6 +2962,7 @@ impl SupertableWriter {
             graph_ref: None,
             schema: None,
             expected_schema_id: Some(built_against),
+            idempotency_token: self.idempotency_token.clone(),
         };
         let scalar_schema = manifest.scalar_schema();
         let stats = self.op_stats.clone();
@@ -3004,9 +3114,9 @@ impl SupertableWriter {
             .op_stats
             .as_ref()
             .map(|_| commit_output_stats(&user_batch));
-        self.publish_appended(user_batch, list_metadata)?;
-        if let (Some(stats), Some((n_superfiles, bytes, fts_terms))) =
-            (&self.op_stats, output_stats)
+        let published = self.publish_appended(user_batch, list_metadata)?;
+        if let (true, Some(stats), Some((n_superfiles, bytes, fts_terms))) =
+            (published, &self.op_stats, output_stats)
         {
             stats.add_commit_outputs(n_superfiles, bytes, fts_terms);
             stats.add_planned_commit_requests(planned_data_objects(payload_bytes));
@@ -3025,7 +3135,7 @@ impl SupertableWriter {
         }
         // Released here, after the publish, like a commit-time build's guard.
         drop(live);
-        Ok(())
+        Ok(published)
     }
 
     /// [`Self::commit_appends_with_taken_buffer`], rebuilt when the table's
@@ -3039,7 +3149,7 @@ impl SupertableWriter {
         stem: Option<&str>,
         mut live: Option<LiveLanes>,
         scratch: BuildScratchInputs,
-    ) -> Result<(), BuildError> {
+    ) -> Result<bool, BuildError> {
         let attempts = self.inner.options.max_commit_retries.max(1);
         // The live lanes can only serve the first attempt: a retry runs
         // because the schema moved, which is what they cannot follow.
@@ -3139,14 +3249,16 @@ impl SupertableWriter {
     /// Body of [`Self::commit_appends_internal`] after the buffer has been
     /// taken. On `Err`, the caller restores `buffer` onto the writer. `stem`
     /// is the source label every superfile this commit produces is keyed
-    /// under, when the caller gave one.
+    /// under, when the caller gave one. `Ok(true)` when this call published
+    /// the rows; `Ok(false)` when there were none, or the commit's token was
+    /// already committed by an earlier call.
     fn commit_appends_with_taken_buffer(
         &self,
         buffer: &[BufferedBatch],
         stem: Option<&str>,
         live: Option<LiveLanes>,
         scratch: BuildScratchInputs,
-    ) -> Result<(), BuildError> {
+    ) -> Result<bool, BuildError> {
         // The schema this commit builds under: the table's, plus every
         // column the buffered batches add. Earlier batches are null-filled
         // to it, and the superfiles and the schema land in one list, which
@@ -3235,7 +3347,7 @@ impl SupertableWriter {
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         if total_rows == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         // The commit's payload, read off the taken buffer before either
@@ -3259,6 +3371,7 @@ impl SupertableWriter {
             graph_ref: None,
             schema: schema_change,
             expected_schema_id: Some(built_against),
+            idempotency_token: self.idempotency_token.clone(),
         };
 
         // Vector commit: same row-shard fanout as the legacy path. Each writer
@@ -3430,9 +3543,9 @@ impl SupertableWriter {
                 .as_ref()
                 .map(|_| commit_output_stats(&user_batch));
             let publish_t0 = time::Instant::now();
-            self.publish_appended(user_batch, list_metadata)?;
-            if let (Some(stats), Some((superfiles, bytes, fts_terms))) =
-                (&self.op_stats, output_stats)
+            let published = self.publish_appended(user_batch, list_metadata)?;
+            if let (true, Some(stats), Some((superfiles, bytes, fts_terms))) =
+                (published, &self.op_stats, output_stats)
             {
                 stats.add_commit_outputs(superfiles, bytes, fts_terms);
                 stats.add_planned_commit_requests(planned_data_objects(payload_bytes));
@@ -3452,7 +3565,7 @@ impl SupertableWriter {
             if self.inner.options.storage.is_some() {
                 schedule_background_storage_reclaim(Arc::clone(&self.inner));
             }
-            return Ok(());
+            return Ok(published);
         }
 
         let user_batch =
@@ -3463,9 +3576,9 @@ impl SupertableWriter {
             .op_stats
             .as_ref()
             .map(|_| commit_output_stats(&user_batch));
-        self.publish_appended(user_batch, list_metadata)?;
-        if let (Some(stats), Some((n_superfiles, bytes, fts_terms))) =
-            (&self.op_stats, output_stats)
+        let published = self.publish_appended(user_batch, list_metadata)?;
+        if let (true, Some(stats), Some((n_superfiles, bytes, fts_terms))) =
+            (published, &self.op_stats, output_stats)
         {
             stats.add_commit_outputs(n_superfiles, bytes, fts_terms);
             stats.add_planned_commit_requests(planned_data_objects(payload_bytes));
@@ -3475,7 +3588,7 @@ impl SupertableWriter {
         }
         debug!(superfiles, "published appended superfiles");
 
-        Ok(())
+        Ok(published)
     }
 
     /// Build the buffered rows of a table without vector columns into
@@ -3691,6 +3804,23 @@ impl SupertableWriter {
         Ok((batch, built_against))
     }
 
+    /// Set the idempotency token the next commit records with its rows.
+    /// Refused for a table with no storage, which keeps no list to record
+    /// it in.
+    /// The token names a write of `rows` rows: a later write reusing it
+    /// with another count is refused rather than skipped.
+    pub(crate) fn set_idempotency_token(
+        &mut self,
+        token: Option<IdempotencyToken<'_>>,
+        rows: u64,
+    ) -> Result<(), BuildError> {
+        if token.is_some() && self.inner.options.storage.is_none() {
+            return Err(BuildError::Unsupported(NO_STORAGE_FOR_TOKENS.into()));
+        }
+        self.idempotency_token = token.map(|token| token.to_owned_token(rows));
+        Ok(())
+    }
+
     /// Publish staged appends in one commit: their superfiles join the
     /// table together, or none do. Losing the commit race to another writer
     /// is retried as any append's publish is, without building or writing
@@ -3733,6 +3863,17 @@ impl SupertableWriter {
         // append in two commits lands in at most one; released unless the
         // commit lands.
         let mut claim = StagedClaim::take(&staged)?;
+        // A token this handle's table records means these rows are
+        // committed: the appends are settled as committed, and nothing is
+        // published again, whatever the schema or the superfiles' state now.
+        // A table that recorded it where this handle has not looked yet is
+        // found by the commit.
+        if let Some(token) = &self.idempotency_token
+            && self.inner.manifest.load().holds_idempotency_token(token)?
+        {
+            claim.keep();
+            return Ok(());
+        }
         if claim.uncertain {
             // With the claim held no other call is publishing these appends,
             // so what the pointer names now settles whether a failed commit
@@ -3778,20 +3919,22 @@ impl SupertableWriter {
         }
         let list_metadata = CommitListMetadata {
             expected_schema_id: Some(current),
+            idempotency_token: self.idempotency_token.clone(),
             ..CommitListMetadata::default()
         };
         let output_stats = self.op_stats.as_ref().map(|_| commit_output_stats(&batch));
         claim.publishing();
-        self.publish_appended(batch, list_metadata)
-            .map_err(|error| match error {
+        let published = self.publish_appended(batch, list_metadata).map_err(
+            |error| match error {
                 BuildError::SchemaMoved { expected, current } => BuildError::Unsupported(format!(
                     "the table's schema moved from {expected} to {current} while the staged \
                      appends were committed; stage their rows again"
                 )),
                 error => error,
-            })?;
+            },
+        )?;
         claim.keep();
-        if let Some(stats) = &self.op_stats {
+        if let Some(stats) = self.op_stats.as_ref().filter(|_| published) {
             for one in &staged {
                 let ingest = one.ingest;
                 if ingest.rows > 0 {
@@ -3822,12 +3965,14 @@ impl SupertableWriter {
     /// its term-index layer before taking its turn in the append queue, so
     /// only the manifest and root writes are serialized between appends. When
     /// the root is not one the queue published, its length is unknown until
-    /// the turn, so the layer is built then, once.
+    /// the turn, so the layer is built then, once. False when the table
+    /// already records the publish's idempotency token, and nothing was
+    /// published.
     fn publish_appended(
         &self,
         mut batch: SuperfilePublishBatch,
         list_metadata: CommitListMetadata,
-    ) -> Result<(), BuildError> {
+    ) -> Result<bool, BuildError> {
         let runtime = self.inner.query_runtime();
         let uploads = mem::take(&mut batch.uploads);
         if !self.shared || batch.new_entries.is_empty() {
@@ -3835,13 +3980,21 @@ impl SupertableWriter {
             return bridge_on_runtime(
                 persist_superfile_publish_batch_async(&self.inner, batch, list_metadata, None),
                 &runtime,
-            )
-            .map(drop);
+            );
         }
-        // A schema that already moved fails this publish. A live commit's
+        // A schema that already moved fails this publish, unless the table
+        // records its token: those rows are committed. A live commit's
         // uploads started as its pieces were built, so they are waited out
-        // before the failure is reported; nothing else is written for it.
-        if let Err(error) = list_metadata.check_schema(&self.inner.manifest.load()) {
+        // before either is reported; nothing else is written for it.
+        let current = self.inner.manifest.load();
+        match list_metadata.token_committed_in(&current) {
+            Ok(false) => {}
+            held => {
+                settle_abandoned_uploads(&runtime, uploads);
+                return held.map(|_| false);
+            }
+        }
+        if let Err(error) = list_metadata.check_schema(&current) {
             settle_abandoned_uploads(&runtime, uploads);
             return Err(error.into());
         }
@@ -3919,7 +4072,7 @@ impl SupertableWriter {
         };
         let mut run = match self.inner.append_queue.lead_or_follow(&mut ticket, parked) {
             Turn::Lead(run) => run,
-            Turn::Published(result) => return result,
+            Turn::Published(result) => return result.map(|()| true),
         };
         drop(wait_span);
         let _turn_span = detail_span!("publish.turn", publishes = run.len()).entered();
@@ -3941,7 +4094,6 @@ impl SupertableWriter {
             ),
             &runtime,
         );
-        let published = published.map(drop);
         self.inner
             .append_queue
             .publish_followers(&mut ticket, &published);
@@ -6274,19 +6426,21 @@ pub(super) fn prepare_user_superfile_batch(
         .install(|| prepare_user_superfile_batch_in_scope(inner, manifest, outputs, hints, stem))
 }
 
-/// Publish `batch`, returning the term-index root of the manifest it
-/// published, if any.
+/// Publish `batch`. False when the table already records the batch's
+/// idempotency token from an earlier call, which committed these rows: this
+/// call publishes nothing, and the superfiles it uploaded are left for the
+/// orphan sweep.
 pub(super) async fn persist_superfile_publish_batch_async(
     inner: &SupertableInner,
     batch: SuperfilePublishBatch,
     list_metadata: CommitListMetadata,
     reserved_layers: Option<&mut [ReservedSegment]>,
-) -> Result<Option<RoutingRef>, BuildError> {
+) -> Result<bool, BuildError> {
     if batch.new_entries.is_empty() {
-        return Ok(None);
+        return Ok(true);
     }
     if let Some(storage) = inner.options.storage.as_ref().cloned() {
-        let new_manifest = persist_commit_with_layer_async(
+        let landing = persist_commit_with_layer_async(
             inner,
             storage,
             batch.new_entries,
@@ -6299,7 +6453,10 @@ pub(super) async fn persist_superfile_publish_batch_async(
         )
         .await
         .map_err(BuildError::from)?;
-        let published_root = new_manifest.term_index_ref().cloned();
+        let new_manifest = match landing {
+            CommitLanding::Published(manifest) => manifest,
+            CommitLanding::TokenHeld => return Ok(false),
+        };
         inner.manifest.store(new_manifest);
         apply_pending_store_inserts(inner, batch.pending_store_inserts);
         // Already async — await the warm-cache fill directly. Do NOT call
@@ -6315,7 +6472,7 @@ pub(super) async fn persist_superfile_publish_batch_async(
         ) {
             cache.sweep_for_budget(budget);
         }
-        return Ok(published_root);
+        return Ok(true);
     }
     let old = inner.manifest.load();
     list_metadata.check_schema(&old)?;
@@ -6339,9 +6496,8 @@ pub(super) async fn persist_superfile_publish_batch_async(
             .insert(uri, bytes)
             .map_err(|e| BuildError::Store(format!("store insert for {uri:?}: {e}")))?;
     }
-    let published_root = new.term_index_ref().cloned();
     inner.manifest.store(Arc::new(new));
-    Ok(published_root)
+    Ok(true)
 }
 
 /// Rayon pool for hidden-maintenance CPU work (cell-split planning, child
@@ -8997,6 +9153,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             graph_ref: None,
             schema: None,
             expected_schema_id: None,
+            idempotency_token: None,
         };
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
         // Build the resident `hnsw` graph NOW, against a PROSPECTIVE manifest
@@ -11611,6 +11768,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         graph_ref: None,
         schema: None,
         expected_schema_id: None,
+        idempotency_token: None,
     };
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
     let new_manifest = match persist_commit_async(
@@ -12172,6 +12330,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         graph_ref: None,
         schema: None,
         expected_schema_id: None,
+        idempotency_token: None,
     };
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
     let new_manifest = match persist_commit_async(
@@ -13184,6 +13343,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             graph_ref: None,
             schema: None,
             expected_schema_id: None,
+            idempotency_token: None,
         };
         let base = Arc::new(list_metadata.apply(&manifest));
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
@@ -14712,6 +14872,10 @@ fn column_that_starts_requiring_a_value(base: &TableSchema, next: &TableSchema) 
     })
 }
 
+/// Why a table with no storage refuses idempotency tokens.
+const NO_STORAGE_FOR_TOKENS: &str = "idempotency tokens need a table on storage: one with none keeps no manifest list to record \
+     them in";
+
 /// List-level metadata stamped onto the OCC base snapshot for one durable
 /// commit attempt. Applied inside every retry so contention refresh cannot
 /// drop grid / watermark / bootstrap stamps that must land with membership.
@@ -14747,6 +14911,11 @@ pub(crate) struct CommitListMetadata {
     /// schema it was not built for and ids are minted by one list at a
     /// time; the caller re-resolves against the winner and retries.
     pub(crate) expected_schema_id: Option<u32>,
+    /// The caller's idempotency token. The commit records it in the list it
+    /// publishes, and an attempt whose base already records it publishes
+    /// nothing: the rows it names are committed. Never grouped with another
+    /// publish, so the token marks exactly the rows its caller sent.
+    pub(crate) idempotency_token: Option<OwnedToken>,
 }
 
 impl CommitListMetadata {
@@ -14771,6 +14940,33 @@ impl CommitListMetadata {
             && self.split_checks_additions.is_none()
             && self.graph_ref.is_none()
             && self.schema.is_none()
+            && self.idempotency_token.is_none()
+    }
+
+    /// Whether `base` records this commit's idempotency token, so the rows
+    /// the commit carries are in the table already. Refused when the token
+    /// names a write of another row count.
+    pub(crate) fn token_committed_in(&self, base: &ManifestSnapshot) -> Result<bool, BuildError> {
+        match &self.idempotency_token {
+            Some(token) => Ok(base.holds_idempotency_token(token)?),
+            None => Ok(false),
+        }
+    }
+
+    /// How a commit whose token `manifest` records settled: published by
+    /// one of this call's attempts, `attempted` holding their ids, whose
+    /// answer was lost; or by an earlier call.
+    fn token_landing(&self, manifest: Arc<ManifestSnapshot>, attempted: &[u64]) -> CommitLanding {
+        let recorded_in = self.idempotency_token.as_ref().and_then(|token| {
+            match manifest.idempotency_token_status(token.as_token(), 0) {
+                TokenStatus::Committed { manifest_id, .. } => Some(manifest_id),
+                TokenStatus::Absent | TokenStatus::Expired => None,
+            }
+        });
+        match recorded_in {
+            Some(id) if attempted.contains(&id) => CommitLanding::Published(manifest),
+            _ => CommitLanding::TokenHeld,
+        }
     }
 
     /// Whether a publish under `self` can carry one under `other` too: both
@@ -14868,6 +15064,19 @@ pub(in crate::supertable) async fn persist_commit_async(
         None,
     )
     .await
+    .map(|landing| match landing {
+        CommitLanding::Published(manifest) => manifest,
+        CommitLanding::TokenHeld => inner.manifest.load_full(),
+    })
+}
+
+/// How a commit settled.
+enum CommitLanding {
+    /// This call published the manifest.
+    Published(Arc<ManifestSnapshot>),
+    /// The table already records the commit's idempotency token from an
+    /// earlier call, which committed these rows; this one published nothing.
+    TokenHeld,
 }
 
 /// [`persist_commit_async`] appending `reserved_layer`, when given, as the
@@ -14882,13 +15091,16 @@ async fn persist_commit_with_layer_async(
     list_metadata: CommitListMetadata,
     term_contributions: Vec<TermContribution>,
     mut reserved_layers: Option<&mut [ReservedSegment]>,
-) -> Result<Arc<ManifestSnapshot>, SupertableCommitError> {
+) -> Result<CommitLanding, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
     let max_retries = opts.max_commit_retries.max(1);
     let contributions: &[TermContribution] = &term_contributions;
     let drive = async move {
         let mut next_id_floor: u64 = 0;
+        // Ids this call's attempts tried to publish: a refreshed list that
+        // records the token under one of them is this call's own publish.
+        let mut attempted_ids = Vec::new();
         for attempt in 0..max_retries {
             let old = inner.manifest.load_full();
             // A prior attempt found its id occupied by a crash-orphaned
@@ -14902,6 +15114,15 @@ async fn persist_commit_with_layer_async(
             // `base`: the stamps below may already carry this commit's own refs (a drain batch's
             // new graph), which would hide the ones they replace.
             let committed = Arc::clone(&old);
+            // A token the base already records means these rows are
+            // committed. Checked before the schema, whose move a retry of a
+            // committed write would otherwise be refused for.
+            if list_metadata
+                .token_committed_in(&old)
+                .map_err(SupertableCommitError::Build)?
+            {
+                return Ok(list_metadata.token_landing(old, &attempted_ids));
+            }
             list_metadata.check_schema(&old)?;
             // Re-apply call-site stamps on every attempt. A pre-store of these
             // fields is not OCC-safe: contention refresh reloads from storage
@@ -14912,6 +15133,27 @@ async fn persist_commit_with_layer_async(
                 Arc::new(list_metadata.apply(&old))
             };
             let attempted_id = base.get_next_manifest_id();
+            attempted_ids.push(attempted_id);
+            // The token lands in the same list as the rows, so the pointer
+            // swap publishes both or neither.
+            let base = match &list_metadata.idempotency_token {
+                Some(token) => Arc::new(
+                    base.with_idempotency_token_recorded(
+                        token,
+                        attempted_id,
+                        idempotency::now_ms(),
+                        opts.idempotency_token_ttl,
+                    )
+                    .ok_or_else(|| {
+                        SupertableCommitError::Build(BuildError::Unsupported(
+                            "this table's manifest keeps no list to record an idempotency token \
+                             in"
+                            .into(),
+                        ))
+                    })?,
+                ),
+                None => base,
+            };
             let pending_writes = &mut pending_storage_writes;
             let pending_replaces = &mut pending_storage_replaces;
             match try_commit_attempt(
@@ -14933,7 +15175,7 @@ async fn persist_commit_with_layer_async(
             {
                 Ok(new_manifest) => {
                     inner.note_superseded(&committed, &new_manifest, entries_to_remove);
-                    return Ok(Arc::new(new_manifest));
+                    return Ok(CommitLanding::Published(Arc::new(new_manifest)));
                 }
                 Err(SupertableCommitError::WriteContentionExhausted) => {
                     let last_attempt = attempt + 1 == max_retries;
@@ -14946,14 +15188,27 @@ async fn persist_commit_with_layer_async(
                             refresh_and_orphaned_id_floor(inner, &storage_async, attempted_id)
                                 .await?,
                         );
-                    } else if !new_entries.is_empty() {
+                    } else if !new_entries.is_empty() || list_metadata.idempotency_token.is_some() {
                         refresh_inner_state_async(inner, &storage_async).await?;
+                    }
+                    // A refreshed list that records the token settles it: an
+                    // earlier attempt, or an earlier call, published these rows.
+                    let refreshed = inner.manifest.load_full();
+                    if list_metadata
+                        .token_committed_in(&refreshed)
+                        .map_err(SupertableCommitError::Build)?
+                    {
+                        warn!(
+                            manifest_id = refreshed.get_manifest_id(),
+                            "commit's idempotency token already published; not committing it again"
+                        );
+                        return Ok(list_metadata.token_landing(refreshed, &attempted_ids));
                     }
                     // Nothing is recorded for the deferred sweep here: the attempt that landed was
                     // an earlier one, whose base this loop no longer holds, and `published` may be
                     // several commits past it. What that commit replaced is left to the listing sweep.
                     match published_by_earlier_attempt(inner, &new_entries).await {
-                        Ok(Some(published)) => return Ok(published),
+                        Ok(Some(published)) => return Ok(CommitLanding::Published(published)),
                         Ok(None) => {}
                         Err(e) => {
                             inner.note_commit_error(&e);
@@ -16148,7 +16403,7 @@ mod tests {
         io::Write,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
-            Arc,
+            Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
         },
         thread,
@@ -16158,7 +16413,7 @@ mod tests {
     use arrow::{compute::concat_batches, ipc::reader::StreamReader};
     use arrow_array::{
         Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array,
-        Int32Array, LargeStringArray, RecordBatch, StringArray, StructArray,
+        Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray, StructArray,
     };
     use arrow_schema::{DataType, Field, Fields, Schema};
     use datafusion::prelude::{col, lit};
@@ -16198,7 +16453,7 @@ mod tests {
                 config::DiskCacheConfig,
                 disk::{DiskCacheStore, give_back_temp_file_charge},
             },
-            schema::change::SchemaChange,
+            schema::change::{FieldPatch, SchemaChange},
             slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
             storage::{LocalFsStorageProvider, ObjectMeta},
             wal::{recovery::scan_and_recover, state_doc::SupertableHandleId},
@@ -19842,6 +20097,697 @@ mod tests {
         assert_eq!(manifest.n_docs_total(), rows as u64, "{name}: rows listed");
     }
 
+    /// Arm the next pointer write to land and then fail, and the pointer
+    /// read-back that would settle it to fail as well, so the commit stays
+    /// uncertain.
+    fn land_pointer_write_unsettled(faults: &Arc<FaultStorage>) {
+        faults.fail_with(
+            FaultKind::LandedThenFailed,
+            FaultOp::PutIfMatch,
+            POINTER_PATH,
+            1,
+        );
+        let armed = Arc::clone(faults);
+        faults.before(FaultOp::PutIfMatch, POINTER_PATH, move || {
+            armed.fail_with(FaultKind::Transient, FaultOp::Get, POINTER_PATH, 1);
+        });
+    }
+
+    #[test]
+    fn a_pointer_write_that_landed_but_failed_reports_the_commit_landed() {
+        // The pointer PUT lands but answers with an error the storage
+        // client's retries never got past. The read-back finds this commit's
+        // list named, so the append returns `Ok`: a caller that retries on
+        // error would otherwise write the rows twice. Both a plain append
+        // and a staged commit settle this way.
+        let directory = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let faults = FaultStorage::wrap(Arc::clone(&local));
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st =
+            Supertable::create(options_id_title_serial().with_storage(storage)).expect("create");
+
+        faults.fail_with(
+            FaultKind::LandedThenFailed,
+            FaultOp::PutIfMatch,
+            POINTER_PATH,
+            1,
+        );
+        st.append(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+            .expect("an append that landed returns Ok");
+        assert_eq!(faults.fired(), 1, "the pointer write failed after landing");
+        assert_lists_superfiles_once_holding(&st, LOST_RESPONSE_ROWS, "append");
+
+        let staged = [st
+            .stage(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+            .expect("stage")];
+        faults.fail_with(
+            FaultKind::LandedThenFailed,
+            FaultOp::PutIfMatch,
+            POINTER_PATH,
+            1,
+        );
+        st.commit_staged(&staged)
+            .expect("a staged commit that landed returns Ok");
+        assert_eq!(
+            faults.fired(),
+            2,
+            "the second pointer write failed after landing"
+        );
+        assert!(
+            format!("{:?}", staged[0]).contains("\"committed\""),
+            "{:?}",
+            staged[0]
+        );
+        let reopened =
+            Supertable::open(options_id_title_serial().with_storage(local)).expect("reopen");
+        for (handle, name) in [(&st, "handle"), (&reopened, "reopened handle")] {
+            assert_lists_superfiles_once_holding(handle, 2 * LOST_RESPONSE_ROWS, name);
+        }
+    }
+
+    #[test]
+    fn a_pointer_write_that_failed_without_landing_reports_the_error() {
+        // The pointer PUT fails before landing: the read-back finds the
+        // pointer where the commit found it, so the error stands and
+        // nothing is listed.
+        let directory = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let faults = FaultStorage::wrap(Arc::clone(&local));
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st =
+            Supertable::create(options_id_title_serial().with_storage(storage)).expect("create");
+        faults.fail_with(FaultKind::Transient, FaultOp::PutIfMatch, POINTER_PATH, 1);
+        assert!(
+            st.append(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+                .is_err()
+        );
+        assert_lists_superfiles_once_holding(&st, 0, "after the failed append");
+        st.append(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+            .expect("the retry appends");
+        assert_lists_superfiles_once_holding(&st, LOST_RESPONSE_ROWS, "after the retry");
+    }
+
+    /// A table on local storage behind a [`FaultStorage`], built from
+    /// `options`.
+    fn faulted_token_table(options: SupertableOptions) -> (TempDir, Arc<FaultStorage>, Supertable) {
+        let directory = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st = Supertable::create(options.with_storage(storage)).expect("create");
+        (directory, faults, st)
+    }
+
+    /// The manifest `st` names after reading the pointer.
+    fn manifest_id_after_refresh(st: &Supertable) -> u64 {
+        bridge_on_runtime(st.refresh(), &st.inner().query_runtime()).expect("refresh");
+        st.inner().manifest.load().get_manifest_id()
+    }
+
+    fn token_status(st: &Supertable, token: IdempotencyToken<'_>) -> TokenStatus {
+        st.idempotency_token_status(token, 0)
+            .expect("the table answers for its tokens")
+    }
+
+    #[test]
+    fn a_tokened_append_left_uncertain_lands_once_when_retried() {
+        // The pointer write lands, then fails, and the read-back that would
+        // settle it fails too: the append can only report the error. The
+        // retry under the same token finds the token recorded and returns
+        // `Ok` without committing again, for both token forms.
+        for token in [
+            IdempotencyToken::Key("load-7"),
+            IdempotencyToken::Sequence {
+                scope: "loader",
+                seq: 1,
+            },
+        ] {
+            let (_directory, faults, st) = faulted_token_table(options_id_title_serial());
+            let batch = build_simple_batch(0, LOST_RESPONSE_ROWS);
+            land_pointer_write_unsettled(&faults);
+            assert!(
+                st.append_idempotent(&batch, None, Some(token)).is_err(),
+                "{token:?}: the unsettled pointer write is reported"
+            );
+            assert_eq!(faults.fired(), 2, "{token:?}: write and read-back failed");
+
+            st.append_idempotent(&batch, None, Some(token))
+                .unwrap_or_else(|e| panic!("{token:?}: the retry finds its token: {e:?}"));
+            let landed = manifest_id_after_refresh(&st);
+            assert_lists_superfiles_once_holding(&st, LOST_RESPONSE_ROWS, "after the retry");
+            assert!(
+                matches!(
+                    token_status(&st, token),
+                    TokenStatus::Committed { manifest_id, .. } if manifest_id == landed
+                ),
+                "{token:?}: recorded by the commit that landed"
+            );
+        }
+    }
+
+    #[test]
+    fn every_write_call_records_its_key_and_passes_over_a_repeat() {
+        // Each tokened write commits its rows once and records its key in
+        // the list that lists them; the same call again with the same key
+        // commits nothing and returns `Ok`.
+        let (_directory, _faults, st) = faulted_token_table(options_id_title_serial());
+        let rows: Vec<Value> = (0..LOST_RESPONSE_ROWS)
+            .map(|i| serde_json::json!({ "title": format!("doc {i} beta") }))
+            .collect();
+        type Call<'s> = Box<dyn Fn(IdempotencyToken<'_>) -> Result<(), InfinoError> + 's>;
+        let calls: Vec<(&str, Call<'_>)> = vec![
+            (
+                "append",
+                Box::new(|t| {
+                    st.append_idempotent(&build_simple_batch(0, LOST_RESPONSE_ROWS), None, Some(t))
+                }),
+            ),
+            (
+                "append_named",
+                Box::new(|t| {
+                    st.append_idempotent(
+                        &build_simple_batch(0, LOST_RESPONSE_ROWS),
+                        Some("source.parquet"),
+                        Some(t),
+                    )
+                }),
+            ),
+            (
+                "append_rows",
+                Box::new(|t| st.append_rows_idempotent(&rows, None, Some(t))),
+            ),
+            (
+                "append_rows_named",
+                Box::new(|t| st.append_rows_idempotent(&rows, Some("source.json"), Some(t))),
+            ),
+            (
+                "commit_staged",
+                Box::new(|t| {
+                    let staged = [st
+                        .stage(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+                        .expect("stage")];
+                    st.commit_staged_idempotent(&staged, Some(t))
+                }),
+            ),
+        ];
+        for (n, (name, call)) in calls.iter().enumerate() {
+            let key = format!("write-{name}");
+            let token = IdempotencyToken::Key(&key);
+            call(token).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let landed = manifest_id_after_refresh(&st);
+            assert_lists_superfiles_once_holding(&st, (n + 1) * LOST_RESPONSE_ROWS, name);
+            assert!(
+                matches!(
+                    token_status(&st, token),
+                    TokenStatus::Committed { manifest_id, seq: None, .. } if manifest_id == landed
+                ),
+                "{name}: the key is recorded by the commit that listed its rows"
+            );
+
+            call(token).unwrap_or_else(|e| panic!("{name}: repeat: {e:?}"));
+            assert_eq!(
+                manifest_id_after_refresh(&st),
+                landed,
+                "{name}: the repeat commits nothing"
+            );
+            assert_lists_superfiles_once_holding(
+                &st,
+                (n + 1) * LOST_RESPONSE_ROWS,
+                &format!("{name} repeated"),
+            );
+        }
+        assert_eq!(
+            token_status(&st, IdempotencyToken::Key("never-sent")),
+            TokenStatus::Absent
+        );
+    }
+
+    #[test]
+    fn a_sequence_commits_each_new_number_and_passes_over_the_rest() {
+        // A writer's numbers rise, not necessarily by one. A number the
+        // table holds, or one below it, commits nothing.
+        let (_directory, _faults, st) = faulted_token_table(options_id_title_serial());
+        let at = |seq| IdempotencyToken::Sequence {
+            scope: "writer-a",
+            seq,
+        };
+        let append = |seq| {
+            st.append_idempotent(
+                &build_simple_batch(0, LOST_RESPONSE_ROWS),
+                None,
+                Some(at(seq)),
+            )
+            .unwrap_or_else(|e| panic!("seq {seq}: {e:?}"));
+            manifest_id_after_refresh(&st)
+        };
+        let latest_seq = |seq| match token_status(&st, at(seq)) {
+            TokenStatus::Committed { seq, .. } => seq,
+            other => panic!("{other:?}"),
+        };
+
+        append(1);
+        let second = append(2);
+        assert_eq!(append(2), second, "a repeat of the latest commits nothing");
+        assert_eq!(append(1), second, "a late earlier number commits nothing");
+        assert_lists_superfiles_once_holding(&st, 2 * LOST_RESPONSE_ROWS, "after 1, 2");
+        assert_eq!(latest_seq(1), Some(2), "the status reports the latest");
+
+        assert!(append(5) > second, "a gap is fine");
+        assert_lists_superfiles_once_holding(&st, 3 * LOST_RESPONSE_ROWS, "after 5");
+        assert_eq!(latest_seq(3), Some(5));
+        assert_eq!(
+            token_status(
+                &st,
+                IdempotencyToken::Sequence {
+                    scope: "writer-b",
+                    seq: 1,
+                }
+            ),
+            TokenStatus::Absent,
+            "scopes are independent"
+        );
+    }
+
+    #[test]
+    fn two_handles_racing_one_token_commit_it_once() {
+        // A writer presumed dead and its replacement send the same token
+        // at once, through separate handles on the same table. One commits;
+        // the other loses the pointer race, finds the token in the winner's
+        // list, and returns `Ok` without committing again.
+        const ROUNDS: usize = 6;
+        let (directory, _faults, st) = faulted_token_table(options_id_title_serial());
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let other = Supertable::open(options_id_title_serial().with_storage(local)).expect("open");
+        let mut committed = 0;
+        for round in 0..ROUNDS {
+            let key = format!("round-{round}");
+            let scope = format!("zombie-{round}");
+            for token in [
+                IdempotencyToken::Key(&key),
+                IdempotencyToken::Sequence {
+                    scope: &scope,
+                    seq: 1,
+                },
+            ] {
+                let start = Barrier::new(2);
+                thread::scope(|s| {
+                    for handle in [&st, &other] {
+                        let start = &start;
+                        s.spawn(move || {
+                            let batch = build_simple_batch(0, LOST_RESPONSE_ROWS);
+                            start.wait();
+                            handle
+                                .append_idempotent(&batch, None, Some(token))
+                                .unwrap_or_else(|e| panic!("{token:?}: {e:?}"));
+                        });
+                    }
+                });
+                committed += 1;
+                manifest_id_after_refresh(&st);
+                assert_lists_superfiles_once_holding(
+                    &st,
+                    committed * LOST_RESPONSE_ROWS,
+                    &format!("{token:?}"),
+                );
+                assert!(matches!(
+                    token_status(&other, token),
+                    TokenStatus::Committed { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn many_scopes_interleaved_keep_their_own_numbers() {
+        // Sixty-four writers commit in turn on one table; each scope's
+        // numbers are judged against that scope alone.
+        const SCOPES: usize = 64;
+        let (_directory, _faults, st) = faulted_token_table(options_id_title_serial());
+        let scopes: Vec<String> = (0..SCOPES).map(|i| format!("part-{i}")).collect();
+        let append = |scope: &str, seq| {
+            st.append_idempotent(
+                &build_simple_batch(0, 1),
+                None,
+                Some(IdempotencyToken::Sequence { scope, seq }),
+            )
+            .unwrap_or_else(|e| panic!("{scope} {seq}: {e:?}"));
+        };
+        for seq in [1, 2] {
+            for scope in &scopes {
+                append(scope, seq);
+            }
+        }
+        let settled = manifest_id_after_refresh(&st);
+        for scope in &scopes {
+            append(scope, 1);
+            append(scope, 2);
+        }
+        assert_eq!(
+            manifest_id_after_refresh(&st),
+            settled,
+            "every repeat commits nothing"
+        );
+        assert_lists_superfiles_once_holding(&st, 2 * SCOPES, "every scope twice");
+        for scope in &scopes {
+            assert!(
+                matches!(
+                    token_status(&st, IdempotencyToken::Sequence { scope, seq: 2 }),
+                    TokenStatus::Committed { seq: Some(2), .. }
+                ),
+                "{scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn tokens_survive_every_other_kind_of_commit() {
+        // Writes that carry no token rewrite the list too: a plain append,
+        // a delete, an update, a compaction and an append that adds a
+        // column. Each carries the recorded tokens forward, so a retry
+        // after any of them still commits nothing.
+        let (_directory, _faults, st) = faulted_token_table(options_id_title_serial());
+        let key = IdempotencyToken::Key("kept");
+        let seq = IdempotencyToken::Sequence {
+            scope: "kept-writer",
+            seq: 3,
+        };
+        st.append_idempotent(&row("doc tokened"), None, Some(key))
+            .expect("keyed append");
+        st.append_idempotent(&row("doc sequenced"), None, Some(seq))
+            .expect("sequenced append");
+        let recorded = [token_status(&st, key), token_status(&st, seq)];
+
+        let wider = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, false),
+                Field::new("extra", DataType::LargeUtf8, true),
+            ])),
+            vec![
+                Arc::new(LargeStringArray::from(vec!["doc wider"])),
+                Arc::new(LargeStringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("wider batch");
+        let others: Vec<(&str, Box<dyn Fn()>)> = vec![
+            (
+                "plain append",
+                Box::new(|| {
+                    for i in 0..3 {
+                        st.append(&row(&format!("doc plain {i}"))).expect("append");
+                    }
+                }),
+            ),
+            (
+                "delete",
+                Box::new(|| {
+                    st.delete(col("title").eq(lit("doc plain 0")))
+                        .expect("delete");
+                }),
+            ),
+            (
+                "update",
+                Box::new(|| {
+                    st.update(col("title").eq(lit("doc plain 1")), &row("doc updated"))
+                        .expect("update");
+                }),
+            ),
+            (
+                "compaction",
+                Box::new(|| {
+                    st.optimize(&OptimizeOptions::compact(CompactionSettings {
+                        min_fill_percent: 1,
+                        min_superfiles_for_merge: 2,
+                        ..CompactionSettings::default()
+                    }))
+                    .expect("optimize");
+                }),
+            ),
+            (
+                "column added",
+                Box::new(|| st.append(&wider).expect("append a wider batch")),
+            ),
+        ];
+        for (name, write) in &others {
+            let before = manifest_id_after_refresh(&st);
+            write();
+            assert!(
+                manifest_id_after_refresh(&st) > before,
+                "{name}: precondition: it committed"
+            );
+            assert_eq!(
+                [token_status(&st, key), token_status(&st, seq)],
+                recorded,
+                "{name}: the tokens are carried forward"
+            );
+            let settled = manifest_id_after_refresh(&st);
+            st.append_idempotent(&row("doc tokened"), None, Some(key))
+                .expect("keyed retry");
+            st.append_idempotent(&row("doc sequenced"), None, Some(seq))
+                .expect("sequenced retry");
+            assert_eq!(
+                manifest_id_after_refresh(&st),
+                settled,
+                "{name}: the retries commit nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expired_token_reports_expired_not_absent() {
+        // Retention drops a token once it is older than the table's ttl,
+        // at the next commit. Asked about from before that, the table
+        // cannot tell whether it held the token, and says so; asked about
+        // from after everything it dropped, the token is absent. The ttl is
+        // the one the latest tokened commit wrote into the list: a handle
+        // opened with a short one changes nothing until it records a token,
+        // and then it governs every token on the table.
+        let (directory, _faults, st) = faulted_token_table(options_id_title_serial());
+        let key = IdempotencyToken::Key("short-lived");
+        let seq = IdempotencyToken::Sequence {
+            scope: "short-lived-writer",
+            seq: 1,
+        };
+        st.append_idempotent(&row("doc a"), None, Some(key))
+            .expect("keyed append");
+
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let short = Supertable::open(
+            options_id_title_serial()
+                .with_idempotency_token_ttl(Duration::from_millis(1))
+                .with_storage(local),
+        )
+        .expect("open");
+        thread::sleep(Duration::from_millis(5));
+        short
+            .append(&row("doc b"))
+            .expect("an untokened commit keeps the list's ttl");
+        assert!(
+            matches!(token_status(&st, key), TokenStatus::Committed { .. }),
+            "a handle's own ttl does not expire tokens it did not record under"
+        );
+
+        short
+            .append_idempotent(&row("doc c"), None, Some(seq))
+            .expect("sequenced append writes the short ttl");
+        thread::sleep(Duration::from_millis(5));
+        st.append(&row("doc d"))
+            .expect("a later commit runs retention");
+        let after = idempotency::now_ms();
+
+        for token in [key, seq] {
+            assert_eq!(token_status(&st, token), TokenStatus::Expired, "{token:?}");
+            assert_eq!(
+                st.idempotency_token_status(token, after).expect("status"),
+                TokenStatus::Absent,
+                "{token:?}: nothing dropped was this recent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_without_storage_refuses_a_token() {
+        // Tokens live in the manifest list, which only stored tables have.
+        let st = Supertable::create(options_id_title_serial()).expect("create");
+        let token = IdempotencyToken::Key("nowhere");
+        assert!(matches!(
+            st.append_idempotent(&row("doc"), None, Some(token)),
+            Err(InfinoError::Unsupported(_))
+        ));
+        assert!(matches!(
+            st.idempotency_token_status(token, 0),
+            Err(InfinoError::Unsupported(_))
+        ));
+        st.append_idempotent(&row("doc"), None, None)
+            .expect("no token, no storage needed");
+    }
+
+    #[test]
+    fn a_token_reused_with_other_rows_is_refused() {
+        // A token names one exact write. A retry that carries more rows than
+        // the write that committed under it is refused rather than passed
+        // over, so the new rows are not dropped in silence, on every write
+        // call and for both token forms.
+        for token in [
+            IdempotencyToken::Key("order-1"),
+            IdempotencyToken::Sequence {
+                scope: "loader",
+                seq: 1,
+            },
+        ] {
+            let (_directory, _faults, st) = faulted_token_table(options_id_title_serial());
+            st.append_idempotent(&build_simple_batch(0, 2), None, Some(token))
+                .expect("first write");
+            let landed = manifest_id_after_refresh(&st);
+            let more_rows: Vec<Value> = (0..3)
+                .map(|i| serde_json::json!({ "title": format!("doc {i} beta") }))
+                .collect();
+            let refusals = [
+                (
+                    "append",
+                    st.append_idempotent(&build_simple_batch(0, 3), None, Some(token)),
+                ),
+                (
+                    "append_rows",
+                    st.append_rows_idempotent(&more_rows, None, Some(token)),
+                ),
+                (
+                    "commit_staged",
+                    st.commit_staged_idempotent(
+                        &[st.stage(&build_simple_batch(0, 3)).expect("stage")],
+                        Some(token),
+                    ),
+                ),
+            ];
+            for (name, result) in refusals {
+                match result {
+                    Err(InfinoError::AlreadyExists(message)) => assert!(
+                        message.contains("2 rows") && message.contains("one exact write"),
+                        "{token:?} {name}: {message}"
+                    ),
+                    other => panic!("{token:?} {name}: expected a refusal, got {other:?}"),
+                }
+            }
+            assert_eq!(
+                manifest_id_after_refresh(&st),
+                landed,
+                "{token:?}: nothing committed"
+            );
+            assert_lists_superfiles_once_holding(&st, 2, &format!("{token:?}"));
+            st.append_idempotent(&build_simple_batch(0, 2), None, Some(token))
+                .unwrap_or_else(|e| panic!("{token:?}: the exact retry passes: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn a_token_reused_through_a_stale_handle_is_refused() {
+        // A handle opened before the first write still holds a list without
+        // the token, so the reuse is found only when its commit reads the
+        // newer list. It is refused all the same, not reported as a backend
+        // failure a caller would retry.
+        let (directory, _faults, st) = faulted_token_table(options_id_title_serial());
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let stale = Supertable::open(options_id_title_serial().with_storage(local)).expect("open");
+        let token = IdempotencyToken::Key("order-1");
+        st.append_idempotent(&build_simple_batch(0, 2), None, Some(token))
+            .expect("first write");
+        let landed = manifest_id_after_refresh(&st);
+        match stale.append_idempotent(&build_simple_batch(0, 3), None, Some(token)) {
+            Err(InfinoError::AlreadyExists(message)) => {
+                assert!(message.contains("2 rows"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(manifest_id_after_refresh(&st), landed, "nothing committed");
+        assert_lists_superfiles_once_holding(&st, 2, "the first write alone");
+    }
+
+    #[test]
+    fn a_committed_retry_passes_over_a_breaking_schema_change() {
+        // The write lands but its answer is lost; another writer then
+        // retypes a column the write carried. The retry no longer fits the
+        // schema, but its token is checked first, so it returns `Ok` for the
+        // rows already committed rather than a schema error.
+        let (_directory, _faults, st) = faulted_token_table(options_id_title_serial());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("n", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(vec!["doc alpha"])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .expect("batch");
+        let rows = vec![serde_json::json!({ "title": "doc beta", "n": 2 })];
+        let key = IdempotencyToken::Key("batch");
+        let rows_key = IdempotencyToken::Key("rows");
+        st.append_idempotent(&batch, None, Some(key))
+            .expect("first write");
+        st.append_rows_idempotent(&rows, None, Some(rows_key))
+            .expect("first rows write");
+
+        st.apply_schema(
+            &SchemaPatch::new(vec![FieldPatch::named("n").with_type(DataType::Utf8)]),
+            None,
+        )
+        .expect("retype n");
+        let settled = manifest_id_after_refresh(&st);
+        assert!(
+            st.append_idempotent(&batch, None, None).is_err(),
+            "the batch no longer fits the schema"
+        );
+
+        st.append_idempotent(&batch, None, Some(key))
+            .expect("the retry finds its token before the schema");
+        st.append_rows_idempotent(&rows, None, Some(rows_key))
+            .expect("the rows retry finds its token before the schema");
+        assert_eq!(
+            manifest_id_after_refresh(&st),
+            settled,
+            "the retries commit nothing"
+        );
+        assert_lists_superfiles_once_holding(&st, 2, "after the retries");
+    }
+
+    #[test]
+    fn a_token_recorded_by_this_calls_own_attempt_counts_as_published() {
+        // A commit that loses a pointer race refreshes and finds its token.
+        // When the entry names a list this call itself attempted, its answer
+        // was lost but its rows are its own, so it settles as published; any
+        // other list means an earlier call committed them.
+        let (_directory, _faults, st) = faulted_token_table(options_id_title_serial());
+        let token = IdempotencyToken::Key("own");
+        st.append_idempotent(&build_simple_batch(0, 2), None, Some(token))
+            .expect("write");
+        let landed = manifest_id_after_refresh(&st);
+        let manifest = st.inner().manifest.load_full();
+        let metadata = CommitListMetadata {
+            idempotency_token: Some(token.to_owned_token(2)),
+            ..CommitListMetadata::default()
+        };
+        assert!(matches!(
+            metadata.token_landing(Arc::clone(&manifest), &[landed - 1, landed]),
+            CommitLanding::Published(m) if m.get_manifest_id() == landed
+        ));
+        assert!(matches!(
+            metadata.token_landing(Arc::clone(&manifest), &[landed + 1]),
+            CommitLanding::TokenHeld
+        ));
+        assert!(matches!(
+            metadata.token_landing(manifest, &[]),
+            CommitLanding::TokenHeld
+        ));
+    }
+
     #[test]
     fn a_staged_commit_that_landed_but_failed_is_passed_over_by_the_retry() {
         // The pointer PUT of a staged commit lands, but the caller gets an
@@ -19866,20 +20812,15 @@ mod tests {
                 .expect("stage");
             let staged = [first, second];
 
-            faults.fail_with(
-                FaultKind::LandedThenFailed,
-                FaultOp::PutIfMatch,
-                POINTER_PATH,
-                1,
-            );
+            land_pointer_write_unsettled(&faults);
             assert!(
                 st.commit_staged(&staged[..1]).is_err(),
                 "refresh {refresh_between}: the failed pointer write is reported"
             );
             assert_eq!(
                 faults.fired(),
-                1,
-                "the pointer write failed after landing once"
+                2,
+                "the pointer write failed after landing, and its read-back failed"
             );
             assert!(
                 format!("{:?}", staged[0]).contains("uncertain"),
@@ -19929,14 +20870,10 @@ mod tests {
             .collect();
         let state = |one: &StagedAppend| format!("{one:?}");
 
-        // The first lands but reports failing; the second fails before its
+        // The first lands but reports failing, and the pointer read-back
+        // that would settle it fails too; the second fails before its
         // pointer write, so it did not land.
-        faults.fail_with(
-            FaultKind::LandedThenFailed,
-            FaultOp::PutIfMatch,
-            POINTER_PATH,
-            1,
-        );
+        land_pointer_write_unsettled(&faults);
         assert!(st.commit_staged(&staged[..1]).is_err());
         faults.fail_with(FaultKind::Transient, FaultOp::PutIfMatch, POINTER_PATH, 1);
         assert!(st.commit_staged(&staged[1..2]).is_err());
@@ -23065,7 +24002,7 @@ supertable:
                 "its own publish first, then the parked ones oldest first"
             );
             lead.followers = vec![1, 2];
-            queue.publish_followers(&mut lead, &Ok(()));
+            queue.publish_followers(&mut lead, &Ok(true));
             drop(lead);
             for follower in followers {
                 assert!(

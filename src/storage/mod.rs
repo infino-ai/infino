@@ -37,7 +37,9 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::{ObjectStore, Result as ObjectStoreResult, path::Path as ObjPath};
+use object_store::{
+    ObjectMeta as StoreMeta, ObjectStore, Result as ObjectStoreResult, path::Path as ObjPath,
+};
 use thiserror::Error;
 
 pub mod azure;
@@ -49,6 +51,8 @@ pub(crate) mod options;
 mod retry;
 pub(crate) use retry::{hedged, stuck_after};
 pub mod s3;
+#[cfg(test)]
+mod stalling_endpoint;
 
 pub use azure::AzureStorageProvider;
 pub use gcs::GcsStorageProvider;
@@ -69,6 +73,15 @@ pub struct ObjectMeta {
     pub size: u64,
     pub etag: Option<String>,
     pub last_modified: SystemTime,
+}
+
+/// The metadata of an object as a store that versions objects by ETag (S3, Azure) answered it.
+pub(crate) fn etag_meta(meta: StoreMeta) -> ObjectMeta {
+    ObjectMeta {
+        size: meta.size,
+        etag: meta.e_tag,
+        last_modified: meta.last_modified.into(),
+    }
 }
 
 /// Errors surfaced by [`StorageProvider`] implementations.

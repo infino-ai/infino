@@ -17,6 +17,9 @@
 //!   `Bytes::slice` (the resident-bytes [`LazyByteSource`]); nothing is
 //!   copied into a DataFusion `InMemory` store, so warm SQL is as cheap
 //!   as the FTS/vector resolve path (slice = refcount bump).
+//! - superfiles held in the disk cache's block file serve a small range
+//!   as a copy read with one `pread`, in the call, and a large one as a
+//!   slice of the file's mapping.
 //! - cold / lazy superfiles range-fetch straight from object storage
 //!   through the same source.
 //!
@@ -284,8 +287,10 @@ async fn read_range_ahead(source: &Arc<dyn LazyByteSource>, range: Range<u64>) -
 }
 
 /// `range` of `source`. Goes through `range_async` so a warm, mmap/block-
-/// resident scan serves its bytes synchronously (zero-copy, no I/O) instead
-/// of awaiting a range fetch; a cold miss still `await`s the GET.
+/// resident scan serves its bytes synchronously instead of awaiting a range
+/// fetch: a slice of a mapping, or a small range of the disk cache's block
+/// file read with one `pread` on the calling thread. A cold miss still
+/// `await`s the GET.
 async fn read_range(source: Arc<dyn LazyByteSource>, range: Range<u64>) -> OsResult<Bytes> {
     if range.is_empty() {
         return Ok(Bytes::new());

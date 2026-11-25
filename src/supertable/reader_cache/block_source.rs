@@ -126,7 +126,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -145,7 +145,7 @@ use tokio::{
 };
 use tracing::Instrument;
 
-use super::disk::{ArcMmapOwner, DiskCacheStore, Reservation};
+use super::disk::{ArcMmapOwner, DiskCacheStore, Reservation, unix_us};
 use crate::{
     runtime_bridge::shared_io_runtime,
     storage::{StorageError, stuck_after},
@@ -186,6 +186,16 @@ const FETCH_THROUGH_BLOCKS: u32 = 2;
 /// it.
 const READ_ENDS: usize = 16;
 
+/// How far a read must be past the source's recorded last read before it is recorded again, in
+/// microseconds: eviction ranks files far coarser than this, and readers sharing a source then
+/// rarely write the same cache line.
+const LAST_READ_STEP_US: u64 = 1_000;
+
+/// How far a read must be past the last time a read moved the block file's mtime before it moves
+/// it again, in microseconds. The mtime is what a restart ranks the file by, and a file only read
+/// from cache is never written or released, so its reads move it; one syscall a minute at most.
+const MTIME_MARK_STEP_US: u64 = 60_000_000;
+
 /// Near the aligned region (see [`SourceLayout::aligned_region`]) a GET covers
 /// whole groups of this many bytes, aligned to file offset 0. Vector reads are
 /// already 0.25 to 16 MiB merged ranges, so smaller blocks would not cut their
@@ -195,6 +205,11 @@ const ALIGNED_GET_BYTES: u64 = 512 * 1024;
 
 /// [`ALIGNED_GET_BYTES`] in blocks.
 const ALIGNED_GET_BLOCKS: u32 = (ALIGNED_GET_BYTES / CACHE_BLOCK_BYTES) as u32;
+
+/// Largest read served by `pread` rather than from a mapping of the block
+/// file, outside the vector and FTS sections: column pages, page headers and
+/// page indexes.
+const PREAD_MAX_BYTES: u64 = 1024 * 1024;
 
 /// A read smaller than this gets a copy of its bytes rather than a slice of the
 /// run it came from: a caller may keep it as long as its reader lives (a vector
@@ -285,6 +300,12 @@ pub(crate) struct BlockCachedSource {
     /// past any of them.
     read_ends: [AtomicU64; READ_ENDS],
     next_read_end: AtomicUsize,
+    /// When a query last read through this source, in microseconds since the unix epoch, 0 before
+    /// any read.
+    last_read_us: AtomicU64,
+    /// When a read last moved the block file's mtime, in microseconds since the unix epoch; the
+    /// source's build time before any.
+    mtime_marked_us: AtomicU64,
     state: OnceLock<Option<BlockFile>>,
     /// Filled-block set. Guarded by a sync mutex; never held across await.
     filled: Mutex<RoaringBitmap>,
@@ -790,6 +811,9 @@ impl BlockCachedSource {
             },
             read_ends: array::from_fn(|_| AtomicU64::new(u64::MAX)),
             next_read_end: AtomicUsize::new(0),
+            last_read_us: AtomicU64::new(0),
+            // Built just now: a read moves the mtime once a minute has passed, not on the first read.
+            mtime_marked_us: AtomicU64::new(unix_us(SystemTime::now())),
             state: OnceLock::new(),
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
@@ -934,6 +958,53 @@ impl BlockCachedSource {
         Arc::clone(&self.filled_bytes)
     }
 
+    /// The block file this source opened or adopted, while its path still names it: `None` before
+    /// the first read, or once a newer generation replaced it. Never opens one.
+    pub(crate) fn named_file(&self) -> Option<&fs::File> {
+        self.created_block_file()
+            .filter(|block| self.path_names(block))
+            .map(|block| &block.file)
+    }
+
+    /// When a query last read through this source, `None` before any read.
+    pub(crate) fn last_read(&self) -> Option<SystemTime> {
+        match self.last_read_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(UNIX_EPOCH + Duration::from_micros(us)),
+        }
+    }
+
+    /// Move the block file's mtime to the read at `now_us` when a read last moved it at least
+    /// [`MTIME_MARK_STEP_US`] ago, so a file read only from cache until a stop or a crash still
+    /// ranks by its last use after the restart. Only the reader that wins the swap makes the call.
+    /// It runs on the reading thread: a metadata write with no data I/O, once a minute per file.
+    /// No path check, which would cost a stat per mark: moving a replaced file's mtime is harmless.
+    fn mark_read_in_mtime(&self, now_us: u64) {
+        let marked = self.mtime_marked_us.load(Ordering::Relaxed);
+        if now_us.abs_diff(marked) < MTIME_MARK_STEP_US {
+            return;
+        }
+        let Some(block) = self.created_block_file() else {
+            return;
+        };
+        if self
+            .mtime_marked_us
+            .compare_exchange(marked, now_us, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            // On failure the mtime stays at the last write or release.
+            let _ = block
+                .file
+                .set_modified(UNIX_EPOCH + Duration::from_micros(now_us));
+        }
+    }
+
+    /// As if a read last moved the block file's mtime more than [`MTIME_MARK_STEP_US`] ago.
+    #[cfg(test)]
+    pub(crate) fn forget_mtime_mark_for_test(&self) {
+        self.mtime_marked_us.store(0, Ordering::Relaxed);
+    }
+
     /// The sparse file, created on first use once the object size is known.
     fn block_file(&self) -> Option<&BlockFile> {
         let size = self.inner.size();
@@ -1074,12 +1145,6 @@ impl BlockCachedSource {
     /// naming a later generation's file.
     fn path_names(&self, bf: &BlockFile) -> bool {
         fs::metadata(&self.path).is_ok_and(|named| named.ino() == bf.ino)
-    }
-
-    /// Whether this source has a block file and its path still names it.
-    pub(crate) fn path_names_its_file(&self) -> bool {
-        self.created_block_file()
-            .is_some_and(|bf| self.path_names(bf))
     }
 
     /// Byte length of block `b` (the trailing block may be partial).
@@ -1291,6 +1356,17 @@ impl BlockCachedSource {
         let last = group_first(off.saturating_add(len.max(1) - 1))
             .map_or(u32::MAX, |b| b.saturating_add(ALIGNED_GET_BLOCKS - 1));
         Some((first, last))
+    }
+
+    /// Whether `[start, start+len)` overlaps the vector or the FTS section,
+    /// whose readers read a range and touch only part of it: cluster spans,
+    /// a term dictionary they search. A slice of the mapping reads only the
+    /// pages they touch; a copy would read them all.
+    fn read_touches_part(&self, start: u64, len: u64) -> bool {
+        let overlaps = |section: Option<(u64, u64)>| {
+            section.is_some_and(|(off, n)| start < off.saturating_add(n) && start + len > off)
+        };
+        overlaps(self.layout.aligned_region) || overlaps(self.layout.fts_hole)
     }
 
     /// The block holding the aligned region's first byte.
@@ -1595,7 +1671,8 @@ impl BlockCachedSource {
             let s = (u64::from(first) * CACHE_BLOCK_BYTES).max(start);
             let e = ((u64::from(last) + 1) * CACHE_BLOCK_BYTES).min(end);
             pieces.push(match segment {
-                Segment::Filled { .. } => self.read_local(bf, s, e - s)?,
+                // Copied below, so a slice: a `pread` would copy twice.
+                Segment::Filled { .. } => self.read_mapped(bf, s, e - s)?,
                 Segment::InMemory {
                     run_first, bytes, ..
                 } => {
@@ -2030,6 +2107,24 @@ impl BlockCachedSource {
     /// Serve `[start, start+len)` from the sparse file. `None` on a read
     /// error (caller degrades to passthrough).
     fn read_local(&self, bf: &BlockFile, start: u64, len: u64) -> Option<Bytes> {
+        // A small read outside the vector and FTS sections is copied out with
+        // one `pread`. A slice of the mapping takes its page faults later, in
+        // the decoder: each takes the process's memory-map lock and reads
+        // ahead pages nobody asked for, and with thousands of files read per
+        // query that cost more than the copy. The `pread` runs here, on the
+        // caller's thread (a tokio worker for a scan or a take), and reads
+        // from local disk only when the page cache does not hold the range.
+        if len <= PREAD_MAX_BYTES && !self.read_touches_part(start, len) {
+            let mut out = vec![0u8; len as usize];
+            bf.file.read_exact_at(&mut out, start).ok()?;
+            return Some(Bytes::from(out));
+        }
+        self.read_mapped(bf, start, len)
+    }
+
+    /// `[start, start+len)` of the sparse file as a slice of its mapping.
+    /// `None` on a read error (caller degrades to passthrough).
+    fn read_mapped(&self, bf: &BlockFile, start: u64, len: u64) -> Option<Bytes> {
         // Zero-copy hit service: filled ranges are handed out as slices of
         // one shared read-only mapping instead of alloc+pread per range. At
         // law width a warm vector query reads ~20 MB through here; the
@@ -2287,6 +2382,12 @@ impl LazyByteSource for BlockCachedSource {
     fn note_read(&self, start: u64, len: u64) {
         if len > 0 {
             self.note_read_end(start.saturating_add(len));
+            let now = unix_us(SystemTime::now());
+            // A move either way counts, so reads still record after the wall clock steps back.
+            if now.abs_diff(self.last_read_us.load(Ordering::Relaxed)) >= LAST_READ_STEP_US {
+                self.last_read_us.store(now, Ordering::Relaxed);
+                self.mark_read_in_mtime(now);
+            }
         }
     }
 
@@ -3384,6 +3485,95 @@ mod tests {
 
     /// Bytes in one aligned group.
     const GROUP: u64 = ALIGNED_GET_BYTES;
+
+    /// Whether `src` has mapped its block file.
+    fn mapped(src: &BlockCachedSource) -> bool {
+        src.block_file()
+            .and_then(|bf| bf.mmap.get())
+            .is_some_and(Option::is_some)
+    }
+
+    /// Bytes of the blob behind [`filled_source`].
+    const FILLED_BYTES: u64 = 8 * GROUP;
+
+    /// The layout of [`filled_source`]: the FTS section is its fifth group, the
+    /// vector section its seventh, and its first four groups are neither.
+    const FILLED_LAYOUT: SourceLayout = SourceLayout {
+        fts_hole: Some((4 * GROUP, GROUP)),
+        aligned_region: Some((6 * GROUP, GROUP)),
+    };
+
+    /// A source over a [`FILLED_BYTES`]-byte blob with `layout`, every block
+    /// filled and nothing read from its blocks yet.
+    async fn filled_source(
+        dir: &Path,
+        store: &Arc<DiskCacheStore>,
+        layout: SourceLayout,
+    ) -> (SuperfileUri, Arc<CountingSource>, Arc<BlockCachedSource>) {
+        let inner = Arc::new(CountingSource::new(FILLED_BYTES as usize));
+        let uri = SuperfileUri::new_v4();
+        let src = BlockCachedSource::new_with_accounting(
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(store),
+            uri,
+            dir.join("filled.blocks"),
+            true,
+            layout,
+        );
+        store.install_block_entry_for_test(uri, Arc::clone(&src));
+        // A prefetch also fills the FTS section, which reads leave out.
+        src.prefetch(0, FILLED_BYTES, GROUP, 2)
+            .await
+            .expect("prefetch");
+        store.block_writes_settled().await;
+        assert!(src.all_filled(0, (FILLED_BYTES / CACHE_BLOCK_BYTES) as u32 - 1));
+        assert!(!mapped(&src), "filling does not map the file");
+        (uri, inner, src)
+    }
+
+    /// Read `len` bytes at `at` from `src` and check them against `inner`.
+    async fn read_checked(src: &BlockCachedSource, inner: &CountingSource, at: u64, len: u64) {
+        let got = src.range(at, len).await.expect("read");
+        assert_eq!(got, inner.blob.slice(at as usize..(at + len) as usize));
+    }
+
+    /// A read of up to `PREAD_MAX_BYTES` outside the vector and FTS sections
+    /// is copied out with `pread`, so the block file is not mapped; one byte
+    /// more is a slice of the mapping. The bytes are the same either way.
+    #[tokio::test]
+    async fn a_small_read_outside_the_sections_does_not_map_the_file() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = filled_source(dir.path(), &store, FILLED_LAYOUT).await;
+
+        read_checked(&src, &inner, GROUP - 100, 50).await;
+        assert!(!mapped(&src), "a small read");
+        read_checked(&src, &inner, 100, PREAD_MAX_BYTES).await;
+        assert!(!mapped(&src), "a read of exactly PREAD_MAX_BYTES");
+        read_checked(&src, &inner, 100, PREAD_MAX_BYTES + 1).await;
+        assert!(mapped(&src), "a read past PREAD_MAX_BYTES");
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A small read in the vector section, or in the FTS section, keeps the
+    /// zero-copy slice of the mapping: their readers touch only part of what
+    /// they read. So does any read of a source whose layout is unknown.
+    #[tokio::test]
+    async fn a_small_read_in_a_section_is_a_slice_of_the_mapping() {
+        for (name, layout, at) in [
+            ("vector", FILLED_LAYOUT, 6 * GROUP + 100),
+            ("FTS", FILLED_LAYOUT, 4 * GROUP + 100),
+            ("straddling FTS", FILLED_LAYOUT, 4 * GROUP - 20),
+            ("unknown layout", SourceLayout::ALL_ALIGNED, GROUP - 100),
+        ] {
+            let dir = tempdir().expect("tempdir");
+            let store = test_store(dir.path(), u64::MAX);
+            let (uri, inner, src) = filled_source(dir.path(), &store, layout).await;
+            read_checked(&src, &inner, at, 50).await;
+            assert!(mapped(&src), "a read in the {name} section maps the file");
+            store.remove_block_entry_for_test(&uri);
+        }
+    }
 
     /// Outside the aligned region a GET for a missing run at least as long as
     /// `MIN_GET_BYTES` covers only the blocks the run touches.
@@ -4708,7 +4898,7 @@ mod tests {
         fs::remove_file(&path).expect("unlink blocks");
         fs::File::create(&path).expect("newer file");
 
-        store.retain_block_file(&uri, &older, 0);
+        store.retain_block_file(&uri, &older, None);
         drop(older);
         assert_eq!(
             store.stats().current_bytes,
@@ -4745,7 +4935,7 @@ mod tests {
         let _ = older.range(0, 100).await.expect("fill block 0");
         store.block_writes_settled().await;
         store.remove_block_entry_for_test(&uri);
-        store.retain_block_file(&uri, &older, 0);
+        store.retain_block_file(&uri, &older, None);
         drop(older);
         assert!(store.stats().current_bytes > 0, "the kept file is charged");
 

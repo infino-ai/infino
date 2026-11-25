@@ -43,6 +43,6 @@ fn arrow_reexports_work_for_create_table_and_append() {
         .expect("valid batch");
 
     table
-        .append(&batch)
+        .append(&batch, None)
         .expect("append accepts the re-exported RecordBatch");
 }

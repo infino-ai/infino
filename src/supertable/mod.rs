@@ -32,6 +32,7 @@ pub(crate) mod graph_index;
 pub mod handle;
 pub(crate) mod hidden_deleted;
 pub(crate) mod hydrate;
+pub mod idempotency;
 pub mod lazy_source;
 pub mod manifest;
 pub mod mutations;

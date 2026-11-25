@@ -176,6 +176,12 @@ pub enum BuildError {
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
+    /// A held idempotency token was passed with a write of another row
+    /// count: not a retry of the write that recorded it. Nothing is
+    /// published. Routes to `InfinoError::AlreadyExists`.
+    #[error("{0}")]
+    IdempotencyTokenReused(String),
+
     /// The table was dropped and purged while this handle was open, so the
     /// commit had no pointer to fence against. Carried as its own variant
     /// rather than folded into [`Self::Store`] so the public mapping can
@@ -321,6 +327,12 @@ impl From<ReadError> for BuildError {
     }
 }
 
+impl From<crate::supertable::idempotency::TokenReused> for BuildError {
+    fn from(e: crate::supertable::idempotency::TokenReused) -> Self {
+        BuildError::IdempotencyTokenReused(e.to_string())
+    }
+}
+
 impl From<CommitError> for BuildError {
     /// Commit failures reach the build path as `Store` carrying the message —
     /// except a vanished pointer and a lost commit race, which keep their own
@@ -333,6 +345,11 @@ impl From<CommitError> for BuildError {
             CommitError::SchemaMoved { expected, current } => {
                 BuildError::SchemaMoved { expected, current }
             }
+            // The commit's own refusals, which say what to do; a stringified
+            // `Build` would read as a backend fault.
+            CommitError::Build(
+                inner @ (BuildError::IdempotencyTokenReused(_) | BuildError::Unsupported(_)),
+            ) => inner,
             other if other.is_conflict() => BuildError::WriteContention,
             other if other.is_permission_denied() => {
                 BuildError::PermissionDenied(other.to_string())

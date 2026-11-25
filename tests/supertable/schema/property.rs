@@ -345,7 +345,7 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
                 )
                 .expect("batch");
                 let stored = oracle.append(&present, &rows);
-                match table.append(&batch) {
+                match table.append(&batch, None) {
                     Ok(()) => prop_assert!(stored, "the oracle refuses this batch"),
                     Err(InfinoError::Schema(_)) => {
                         prop_assert!(!stored, "the oracle stores this batch")

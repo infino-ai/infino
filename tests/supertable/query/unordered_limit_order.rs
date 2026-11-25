@@ -45,7 +45,7 @@ fn table_of(root: &TempDir, commits: i64) -> Connection {
     for c in 0..commits {
         let seq = Int64Array::from((c * ROWS..(c + 1) * ROWS).collect::<Vec<_>>());
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(seq)]).expect("batch");
-        t.append(&batch).expect("append");
+        t.append(&batch, None).expect("append");
     }
     conn
 }

@@ -267,7 +267,7 @@ pub fn run() {
         .expect("create");
     for _ in 0..commits {
         table
-            .append(&batch(&schema, ROWS_PER_COMMIT, &zipf, &mut rng))
+            .append(&batch(&schema, ROWS_PER_COMMIT, &zipf, &mut rng), None)
             .expect("append");
     }
     let table = conn.open_table(TABLE).expect("open");

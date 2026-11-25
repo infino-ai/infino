@@ -331,6 +331,8 @@ fn superfiles_in_flight_for(total_bytes: u64) -> usize {
 const MANIFEST_CACHE_SUBDIR: &str = "manifest-parts";
 /// Default optimistic-commit retry budget under contention.
 const DEFAULT_MAX_COMMIT_RETRIES: u32 = 10;
+/// Default for [`SupertableOptions::idempotency_token_ttl`]: seven days.
+const DEFAULT_IDEMPOTENCY_TOKEN_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Default writer auto-flush threshold (1 GiB, in MiB units).
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Default target buffered bytes per commit shard (in MiB units).
@@ -736,6 +738,18 @@ pub struct SupertableOptions {
     /// concurrent-writer contention; writer-heavy workloads can
     /// raise via [`Self::with_max_commit_retries`].
     pub max_commit_retries: u32,
+    /// How long the table remembers an idempotency token after the commit
+    /// that recorded it. Past it the token's entry is dropped when the next
+    /// list is written, and asking about the token answers
+    /// [`TokenStatus::Expired`](crate::supertable::idempotency::TokenStatus::Expired);
+    /// a retry carrying it would commit again. Zero keeps tokens forever.
+    ///
+    /// A commit that records a token writes this value into the manifest
+    /// list, and every handle expires tokens by the value the list holds, so
+    /// the latest recording commit's setting governs the whole table. A
+    /// handle that never passes a token does not change it.
+    /// Default seven days; set via [`Self::with_idempotency_token_ttl`].
+    pub idempotency_token_ttl: Duration,
     /// How many sealed-sidecar retries a mutation may spend without forward
     /// progress before it gives up with `SealedSidecarRetryExhausted`.
     /// Progress refunds the budget, so a healthy table never reaches this;
@@ -995,6 +1009,7 @@ impl SupertableOptions {
             drain_consolidate: DrainConsolidate::Kmeans,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
             max_commit_retries: DEFAULT_MAX_COMMIT_RETRIES,
+            idempotency_token_ttl: DEFAULT_IDEMPOTENCY_TOKEN_TTL,
             max_sealed_retries: DEFAULT_MAX_SEALED_RETRIES,
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
             superfile_buffer_split_mb: DEFAULT_SUPERFILE_BUFFER_SPLIT_MB,
@@ -1337,6 +1352,15 @@ impl SupertableOptions {
     /// `10`.
     pub fn with_max_commit_retries(mut self, n: u32) -> Self {
         self.max_commit_retries = n;
+        self
+    }
+
+    /// Override how long idempotency tokens are remembered once this handle
+    /// records one; the table keeps the latest recording commit's value. See
+    /// [`Self::idempotency_token_ttl`]. Default seven days; zero keeps them
+    /// forever.
+    pub fn with_idempotency_token_ttl(mut self, ttl: Duration) -> Self {
+        self.idempotency_token_ttl = ttl;
         self
     }
 

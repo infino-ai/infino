@@ -141,8 +141,12 @@ fn hydrate_matches_normal_ingest() {
     let ingested = db
         .create_table("ingested", user_schema(), IndexSpec::new())
         .expect("create_table (ingest)");
-    ingested.append(&rows_batch(1, 100)).expect("append 1");
-    ingested.append(&rows_batch(101, 200)).expect("append 2");
+    ingested
+        .append(&rows_batch(1, 100), None)
+        .expect("append 1");
+    ingested
+        .append(&rows_batch(101, 200), None)
+        .expect("append 2");
     ingested
         .optimize(&OptimizeOptions::default())
         .expect("optimize");

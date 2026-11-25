@@ -9,7 +9,7 @@
 //! an unbiased estimate of `<R·query, R·doc>` (which equals
 //! `<query, doc>` because `R` is orthogonal).
 //!
-//! The `sign_table` is a precomputed lookup of all 256 byte values to
+//! The sign table is a precomputed lookup of all 256 byte values to
 //! their 8-lane `±1.0` expansions. SIMD-friendly: each input byte
 //! becomes one `f32x8` register load; multiplication against the
 //! query lanes is one fused-multiply-add.
@@ -88,34 +88,46 @@ const RABITQ_DOT_POS_COEFF: f32 = 2.0;
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const AVX512_F32_LANES: usize = 16;
 
-/// 1-bit quantizer + estimator for vectors of fixed dimension `dim`.
-/// Construct once per column at index-build time; reuse for both
-/// encoding (build-side) and dot-estimation (query-side).
+/// Each byte value's eight `±1` signs, one per bit (low bit first). The same for every dimension,
+/// so one copy serves every quantizer (8 KB).
+static SIGN_TABLE: CacheLineAligned<[f32; SIGN_TABLE_BYTE_PATTERNS * BITS_PER_CODE_BYTE]> =
+    CacheLineAligned(sign_table());
+
+/// A value aligned to a 64-byte cache line, so each of the sign table's 32-byte rows sits inside
+/// one line.
+#[repr(align(64))]
+struct CacheLineAligned<T>(T);
+
+const fn sign_table() -> [f32; SIGN_TABLE_BYTE_PATTERNS * BITS_PER_CODE_BYTE] {
+    let mut table = [0.0f32; SIGN_TABLE_BYTE_PATTERNS * BITS_PER_CODE_BYTE];
+    let mut b = 0;
+    while b < SIGN_TABLE_BYTE_PATTERNS {
+        let mut bit = 0;
+        while bit < BITS_PER_CODE_BYTE {
+            table[b * BITS_PER_CODE_BYTE + bit] = if (b >> bit) & 1 == 1 {
+                RABITQ_POSITIVE_SIGN
+            } else {
+                RABITQ_NEGATIVE_SIGN
+            };
+            bit += 1;
+        }
+        b += 1;
+    }
+    table
+}
+
+/// 1-bit quantizer + estimator for vectors of fixed dimension `dim`, for both encoding
+/// (build side) and dot estimation (query side).
 #[derive(Debug, Clone)]
 pub struct BitQuantizer {
     pub dim: usize,
-    sign_table: Box<[f32; SIGN_TABLE_BYTE_PATTERNS * BITS_PER_CODE_BYTE]>,
 }
 
 impl BitQuantizer {
-    /// Build the sign lookup table for vectors of dimension `dim`.
-    /// Cost: `256 * 8 * 4 = 8 KB` heap, computed once.
+    /// A quantizer for vectors of dimension `dim`. Allocates nothing: every quantizer reads the
+    /// one shared sign table.
     pub fn new(dim: usize) -> Self {
-        let mut table = Box::new([0.0f32; SIGN_TABLE_BYTE_PATTERNS * BITS_PER_CODE_BYTE]);
-        for b in 0..SIGN_TABLE_BYTE_PATTERNS {
-            for bit in 0..BITS_PER_CODE_BYTE {
-                let set = (b >> bit) & 1;
-                table[b * BITS_PER_CODE_BYTE + bit] = if set == 1 {
-                    RABITQ_POSITIVE_SIGN
-                } else {
-                    RABITQ_NEGATIVE_SIGN
-                };
-            }
-        }
-        Self {
-            dim,
-            sign_table: table,
-        }
+        Self { dim }
     }
 
     /// Number of bytes required to hold one encoded vector.
@@ -212,7 +224,7 @@ impl BitQuantizer {
             return unsafe { estimate_dot_rotated_avx512(q_rot, code, q_total, self.dim) };
         }
         let _ = q_total; // ignored on the wide fallback
-        estimate_dot_rotated_wide(&self.sign_table, q_rot, code, self.dim)
+        estimate_dot_rotated_wide(&SIGN_TABLE.0, q_rot, code, self.dim)
     }
 }
 
@@ -922,9 +934,20 @@ mod tests {
     // --- sanity --------------------------------------------------------
 
     #[test]
-    fn sign_table_has_correct_size() {
-        let q = BitQuantizer::new(128);
-        assert_eq!(q.sign_table.len(), 256 * 8);
+    fn sign_table_expands_each_byte_into_its_bit_signs() {
+        assert_eq!(
+            SIGN_TABLE.0.len(),
+            SIGN_TABLE_BYTE_PATTERNS * BITS_PER_CODE_BYTE
+        );
+        for (i, &sign) in SIGN_TABLE.0.iter().enumerate() {
+            let (byte, bit) = (i / BITS_PER_CODE_BYTE, i % BITS_PER_CODE_BYTE);
+            let want = if (byte >> bit) & 1 == 1 {
+                RABITQ_POSITIVE_SIGN
+            } else {
+                RABITQ_NEGATIVE_SIGN
+            };
+            assert_eq!(sign, want, "byte {byte} bit {bit}");
+        }
     }
 
     #[test]
@@ -1131,7 +1154,7 @@ mod tests {
             let q_rot = fake_vec(dim, 0xC0DE);
             let code = fake_code(&q, 0xD0DE);
             let q_total: f32 = q_rot.iter().sum();
-            let want = estimate_dot_rotated_wide(&q.sign_table, &q_rot, &code, dim);
+            let want = estimate_dot_rotated_wide(&SIGN_TABLE.0, &q_rot, &code, dim);
             // SAFETY: gated on avx512_enabled() above.
             let got = unsafe { estimate_dot_rotated_avx512(&q_rot, &code, q_total, dim) };
             let tol = 1e-4 * want.abs().max(1.0) + 1e-5 * (dim as f32).sqrt();
@@ -1199,7 +1222,7 @@ mod tests {
             // the call out of the loop on loop-invariant slice refs.
             for _ in 0..(iters / 10).max(64) {
                 black_box(estimate_dot_rotated_wide(
-                    black_box(&q.sign_table),
+                    black_box(&SIGN_TABLE.0),
                     black_box(&q_rot),
                     black_box(&code),
                     black_box(dim),
@@ -1208,7 +1231,7 @@ mod tests {
             let t = Instant::now();
             for _ in 0..iters {
                 black_box(estimate_dot_rotated_wide(
-                    black_box(&q.sign_table),
+                    black_box(&SIGN_TABLE.0),
                     black_box(&q_rot),
                     black_box(&code),
                     black_box(dim),

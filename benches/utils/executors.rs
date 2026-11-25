@@ -300,7 +300,6 @@ pub mod fts {
         harness::{BoolMode, FtsQuery},
         markdown::{fmt_count, fmt_time},
         report::{Better, Block, Cell, Report, Section, metric, text},
-        rss::{PeakSampler, RssStats},
     };
 
     /// Nanoseconds per second, for time-cell formatting.
@@ -875,13 +874,12 @@ pub mod fts {
         /// receives, priced for egress.
         pub fetched_payload_rows: u64,
         pub fetched_payload_bytes: u64,
-        pub rss: RssStats,
     }
 
     /// Untimed iterations before sampling, to reach steady state.
     const WARMUP_ITERS: usize = 5;
 
-    /// One warm measurement of a query: query-phase `Stats` + fetch + RSS.
+    /// One warm measurement of a query: query-phase `Stats` + fetch.
     fn measure_warm_once<R: FtsRead>(
         reader: &R,
         q: &FtsQuery,
@@ -894,7 +892,6 @@ pub mod fts {
         for _ in 0..WARMUP_ITERS {
             std::hint::black_box(reader.bm25_rows(column, &query, k, mode));
         }
-        let sampler = PeakSampler::start_default();
         let (mut samples, cpu_s) =
             sample_batched_cpu(iters, || reader.bm25_rows(column, &query, k, mode));
         for _ in 0..WARMUP_ITERS {
@@ -909,7 +906,6 @@ pub mod fts {
             (search_payload_rows, search_payload_bytes),
             (fetched_payload_rows, fetched_payload_bytes),
         ) = reader.bm25_payloads(column, &query, k, mode);
-        let rss = sampler.stop_stats();
         FtsQueryStat {
             name: q.name,
             warm: summarize(&mut samples),
@@ -920,7 +916,6 @@ pub mod fts {
             search_payload_bytes,
             fetched_payload_rows,
             fetched_payload_bytes,
-            rss,
         }
     }
 
@@ -2598,7 +2593,6 @@ pub mod sql {
         harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery},
         markdown::{fmt_count, fmt_time},
         report::{Better, Block, Cell, Report, Section, metric, text},
-        rss::{PeakSampler, RssStats},
     };
 
     /// Timed query repetitions per query (after one warmup).
@@ -2744,6 +2738,21 @@ pub mod sql {
             (
                 "vector_search",
                 format!("SELECT _id FROM vector_search('emb', '{qv}', 10)"),
+            ),
+            // A scalar `WHERE` no index bounds: the search widens until 10
+            // rows pass, so each filter prices the rounds its selectivity
+            // costs. `rating` is `doc_id % 100`, independent of the vectors.
+            (
+                "vector_search WHERE rating < 50 (keeps 50%)",
+                format!("SELECT _id FROM vector_search('emb', '{qv}', 10) WHERE rating < 50"),
+            ),
+            (
+                "vector_search WHERE rating < 10 (keeps 10%)",
+                format!("SELECT _id FROM vector_search('emb', '{qv}', 10) WHERE rating < 10"),
+            ),
+            (
+                "vector_search WHERE rating < 1 (keeps 1%)",
+                format!("SELECT _id FROM vector_search('emb', '{qv}', 10) WHERE rating < 1"),
             ),
             (
                 "hybrid_search",
@@ -3120,7 +3129,6 @@ pub mod sql {
         /// count is `rows`). Cache-independent, so it is the egress payload
         /// for the cold path too.
         pub payload_bytes: u64,
-        pub rss: RssStats,
     }
 
     /// Untimed iterations before sampling, to reach steady state.
@@ -3148,9 +3156,7 @@ pub mod sql {
         // Warmup opened this query's working set; settle its background
         // fills so the timed iterations measure steady state.
         reader.settle_warm();
-        let sampler = PeakSampler::start_default();
         let (mut samples, cpu_s) = sample_batched_cpu(iters, || reader.query_rows(sql));
-        let rss = sampler.stop_stats();
         // Result payload from the ENGINE's ledger (one extra untimed call).
         let (_, payload_bytes) = reader.query_payload(sql);
         SqlQueryStat {
@@ -3159,7 +3165,6 @@ pub mod sql {
             rows: warm_rows,
             cpu_s,
             payload_bytes,
-            rss,
         }
     }
 

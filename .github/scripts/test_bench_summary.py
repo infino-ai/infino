@@ -16,6 +16,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import bench_summary as bs
 
@@ -38,7 +39,12 @@ BYTES_PER_MIB = 1048576
 RSS_OLD_BYTES = 494.23 * BYTES_PER_MIB
 RSS_NEW_BYTES = 787.78 * BYTES_PER_MIB
 
-REPORT = "supertable_sql"
+REPORT = "supertable_fts"
+
+# The report, anchor and label of the row `P50_GATED_ROWS` gates on warm p50.
+GATED_REPORT = "supertable_sql"
+GATED_ANCHOR = "bench/sql/supertable/queries/post-compact"
+GATED_LABEL = "token_match (all rows)"
 
 # Every header the bench emits that reaches the gate, with whether it is
 # genuinely nanosecond-valued (and therefore gate-eligible).
@@ -152,6 +158,69 @@ class GateClassification(unittest.TestCase):
         r = self.diff({("point lookup", "warm p50"): (SMALL_NS, BIG_NS)})
         self.assertEqual(self.metrics(r, "blocking"), set())
         self.assertEqual(self.metrics(r, "informational"), {"point lookup / warm p50"})
+
+    def gated_diff(self, anchor, label, reports=(GATED_REPORT,)):
+        """Run `diff` over a `GATED_REPORT` holding one row's warm p50 and p90, both moving
+        past the gate."""
+        with tempfile.TemporaryDirectory() as tmp:
+            arms = (("baseline", (SMALL_NS, SMALL_NS)), ("current", (BIG_NS, BIG_NS)))
+            for arm, (p50, p90) in arms:
+                os.mkdir(os.path.join(tmp, arm))
+                path = os.path.join(tmp, arm, f"{GATED_REPORT}.json")
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            f"{anchor}|sub|{label}|warm p50": p50,
+                            f"{anchor}|sub|{label}|warm p90": p90,
+                        },
+                        fh,
+                    )
+            return bs.diff(
+                list(reports),
+                os.path.join(tmp, "baseline"),
+                os.path.join(tmp, "current"),
+                bs.DEFAULT_THRESHOLD,
+                "warm p90",
+            )
+
+    def test_p50_gated_row_blocks_on_p50_not_p90(self):
+        """A row in `P50_GATED_ROWS` gates on warm p50; its p90 only reports."""
+        r = self.gated_diff(GATED_ANCHOR, GATED_LABEL)
+        self.assertEqual(self.metrics(r, "blocking"), {f"{GATED_LABEL} / warm p50"})
+        self.assertEqual(self.metrics(r, "informational"), {f"{GATED_LABEL} / warm p90"})
+        self.assertEqual(r.unseen_gated_rows, [])
+
+    def test_renamed_gated_row_is_reported_unseen(self):
+        """A `P50_GATED_ROWS` entry whose report ran without its row is reported, so the
+        summary fails rather than gate the renamed row on p90."""
+        r = self.gated_diff(GATED_ANCHOR, "token_match (every row)")
+        self.assertEqual(r.unseen_gated_rows, [(GATED_REPORT, GATED_ANCHOR, GATED_LABEL)])
+
+    def test_gated_row_of_a_report_not_run_is_not_reported(self):
+        """A lane that did not run the entry's report has nothing to match."""
+        r = self.gated_diff(GATED_ANCHOR, "token_match (every row)", reports=(REPORT,))
+        self.assertEqual(r.unseen_gated_rows, [])
+
+    def test_summary_exits_nonzero_on_an_unseen_gated_row(self):
+        """`main` fails the step on an unseen entry when the run reported no failure."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cur = os.path.join(tmp, "current")
+            os.mkdir(cur)
+            with open(os.path.join(cur, f"{GATED_REPORT}.json"), "w", encoding="utf-8") as fh:
+                json.dump({f"{GATED_ANCHOR}|sub|renamed|warm p50": SMALL_NS}, fh)
+            env = {
+                "REPORTS": GATED_REPORT,
+                "BASELINE_DIR": os.path.join(tmp, "baseline"),
+                "CURRENT_DIR": cur,
+                "OUT_FILE": os.path.join(tmp, "out.md"),
+                "GATE_FILE": os.path.join(tmp, "gate"),
+                "INFO_FILE": os.path.join(tmp, "info"),
+                "ERRORS": "",
+            }
+            with mock.patch.dict(os.environ, env):
+                with self.assertRaises(SystemExit) as raised:
+                    bs.main()
+        self.assertEqual(raised.exception.code, 1)
 
     def test_transition_wall_never_blocks(self):
         """A one-shot mutation wall against a real object store reports only."""

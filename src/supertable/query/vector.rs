@@ -64,6 +64,8 @@
 //! object-store-native engine never issues. For cold queries
 //! this is the difference between seconds and milliseconds.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::{
     borrow::Cow,
     cmp::Ordering,
@@ -145,6 +147,7 @@ use crate::{
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
             superfile_reader::OpenTierCounts,
+            widening::next_want,
         },
         reader_cache::ReadIntent,
         schema::FieldId,
@@ -175,9 +178,6 @@ const LAW_WIDTH_WITHIN_DEFAULT: usize = 1;
 /// survivor budget well below the undivided width sweep.
 const WIDTH_BUDGET_OVERSAMPLE: usize = 4;
 
-/// Candidate growth when a deleted row occupies a current top-k slot.
-const DELETE_REFILL_GROWTH_FACTOR: usize = 2;
-
 /// A filtered search on the hidden index reads the cells that hold matching
 /// rows, instead of the cells near the query, when those cells hold at most
 /// this many times the rows the routed search would read. Cell routing is
@@ -205,6 +205,13 @@ const CHECK_HITS_SLACK: f64 = 1.5;
 /// the vectors, keeping few rows near the query, and more rounds would only
 /// add cost.
 const CHECK_HITS_GIVE_UP_FACTOR: f64 = 4.0;
+
+#[cfg(test)]
+thread_local! {
+    /// The hits each delete-refill round asked for, in order. A sync search drives its future on
+    /// the caller's thread, so a test reads back exactly its own searches' refill sizes.
+    static REFILL_REQUESTS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Rounds of checking before the filter's rows are mapped instead.
 const CHECK_HITS_MAX_ROUNDS: usize = 3;
@@ -7380,11 +7387,7 @@ impl SupertableReader {
                     .map_err(QueryError::from)?;
                 // The predicate-resolution leg of filtered vector search
                 // is FTS work like any other; flush it per superfile.
-                if let Some(stats) = &op_stats {
-                    stats.add_fts_postings_bytes(work.postings_bytes);
-                    stats.add_planned_read_ranges(work.planned_ranges);
-                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                }
+                work.add_to(op_stats.as_deref());
                 Ok(row_bitmap(&docs))
             }
         })
@@ -8391,11 +8394,7 @@ impl SupertableReader {
                     .map_err(QueryError::from)?;
                 // The SQL predicate's posting walks, summed across the
                 // plan tree — the pushdown leg of the vector TVF.
-                if let Some(stats) = &op_stats {
-                    stats.add_fts_postings_bytes(work.postings_bytes);
-                    stats.add_planned_read_ranges(work.planned_ranges);
-                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                }
+                work.add_to(op_stats.as_deref());
                 match bitmap {
                     Some(bitmap) => Ok(bitmap),
                     None if unbounded_is_legitimate => {
@@ -8585,18 +8584,13 @@ impl SupertableReader {
                 return Ok(combined);
             }
 
-            let next = requested
-                .saturating_mul(DELETE_REFILL_GROWTH_FACTOR)
-                .min(refill_cap);
-            if next == requested {
-                combined.retain(|hit| {
-                    hit.stable_id
-                        .is_some_and(|id| deleted.binary_search(&id).is_err())
-                });
-                combined.truncate(k);
-                return Ok(combined);
-            }
-            requested = next;
+            // Each refill reruns the fan-out over every superfile, so size it
+            // from how many of the last round's hits were live: a top-k
+            // buried under deletes refills in a round or two. It always
+            // grows, so the loop reaches the cap.
+            requested = next_want(k, requested, live, refill_cap);
+            #[cfg(test)]
+            REFILL_REQUESTS.with_borrow_mut(|requests| requests.push(requested));
             let hidden_retry = async {
                 if hidden_entries.is_empty() {
                     Ok(Vec::new())
@@ -9110,7 +9104,7 @@ impl Supertable {
     /// # let vecs = db.create_table("vecs", schema.clone(), IndexSpec::new().vector("emb", 16, Metric::Cosine))?;
     /// # let mut data = vec![0.0f32; 16]; data[0] = 1.0;
     /// # let col = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vec![Some(data.iter().copied().map(Some).collect::<Vec<_>>())], 16);
-    /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?)?;
+    /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?, None)?;
     /// # let mut query = vec![0.0f32; 16]; query[0] = 1.0;
     /// // Bare call → `_id` + `score`, no scalar decode:
     /// let hits = vecs.vector_search("emb", &query, 10, None, None)?;
@@ -9176,7 +9170,8 @@ mod tests {
     use std::{
         borrow::Cow,
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-        fs,
+        fs, mem,
+        ops::Range,
         path::Path,
         sync::{
             Arc, Mutex as StdMutex,
@@ -9187,6 +9182,7 @@ mod tests {
     use arrow::array::Array;
     use async_trait::async_trait;
     use bytes::Bytes;
+    use datafusion::prelude::{col, lit};
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use roaring::RoaringBitmap;
 
@@ -9227,9 +9223,9 @@ mod tests {
 
     use super::{
         CellLayout, CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN,
-        ReadIntent, SCORE_COLUMN, ScanCandidate, VectorFilter, VectorSearchOptions,
-        admit_extension_round, admit_shortlist_window, allowed_cells, apply_width_pin,
-        assemble_flat_sections, assemble_hnsw_sections, build_centroid_router,
+        REFILL_REQUESTS, ReadIntent, SCORE_COLUMN, ScanCandidate, VectorFilter,
+        VectorSearchOptions, admit_extension_round, admit_shortlist_window, allowed_cells,
+        apply_width_pin, assemble_flat_sections, assemble_hnsw_sections, build_centroid_router,
         calibrated_query_for, cell_layout, cell_passes, cell_row_ranges,
         cells_ranked_by_fine_score, centroid_router_from_stored, centroid_router_walk,
         decode_centroid_router_section, dispatch, encode_centroid_router_section, filtered_k,
@@ -15892,6 +15888,109 @@ mod tests {
             hits_before.len() - 1,
             "the deleted doc must drop out of the results"
         );
+    }
+
+    /// Rows in the delete-refill fixture: one superfile, drained to the hidden
+    /// index, every row one-hot so the query's nearest rows are known.
+    const REFILL_ROWS: usize = 64;
+
+    /// The `k` the delete-refill test asks for.
+    const REFILL_K: usize = 10;
+
+    /// Rows the delete-refill test deletes first: enough that most of the
+    /// first round's hits are deleted and the search has to refill, while
+    /// more than [`REFILL_K`] rows stay live.
+    const REFILL_FIRST_DELETES: usize = 40;
+
+    /// Live rows left after the second delete, fewer than [`REFILL_K`], so
+    /// the refill runs to its cap of `k` plus the deleted count.
+    const REFILL_LAST_LIVE: usize = 4;
+
+    /// When deleted rows crowd a vector search's top `k`, the search refills
+    /// with more hits until `k` live rows stand or it has asked for `k` plus
+    /// every deleted row. Sized from the live rate, a refill reaches that cap
+    /// in one round here, and must still end: with enough live rows it returns
+    /// `k` of them, and with too few it returns every live row.
+    #[test]
+    fn a_refill_past_deletes_returns_k_live_rows_or_every_live_row() {
+        let dim = 16;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(options_one_superfile_per_commit(dim).with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, REFILL_ROWS, dim, schema))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w); // release the writer so the deletes can take one
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let search = |k: usize| {
+            st.reader()
+                .expect("reader")
+                .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
+                .expect("search")
+        };
+        let ids = |hits: &[SuperfileHit]| -> HashSet<i128> {
+            hits.iter()
+                .map(|hit| hit.stable_id.expect("stable _id"))
+                .collect()
+        };
+        assert_eq!(search(REFILL_ROWS).len(), REFILL_ROWS, "every row found");
+        let delete_rows = |rows: Range<usize>| {
+            let titles = rows.map(|i| lit(format!("doc {i}"))).collect();
+            st.delete(col("title").in_list(titles, false))
+                .expect("delete")
+        };
+
+        let stats = delete_rows(0..REFILL_FIRST_DELETES);
+        assert_eq!(stats.n_tombstoned(), REFILL_FIRST_DELETES);
+        let every_live = search(REFILL_ROWS);
+        let live = ids(&every_live);
+        assert_eq!(live.len(), REFILL_ROWS - REFILL_FIRST_DELETES);
+        REFILL_REQUESTS.with_borrow_mut(mem::take);
+        let top_k = search(REFILL_K);
+        // Sized from the live rate, one refill asks for the cap of `k` plus every
+        // deleted row; doubling from `k` takes two (20, then 40).
+        assert_eq!(
+            REFILL_REQUESTS.with_borrow_mut(mem::take),
+            [REFILL_K + REFILL_FIRST_DELETES],
+            "the refill was not sized from the live rate"
+        );
+        assert_eq!(top_k.len(), REFILL_K, "k live rows exist, so k come back");
+        assert!(
+            ids(&top_k).is_subset(&live),
+            "a deleted row came back from the refill"
+        );
+        // One live row is the query's exact match; the others tie far away.
+        let nearest_live = every_live[0].stable_id.expect("stable _id");
+        assert!(
+            ids(&top_k).contains(&nearest_live),
+            "the refill missed the nearest live row"
+        );
+
+        let stats = delete_rows(REFILL_FIRST_DELETES..REFILL_ROWS - REFILL_LAST_LIVE);
+        assert_eq!(
+            stats.n_tombstoned(),
+            REFILL_ROWS - REFILL_LAST_LIVE - REFILL_FIRST_DELETES
+        );
+        REFILL_REQUESTS.with_borrow_mut(mem::take);
+        let top_k = search(REFILL_K);
+        assert_eq!(
+            REFILL_REQUESTS.with_borrow_mut(mem::take),
+            [REFILL_K + REFILL_ROWS - REFILL_LAST_LIVE],
+            "the refill was not sized from the live rate"
+        );
+        assert_eq!(
+            top_k.len(),
+            REFILL_LAST_LIVE,
+            "fewer than k live rows, so every one comes back"
+        );
+        assert_eq!(ids(&top_k), ids(&search(REFILL_ROWS)));
     }
 
     /// Commit writes user superfiles in the cell-packed (MultiCellIvf) layout,

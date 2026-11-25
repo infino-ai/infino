@@ -36,7 +36,7 @@ use object_store::{
 
 use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, child_prefix_names, counting,
-    io_counters, logical_list_key, options::apply, retry,
+    etag_meta, io_counters, logical_list_key, options::apply, retry,
 };
 use crate::{runtime_metrics::io::UsageMeter, utils::trace::record};
 
@@ -456,33 +456,27 @@ impl StorageProvider for S3StorageProvider {
             .await
             .map_err(|e| translate(uri, e))?;
         self.meter.record_head();
-        Ok(ObjectMeta {
-            size: meta.size as u64,
-            etag: meta.e_tag,
-            last_modified: meta.last_modified.into(),
-        })
+        Ok(etag_meta(meta))
     }
 
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(uri = uri, len = tracing::field::Empty))
+        tracing::instrument(
+            skip_all,
+            fields(uri = uri, len = tracing::field::Empty, hedged = tracing::field::Empty)
+        )
     )]
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
         let tl = io_counters::timeline_start();
         // etag and bytes are atomically paired in the same response, so
         // no follow-up HEAD is needed.
-        let out = retry::complete_get(uri, || async {
+        let out = retry::read_body(uri, retry::Hedging::reads(&self.meter), || async {
             let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
-            let meta = ObjectMeta {
-                size: result.meta.size as u64,
-                etag: result.meta.e_tag.clone(),
-                last_modified: result.meta.last_modified.into(),
-            };
-            let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
-            Ok((bytes, meta))
+            Ok(retry::Response::new(result, move |e| translate(uri, e)))
         })
-        .await;
+        .await
+        .map(|(bytes, meta)| (bytes, etag_meta(meta)));
         if let Ok((b, _)) = &out {
             self.meter.record_get(uri, None, b.len() as u64);
             record("len", b.len() as u64);
@@ -493,7 +487,10 @@ impl StorageProvider for S3StorageProvider {
 
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(uri = uri, len = tracing::field::Empty))
+        tracing::instrument(
+            skip_all,
+            fields(uri = uri, len = tracing::field::Empty, hedged = tracing::field::Empty)
+        )
     )]
     async fn get_if_none_match(
         &self,
@@ -504,25 +501,21 @@ impl StorageProvider for S3StorageProvider {
         // Native `If-None-Match`: an unchanged object comes back as a
         // bodyless 304 instead of a full read. Both arms are still a
         // billable GET (0 body bytes on 304).
-        let out = retry::with_reissue(|| async {
+        let out = retry::read_whole(uri, retry::Hedging::reads(&self.meter), || async {
             let options = GetOptions {
                 if_none_match: Some(etag.to_string()),
                 ..GetOptions::default()
             };
-            let result = match self.store.get_opts(&path, options).await {
-                Ok(result) => result,
-                Err(ObjError::NotModified { .. }) => return Ok(None),
-                Err(e) => return Err(translate(uri, e)),
-            };
-            let meta = ObjectMeta {
-                size: result.meta.size as u64,
-                etag: result.meta.e_tag.clone(),
-                last_modified: result.meta.last_modified.into(),
-            };
-            let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
-            Ok(Some((bytes, meta)))
+            match self.store.get_opts(&path, options).await {
+                Ok(result) => Ok(Some(retry::Response::new(result, move |e| {
+                    translate(uri, e)
+                }))),
+                Err(ObjError::NotModified { .. }) => Ok(None),
+                Err(e) => Err(translate(uri, e)),
+            }
         })
-        .await;
+        .await
+        .map(|read| read.map(|(bytes, meta)| (bytes, etag_meta(meta))));
         match &out {
             Ok(Some((b, _))) => {
                 self.meter.record_get(uri, None, b.len() as u64);
@@ -539,18 +532,23 @@ impl StorageProvider for S3StorageProvider {
 
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(uri = uri, len = range.end - range.start))
+        tracing::instrument(
+            skip_all,
+            fields(uri = uri, len = range.end - range.start, hedged = tracing::field::Empty)
+        )
     )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
         let requested = (range.start, range.end);
         let off = range.start;
         let tl = io_counters::timeline_start();
-        let out = retry::complete_range(uri, range, |r| async {
-            self.store
-                .get_range(&path, r)
+        let out = retry::read_range(uri, range, retry::Hedging::reads(&self.meter), |r| async {
+            let result = self
+                .store
+                .get_opts(&path, GetOptions::new().with_range(Some(r)))
                 .await
-                .map_err(|e| translate(uri, e))
+                .map_err(|e| translate(uri, e))?;
+            Ok(retry::Response::new(result, move |e| translate(uri, e)))
         })
         .await;
         if let Ok(b) = &out {
@@ -570,6 +568,10 @@ impl StorageProvider for S3StorageProvider {
     /// GET = 2 RTTs), this collapses to 1 RTT — on a typical
     /// in-region AWS S3 path that's a ~25-50 ms saving per
     /// cold open.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(uri = uri, len = len, hedged = tracing::field::Empty))
+    )]
     async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
         if len == 0 {
             // Suffix-range of 0 isn't well-defined in HTTP;
@@ -580,7 +582,7 @@ impl StorageProvider for S3StorageProvider {
         }
         let path = self.path(uri)?;
         let tl = io_counters::timeline_start();
-        let out = retry::with_reissue(|| async {
+        let out = retry::read_body(uri, retry::Hedging::reads(&self.meter), || async {
             let opts = GetOptions {
                 range: Some(GetRange::Suffix(len)),
                 ..Default::default()
@@ -590,11 +592,10 @@ impl StorageProvider for S3StorageProvider {
                 .get_opts(&path, opts)
                 .await
                 .map_err(|e| translate(uri, e))?;
-            let size = result.meta.size as u64;
-            let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
-            Ok((bytes, size))
+            Ok(retry::Response::new(result, move |e| translate(uri, e)))
         })
-        .await;
+        .await
+        .map(|(bytes, meta)| (bytes, meta.size));
         if let Ok((b, size)) = &out {
             let start = size.saturating_sub(b.len() as u64);
             self.meter
@@ -754,14 +755,7 @@ impl StorageProvider for S3StorageProvider {
         let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
             let location = meta.location.to_string();
-            out.push((
-                logical_list_key(&self.prefix, &location),
-                ObjectMeta {
-                    size: meta.size,
-                    etag: meta.e_tag,
-                    last_modified: meta.last_modified.into(),
-                },
-            ));
+            out.push((logical_list_key(&self.prefix, &location), etag_meta(meta)));
         }
         Ok(out)
     }
@@ -799,6 +793,9 @@ mod tests {
     //! `infino` crate instance).
 
     use super::*;
+    use crate::storage::stalling_endpoint::{
+        Endpoint, Read, Stall, assert_stalled_read_recovers, stalling_endpoint,
+    };
 
     // ---- translate -----------------------------------------------------
 
@@ -1178,5 +1175,85 @@ mod tests {
             .object_store_handle("data/seg-1")
             .expect("handle for valid uri");
         assert_eq!(path.to_string(), "tbl/data/seg-1");
+    }
+
+    // ---- stalled reads, through the real client ---------------------------
+
+    /// The bucket, credentials and region the stalled-read tests' provider is built with; the
+    /// endpoint checks none of them.
+    const STALL_BUCKET: &str = "bucket";
+    const STALL_ACCESS_KEY: &str = "AKIATESTKEY";
+    const STALL_SECRET: &str = "secret";
+    const STALL_REGION: &str = "us-east-1";
+
+    /// An S3 provider whose store is `endpoint`, its usage counted on `meter`.
+    fn stalling_provider(endpoint: &Endpoint, meter: &Arc<UsageMeter>) -> S3StorageProvider {
+        S3StorageProvider::new_with_endpoint(
+            endpoint.url.clone(),
+            STALL_BUCKET,
+            STALL_ACCESS_KEY,
+            STALL_SECRET,
+            STALL_REGION,
+            None,
+        )
+        .expect("provider")
+        .with_usage_meter(Arc::clone(meter))
+    }
+
+    /// Through the real S3 client: a range GET whose headers never arrive gets a second request
+    /// after its delay, so the read returns in seconds instead of waiting out the 30 s request
+    /// timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_range_get_with_stalled_headers_is_answered_by_its_hedge() {
+        let endpoint = stalling_endpoint(Stall::BeforeHeaders);
+        let meter = UsageMeter::new();
+        let provider = stalling_provider(&endpoint, &meter);
+        assert_stalled_read_recovers(
+            &provider,
+            &meter,
+            &endpoint,
+            Stall::BeforeHeaders,
+            Read::Range,
+        )
+        .await;
+    }
+
+    /// Through the real S3 client: a range GET whose body stops partway is dropped after its
+    /// idle timeout and only its missing bytes are asked for again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_range_get_with_a_stalled_body_asks_again_for_its_missing_bytes() {
+        let endpoint = stalling_endpoint(Stall::MidBody);
+        let meter = UsageMeter::new();
+        let provider = stalling_provider(&endpoint, &meter);
+        assert_stalled_read_recovers(&provider, &meter, &endpoint, Stall::MidBody, Read::Range)
+            .await;
+    }
+
+    /// Through the real S3 client: a tail whose headers never arrive gets a second request after
+    /// its delay, as a range read does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tail_with_stalled_headers_is_answered_by_its_hedge() {
+        let endpoint = stalling_endpoint(Stall::BeforeHeaders);
+        let meter = UsageMeter::new();
+        let provider = stalling_provider(&endpoint, &meter);
+        assert_stalled_read_recovers(
+            &provider,
+            &meter,
+            &endpoint,
+            Stall::BeforeHeaders,
+            Read::Tail,
+        )
+        .await;
+    }
+
+    /// Through the real S3 client: a whole-object GET whose body stops partway is dropped after
+    /// its idle timeout and sent again whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_get_with_a_stalled_body_is_sent_again() {
+        let endpoint = stalling_endpoint(Stall::MidBody);
+        let meter = UsageMeter::new();
+        let provider = stalling_provider(&endpoint, &meter);
+        assert_stalled_read_recovers(&provider, &meter, &endpoint, Stall::MidBody, Read::Whole)
+            .await;
     }
 }
