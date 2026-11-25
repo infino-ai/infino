@@ -2689,6 +2689,8 @@ mod tests {
     const ORDER_FIXTURE_ROWS: [u32; 2] = [4096, 4101];
     /// Every this many rows carry `beta`: a match dense enough for the bitset.
     const BETA_EVERY: u32 = 3;
+    /// Doc ids in one doc-id map page.
+    const IDS_PER_PAGE: u32 = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
     /// Every this many rows carry `rare`: a match sparse enough to be sorted.
     const RARE_EVERY: u32 = 128;
     /// Seed of the term lists the dedup test draws.
@@ -4303,24 +4305,23 @@ mod tests {
                 .await
                 .expect("open_lazy")
         };
-        let per_page = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
-        let last_page = (N_DOCS - 1) / per_page;
+        let last_page = (N_DOCS - 1) / IDS_PER_PAGE;
         assert!(
-            !N_DOCS.is_multiple_of(per_page),
+            !N_DOCS.is_multiple_of(IDS_PER_PAGE),
             "the map's last page must be shorter than the rest"
         );
         let row = |id: u32| RowId::new(order[id as usize]);
 
         // Pages 0 to 3 in one run, a lone page, and the last page.
         let ids: Vec<u32> = vec![
-            last_page * per_page + 3,
+            last_page * IDS_PER_PAGE + 3,
             0,
-            per_page - 1,
-            per_page,
-            3 * per_page,
+            IDS_PER_PAGE - 1,
+            IDS_PER_PAGE,
+            3 * IDS_PER_PAGE,
             N_DOCS / 2,
             N_DOCS - 1,
-            last_page * per_page,
+            last_page * IDS_PER_PAGE,
         ];
         let r = open().await;
         let hits: Vec<(FtsDocId, f32)> = ids
@@ -4346,7 +4347,7 @@ mod tests {
         // One id in every page, read with CRC checks on: past the sparse share, so the reader keeps
         // the whole map when the heap budget has room.
         let r = open().await.with_heap_budget(roomy(None));
-        let every_page: Vec<u32> = (0..=last_page).map(|p| p * per_page).collect();
+        let every_page: Vec<u32> = (0..=last_page).map(|p| p * IDS_PER_PAGE).collect();
         let hits: Vec<(FtsDocId, f32)> = every_page
             .iter()
             .map(|&id| (FtsDocId::new(id), 1.0))
@@ -4498,9 +4499,8 @@ mod tests {
         }
         // Hits in every fourth page are dense but leave gaps; without room for the map the pass
         // still reads every page, so the damage is caught.
-        let per_page = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
         let gapped: Vec<FtsDocId> = (0..N_DOCS)
-            .step_by(4 * per_page as usize)
+            .step_by(4 * IDS_PER_PAGE as usize)
             .map(FtsDocId::new)
             .collect();
         let r = open(damaged).await.with_heap_budget(roomy(Some(0)));
@@ -4529,9 +4529,8 @@ mod tests {
         let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
         let order: Vec<u32> = (0..N_DOCS).rev().collect();
         let (blob, json) = build_standard_blob_with(&refs, Some(&order));
-        let per_page = DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES;
         let hits = (0..N_DOCS)
-            .step_by(per_page)
+            .step_by(IDS_PER_PAGE as usize)
             .rev()
             .map(|id| (FtsDocId::new(id), id as f32))
             .collect();
@@ -5260,9 +5259,8 @@ mod tests {
         let (blob, json, order, _) = dense_translation();
         let budget = roomy(None);
         let r = open_charged(blob, &json, budget).await;
-        let per_page = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
         let hits: Vec<(FtsDocId, f32)> = (0..=DOC_MAP_KEPT_PAGES_MAX as u32)
-            .map(|i| (FtsDocId::new(i * CAP_TEST_PAGE_STRIDE * per_page), 1.0))
+            .map(|i| (FtsDocId::new(i * CAP_TEST_PAGE_STRIDE * IDS_PER_PAGE), 1.0))
             .collect();
         assert_eq!(
             r.hits_to_rows_async(hits.clone()).await.expect("translate"),
@@ -5294,8 +5292,10 @@ mod tests {
         let (blob, json, order, _) = dense_translation();
         let budget = roomy(None);
         let r = open_charged(blob, &json, budget).await;
-        let per_page = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
-        let hits = vec![(FtsDocId::new(2 * per_page), 2.0), (FtsDocId::new(0), 1.0)];
+        let hits = vec![
+            (FtsDocId::new(2 * IDS_PER_PAGE), 2.0),
+            (FtsDocId::new(0), 1.0),
+        ];
         assert_eq!(
             r.hits_to_rows_async(hits.clone()).await.expect("translate"),
             rows_of(&order, &hits)
@@ -5522,9 +5522,8 @@ mod tests {
         let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
         let order: Vec<u32> = (0..N_DOCS).rev().collect();
         let (blob, json) = build_standard_blob_with(&refs, Some(&order));
-        let per_page = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
         let ids: Vec<FtsDocId> = (0..READS)
-            .map(|i| FtsDocId::new(i * STRIDE_PAGES * per_page))
+            .map(|i| FtsDocId::new(i * STRIDE_PAGES * IDS_PER_PAGE))
             .collect();
         let read_bytes = READS as usize * DOC_MAP_PAGE_BYTES;
         let src = Arc::new(GatedSource::new(blob));
