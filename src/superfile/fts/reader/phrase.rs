@@ -984,7 +984,7 @@ mod tests {
                 },
                 tokenize::Phrase,
             },
-            id_space::{FtsDocId, RowId},
+            id_space::{Admitted, FtsDocId, RowId},
             lazy_source::LazyByteSource,
         },
         test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
@@ -2242,7 +2242,7 @@ mod tests {
                     negatives: negs,
                     must_phrases: &must_phrases,
                     negative_phrases: &neg_phrases,
-                    allow: allowed.clone(),
+                    allow: allowed.clone().map(Admitted::Rows),
                     ..ClauseLists::default()
                 };
                 let label = format!("{label} allow={}", allowed.is_some());

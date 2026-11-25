@@ -22,7 +22,7 @@ use super::{
     bounds::BoundDecoder,
     core::*,
     cursor::{CursorUse, TermCursor, TermMeta},
-    filter::{AtomExcludeFilter, ExcludeFilter},
+    filter::{AllowGate, AtomExcludeFilter, ExcludeFilter},
     metadata::NormTable,
     options::BoolMode,
     phrase::{AnyCursor, approx_align, batch_phrase_with_terms},
@@ -47,7 +47,7 @@ use crate::{
             posting::{BLOCK_LEN, BlockHeader, decode_block},
             short::{decode_short, short_df},
         },
-        id_space::{DocMap, FtsDocId, RowId, RowSet},
+        id_space::{Admitted, BlobIdSet, DocMap, FtsDocId, RowId, RowSet},
     },
     utils::terms::{DictEntry, make_key},
 };
@@ -662,14 +662,17 @@ impl FtsReader {
         (distinct, qtf)
     }
 
-    /// The doc-id map for a filter: read now when it checks rows against an
-    /// allow set, and the identity otherwise, which such a filter never
-    /// consults.
-    async fn filter_doc_map(&self, checks_rows: bool) -> Result<DocMap, FtsError> {
-        match checks_rows {
-            true => Ok(self.ensure_doc_map().await?.clone()),
-            false => Ok(DocMap::Identity),
-        }
+    /// `allow` as a filter checks it. A row set reads the doc-id map now, so a filter that checks
+    /// rows always holds the real one; a blob-id set needs no map.
+    async fn allow_gate(&self, allow: Option<Admitted>) -> Result<Option<AllowGate>, FtsError> {
+        Ok(match allow {
+            None => None,
+            Some(Admitted::Rows(rows)) => Some(AllowGate::Rows {
+                rows: RowSet::new(rows),
+                doc_map: self.ensure_doc_map().await?.clone(),
+            }),
+            Some(Admitted::BlobIds(ids)) => Some(AllowGate::BlobIds(BlobIdSet::new(ids))),
+        })
     }
 
     /// I/O half of an un-ranged clause search: resolve the column,
@@ -807,14 +810,10 @@ impl FtsReader {
             // atom, or a pushed-down row set.
             let filter = match (negative_atoms.is_empty(), lists.allow.clone()) {
                 (true, None) => None,
-                (_, allow) => {
-                    let doc_map = self.filter_doc_map(allow.is_some()).await?;
-                    Some(AtomExcludeFilter::with_allow(
-                        negative_atoms,
-                        allow.map(RowSet::new),
-                        doc_map,
-                    ))
-                }
+                (_, allow) => Some(AtomExcludeFilter::with_allow(
+                    negative_atoms,
+                    self.allow_gate(allow).await?,
+                )),
             };
             // The atom walk is the whole kernel for phrase shapes —
             // `run_prepared` sees only the finished `Done` — so bracket
@@ -871,17 +870,11 @@ impl FtsReader {
         // term present in this superfile, or a pushed-down row set.
         let neg_filter = match (neg_cursors.is_empty(), lists.allow.clone()) {
             (true, None) => None,
-            (_, allow) => {
-                // The positive terms are resolved below, after the filter;
-                // with an allow set the map is read here so a filter that
-                // checks rows always holds the real one.
-                let doc_map = self.filter_doc_map(allow.is_some()).await?;
-                Some(ExcludeFilter::with_allow(
-                    neg_cursors,
-                    allow.map(RowSet::new),
-                    doc_map,
-                ))
-            }
+            // The positive terms are resolved below, after the filter.
+            (_, allow) => Some(ExcludeFilter::with_allow(
+                neg_cursors,
+                self.allow_gate(allow).await?,
+            )),
         };
 
         // Fold repeated MUST/SHOULD terms into one weighted cursor each: the
@@ -3220,7 +3213,7 @@ mod tests {
         let allow: Arc<RoaringBitmap> = Arc::new([0u32, 2].into_iter().collect());
         let lists = || ClauseLists {
             shoulds: &["rust", "java"],
-            allow: Some(Arc::clone(&allow)),
+            allow: Some(Admitted::Rows(Arc::clone(&allow))),
             ..ClauseLists::default()
         };
         let pruned = r
@@ -3260,7 +3253,7 @@ mod tests {
         let lists = || ClauseLists {
             shoulds: &["w"],
             negatives: &["x"],
-            allow: Some(Arc::clone(&allow)),
+            allow: Some(Admitted::Rows(Arc::clone(&allow))),
             ..ClauseLists::default()
         };
         let want = (0..N_DOCS)
@@ -3704,7 +3697,7 @@ mod tests {
                 "body",
                 ClauseLists {
                     shoulds: &["rust"],
-                    allow: only_one.clone(),
+                    allow: only_one.clone().map(Admitted::Rows),
                     ..ClauseLists::default()
                 },
                 10,
@@ -3721,7 +3714,7 @@ mod tests {
                 "body",
                 ClauseLists {
                     shoulds: &["rust", "spring"],
-                    allow: zero_two.clone(),
+                    allow: zero_two.clone().map(Admitted::Rows),
                     ..ClauseLists::default()
                 },
                 10,
@@ -3737,7 +3730,7 @@ mod tests {
                 "body",
                 ClauseLists {
                     musts: &["rust", "runtime"],
-                    allow: zero_two.clone(),
+                    allow: zero_two.clone().map(Admitted::Rows),
                     ..ClauseLists::default()
                 },
                 10,
@@ -3755,7 +3748,7 @@ mod tests {
                 ClauseLists {
                     shoulds: &["rust"],
                     negatives: &["async"],
-                    allow: zero_two,
+                    allow: zero_two.map(Admitted::Rows),
                     ..ClauseLists::default()
                 },
                 10,
@@ -3778,7 +3771,7 @@ mod tests {
                 "title",
                 ClauseLists {
                     should_phrases: &phrases,
-                    allow: Some(Arc::new([2u32, 3].into_iter().collect())),
+                    allow: Some(Admitted::Rows(Arc::new([2u32, 3].into_iter().collect()))),
                     ..ClauseLists::default()
                 },
                 10,
@@ -3794,7 +3787,7 @@ mod tests {
                 "title",
                 ClauseLists {
                     shoulds: &["new"],
-                    allow: Some(Arc::new(RoaringBitmap::new())),
+                    allow: Some(Admitted::Rows(Arc::new(RoaringBitmap::new()))),
                     ..ClauseLists::default()
                 },
                 10,

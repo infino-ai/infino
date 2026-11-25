@@ -475,6 +475,21 @@ impl FtsReader {
         prefetched: Option<&FetchedTermMemo>,
         dict: &QueryDict,
     ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
+        let (docs, work) = self
+            .token_match_prefetched_in_blob_ids(column, tokens, mode, prefetched, dict)
+            .await?;
+        Ok((self.ids_to_rows_async(docs).await?, work))
+    }
+
+    /// [`Self::token_match_prefetched`] left in blob ids, ascending: no doc-id map is read.
+    pub(crate) async fn token_match_prefetched_in_blob_ids(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+        dict: &QueryDict,
+    ) -> Result<(Vec<FtsDocId>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
@@ -502,7 +517,7 @@ impl FtsReader {
             .flatten()
             .collect();
         // The cursors are built; a dictionary `dict` did not keep is not held through the walk and
-        // the row-map read below.
+        // a caller's row-map read after it.
         drop(dict_bytes);
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
@@ -525,7 +540,7 @@ impl FtsReader {
                 .collect(),
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((self.ids_to_rows_async(docs).await?, work))
+        Ok((docs, work))
     }
 
     /// The documents of `column` holding every one of `tokens` whose length is

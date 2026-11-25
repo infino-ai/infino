@@ -84,7 +84,7 @@ use crate::{
             tokenize::{Phrase, Tokenizer},
         },
         held_buffer_bytes, held_table_bytes,
-        id_space::{FtsDocId, RowId},
+        id_space::{Admitted, FtsDocId, RowId, row_bitmap},
         ids::{self, PackedIds},
         load_watch::{LoadListener, LoadWatch},
         range::{KeyKind, RangeDirectory, same_keys},
@@ -2960,6 +2960,44 @@ impl SuperfileReader {
         Ok(fts
             .token_match_prefetched(column, tokens, mode, prefetched, dict)
             .await?)
+    }
+
+    /// [`Self::token_match_prefetched`] left in blob ids, ascending, reading no doc-id map.
+    /// Delegates to [`FtsReader::token_match_prefetched_in_blob_ids`].
+    pub(crate) async fn token_match_prefetched_in_blob_ids(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+        dict: &QueryDict,
+    ) -> Result<(Vec<FtsDocId>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .token_match_prefetched_in_blob_ids(column, tokens, mode, prefetched, dict)
+            .await?)
+    }
+
+    /// `set` in rows: as it is, or a blob-id set translated through this superfile's doc-id map,
+    /// which a blob that keeps its documents in row order does not read.
+    pub(crate) async fn admitted_rows(
+        &self,
+        set: &Admitted,
+    ) -> Result<Arc<RoaringBitmap>, ReadError> {
+        match set {
+            Admitted::Rows(rows) => Ok(Arc::clone(rows)),
+            Admitted::BlobIds(ids) => {
+                let fts = self
+                    .fts()
+                    .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+                let rows = fts
+                    .ids_to_rows_async(ids.iter().map(FtsDocId::new).collect())
+                    .await?;
+                Ok(Arc::new(row_bitmap(&rows)))
+            }
+        }
     }
 
     /// [`FtsReader::exact_match_candidates`] on this superfile's index.

@@ -66,7 +66,17 @@ impl RowId {
 /// strictly ascending (only a corrupt doc-id map, naming a row twice, gives them) are inserted one
 /// by one.
 pub(crate) fn row_bitmap(rows: &[RowId]) -> RoaringBitmap {
-    let positions = || rows.iter().map(|row| row.get());
+    bitmap_of(|| rows.iter().map(|row| row.get()))
+}
+
+/// `ids` as a bitmap of their positions, as [`row_bitmap`] does for rows. A match walks postings
+/// in blob order, so they come ascending.
+pub(crate) fn blob_id_bitmap(ids: &[FtsDocId]) -> RoaringBitmap {
+    bitmap_of(|| ids.iter().map(|id| id.get()))
+}
+
+/// The positions `positions` yields, appended while they ascend and inserted one by one if not.
+fn bitmap_of<I: Iterator<Item = u32>>(positions: impl Fn() -> I) -> RoaringBitmap {
     RoaringBitmap::from_sorted_iter(positions()).unwrap_or_else(|_| positions().collect())
 }
 
@@ -275,6 +285,53 @@ impl RowSet {
     #[inline]
     pub fn contains(&self, row: RowId) -> bool {
         self.0.contains(row.get())
+    }
+}
+
+/// The blob documents a caller admits: a SQL `WHERE` every bound of which came from one
+/// superfile's own full-text index, resolved there and left in blob ids. A kernel checks the doc it
+/// walks against it directly, so the blob's [`DocMap`] is never read for it; [`RowSet`] is the
+/// same gate in rows, for a bound from anywhere else.
+#[derive(Clone, Debug)]
+pub(crate) struct BlobIdSet(Arc<RoaringBitmap>);
+
+impl BlobIdSet {
+    /// The set of the blob ids in `bitmap`, which is already in blob space.
+    #[inline]
+    pub fn new(bitmap: Arc<RoaringBitmap>) -> Self {
+        Self(bitmap)
+    }
+
+    /// Whether `doc` is admitted.
+    #[inline]
+    pub fn contains(&self, doc: FtsDocId) -> bool {
+        self.0.contains(doc.get())
+    }
+}
+
+/// What a pushed-down SQL `WHERE` admits in one superfile, in the space it was resolved in.
+#[derive(Clone, Debug)]
+pub(crate) enum Admitted {
+    /// Rows, which a kernel checks a blob id against through the blob's [`DocMap`].
+    Rows(Arc<RoaringBitmap>),
+    /// Blob ids, from a `WHERE` the superfile's own full-text index bounds alone: a kernel checks
+    /// them as it walks, and reads no map for them.
+    BlobIds(Arc<RoaringBitmap>),
+}
+
+impl Admitted {
+    /// How many documents it admits, the same count in either space.
+    #[inline]
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Rows(set) | Self::BlobIds(set) => set.len(),
+        }
+    }
+
+    /// Whether it admits no document.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

@@ -128,7 +128,7 @@ use crate::{
             },
             tokenize::{KEYWORD_TOKENIZER, MAX_TOKEN_CHARS, STANDARD_TOKENIZER, Tokenizer},
         },
-        id_space::row_bitmap,
+        id_space::{Admitted, blob_id_bitmap, row_bitmap},
         range::{KeyKind, float_key, signed_key, unsigned_key},
     },
     supertable::{
@@ -171,20 +171,42 @@ const MIN_FILES_PER_POOL_JOB: usize = 2;
 // admitted" — the opposite polarity from [`CandidateScope::empty`], and a
 // silent way for a future `..Default::default()` to drop the row bound.
 // Construct one through `empty()` or `SupertableReader::candidate_scope`.
+//
+// Each superfile's set is its rows (`S` is a row bitmap), what every caller takes; a ranked text
+// search also takes a [`RankScope`], whose sets may be blob ids.
 #[derive(Debug, Clone)]
-pub(crate) struct CandidateScope {
+pub(crate) struct CandidateScope<S = Arc<RoaringBitmap>> {
     /// Superfiles a match may live in, in manifest order.
     pub(crate) superfiles: Vec<Arc<SuperfileEntry>>,
-    /// Candidate `local_doc_id`s per superfile — a superset of the rows
-    /// satisfying the predicate, keyed by the superfile's URI; a superfile
+    /// Each superfile's candidate set (rows, or blob ids in a [`RankScope`]): a superset of the
+    /// rows satisfying the predicate, keyed by the superfile's URI; a superfile
     /// absent from the map has no candidate row. `None` when the plan is
     /// [`Unbounded`](CandidatePlan::Unbounded): the index bounds no row,
     /// every row of every superfile above is a candidate, and the caller
     /// fills its top-k by over-fetching under the exact predicate.
-    pub(crate) allow: Option<HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+    pub(crate) allow: Option<HashMap<SuperfileUri, S>>,
 }
 
-impl CandidateScope {
+/// A [`CandidateScope`] for a ranked text search: a superfile's set is in blob ids when its own
+/// full-text index bounds the `WHERE` alone, so the search checks it with no doc-id map, and in
+/// rows otherwise.
+pub(crate) type RankScope = CandidateScope<Admitted>;
+
+impl From<CandidateScope> for RankScope {
+    fn from(scope: CandidateScope) -> Self {
+        Self {
+            superfiles: scope.superfiles,
+            allow: scope.allow.map(|allow| {
+                allow
+                    .into_iter()
+                    .map(|(uri, rows)| (uri, Admitted::Rows(rows)))
+                    .collect()
+            }),
+        }
+    }
+}
+
+impl<S> CandidateScope<S> {
     /// A scope that admits nothing: no superfile can hold a match.
     pub(crate) fn empty() -> Self {
         Self {
@@ -206,7 +228,9 @@ impl CandidateScope {
                 .is_none_or(|allow| allow.contains_key(&entry.uri))
         })
     }
+}
 
+impl RankScope {
     /// Whether this scope narrows the *rows* of `kept` at all: false under
     /// an unbounded plan, and false when every kept superfile's candidate
     /// set is its whole row set - a bitmap that admits every row is no gate,
@@ -221,7 +245,7 @@ impl CandidateScope {
         kept.iter().any(|entry| {
             allow
                 .get(&entry.uri)
-                .is_none_or(|rows| rows.len() < entry.n_docs)
+                .is_none_or(|set| set.len() < entry.n_docs)
         })
     }
 }
@@ -468,6 +492,19 @@ impl CandidatePlan {
         memos: &'a TermMemos,
         dict: &'a QueryDict,
     ) -> BoxFuture<'a, Result<(Option<RoaringBitmap>, MatchWork), ReadError>> {
+        self.evaluate_in(SetSpace::Rows, reader, pool, memos, dict)
+    }
+
+    /// [`Self::evaluate`] with the sets built in `space`. In blob ids a range leaf bounds nothing
+    /// (a range index names rows), so a caller asks for them only for a plan without one.
+    pub(crate) fn evaluate_in<'a>(
+        &'a self,
+        space: SetSpace,
+        reader: &'a SuperfileReader,
+        pool: Option<&'a ThreadPool>,
+        memos: &'a TermMemos,
+        dict: &'a QueryDict,
+    ) -> BoxFuture<'a, Result<(Option<RoaringBitmap>, MatchWork), ReadError>> {
         Box::pin(async move {
             match self {
                 CandidatePlan::Unbounded => Ok((None, MatchWork::default())),
@@ -481,11 +518,10 @@ impl CandidatePlan {
                         return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
                     };
                     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-                    let memo = memos.get(column).map(Arc::as_ref);
-                    let (docs, work) = reader
-                        .token_match_prefetched(file_column, &refs, BoolMode::And, memo, dict)
-                        .await?;
-                    Ok((Some(row_bitmap(&docs)), work))
+                    let column = (file_column, memos.get(column));
+                    let (set, work) =
+                        term_match(space, reader, column, &refs, BoolMode::And, dict).await?;
+                    Ok((Some(set), work))
                 }
                 CandidatePlan::TermsAny {
                     column,
@@ -502,11 +538,10 @@ impl CandidatePlan {
                         return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
                     };
                     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-                    let memo = memos.get(column).map(Arc::as_ref);
-                    let (docs, work) = reader
-                        .token_match_prefetched(file_column, &refs, BoolMode::Or, memo, dict)
-                        .await?;
-                    Ok((Some(row_bitmap(&docs)), work))
+                    let column = (file_column, memos.get(column));
+                    let (set, work) =
+                        term_match(space, reader, column, &refs, BoolMode::Or, dict).await?;
+                    Ok((Some(set), work))
                 }
                 CandidatePlan::TermsLike {
                     column,
@@ -517,7 +552,9 @@ impl CandidatePlan {
                     let (expanded, mut work) =
                         expand_like(reader, column, *field, tokens, *fold, true, pool, dict)
                             .await?;
-                    let (docs, eval_work) = expanded.evaluate(reader, pool, memos, dict).await?;
+                    let (docs, eval_work) = expanded
+                        .evaluate_in(space, reader, pool, memos, dict)
+                        .await?;
                     work.merge(eval_work);
                     Ok((docs, work))
                 }
@@ -526,15 +563,24 @@ impl CandidatePlan {
                     data_type,
                     lo,
                     hi,
-                } => {
-                    let rows = reader.range_rows(*field, data_type, *lo, *hi, pool).await?;
-                    Ok((rows, MatchWork::default()))
-                }
+                } => match space {
+                    SetSpace::Rows => {
+                        let rows = reader.range_rows(*field, data_type, *lo, *hi, pool).await?;
+                        Ok((rows, MatchWork::default()))
+                    }
+                    // A range index names rows, so it bounds nothing in blob ids: a caller asks
+                    // for blob ids only for a plan without a range leaf.
+                    SetSpace::BlobIds => {
+                        debug_assert!(false, "a range leaf evaluated in blob ids");
+                        Ok((None, MatchWork::default()))
+                    }
+                },
                 CandidatePlan::And(children) => {
                     let mut acc: Option<RoaringBitmap> = None;
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.evaluate(reader, pool, memos, dict).await?;
+                        let (child, child_work) =
+                            c.evaluate_in(space, reader, pool, memos, dict).await?;
                         work.merge(child_work);
                         if let Some(bm) = child {
                             acc = Some(match acc {
@@ -553,7 +599,8 @@ impl CandidatePlan {
                     let mut acc = RoaringBitmap::new();
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.evaluate(reader, pool, memos, dict).await?;
+                        let (child, child_work) =
+                            c.evaluate_in(space, reader, pool, memos, dict).await?;
                         work.merge(child_work);
                         match child {
                             Some(bm) => acc |= bm,
@@ -566,6 +613,43 @@ impl CandidatePlan {
             }
         })
     }
+}
+
+/// The numbering [`CandidatePlan::evaluate_in`] builds a superfile's set in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SetSpace {
+    /// Parquet rows, which anything outside the full-text index can use.
+    Rows,
+    /// The superfile's full-text blob ids, which only its own index's kernels can check, but
+    /// which need no doc-id map.
+    BlobIds,
+}
+
+/// One term leaf's matches in `space`: `column` is the superfile's name for it and the memo
+/// serving its terms.
+async fn term_match(
+    space: SetSpace,
+    reader: &SuperfileReader,
+    (column, memo): (&str, Option<&Arc<FetchedTermMemo>>),
+    terms: &[&str],
+    mode: BoolMode,
+    dict: &QueryDict,
+) -> Result<(RoaringBitmap, MatchWork), ReadError> {
+    let memo = memo.map(Arc::as_ref);
+    Ok(match space {
+        SetSpace::Rows => {
+            let (rows, work) = reader
+                .token_match_prefetched(column, terms, mode, memo, dict)
+                .await?;
+            (row_bitmap(&rows), work)
+        }
+        SetSpace::BlobIds => {
+            let (ids, work) = reader
+                .token_match_prefetched_in_blob_ids(column, terms, mode, memo, dict)
+                .await?;
+            (blob_id_bitmap(&ids), work)
+        }
+    })
 }
 
 /// A superfile's index is worth using only when its estimated matches are at most `index` and
@@ -1105,6 +1189,20 @@ impl CandidatePlan {
             | CandidatePlan::TermsLike { .. }
             | CandidatePlan::Range { .. }
             | CandidatePlan::Unbounded => 1,
+        }
+    }
+
+    /// Whether any leaf is a [`Range`](Self::Range), which only rows can hold.
+    pub(crate) fn has_range(&self) -> bool {
+        match self {
+            CandidatePlan::Range { .. } => true,
+            CandidatePlan::And(children) | CandidatePlan::Or(children) => {
+                children.iter().any(CandidatePlan::has_range)
+            }
+            CandidatePlan::TermsAll { .. }
+            | CandidatePlan::TermsAny { .. }
+            | CandidatePlan::TermsLike { .. }
+            | CandidatePlan::Unbounded => false,
         }
     }
 
@@ -2393,7 +2491,7 @@ mod tests {
             vec![a.uri, c.uri],
             "in scope order, without the file whose set is empty"
         );
-        let unbounded = CandidateScope {
+        let unbounded: CandidateScope = CandidateScope {
             superfiles: vec![Arc::clone(&a), Arc::clone(&b)],
             allow: None,
         };
@@ -2401,7 +2499,7 @@ mod tests {
             uris(unbounded.admitted_superfiles().collect()),
             vec![a.uri, b.uri]
         );
-        assert_eq!(CandidateScope::empty().admitted_superfiles().count(), 0);
+        assert_eq!(<CandidateScope>::empty().admitted_superfiles().count(), 0);
     }
 
     /// A scope narrows the rows of the kept superfiles only when some kept
@@ -2410,7 +2508,7 @@ mod tests {
     #[test]
     fn bounds_rows_only_when_a_kept_set_is_less_than_the_whole_file() {
         let (whole, partial, missing) = (entry(4), entry(4), entry(4));
-        let scope = CandidateScope {
+        let scope = RankScope::from(CandidateScope {
             superfiles: vec![
                 Arc::clone(&whole),
                 Arc::clone(&partial),
@@ -2420,7 +2518,7 @@ mod tests {
                 (whole.uri, rows(4)),
                 (partial.uri, rows(3)),
             ])),
-        };
+        });
         assert!(
             !scope.bounds_rows(&[Arc::clone(&whole)]),
             "a set holding every row of every kept file is no gate"
@@ -2428,7 +2526,7 @@ mod tests {
         assert!(scope.bounds_rows(&[Arc::clone(&whole), Arc::clone(&partial)]));
         assert!(scope.bounds_rows(&[Arc::clone(&missing)]));
         assert!(!scope.bounds_rows(&[]), "nothing kept, nothing bounded");
-        let unbounded = CandidateScope {
+        let unbounded = RankScope {
             superfiles: vec![Arc::clone(&partial)],
             allow: None,
         };

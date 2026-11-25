@@ -30,7 +30,6 @@ use std::{
 
 use bytes::Bytes;
 use rayon::ThreadPool;
-use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 use tokio::sync::{OnceCell, Semaphore};
 use tracing::debug;
@@ -71,7 +70,7 @@ use crate::{
             short::{SHORT_MAX_DF, decode_short, short_df},
             tokenize::{Phrase, Tokenizer},
         },
-        id_space::{DocMap, FtsDocId, RowId},
+        id_space::{Admitted, DocMap, FtsDocId, RowId},
         lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
         load_watch::{LoadListener, LoadWatch},
     },
@@ -201,14 +200,15 @@ pub(crate) struct ClauseLists<'a> {
     /// kth into it as their heaps fill. `None` on single-superfile
     /// entry points, where there is no fan-out to share with.
     pub live_floor: Option<&'a LiveFloor>,
-    /// The rows this search may rank at all, as this superfile's
-    /// `local_doc_id`s — a SQL `WHERE` pushed into the search and
-    /// resolved against the index. Every kernel admits a doc into its
-    /// heap only if the set holds it, so the top-k fills from allowed
-    /// rows instead of being a post-filtered global top-k that
-    /// underflows. `None` ranks every matching row. Owned (`Arc`), not
-    /// borrowed: the prepared clauses carry it into a `'static` kernel.
-    pub allow: Option<Arc<RoaringBitmap>>,
+    /// The documents this search may rank at all: a SQL `WHERE` pushed
+    /// into the search and resolved against the index, as rows or, when
+    /// this superfile's own index bounds it alone, as blob ids. Every
+    /// kernel admits a doc into its heap only if the set holds it, so the
+    /// top-k fills from allowed rows instead of being a post-filtered
+    /// global top-k that underflows. `None` ranks every matching row.
+    /// Owned, not borrowed: the prepared clauses carry it into a `'static`
+    /// kernel.
+    pub allow: Option<Admitted>,
     /// Score every match in one pass and count them, instead of pruning
     /// to the top-k. Set by the exact-count entry points, which pair it
     /// with `run_prepared_with_count`.
@@ -4018,6 +4018,7 @@ mod tests {
 
     use async_trait::async_trait;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use roaring::RoaringBitmap;
     use tokio::{
         join, spawn,
         sync::Notify,
@@ -6270,7 +6271,7 @@ mod tests {
                 "body",
                 ClauseLists {
                     shoulds: &[PROBE_TERM],
-                    allow: Some(allow),
+                    allow: Some(Admitted::Rows(allow)),
                     ..Default::default()
                 },
                 10,
@@ -6384,7 +6385,7 @@ mod tests {
             &r,
             ClauseLists {
                 should_phrases: &missing_phrase,
-                allow: Some(Arc::clone(&allow)),
+                allow: Some(Admitted::Rows(Arc::clone(&allow))),
                 ..Default::default()
             },
         )
@@ -6441,7 +6442,7 @@ mod tests {
                         &r,
                         ClauseLists {
                             must_phrases: &hit_phrase,
-                            allow: Some(every_row(&r)),
+                            allow: Some(Admitted::Rows(every_row(&r))),
                             ..Default::default()
                         },
                     )
