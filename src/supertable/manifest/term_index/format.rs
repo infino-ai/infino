@@ -974,7 +974,7 @@ fn check_crc(crcs: &[u8], at: usize, bytes: &[u8], what: &str) -> Result<(), Ter
 }
 
 /// Append `run` and its crc32c to a checked slice's `postings`, returning
-/// the bytes appended.
+/// how many bytes it appended.
 pub(crate) fn push_checked_run(postings: &mut Vec<u8>, run: &[u8]) -> usize {
     postings.extend_from_slice(run);
     postings.extend_from_slice(&crc32c(run).to_le_bytes());

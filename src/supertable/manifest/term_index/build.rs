@@ -78,10 +78,9 @@ use crate::{
     },
 };
 
-/// Target slice size. A cold lookup fetches one slice, so this is the
-/// cold cost of a term; a smaller slice means a larger root. **Pending
-/// measurement** — the plan's first milestone replaces this with a
-/// measured value.
+/// Target slice size. A smaller slice means a larger root; a larger one
+/// means a larger block index for a lookup's first read, and a larger whole
+/// read for prefix scans and background promotions.
 pub(crate) const SLICE_TARGET_BYTES: usize = 8 * 1024 * 1024;
 
 /// A tier of at most this many entries rides in its run instead of a
@@ -2390,8 +2389,8 @@ pub(crate) fn build(
 /// A change to what this writes reaches an existing table's next commit at
 /// once, in the layer the commit adds; its older layers change only as
 /// folds rewrite them, since optimize skips the rebuild when the index
-/// already has a full build's shape. Older roots and slices still load,
-/// and are read as their layout allows.
+/// already has a full build's shape. Roots from version 3 on, and their
+/// slices, still load, and are read as their layout allows.
 #[cfg_attr(
     feature = "detailed-tracing",
     tracing::instrument(skip_all, fields(inputs = contributions.len()))

@@ -120,7 +120,8 @@ pub(crate) const STORAGE_PREFIX: &str = "term-index/";
 
 /// Bytes of slices kept resident per table, whole or as block indexes,
 /// least recently used first out: about 64 whole slices, or the block
-/// indexes of thousands.
+/// indexes of thousands. Tier chunks and head levels each get a budget this
+/// size too, so a table holds up to three times this.
 const RESIDENT_SLICE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Most bytes one ranged read of a tier takes: a term's chunks lie back to
@@ -168,13 +169,14 @@ const SLICE_OVERSHOOT_BYTES: usize = SLICE_TARGET_BYTES / 8;
 const SLICE_FETCH_BUDGET_BYTES: u32 =
     (WHOLE_SLICES_AT_ONCE * (SLICE_TARGET_BYTES + SLICE_OVERSHOOT_BYTES)) as u32;
 
-/// Ranged object store requests one batched lookup has in flight at once.
-/// Pieces are small, so the byte budget alone would allow thousands.
+/// Requests one batched lookup has in flight at once: ranged reads, from
+/// local disk or the object store, and whole reads of small slices. Pieces
+/// are small, so the byte budget alone would allow thousands.
 const SLICE_REQUESTS_AT_ONCE: usize = 64;
 
 /// Slices one table reads whole at once in the background, after reading
-/// them by range, to keep them resident and on local disk. As many as one
-/// lookup reads whole at once.
+/// them by range, to keep them resident and, with a disk cache, on local
+/// disk. As many as one lookup reads whole at once.
 const SLICE_PROMOTION_CONCURRENCY: usize = WHOLE_SLICES_AT_ONCE;
 
 /// Slices one batched lookup works on at once. A slice read by range holds
@@ -188,7 +190,8 @@ const SLICE_LOOKUP_CONCURRENCY: usize = 64;
 const SMALL_SLICE_BYTES: u64 = 256 * 1024;
 
 /// Most slices remembered in each of `read_whole` and `unpromotable`
-/// ([`TierChunks`]), at 32 bytes each.
+/// ([`TierChunks`]), at about 100 bytes each, so about 6 MiB per set when
+/// full.
 const READ_WHOLE_SLICES: usize = 1 << 16;
 
 /// Largest gap between two pieces of a slice that one read spans. Reading
@@ -452,8 +455,8 @@ impl TierChunkData {
 /// What a table's term index keeps resident: tier chunks, head levels and
 /// slices (whole or as block indexes). All are content-addressed, so the
 /// cache is shared across the roots a table goes through. A std mutex:
-/// nothing awaits while it is held, and a tokio one would queue every lookup
-/// of a busy table behind the scheduler.
+/// nothing awaits while it is held, and each hold is a few map operations, so
+/// an async mutex would only add a scheduler round trip per lookup.
 pub(crate) type TierChunkCache = Arc<Mutex<TierChunks>>;
 
 /// The term index's resident objects. Tier chunks a read in flight is about
@@ -645,12 +648,14 @@ fn runs_in(
         .collect()
 }
 
-/// Limits on what one batched lookup has in flight: slice bytes, ranged
-/// requests and whole slice reads. A read takes its bytes first and its turn
-/// second. A read holding a turn waits only on its own read, or on another
-/// whole read of the same slice from local disk (by another lookup, or by
-/// this one for a second layer naming the slice), which already holds every
-/// permit it needs. So the limits cannot deadlock.
+/// Limits on what one batched lookup has in flight: slice bytes, requests
+/// (ranged reads, and whole reads of small slices) and whole reads of larger
+/// slices. A read takes its bytes first and its turn second. A read holding a
+/// turn waits only on its own read, or on another whole read of the same
+/// slice from local disk (by another lookup, or by this one for a second
+/// layer naming the slice), which already holds every permit it needs. A
+/// lookup waiting on another's first read of a block index holds nothing. So
+/// the limits cannot deadlock.
 struct FetchBudget {
     bytes: Semaphore,
     most_bytes: u32,
@@ -677,7 +682,7 @@ impl FetchBudget {
             .expect("a lookup's budget is never closed")
     }
 
-    /// A turn to send one ranged object store request.
+    /// A turn for one ranged read, or one whole read of a small slice.
     async fn request(&self) -> SemaphorePermit<'_> {
         self.requests
             .acquire()
@@ -3082,7 +3087,8 @@ pub(crate) struct TermIndex {
     promote: Promote,
     /// Bytes of each batched lookup's [`FetchBudget`].
     fetch_budget_bytes: u32,
-    /// Ranged slice requests each batched lookup has in flight at most.
+    /// Requests each batched lookup has in flight at most; see
+    /// [`SLICE_REQUESTS_AT_ONCE`].
     requests_at_once: usize,
 }
 
@@ -3240,16 +3246,16 @@ impl TermIndex {
         self
     }
 
-    /// This index's lookups having at most `reads` ranged requests in flight,
-    /// so a test reaches the cap with few slices.
+    /// This index's lookups having at most `reads` requests in flight (see
+    /// [`SLICE_REQUESTS_AT_ONCE`]), so a test reaches the cap with few slices.
     #[cfg(test)]
     fn with_requests_at_once(mut self, reads: usize) -> Self {
         self.requests_at_once = reads;
         self
     }
 
-    /// This index promoting as `promote` says, whatever its size and cache,
-    /// so a test can count a lookup's reads without background ones.
+    /// This index promoting as `promote` says, whatever its disk cache, so a
+    /// test can count a lookup's reads without background ones.
     #[cfg(test)]
     fn with_promote(mut self, promote: Promote) -> Self {
         self.promote = promote;
@@ -4043,9 +4049,10 @@ impl TermIndex {
                 &hash,
             )
             .await;
-            // A storage error or a briefly full disk cache leaves the slice to a
-            // later read. A slice failing its hash, or larger than the whole disk
-            // cache, would fail again, so it is marked unpromotable.
+            // A storage error leaves the slice to a later read. A disk cache too
+            // full to take it still keeps it in memory, and a later promotion
+            // writes it to disk. A slice failing its hash, or larger than the
+            // whole disk cache, would fail again, so it is marked unpromotable.
             let mut chunks = tier_chunks.lock().expect("tier chunk cache lock");
             let unkept = match read {
                 Ok(bytes) => {
@@ -4088,7 +4095,8 @@ impl TermIndex {
     /// [`Self::postings`] for each of `terms`, in the same order.
     ///
     /// Terms the resident runs miss are grouped by slice and each slice read once
-    /// ([`Self::slice_runs`]), many at a time, within one [`FetchBudget`].
+    /// ([`Self::slice_runs`]), many at a time, within one [`FetchBudget`]. One by
+    /// one, terms would wait on their slice reads in series.
     pub(crate) async fn runs_many(
         &self,
         column: FieldId,
@@ -11143,7 +11151,8 @@ mod tests {
         // One slice; its first, middle and last terms looked up, each read apart.
         //  - first on a full budget, to learn the largest block or run read;
         //  - then on a budget of just that, each read held open a moment;
-        //  - no block or run read starts while earlier reads pass the budget.
+        //  - when a block or run read starts, it and every read still held fit
+        //    the budget.
         // This test pins that a read's bytes are freed with its budget.
         let (local, root, terms, _store) = one_slice_index(SEPARATED_TERMS).await;
         let slices: usize = root.layers.iter().map(|l| l.slices.len()).sum();
@@ -11337,12 +11346,14 @@ mod tests {
     async fn a_lookup_waiting_on_a_dropped_disk_read_reads_the_slice_itself() {
         // A lookup of one term whose slices are on local disk, small enough to
         // be read whole, each already being read whole by another lookup; then
-        // those reads are dropped unfinished. The reads are made by hand: a
-        // real one can land within its first poll.
+        // those reads are dropped unfinished. The reads are made by hand, joined
+        // to the shared reads and never finishing: a real one can land within
+        // its first poll.
         //  - the lookup waits on the reads;
         //  - then it reads the slices itself and answers as whole-slice reads
         //    do.
-        // This test pins that a cancelled read never leaves a lookup waiting.
+        // This test pins that a cancelled shared read passes to a waiter, never
+        // leaving it waiting.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let dir = TempDir::new().expect("cache dir");
         let disk = MetadataDiskCache::new(dir.path().to_path_buf(), DISK_CACHE_BYTES, None)

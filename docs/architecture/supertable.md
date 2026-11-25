@@ -340,13 +340,18 @@ checked one of 256 KiB or less, is read whole in one request and
 checked by its content hash; a prefix scan reads one slice or a few
 adjacent ones whole. A slice already on local disk is read from there,
 by range or whole by the same rule. Lookups racing for a slice share
-one read of its block index. A slice read by range is then read whole
-in the background and kept in memory: with a disk cache, every such
-slice, from local disk when it is there and otherwise from the object
-store, then written to local disk; without one, a slice read by range
-a second time. Root and slices are content-addressed and immutable;
-slices on local disk are cached like manifest parts, and all are kept
-live by garbage collection for as long as a manifest names them.
+one read of its block index. A piece that fails its check is never
+read as absent: the lookup reads the slice whole instead.
+
+After a slice is read by range, it is read whole in the background and
+kept in memory, in room the resident budget has free. With a disk
+cache this happens to every such slice: it is read from local disk
+when it is there, otherwise downloaded and also written to local disk.
+Without a disk cache it happens to a slice read by range a second time
+while its block index is still in memory. Root and slices are
+content-addressed and immutable. Slices are cached on local disk like
+manifest parts, and both are kept live by garbage collection for as
+long as a manifest names them.
 
 Every commit publishes its superfiles' postings in the same atomic
 step as their entries: the writer already holds each new superfile's

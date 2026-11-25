@@ -967,8 +967,9 @@ fn current_term_index_root(dir: &Path) -> Vec<u8> {
 ///    layer, and both still answer the same;
 ///  - after the maintenance pass, they still answer the same.
 ///
-/// This test pins an upgrade in place; the fold over the old slices is
-/// pinned beside the fold itself.
+/// This test pins an upgrade in place. Folding the old slices is checked by
+/// `a_fold_reads_the_slices_the_layout_before_checks_wrote` in the term
+/// index's unit tests.
 #[test]
 fn a_table_indexed_by_the_layout_before_checks_serves_beside_new_layers() {
     let fixture =
