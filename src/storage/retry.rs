@@ -855,6 +855,73 @@ mod tests {
         assert_eq!(store.heads.get(), 2);
     }
 
+    /// The CAS token a create below answers once a PUT succeeds.
+    const CREATED_TOKEN: &str = "created";
+
+    /// Run [`create_with_reissue`] against a free key whose `n`th PUT answers
+    /// `issue(n)`. Answers the result with the PUTs and HEADs it made.
+    async fn create_on_free_key(
+        issue: impl Fn(u32) -> Result<Option<String>, StorageError>,
+    ) -> (Result<Option<String>, StorageError>, u32, u32) {
+        let (puts, heads) = (Cell::new(0u32), Cell::new(0u32));
+        let result = create_with_reissue(
+            CREATE_URI,
+            &CreateId::new(),
+            || {
+                let n = puts.get();
+                puts.set(n + 1);
+                let answer = issue(n);
+                async move { answer }
+            },
+            || {
+                heads.set(heads.get() + 1);
+                async { Err(not_found()) }
+            },
+        )
+        .await;
+        (result, puts.get(), heads.get())
+    }
+
+    /// A create that fails for a reason other than a transient one is
+    /// neither settled by a HEAD nor re-issued.
+    #[tokio::test(start_paused = true)]
+    async fn a_create_with_a_non_transient_failure_is_not_reissued() {
+        let (result, puts, heads) = create_on_free_key(|_| Err(not_found())).await;
+        assert!(matches!(result, Err(StorageError::NotFound { .. })));
+        assert_eq!((puts, heads), (1, 0));
+    }
+
+    /// A create whose first two issues fail transiently against a free key is
+    /// re-issued until the third lands.
+    #[tokio::test(start_paused = true)]
+    async fn a_create_recovers_after_several_transient_failures() {
+        let (result, puts, heads) = create_on_free_key(|n| {
+            if n < 2 {
+                Err(transient())
+            } else {
+                Ok(Some(CREATED_TOKEN.into()))
+            }
+        })
+        .await;
+        assert_eq!(result.expect("created"), Some(CREATED_TOKEN.into()));
+        assert_eq!((puts, heads), (3, 2));
+    }
+
+    /// A create that fails transiently on every issue spends the re-issue
+    /// budget and reports the transient failure.
+    #[tokio::test(start_paused = true)]
+    async fn a_create_that_keeps_failing_transiently_spends_the_budget() {
+        let (result, puts, heads) = create_on_free_key(|_| Err(transient())).await;
+        assert!(matches!(
+            result,
+            Err(StorageError::TransientExhausted { .. })
+        ));
+        assert_eq!(
+            (puts, heads),
+            (MAX_TRANSIENT_RETRIES + 1, MAX_TRANSIENT_RETRIES)
+        );
+    }
+
     // ---- delete_with_reissue ---------------------------------------------
 
     /// The key every delete below targets.
