@@ -430,8 +430,8 @@ impl ExecutionPlan for Bm25Exec {
         let fut = async move {
             // What the pushed-down `WHERE` admits: the superfiles the
             // manifest keeps and, under an index-bounded predicate, the
-            // documents in each (in blob ids where the file's own text index
-            // bounds it alone, so the whole doc-id map is not read). Prefix search has no
+            // documents in each (in blob ids where `rank_scope` chooses them, so
+            // the whole doc-id map is not read). Prefix search has no
             // scoped kernel (its term set is only known per superfile), so it
             // fills its `k` under the exact predicate alone.
             let scope = match &query {
@@ -1955,13 +1955,15 @@ mod tests {
     }
 
     /// A query for each way the search walks, with the rows it matches: a phrase and a negated
-    /// phrase (the phrase walk), a negated term, every term required, and any term.
+    /// phrase (the phrase walk), a negated term, every term required, a required term beside an
+    /// optional one, and any term.
     fn mapped_queries() -> Vec<(&'static str, fn(usize) -> bool)> {
         vec![
             ("\"shared t1\"", |n| n % MAPPED_SHARED_WORDS[0] == 1),
             ("shared -\"shared t1\"", |n| n % MAPPED_SHARED_WORDS[0] != 1),
             ("shared -t1", |n| !mapped_holds(n, 1)),
             ("+shared +t1", |n| mapped_holds(n, 1)),
+            ("+t1 shared", |n| mapped_holds(n, 1)),
             ("t1 t2", |n| mapped_holds(n, 1) || mapped_holds(n, 2)),
         ]
     }
@@ -1979,10 +1981,9 @@ mod tests {
         ]))
     }
 
-    /// `commits` commits with `body` and `tag` text-indexed and `n`, the row number,
-    /// range-indexed, merged into one
-    /// superfile that reorders its documents. Reopened cold behind a lazily
-    /// filled disk cache, so a query reads the doc-id map only if it needs it.
+    /// `commits` commits with `body` and `tag` text-indexed and `n`, the row number, range-indexed,
+    /// merged into one superfile that reorders its documents. Reopened cold behind a lazily filled
+    /// disk cache, so a query reads the doc-id map only if it needs it.
     fn mapped_body_tag_table(commits: usize) -> (Supertable, TempDir, TempDir) {
         let storage_dir = TempDir::new().expect("storage tempdir");
         let storage: Arc<dyn StorageProvider> =
@@ -2055,6 +2056,39 @@ mod tests {
     fn assert_in_blob_ids(scope: &RankScope) {
         let sets = scope.allow.as_ref().expect("a bounded scope");
         assert!(sets.values().all(|set| matches!(set, Admitted::BlobIds(_))));
+    }
+
+    /// Asserts every superfile's set in `scope` is in rows.
+    fn assert_in_rows(scope: &RankScope) {
+        let sets = scope.allow.as_ref().expect("a bounded scope");
+        assert!(sets.values().all(|set| matches!(set, Admitted::Rows(_))));
+    }
+
+    /// The scope `filters` gives in blob ids (asserted so), and the same scope in rows.
+    fn scopes_both_ways(reader: &SupertableReader, filters: &[Expr]) -> [RankScope; 2] {
+        let plan = candidate_plan_for_filters(reader.manifest(), filters);
+        let in_blob_ids = reader
+            .block_on(reader.rank_scope(filters, &plan))
+            .expect("scope");
+        assert_in_blob_ids(&in_blob_ids);
+        let in_rows = reader
+            .block_on(reader.candidate_scope(filters, &plan))
+            .expect("scope");
+        [in_blob_ids, RankScope::from(in_rows)]
+    }
+
+    /// The top-`k` hits of `query` on `body` under each of `scopes`.
+    fn hits_under(
+        reader: &SupertableReader,
+        query: &str,
+        k: usize,
+        scopes: [&RankScope; 2],
+    ) -> [Vec<SuperfileHit>; 2] {
+        scopes.map(|scope| {
+            let opts = Bm25SearchOptions::new();
+            let search = reader.bm25_search_scoped_async("body", query, k, opts, Some(scope));
+            reader.block_on(search).expect("search")
+        })
     }
 
     /// The reader of the table's one superfile, the same one its queries use.
@@ -2172,6 +2206,7 @@ mod tests {
         // - The widening stops short at the ceiling.
         // - The search ranks again within the rows its terms match, checking
         //   the predicate on them in rows, through the doc-id map.
+        // - From a blob-id scope and a row scope, the rows the check works on are the same.
         // This test pins that the answer is exactly the one row the `WHERE` keeps.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(CHECKED_COMMITS);
         let file = the_superfile_reader(&st).await;
@@ -2184,27 +2219,16 @@ mod tests {
             bodies_of(&reader, &shared_search(MAPPED_FEW_HITS, &checked_where())),
             vec![mapped_body(CHECKED_ROW)]
         );
-        // The rows the check works on are the same from a blob-id scope as from a row scope.
         let filters = vec![
             col("tag")
                 .eq(lit("red"))
                 .and(col("body").like(lit(format!("%uq{CHECKED_ROW} %")))),
         ];
-        let plan = candidate_plan_for_filters(reader.manifest(), &filters);
-        let in_blob_ids = reader
-            .block_on(reader.rank_scope(&filters, &plan))
-            .expect("scope");
-        assert_in_blob_ids(&in_blob_ids);
-        let in_rows = RankScope::from(
-            reader
-                .block_on(reader.candidate_scope(&filters, &plan))
-                .expect("scope"),
-        );
-        let mut matched = Vec::new();
-        for scope in [&in_blob_ids, &in_rows] {
+        let [in_blob_ids, in_rows] = scopes_both_ways(&reader, &filters);
+        let matched = [&in_blob_ids, &in_rows].map(|scope| {
             let scope = reader.match_scope("body", "shared", BoolMode::Or, scope);
-            matched.push(reader.block_on(scope).expect("match scope").allow);
-        }
+            reader.block_on(scope).expect("match scope").allow
+        });
         assert_eq!(matched[0], matched[1]);
     }
 
@@ -2262,34 +2286,12 @@ mod tests {
         // This test pins that checking in blob ids changes no hit, tie or cut at `k`.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
         let reader = st.reader().expect("reader");
-        let filters = vec![col("tag").eq(lit("red"))];
-        let plan = candidate_plan_for_filters(reader.manifest(), &filters);
         let red = (0..MAPPED_ROWS).filter(|&n| mapped_tag(n) == "red").count();
-        reader.block_on(async {
-            let in_blob_ids = reader.rank_scope(&filters, &plan).await.expect("scope");
-            let in_rows = RankScope::from(
-                reader
-                    .candidate_scope(&filters, &plan)
-                    .await
-                    .expect("scope"),
-            );
-            assert_in_blob_ids(&in_blob_ids);
-            for k in [1, MAPPED_FEW_HITS, red - 1, red, red + 1] {
-                let mut hits = Vec::new();
-                for scope in [&in_blob_ids, &in_rows] {
-                    let opts = Bm25SearchOptions::new();
-                    let search = reader.bm25_search_scoped_async(
-                        "body",
-                        "shared t1 t2",
-                        k,
-                        opts,
-                        Some(scope),
-                    );
-                    hits.push(search.await.expect("search"));
-                }
-                assert_eq!(hits[0], hits[1], "k = {k}");
-            }
-        });
+        let [in_blob_ids, in_rows] = scopes_both_ways(&reader, &[col("tag").eq(lit("red"))]);
+        for k in [1, MAPPED_FEW_HITS, red - 1, red, red + 1] {
+            let hits = hits_under(&reader, "shared t1 t2", k, [&in_blob_ids, &in_rows]);
+            assert_eq!(hits[0], hits[1], "k = {k}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2316,17 +2318,7 @@ mod tests {
             .expect("scope");
         let live = bodies_kept(|n| mapped_tag(n) == "red" && !MAPPED_DELETED.contains(&n)).len();
         for k in [MAPPED_FEW_HITS, live, MAPPED_EVERY_HIT] {
-            let mut hits = Vec::new();
-            for scope in [&scope, &fresh] {
-                let search = after.bm25_search_scoped_async(
-                    "body",
-                    "shared",
-                    k,
-                    Bm25SearchOptions::new(),
-                    Some(scope),
-                );
-                hits.push(after.block_on(search).expect("search"));
-            }
+            let hits = hits_under(&after, "shared", k, [&scope, &fresh]);
             assert_eq!(hits[0].len(), k.min(live), "k = {k}: live red rows only");
             assert_eq!(hits[0], hits[1], "k = {k}");
         }
@@ -2336,37 +2328,17 @@ mod tests {
     async fn each_query_shape_under_a_blob_id_scope_ranks_the_same_hits_as_in_rows() {
         // A reordered superfile under `tag = 'red'`, searched with each query of
         // `mapped_queries`, with the scope in blob ids and with the same scope in rows.
-        // - Each gives exactly the red rows the query matches, the same hits both ways.
+        // - Each gives as many hits as red rows the query matches, the same hits both ways.
         // This test pins that every walk checks a blob-id set as it checks rows.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
         let reader = st.reader().expect("reader");
-        let filters = vec![col("tag").eq(lit("red"))];
-        let plan = candidate_plan_for_filters(reader.manifest(), &filters);
-        let in_blob_ids = reader
-            .block_on(reader.rank_scope(&filters, &plan))
-            .expect("scope");
-        assert_in_blob_ids(&in_blob_ids);
-        let in_rows = RankScope::from(
-            reader
-                .block_on(reader.candidate_scope(&filters, &plan))
-                .expect("scope"),
-        );
+        let [in_blob_ids, in_rows] = scopes_both_ways(&reader, &[col("tag").eq(lit("red"))]);
         for (query, matches) in mapped_queries() {
             let want = (0..MAPPED_ROWS)
                 .filter(|&n| mapped_tag(n) == "red" && matches(n))
                 .count();
             assert!(want > 0, "{query} matches no red row");
-            let mut hits = Vec::new();
-            for scope in [&in_blob_ids, &in_rows] {
-                let search = reader.bm25_search_scoped_async(
-                    "body",
-                    query,
-                    MAPPED_EVERY_HIT,
-                    Bm25SearchOptions::new(),
-                    Some(scope),
-                );
-                hits.push(reader.block_on(search).expect("search"));
-            }
+            let hits = hits_under(&reader, query, MAPPED_EVERY_HIT, [&in_blob_ids, &in_rows]);
             assert_eq!(hits[0].len(), want, "{query}: the red rows it matches");
             assert_eq!(hits[0], hits[1], "{query}");
         }
@@ -2392,8 +2364,7 @@ mod tests {
         let scope = reader
             .block_on(reader.rank_scope(&filters, &plan))
             .expect("scope");
-        let sets = scope.allow.as_ref().expect("a bounded scope");
-        assert!(sets.values().all(|set| matches!(set, Admitted::Rows(_))));
+        assert_in_rows(&scope);
         let filter = format!("tag = 'red' AND n >= {lo} AND n <= {hi}");
         assert_eq!(
             bodies_of(&reader, &shared_search(MAPPED_EVERY_HIT, &filter)),
