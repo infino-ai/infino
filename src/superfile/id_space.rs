@@ -287,8 +287,8 @@ impl RowSet {
     }
 }
 
-/// The blob ids a pushed-down SQL `WHERE` admits, when one superfile's own text index bounds it
-/// alone. A kernel checks the blob id it walks directly, with no [`DocMap`].
+/// The blob ids a pushed-down SQL `WHERE` admits in one superfile. A kernel checks the blob id it
+/// walks directly, with no [`DocMap`].
 /// [`RowSet`] is the same gate in rows.
 #[derive(Clone, Debug)]
 pub(crate) struct BlobIdSet(Arc<RoaringBitmap>);
@@ -312,8 +312,8 @@ impl BlobIdSet {
 pub(crate) enum Admitted {
     /// Rows. A kernel turns each blob id into its row through the blob's [`DocMap`] to check it.
     Rows(Arc<RoaringBitmap>),
-    /// Blob ids, when the superfile's own text index bounds the `WHERE` alone. A kernel checks
-    /// them directly and reads no map.
+    /// Blob ids, when a ranked search's scope chooses them (`SupertableReader::rank_scope` says
+    /// when). A kernel checks them directly and reads no map.
     BlobIds(Arc<RoaringBitmap>),
 }
 

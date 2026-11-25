@@ -24,7 +24,7 @@ pub(super) enum AllowGate {
     /// Rows. The kernel walks blob ids, so each one is turned into its row through `doc_map`, this
     /// blob's doc-id map, before the check; on a reordered blob a blob id is not its row.
     Rows { rows: RowSet, doc_map: DocMap },
-    /// Blob ids, when this blob's own text index bounds the `WHERE` alone: checked directly.
+    /// Blob ids, checked directly.
     BlobIds(BlobIdSet),
 }
 

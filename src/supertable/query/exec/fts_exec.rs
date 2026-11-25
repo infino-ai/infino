@@ -688,17 +688,20 @@ mod tests {
     }
 
     fn titles_of(batches: &[RecordBatch]) -> Vec<String> {
+        strings_of(batches, "title")
+    }
+
+    /// The values of the `LargeUtf8` column `column` in `batches`, in order.
+    fn strings_of(batches: &[RecordBatch], column: &str) -> Vec<String> {
         let mut out = Vec::new();
         for b in batches {
-            let idx = b.schema().index_of("title").expect("title col");
             let col = b
-                .column(idx)
+                .column_by_name(column)
+                .expect("column projected")
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
                 .expect("utf8");
-            for i in 0..col.len() {
-                out.push(col.value(i).to_string());
-            }
+            out.extend((0..col.len()).map(|i| col.value(i).to_string()));
         }
         out
     }
@@ -1931,6 +1934,8 @@ mod tests {
     /// Moduli that give each body two words shared with many other rows, so
     /// most terms match many documents.
     const MAPPED_SHARED_WORDS: [usize; 2] = [37, 53];
+    /// The `n` range the range test keeps, inclusive.
+    const MAPPED_RANGE: [i64; 2] = [1000, 1999];
 
     /// A `WHERE` only row [`CHECKED_ROW`] passes: it is `red` and the only body
     /// holding its `uq` word.
@@ -1944,6 +1949,23 @@ mod tests {
         format!("uq{n} shared t{} t{}", n % a, n % b)
     }
 
+    /// Whether row `n`'s `body` holds the word `t{w}`.
+    fn mapped_holds(n: usize, w: usize) -> bool {
+        MAPPED_SHARED_WORDS.iter().any(|m| n % m == w)
+    }
+
+    /// A query for each way the search walks, with the rows it matches: a phrase and a negated
+    /// phrase (the phrase walk), a negated term, every term required, and any term.
+    fn mapped_queries() -> Vec<(&'static str, fn(usize) -> bool)> {
+        vec![
+            ("\"shared t1\"", |n| n % MAPPED_SHARED_WORDS[0] == 1),
+            ("shared -\"shared t1\"", |n| n % MAPPED_SHARED_WORDS[0] != 1),
+            ("shared -t1", |n| !mapped_holds(n, 1)),
+            ("+shared +t1", |n| mapped_holds(n, 1)),
+            ("t1 t2", |n| mapped_holds(n, 1) || mapped_holds(n, 2)),
+        ]
+    }
+
     /// Row `n`'s `tag`.
     fn mapped_tag(n: usize) -> &'static str {
         MAPPED_TAGS[n % MAPPED_TAGS.len()]
@@ -1953,10 +1975,12 @@ mod tests {
         Arc::new(Schema::new(vec![
             Field::new("body", DataType::LargeUtf8, false),
             Field::new("tag", DataType::LargeUtf8, false),
+            Field::new("n", DataType::Int64, false),
         ]))
     }
 
-    /// `commits` commits with `body` and `tag` text-indexed, merged into one
+    /// `commits` commits with `body` and `tag` text-indexed and `n`, the row number,
+    /// range-indexed, merged into one
     /// superfile that reorders its documents. Reopened cold behind a lazily
     /// filled disk cache, so a query reads the doc-id map only if it needs it.
     fn mapped_body_tag_table(commits: usize) -> (Supertable, TempDir, TempDir) {
@@ -1976,6 +2000,7 @@ mod tests {
                 vec![],
             )
             .expect("valid options")
+            .with_range_indexes(&["n".to_owned()])
             .with_writer_pool(pool)
             .with_storage(Arc::clone(&storage))
         };
@@ -1984,12 +2009,14 @@ mod tests {
             for commit in 0..commits {
                 let rows = commit * MAPPED_PER_COMMIT..(commit + 1) * MAPPED_PER_COMMIT;
                 let bodies: Vec<String> = rows.clone().map(mapped_body).collect();
-                let tags: Vec<&str> = rows.map(mapped_tag).collect();
+                let tags: Vec<&str> = rows.clone().map(mapped_tag).collect();
+                let ns: Vec<i64> = rows.map(|n| n as i64).collect();
                 let batch = RecordBatch::try_new(
                     body_tag_schema(),
                     vec![
                         Arc::new(LargeStringArray::from(bodies)),
                         Arc::new(LargeStringArray::from(tags)),
+                        Arc::new(Int64Array::from(ns)),
                     ],
                 )
                 .expect("batch");
@@ -2048,16 +2075,7 @@ mod tests {
 
     /// The `body` of each row `sql` returns, sorted.
     fn bodies_of(reader: &SupertableReader, sql: &str) -> Vec<String> {
-        let batches = reader.query_sql(sql).expect("sql");
-        let mut out = Vec::new();
-        for b in &batches {
-            let col = b.column_by_name("body").expect("body projected");
-            let arr = col
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .expect("body is LargeUtf8");
-            out.extend((0..b.num_rows()).map(|i| arr.value(i).to_string()));
-        }
+        let mut out = strings_of(&reader.query_sql(sql).expect("sql"), "body");
         out.sort();
         out
     }
@@ -2166,6 +2184,28 @@ mod tests {
             bodies_of(&reader, &shared_search(MAPPED_FEW_HITS, &checked_where())),
             vec![mapped_body(CHECKED_ROW)]
         );
+        // The rows the check works on are the same from a blob-id scope as from a row scope.
+        let filters = vec![
+            col("tag")
+                .eq(lit("red"))
+                .and(col("body").like(lit(format!("%uq{CHECKED_ROW} %")))),
+        ];
+        let plan = candidate_plan_for_filters(reader.manifest(), &filters);
+        let in_blob_ids = reader
+            .block_on(reader.rank_scope(&filters, &plan))
+            .expect("scope");
+        assert_in_blob_ids(&in_blob_ids);
+        let in_rows = RankScope::from(
+            reader
+                .block_on(reader.candidate_scope(&filters, &plan))
+                .expect("scope"),
+        );
+        let mut matched = Vec::new();
+        for scope in [&in_blob_ids, &in_rows] {
+            let scope = reader.match_scope("body", "shared", BoolMode::Or, scope);
+            matched.push(reader.block_on(scope).expect("match scope").allow);
+        }
+        assert_eq!(matched[0], matched[1]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2290,5 +2330,74 @@ mod tests {
             assert_eq!(hits[0].len(), k.min(live), "k = {k}: live red rows only");
             assert_eq!(hits[0], hits[1], "k = {k}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_query_shape_under_a_blob_id_scope_ranks_the_same_hits_as_in_rows() {
+        // A reordered superfile under `tag = 'red'`, searched with each query of
+        // `mapped_queries`, with the scope in blob ids and with the same scope in rows.
+        // - Each gives exactly the red rows the query matches, the same hits both ways.
+        // This test pins that every walk checks a blob-id set as it checks rows.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
+        let reader = st.reader().expect("reader");
+        let filters = vec![col("tag").eq(lit("red"))];
+        let plan = candidate_plan_for_filters(reader.manifest(), &filters);
+        let in_blob_ids = reader
+            .block_on(reader.rank_scope(&filters, &plan))
+            .expect("scope");
+        assert_in_blob_ids(&in_blob_ids);
+        let in_rows = RankScope::from(
+            reader
+                .block_on(reader.candidate_scope(&filters, &plan))
+                .expect("scope"),
+        );
+        for (query, matches) in mapped_queries() {
+            let want = (0..MAPPED_ROWS)
+                .filter(|&n| mapped_tag(n) == "red" && matches(n))
+                .count();
+            assert!(want > 0, "{query} matches no red row");
+            let mut hits = Vec::new();
+            for scope in [&in_blob_ids, &in_rows] {
+                let search = reader.bm25_search_scoped_async(
+                    "body",
+                    query,
+                    MAPPED_EVERY_HIT,
+                    Bm25SearchOptions::new(),
+                    Some(scope),
+                );
+                hits.push(reader.block_on(search).expect("search"));
+            }
+            assert_eq!(hits[0].len(), want, "{query}: the red rows it matches");
+            assert_eq!(hits[0], hits[1], "{query}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_and_range_where_on_a_reordered_file_ranks_exactly_its_rows() {
+        // A reordered superfile under `tag = 'red'` and a range on `n`.
+        // - The scope stays in rows: a range leaf is checked in rows only.
+        // - With `k` above the row count, the hits are exactly the rows both keep.
+        // This test pins that a range leaf never goes through blob ids.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
+        let reader = st.reader().expect("reader");
+        let [lo, hi] = MAPPED_RANGE;
+        let filters = vec![
+            col("tag")
+                .eq(lit("red"))
+                .and(col("n").gt_eq(lit(lo)))
+                .and(col("n").lt_eq(lit(hi))),
+        ];
+        let plan = candidate_plan_for_filters(reader.manifest(), &filters);
+        assert!(plan.has_range(), "the plan holds a range leaf");
+        let scope = reader
+            .block_on(reader.rank_scope(&filters, &plan))
+            .expect("scope");
+        let sets = scope.allow.as_ref().expect("a bounded scope");
+        assert!(sets.values().all(|set| matches!(set, Admitted::Rows(_))));
+        let filter = format!("tag = 'red' AND n >= {lo} AND n <= {hi}");
+        assert_eq!(
+            bodies_of(&reader, &shared_search(MAPPED_EVERY_HIT, &filter)),
+            bodies_kept(|n| mapped_tag(n) == "red" && (lo..=hi).contains(&(n as i64))),
+        );
     }
 }
