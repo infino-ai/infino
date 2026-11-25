@@ -1955,8 +1955,8 @@ mod tests {
     }
 
     /// A query for each way the search walks, with the rows it matches: a phrase and a negated
-    /// phrase (the phrase walk), a negated term, every term required, a required term beside an
-    /// optional one, and any term.
+    /// phrase (the phrase walk), a negated term, every term required, required terms beside
+    /// optional ones (both must-should walks), and any term.
     fn mapped_queries() -> Vec<(&'static str, fn(usize) -> bool)> {
         vec![
             ("\"shared t1\"", |n| n % MAPPED_SHARED_WORDS[0] == 1),
@@ -1964,6 +1964,7 @@ mod tests {
             ("shared -t1", |n| !mapped_holds(n, 1)),
             ("+shared +t1", |n| mapped_holds(n, 1)),
             ("+t1 shared", |n| mapped_holds(n, 1)),
+            ("+shared +t1 t2", |n| mapped_holds(n, 1)),
             ("t1 t2", |n| mapped_holds(n, 1) || mapped_holds(n, 2)),
         ]
     }
@@ -2316,6 +2317,7 @@ mod tests {
         let fresh = after
             .block_on(after.rank_scope(&filters, &plan))
             .expect("scope");
+        assert_in_rows(&fresh);
         let live = bodies_kept(|n| mapped_tag(n) == "red" && !MAPPED_DELETED.contains(&n)).len();
         for k in [MAPPED_FEW_HITS, live, MAPPED_EVERY_HIT] {
             let hits = hits_under(&after, "shared", k, [&scope, &fresh]);
@@ -2327,8 +2329,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn each_query_shape_under_a_blob_id_scope_ranks_the_same_hits_as_in_rows() {
         // A reordered superfile under `tag = 'red'`, searched with each query of
-        // `mapped_queries`, with the scope in blob ids and with the same scope in rows.
-        // - Each gives as many hits as red rows the query matches, the same hits both ways.
+        // `mapped_queries`, with the scope in blob ids and with the same scope in rows, with a
+        // small `k` and with `k` above the row count.
+        // - Each gives as many hits as red rows the query matches, up to `k`, the same hits both
+        //   ways.
         // This test pins that every walk checks a blob-id set as it checks rows.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
         let reader = st.reader().expect("reader");
@@ -2338,9 +2342,15 @@ mod tests {
                 .filter(|&n| mapped_tag(n) == "red" && matches(n))
                 .count();
             assert!(want > 0, "{query} matches no red row");
-            let hits = hits_under(&reader, query, MAPPED_EVERY_HIT, [&in_blob_ids, &in_rows]);
-            assert_eq!(hits[0].len(), want, "{query}: the red rows it matches");
-            assert_eq!(hits[0], hits[1], "{query}");
+            for k in [MAPPED_FEW_HITS, MAPPED_EVERY_HIT] {
+                let hits = hits_under(&reader, query, k, [&in_blob_ids, &in_rows]);
+                assert_eq!(
+                    hits[0].len(),
+                    k.min(want),
+                    "{query}, k = {k}: red rows it matches"
+                );
+                assert_eq!(hits[0], hits[1], "{query}, k = {k}");
+            }
         }
     }
 

@@ -201,8 +201,8 @@ pub(crate) struct ClauseLists<'a> {
     /// entry points, where there is no fan-out to share with.
     pub live_floor: Option<&'a LiveFloor>,
     /// The documents this search may rank, from a SQL `WHERE` pushed into it:
-    /// in rows, or in blob ids when a ranked search's scope chooses them. A kernel adds a doc to its heap only if the set holds it,
-    /// so the top-k fills from allowed docs instead of coming up short like a
+    /// in rows, or in blob ids where `rank_scope` chooses them. A kernel adds a
+    /// doc to its heap only if the set holds it, so the top-k fills from allowed docs instead of coming up short like a
     /// post-filtered top-k. `None` ranks every match. Owned, so the prepared
     /// clauses can carry it into a `'static` kernel.
     pub allow: Option<Admitted>,
