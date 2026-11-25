@@ -139,8 +139,8 @@ impl SuperfileObjectStore {
     }
 
     /// Reserve room in the cache in front of `location` for `bytes` downloaded
-    /// ahead (see [`LazyByteSource::cache_room_ahead`]): `None` when it has
-    /// none, an error when no source is registered for `location`.
+    /// ahead (see [`LazyByteSource::cache_room_ahead`]). `None` when the cache
+    /// has no room; an error when `location` has no source.
     pub(crate) fn cache_room_ahead(
         &self,
         location: &ObjPath,
@@ -198,9 +198,9 @@ impl SuperfileObjectStore {
     /// Download `clusters` of spans ahead of the scan and return every span's
     /// bytes in order. Not counted as page reads.
     /// - With `kept`, through [`LazyByteSource::range_ahead`], so the cache
-    ///   keeps them. Without, through [`LazyByteSource::range_uncached`]: the
-    ///   cache has no room, so it serves what it holds and keeps none of the
-    ///   rest, and its write queue stays free for reads' own downloads.
+    ///   keeps the bytes. Without, through [`LazyByteSource::range_uncached`]:
+    ///   the cache serves what it already holds and writes none of the rest,
+    ///   which leaves its write queue to reads' own downloads.
     /// - Clusters download [`FETCH_PARALLELISM`] at a time.
     /// - A cluster's spans download one after another, so a cache block they
     ///   share is downloaded once.

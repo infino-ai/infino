@@ -30,25 +30,22 @@
 //! - It stops for good when the scan reads out of order, keeping only the
 //!   batch the scan is in. At most two batches are wasted.
 //! - It never starts while every read finds its bytes already local.
-//! - It runs under a `LIMIT` or a top-k as in any scan. It fetches only row
-//!   groups the scan planned, after the scan's own pruning, and a top-k's
-//!   filter prunes a file's row groups when the file is planned. So a scan
-//!   that stops early wastes at most what each reader holds unread when it
-//!   stops, no more row groups than that reader has read (see below), and
-//!   [`READ_AHEAD_SCAN_MAX_BYTES`] for the whole scan.
+//! - It runs under a `LIMIT` or a top-k as in any other scan. A scan that
+//!   stops early wastes only what its readers hold unread: per reader, no
+//!   more row groups than it has read (see below), and at most
+//!   [`READ_AHEAD_SCAN_MAX_BYTES`] for the whole scan. A top-k's filter also
+//!   prunes the row groups of each file planned after it tightens.
 //!
 //! # How it downloads
 //!
-//! A batch at a time, and the next batch starts once the scan reads from the
-//! last one. What a reader holds unread, with the batch it starts, is no more
-//! row groups than it has read so far (two at first), up to the reader's cap:
-//! the way TCP's slow start grows its window by what was delivered. A scan
-//! that keeps reading grows its batches with what it reads and reaches full
-//! ones after a few; one that stops has fetched ahead no more than it read.
-//! A batch merges byte ranges the way the scan
-//! would (see [`fetch_spans`]), and keeps clear of bytes another read may be
-//! downloading at the same moment, so no block is downloaded twice (see
-//! [`leave_shared_ends`]).
+//! One batch at a time: the next batch starts once the scan reads from the
+//! last one. A reader never holds more row groups unread than it has read
+//! (two at first), up to its byte cap. So a scan that keeps reading gets
+//! bigger batches, and one that stops has fetched ahead no more than it read.
+//!
+//! A batch merges byte ranges the way the scan would (see [`fetch_spans`]),
+//! and keeps clear of bytes another read may be downloading at the same
+//! moment, so no block is downloaded twice (see [`leave_shared_ends`]).
 //!
 //! # Memory
 //!
@@ -57,10 +54,10 @@
 //! 16 MiB per reader (one file in one partition) and 256 MiB per scan. A batch
 //! is charged what the cache downloads for it, which can be more than the
 //! scan's bytes. It also reserves room in the disk cache's write queue, so
-//! the cache keeps what it downloads. When the queue has none, a disk slower
-//! than the network say, the batch is fetched past the cache: the cache keeps
-//! none of it, and the share of the queue left for reads' own downloads stays
-//! theirs. Waiting for room instead would leave the scan one GET at a time.
+//! the cache keeps what it downloads. When the queue is full (a disk slower
+//! than the network, say), the batch is fetched past the cache: downloaded
+//! but not written, which leaves the queue to the scan's own reads. Waiting
+//! for room instead would put the scan back to one GET at a time.
 //!
 //! When anything else on the connection needs memory the budget can't give, a
 //! join's build side say, read-ahead gives back everything it holds and stays
@@ -122,8 +119,8 @@ use crate::{
     supertable::query::df_object_store::{SuperfileObjectStore, merged_ranges},
 };
 
-/// Row groups a reader's first batch takes (fewer when the byte cap cuts it):
-/// one row group ahead is only the read the scan is about to make. Later
+/// Row groups in a reader's first batch, fewer if the byte cap cuts it. One
+/// row group ahead would be only the read the scan is about to make. Later
 /// batches grow with what the reader has read.
 const READ_AHEAD_MIN_ROW_GROUPS: usize = 2;
 
@@ -131,12 +128,11 @@ const READ_AHEAD_MIN_ROW_GROUPS: usize = 2;
 /// downloading, so each batch is sized to half the reader's cap.
 const READ_AHEAD_BATCHES_IN_FLIGHT: usize = 2;
 
-/// Most bytes one reader (one file in one partition) may hold. A batch
-/// takes as many row groups as fit half of it, once the reader has read that
-/// many, which on a file of small row groups is what turns a round trip per
-/// row group into one per batch; a
-/// row group bigger than half of it is read ahead on its own, as long as it
-/// fits the whole. A row group bigger than this is left to the scan.
+/// Most bytes one reader (one file in one partition) may hold. A batch takes
+/// as many row groups as fit half of it, once the reader has read that many:
+/// on a file of small row groups, one round trip per batch instead of one per
+/// row group. A row group over half of it is read ahead on its own; one over
+/// all of it is left to the scan.
 const READ_AHEAD_MAX_BYTES: usize = 16 << 20;
 
 /// Most bytes all readers of one scan may hold, so a scan stays bounded even
@@ -699,12 +695,13 @@ pub(crate) struct ReadAhead {
     /// The columns the scan has read since the order was built. Under a row
     /// filter that's more than one read's columns.
     columns: BTreeSet<usize>,
-    /// Planned row groups the scan has read in order. A batch takes no more
-    /// row groups than this (and at least [`READ_AHEAD_MIN_ROW_GROUPS`]).
+    /// Planned row groups the scan has read in order. The reader never holds
+    /// more row groups unread than this (at least
+    /// [`READ_AHEAD_MIN_ROW_GROUPS`]).
     read_in_order: usize,
-    /// Row groups whose bytes the scan took whole from this reader's batches.
-    /// Nothing downloads them from the store, so a batch need not keep clear
-    /// of them (see [`Self::others_near`]).
+    /// Row groups the scan read entirely from this reader's batches. No one
+    /// downloads them from the store, so a batch need not keep clear of them
+    /// (see [`Self::others_near`]).
     from_ahead: BTreeSet<usize>,
 }
 
@@ -767,11 +764,10 @@ impl ReadAhead {
             Some((rg, batch)) => self.serve(rg, batch, &ranges).await?,
             None => self.fetch(&ranges).await?,
         };
-        // Only a row group's first read starts a batch: under a row filter the
-        // scan reads the filter's columns first and the rest after, and the
-        // second read mustn't replace the batch the first one started. So under
-        // a row filter a batch holds the filter's columns, and the scan reads
-        // the rest itself.
+        // Only a row group's first read starts a batch, so a second read can't
+        // replace it. Under a row filter the scan reads the filter's columns
+        // first and the rest after, so a batch holds the filter's columns and
+        // the scan reads the rest itself.
         if let Some(rg) = entered
             && matches!(self.state, State::InOrder { last } if last == rg)
             && let Some(columns) = self.mostly_read_columns(rg, &ranges)
@@ -949,17 +945,16 @@ impl ReadAhead {
     }
 
     /// Start downloading the next batch: `columns` of the planned row groups
-    /// after the last one held, as many as fit the reader's cap and no more
-    /// than the scan has read.
+    /// after the last one held, as many as fit the reader's cap.
     /// - It stops at a row group the scan reads only in part; the scan reads
     ///   that one itself.
     /// - It skips row groups whose columns are already local.
-    /// - With what the reader holds unread, it fetches no more row groups than
-    ///   the scan has read (see [`ReadAhead::read_in_order`]); ones already
-    ///   local don't count.
+    /// - Counting what the reader holds unread, it fetches no more row groups
+    ///   than the scan has read (see [`ReadAhead::read_in_order`]). Skipped
+    ///   local ones don't count.
     /// - It drops row groups from the end until the batch fits the reader's
-    ///   cap, and starts nothing if the budget has no room. With no room in
-    ///   the cache's write queue it still downloads, past the cache.
+    ///   cap, and starts nothing if the budget has no room. If the cache's
+    ///   write queue has no room, it still downloads, past the cache.
     /// - It does nothing while a batch is still downloading.
     fn start_ahead(&mut self, row_group: usize, columns: &[usize]) {
         if !self.scan.is_enabled() || self.batches.iter().any(Batch::is_running) {
@@ -1040,17 +1035,16 @@ impl ReadAhead {
             row_groups.pop();
         };
         // Reserve room in the cache's write queue for what the cache will
-        // download (not just the spans), so it keeps the batch's downloads,
-        // held until the download ends. With none, the batch is fetched past
-        // the cache instead.
+        // download (not just the spans), held until the download ends, so the
+        // cache keeps it. With no room, the batch is fetched past the cache.
         let downloads = blocks.map_or(charge as u64, |blocks| download_bytes(&clusters, blocks));
         let Ok(room) = self.scan.store.cache_room_ahead(location, downloads) else {
             return;
         };
         let kept = room.is_some();
-        // A kept batch is charged what the cache downloads, not just the
-        // spans: a read of a whole download is served as a slice of it, which
-        // keeps it all alive. A batch past the cache fetches just its spans.
+        // A kept batch reserves what the cache downloads, not just the spans:
+        // a read of a whole download is served as a slice of it, which keeps
+        // all of it in memory. A batch past the cache downloads just its spans.
         let charged = if kept {
             charge.max(downloads as usize)
         } else {
@@ -1615,7 +1609,7 @@ pub(crate) mod fixture {
         write_groups(rows_per_group, page_rows, wide, GROUPS)
     }
 
-    /// A small file of `groups` row groups, for a test that reads on past
+    /// A small file of `groups` row groups, for a test that reads past
     /// [`GROUPS`] of them.
     pub(crate) fn long_file(groups: usize) -> (Bytes, Arc<ParquetMetaData>) {
         write_groups(ROWS_PER_GROUP, None, false, groups)
@@ -1774,13 +1768,14 @@ mod tests {
 
     /// Columns `a` and `c`: the scan reads both, leaving `b` unread between them.
     const PROJECTED: [usize; 2] = [0, 2];
-    /// Row groups in the file the ramp test reads through.
+    /// Row groups in the file the batch-growth test reads through.
     const LONG_GROUPS: usize = 40;
-    /// The first step a test takes read-ahead's write-queue share in.
+    /// The first, largest piece a test reserves to use up read-ahead's share
+    /// of the write queue; each later piece is half the last.
     const SHARE_FIRST_STEP_BYTES: u64 = 64 << 20;
     /// How long a test waits for the cache to write a read's blocks.
     const WRITES_LAND: Duration = Duration::from_secs(10);
-    /// How often a test checks whether they have landed.
+    /// How often a test checks whether they are written.
     const WRITE_POLL: Duration = Duration::from_millis(5);
     /// The cache block size the span tests assume.
     const BLOCK: u64 = 64 * 1024;
@@ -2012,15 +2007,15 @@ mod tests {
 
     #[tokio::test]
     async fn batches_grow_with_what_the_scan_reads_and_never_pass_it() {
-        // A file of many small row groups, with the shipped cap, read in order
-        // one row group at a time.
-        //  - after every read, the row groups the reader holds unread are no
-        //    more than the ones it has read;
-        //  - batches grow: later ones take more than two row groups;
-        //  - every row group the scan reads comes from a batch, not the store.
-        // This test pins both sides of the ramp: a scan that stops has fetched
-        // ahead no more than it read, and one that keeps reading gets big
-        // batches.
+        // Read a file of many small row groups in order, one at a time, with
+        // the shipped cap.
+        //  - after each read, the reader holds no more row groups unread than
+        //    it has read;
+        //  - batches grow: the biggest takes more than twice the first's two;
+        //  - every row group after the first two comes from a batch, not the
+        //    store.
+        // This test pins both sides: a scan that stops has fetched ahead no
+        // more than it read, and one that keeps reading gets big batches.
         let (bytes, meta) = long_file(LONG_GROUPS);
         let superfile = Superfile::new(bytes, false);
         let path = ObjPath::from("t/sf.parquet");
@@ -2707,14 +2702,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_batch_with_no_cache_room_is_fetched_past_the_cache() {
-        // A real block cache whose write-queue share for downloads ahead is
-        // taken. The scan reads row groups 0 and 1, and read-ahead starts on 2
-        // and 3.
+        // A real block cache with read-ahead's share of its write queue used
+        // up. The scan reads row groups 0 and 1, so read-ahead fetches 2 and 3.
         //  - the batch is fetched and serves row group 2;
-        //  - once the scan's own reads are on the cache's disk, row group 2's
-        //    bytes are still not: the batch was not written.
-        // This test pins that a batch the cache has no room for leaves the
-        // write queue's share for reads' own downloads alone.
+        //  - once the scan's own reads are on disk, row group 2 is still not:
+        //    the batch was not written.
+        // This test pins that a batch with no cache room leaves the write queue
+        // to the scan's own reads.
         let (bytes, meta) = wide_file(WIDE_ROWS, WIDE_ROWS);
         let superfile = Superfile::new(bytes, false);
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2765,19 +2759,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_top_k_that_stops_early_wastes_at_most_the_batches_in_flight() {
-        // A top-k reads row groups 0 and 1 of a file, read-ahead starts on 2
-        // and 3, then the top-k's filter rules out every later row: the scan
-        // stops and drops the reader.
+        // A top-k reads row groups 0 and 1, read-ahead starts on 2 and 3, then
+        // the top-k's filter rules out every later row and the scan drops the
+        // reader.
         //  - nothing past the batch in flight was fetched;
         //  - the batch's memory is given back;
-        //  - a file planned after the filter tightened prunes its row groups
-        //    and fetches nothing ahead.
-        // This test pins the bound on what read-ahead can waste under a
-        // `LIMIT` or top-k: the batches in flight when the scan stops.
+        //  - a reader created after the filter tightened prunes the later row
+        //    groups and fetches nothing ahead.
+        // This test pins what read-ahead can waste under a `LIMIT` or top-k:
+        // the batch in flight when the scan stops.
         let (superfile, store, path, meta) = setup(false);
         let budget = ConnectionMemoryBudget::measured();
-        // The shipped cap would take every row group left in one batch: the
-        // first batch's size comes from what the scan has read.
+        // With the shipped cap every row group left fits one batch, so the
+        // first batch's size comes only from what the scan has read.
         let scan = Arc::new(ScanReadAhead::new(
             Arc::clone(&store),
             Arc::clone(&budget),
