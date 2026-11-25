@@ -3982,13 +3982,15 @@ impl TermIndex {
     /// After slice `hash` (`len` bytes) is read by range, start a background
     /// whole read of it as [`Promote`] says and keep the result resident; the
     /// lookup never waits for it. `reused` says its block index was resident.
-    /// The copy only takes free room in the resident set, never pushing out
-    /// block indexes (see [`TierChunks::keep_whole_in_room`]). Skipped when a
-    /// read of it is already queued; when it would only go to memory (a slice
-    /// on disk, or no disk cache) and memory has no room for it; when the
-    /// queue would pass its bound (the resident budget for a slice on disk,
-    /// else the larger of the disk cache and the resident budget); or when an
-    /// earlier whole read failed its hash or could never fit on disk.
+    /// - Only into free room: it is queued only if the resident set's free
+    ///   room, plus what its own block index frees, minus what promotions
+    ///   already queued hold, fits it, and it holds that room until it lands
+    ///   or gives up. A copy never pushes block indexes out
+    ///   ([`TierChunks::keep_whole_in_room`]), so a working set too big for
+    ///   whole copies stays on its block indexes, and nothing is read only to
+    ///   be dropped.
+    /// - Skipped too when a read of it is already queued, or an earlier whole
+    ///   read failed its hash or could never fit on disk.
     async fn promote_slice(&self, hash: &ContentHash, len: Option<u64>, reused: bool) {
         let wanted = match self.promote {
             Promote::Disk => true,
@@ -4000,29 +4002,24 @@ impl TermIndex {
             return;
         }
         let len = len.unwrap_or(SLICE_TARGET_BYTES as u64);
-        // A slice to download also goes to disk, worth it even when memory is
-        // full; one already on disk, or with no disk cache, only to memory.
-        let to_disk = self.disk_cache.as_ref().is_some_and(|c| !c.contains(hash));
         let promotions = {
             let mut chunks = self.tier_chunks.lock().expect("tier chunk cache lock");
-            let room = chunks.slices.room() + chunks.slices.weight_of(hash);
-            if chunks.unpromotable.get(hash).is_some() || (!to_disk && (room as u64) < len) {
+            if chunks.unpromotable.get(hash).is_some() {
                 return;
             }
-            Arc::clone(&chunks.promotions)
-        };
-        let most = match (to_disk, &self.disk_cache) {
-            (true, Some(cache)) => cache.budget_bytes().max(RESIDENT_SLICE_BUDGET_BYTES as u64),
-            _ => RESIDENT_SLICE_BUDGET_BYTES as u64,
-        };
-        {
+            let room = (chunks.slices.room() + chunks.slices.weight_of(hash)) as u64;
+            let promotions = Arc::clone(&chunks.promotions);
+            // Taken while the cache is locked, so the room it reserves against
+            // is the room it saw.
             let mut queued = promotions.queued.lock().expect("promotions lock");
-            if queued.slices.contains_key(hash) || queued.bytes.saturating_add(len) > most {
+            if queued.slices.contains_key(hash) || queued.bytes.saturating_add(len) > room {
                 return;
             }
             queued.slices.insert(*hash, len);
             queued.bytes += len;
-        }
+            drop(queued);
+            promotions
+        };
         let promoting = Promoting {
             promotions,
             hash: *hash,
@@ -4050,9 +4047,10 @@ impl TermIndex {
             )
             .await;
             // A storage error leaves the slice to a later read. A disk cache too
-            // full to take it still keeps it in memory, and a later promotion
-            // writes it to disk. A slice failing its hash, or larger than the
-            // whole disk cache, would fail again, so it is marked unpromotable.
+            // full to take it leaves it off disk, kept in memory in the room it
+            // reserved, until a later promotion writes it. A slice failing its
+            // hash, or larger than the whole disk cache, would fail again, so it
+            // is marked unpromotable.
             let mut chunks = tier_chunks.lock().expect("tier chunk cache lock");
             let unkept = match read {
                 Ok(bytes) => {
@@ -4061,8 +4059,8 @@ impl TermIndex {
                     }) {
                         chunks.unpromotable.insert(hash, ());
                     }
-                    // No room left: it stays a block index, and on disk if it
-                    // was downloaded.
+                    // Its room was reserved, but a lookup's block index may
+                    // have taken it meanwhile: then it stays a block index.
                     chunks.keep_whole_in_room(hash, bytes)
                 }
                 Err(error) => {
@@ -10639,6 +10637,116 @@ mod tests {
         assert_eq!(kept(&cache).await, (0, layers), "block indexes only");
     }
 
+    /// Bytes of a disk cache a test fills with one pinned object, so it refuses
+    /// every slice.
+    const PINNED_DISK_CACHE_BYTES: u64 = 64 * 1024;
+
+    /// The resident weight of the block indexes one lookup of `term` reads in
+    /// `root`, and the largest slice it touches.
+    async fn index_weight_and_largest_slice(
+        root: &Root,
+        local: &Arc<dyn StorageProvider>,
+        term: &str,
+    ) -> (usize, usize) {
+        let probe = new_tier_chunk_cache();
+        ranged_index(root, Arc::clone(local))
+            .with_tier_chunk_cache(Arc::clone(&probe))
+            .runs_many(fid("body"), &[term])
+            .await
+            .expect("probe");
+        let indexes = probe.lock().expect("tier chunk cache lock").slices.total;
+        let largest = root
+            .slices_for_key(&fid("body").term_key(term))
+            .map(|s| s.len as usize)
+            .max()
+            .expect("a slice");
+        (indexes, largest)
+    }
+
+    #[tokio::test]
+    async fn a_full_resident_set_downloads_no_whole_slice_even_for_the_disk_cache() {
+        // A disk cache that refuses every slice (a pinned object fills it), and
+        // a resident set that holds the block indexes one term reads and no byte
+        // more; the term looked up three times by indexes sharing that set.
+        //  - no lookup starts a whole download: memory has no room to keep it,
+        //    and the disk cache would refuse it;
+        //  - each lookup after the first reads a block and a run per slice.
+        // This test pins that full memory never turns each ranged read into a
+        // whole download that is then dropped.
+        let (local, root, terms, _store) = two_layer_checked_index().await;
+        let layers = root.layers.len();
+        let (indexes, _) = index_weight_and_largest_slice(&root, &local, &terms[0]).await;
+        let dir = TempDir::new().expect("cache dir");
+        let disk = MetadataDiskCache::new(dir.path().to_path_buf(), PINNED_DISK_CACHE_BYTES, None)
+            .expect("cache");
+        let filler = Bytes::from(vec![0u8; PINNED_DISK_CACHE_BYTES as usize]);
+        let filler_hash = ContentHash::of(&filler);
+        assert!(disk.put(filler_hash, filler).await, "the filler fits");
+        let _pinned = disk.pin(filler_hash).expect("pinned");
+        let slow = SlowStorage::wrap(Arc::clone(&local), Duration::ZERO);
+        let cache = tier_chunk_cache(indexes);
+        for _ in 0..3 {
+            disk_index(&root, slow.clone(), &disk, &cache)
+                .runs_many(fid("body"), &[terms[0].as_str()])
+                .await
+                .expect("lookup");
+            promotions_settle(&cache).await;
+        }
+        assert_eq!(
+            slow.reads_of(SLICE_URI_FRAGMENT),
+            (COLD_RANGED_READS + 2 * WARM_RANGED_READS) * layers,
+            "no whole download"
+        );
+        assert_eq!(kept(&cache).await, (0, layers), "block indexes only");
+    }
+
+    #[tokio::test]
+    async fn queued_whole_reads_never_hold_more_than_the_free_room() {
+        // No disk cache, and a resident set with room, past the block indexes,
+        // for one whole slice of the two a term's lookup reads; the term looked
+        // up twice, background reads held from starting.
+        //  - the second lookup queues one whole read, not two: the first holds
+        //    the room the second would need;
+        //  - once released, that slice is kept whole and the other stays a
+        //    block index.
+        // This test pins that room is reserved when a read is queued, so queued
+        // reads never add up to more than fits.
+        let (local, root, terms, _store) = two_layer_checked_index().await;
+        let layers = root.layers.len();
+        assert_eq!(layers, 2, "two slices compete for the room");
+        let (indexes, largest) = index_weight_and_largest_slice(&root, &local, &terms[0]).await;
+        let cache = tier_chunk_cache(indexes + largest);
+        let index = || {
+            TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None)
+                .with_small_slice_bytes(NO_SMALL_SLICES)
+                .with_tier_chunk_cache(Arc::clone(&cache))
+        };
+        index()
+            .runs_many(fid("body"), &[terms[0].as_str()])
+            .await
+            .expect("first");
+        let promotions = Arc::clone(&cache.lock().expect("tier chunk cache lock").promotions);
+        let held = promotions
+            .permits
+            .acquire_many(SLICE_PROMOTION_CONCURRENCY as u32)
+            .await
+            .expect("permits");
+        index()
+            .runs_many(fid("body"), &[terms[0].as_str()])
+            .await
+            .expect("second");
+        let queued = promotions
+            .queued
+            .lock()
+            .expect("promotions lock")
+            .slices
+            .len();
+        assert_eq!(queued, 1, "one whole read queued, not two");
+        drop(held);
+        promotions_settle(&cache).await;
+        assert_eq!(kept(&cache).await, (1, 1), "one slice whole, one an index");
+    }
+
     #[tokio::test]
     async fn a_lookup_on_a_budget_smaller_than_it_needs_finishes() {
         // Two lookups on a budget smaller than they need:
@@ -11745,7 +11853,7 @@ mod tests {
     #[tokio::test]
     async fn a_slice_read_by_range_waits_for_no_promotion_past_the_queue() {
         // A lookup with a disk cache attached while the table's background
-        // queue already holds as many bytes as the disk cache can keep.
+        // queue already holds more bytes than the resident set has room for.
         //  - the lookup reads each slice by range and queues no whole read, so
         //    none reaches disk;
         //  - once the queue is emptied, the next lookup writes them to disk.
