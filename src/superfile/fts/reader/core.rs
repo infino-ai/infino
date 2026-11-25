@@ -715,8 +715,8 @@ pub struct FtsReader {
     /// that can't keep it reads only the pages it needs. Shared by every view cloned from this
     /// reader.
     pub(super) doc_map: Arc<OnceCell<DocMap>>,
-    /// The map's pages translations read while the whole map is not kept, so a later translation
-    /// landing on one reads nothing. Shared by every view cloned from this reader.
+    /// Doc-id map pages a search has read, kept so a later search on the same page reads nothing.
+    /// Empty once the whole map is kept. Shared by every view cloned from this reader.
     pub(super) kept_pages: Arc<KeptPages>,
     /// Where the map's body lies, with its CRC right after it; `None` on a
     /// blob in row order.
@@ -877,8 +877,8 @@ impl FtsReader {
         self.source.held_tables(out);
     }
 
-    /// Heap bytes reads have loaded into this reader since it opened: the
-    /// doc-id map or the pages of it kept, each column's norms and long terms' block tables.
+    /// Heap bytes reads have loaded into this reader since it opened: the doc-id map or its kept
+    /// pages, each column's norms and long terms' block tables.
     pub(crate) fn held_bytes(&self) -> usize {
         let doc_map = match self.doc_map.get() {
             Some(DocMap::Permuted(map)) => map.len(),
@@ -1485,8 +1485,8 @@ impl FtsReader {
         Ok(map)
     }
 
-    /// The whole map is kept now: the pages kept of it go, and whoever weighs this reader by what it
-    /// holds weighs it again.
+    /// The whole map is kept now: drop its kept pages, and have whoever weighs this reader by what
+    /// it holds weigh it again.
     fn map_kept(&self) {
         self.kept_pages.close();
         self.loads.loaded();
@@ -1643,8 +1643,8 @@ impl FtsReader {
         }
     }
 
-    /// Bytes of the doc-id map pages this reader keeps charged to `budget`: cached bytes a pass
-    /// over budget gives back by letting the reader go.
+    /// Bytes of doc-id map pages this reader keeps, reserved against `budget`. Like other cached
+    /// bytes, the over-budget pass frees them by letting go of this reader's file.
     pub(crate) fn kept_page_bytes(&self, budget: &HeapBudget) -> u64 {
         match ptr::eq(self.heap_budget, budget) {
             true => self.kept_pages.held_bytes() as u64,
@@ -2955,8 +2955,8 @@ fn kept_copy(body: &Bytes, reservation: HeapReservation) -> DocMap {
     DocMap::permuted(kept_bytes(body, reservation))
 }
 
-/// A copy of `body` holding `reservation` until the last copy drops. A copy, because a lazy source
-/// may hand back a window onto a bigger fetch, and keeping the window keeps all of it.
+/// A copy of `body` holding `reservation` until the last copy drops. It copies because a lazy
+/// source may hand back a window onto a bigger fetch, and keeping the window keeps all of it.
 pub(super) fn kept_bytes(body: &[u8], reservation: HeapReservation) -> Bytes {
     Bytes::from_owner(KeptMap {
         body: body.to_vec(),
@@ -2964,12 +2964,12 @@ pub(super) fn kept_bytes(body: &[u8], reservation: HeapReservation) -> Bytes {
     })
 }
 
-/// The doc-id map's pages translations read while the whole map is not kept, each a copy holding
-/// its own heap reservation. Closed for good once the whole map is kept.
+/// Doc-id map pages a reader keeps while it does not keep the whole map, each a copy holding its
+/// own heap reservation. Once the whole map is kept, the pages drop and none is kept again.
 #[derive(Debug, Default)]
 pub(super) struct KeptPages(Mutex<PageCache>);
 
-/// [`KeptPages`]' pages by page number, and whether the whole map is kept so none may be kept again.
+/// [`KeptPages`]' pages by page number, and whether the whole map is kept, after which none is.
 #[derive(Debug, Default)]
 pub(super) struct PageCache {
     pages: HashMap<usize, Bytes>,
@@ -2977,7 +2977,7 @@ pub(super) struct PageCache {
 }
 
 impl KeptPages {
-    /// The pages of `pages`, in order, when every one is kept; `None` otherwise.
+    /// The kept bytes of `pages`, in order, or `None` if any of them is not kept.
     pub(super) fn all(&self, pages: &[usize]) -> Option<Vec<Bytes>> {
         let kept = self.lock();
         pages
@@ -2986,7 +2986,7 @@ impl KeptPages {
             .collect()
     }
 
-    /// Keeps `bytes` as `page` unless it is kept already or the whole map is; whether it was kept.
+    /// Keeps `bytes` as `page` and returns true, unless the page or the whole map is kept already.
     pub(super) fn keep(&self, page: usize, bytes: Bytes) -> bool {
         let mut kept = self.lock();
         if kept.closed || kept.pages.contains_key(&page) {
@@ -3006,7 +3006,7 @@ impl KeptPages {
         self.lock().pages.values().map(Bytes::len).sum()
     }
 
-    /// Drops every page, giving back its reservation, and keeps none again: the whole map is kept.
+    /// The whole map is kept: drops every page, giving back its reservation, and keeps none after.
     fn close(&self) {
         let mut kept = self.lock();
         kept.pages.clear();

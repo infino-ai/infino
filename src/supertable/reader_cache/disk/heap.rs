@@ -347,9 +347,9 @@ impl HeapBudget {
         self.charged.load(Ordering::Acquire)
     }
 
-    /// Reserve `bytes` a reader may keep to save a later read, such as a page of a doc-id map:
-    /// `None` while the process is short of memory or the budget has no room for them. Never makes
-    /// room, so keeping something optional drops nothing else.
+    /// Reserve `bytes` a reader keeps only to save a later read, such as a doc-id map page. `None`
+    /// if the process is short of memory or the budget has no room; it never drops anything to
+    /// make room.
     pub(crate) fn try_reserve_page(&'static self, bytes: u64) -> Option<HeapReservation> {
         if self.short_of_memory() {
             return None;
@@ -750,8 +750,8 @@ mod tests {
         uri
     }
 
-    /// A file of `superfile`, opened lazily and charged to `budget`, after one translation of the
-    /// documents `ids` picks from its count: every one keeps the doc-id map, one keeps its page.
+    /// `superfile` opened lazily against `budget`, after translating the doc ids `ids` returns for
+    /// its document count. Translating every document keeps the whole map; one keeps its page.
     async fn reader_translating(
         superfile: &Bytes,
         budget: &'static HeapBudget,
@@ -769,7 +769,7 @@ mod tests {
         reader
     }
 
-    /// A file whose text index keeps a doc-id map, its map kept by a translation of every document.
+    /// A file whose text index keeps its whole doc-id map, after translating every document.
     async fn reader_keeping_a_map(
         superfile: &Bytes,
         budget: &'static HeapBudget,
@@ -780,7 +780,7 @@ mod tests {
         .await
     }
 
-    /// A file whose text index keeps the doc-id map page of its first document only.
+    /// A file whose text index keeps only the doc-id map page of its first document.
     async fn reader_keeping_a_page(
         superfile: &Bytes,
         budget: &'static HeapBudget,
@@ -1130,12 +1130,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_file_keeping_only_map_pages_goes_on_the_pass_like_other_cached_bytes() {
-        // Setup: a budget of one doc-id map page, kept by an idle file for a sparse translation,
-        // then a newer file's metadata pushing the budget over, in a process short of memory.
-        //  - The pass counts the page as the idle file's, lets that file go, and the page's
-        //    bytes come back.
-        // This test pins that kept pages are cached bytes the pass can free, never bytes it
-        // takes for running statements' and cannot free.
+        // Setup: a budget of one doc-id map page, kept by an idle file; a newer file's metadata
+        // then pushes the budget over while the process is short of memory.
+        //  - The pass counts the page as the idle file's bytes and lets that file go.
+        //  - The page's reservation comes back.
+        // This test pins that kept pages count as an idle file's bytes, not as bytes running
+        // queries hold, so the pass can free them.
         let superfile = Bytes::from(reordered_test_superfile());
         let probe = HeapBudget::with_budget(None);
         probe.set_short_of_memory(false);

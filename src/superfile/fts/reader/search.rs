@@ -249,8 +249,8 @@ fn in_flight_batches(reads: &[Range<usize>], cap: usize) -> Vec<&[Range<usize>]>
     batches
 }
 
-/// `bytes` of a read of `len` bytes of the map that starts on a page, cut into its pages: every one
-/// [`DOC_MAP_PAGE_BYTES`] long but the map's last, which may be short.
+/// Cuts `bytes`, a read of `len` map bytes that starts on a page, into its pages. Each is
+/// [`DOC_MAP_PAGE_BYTES`] long except the map's last, which may be shorter.
 fn split_pages(bytes: &Bytes, len: usize) -> Vec<Bytes> {
     (0..len)
         .step_by(DOC_MAP_PAGE_BYTES)
@@ -1154,7 +1154,7 @@ impl FtsReader {
     /// ```text
     /// map already kept                             -> translate in memory
     /// reads > 1/8 of the map, heap budget has room -> read it whole, keep it, translate in memory
-    /// reads <= 1/8, heap budget has room           -> the pages the ids fall in, kept
+    /// reads <= 1/8, heap budget has room           -> read the pages the ids fall in, keep them
     /// otherwise                                    -> read only the pages the ids fall in
     /// ```
     ///
@@ -1187,8 +1187,8 @@ impl FtsReader {
         if let Some(map) = self.kept_doc_map_within_budget().await? {
             return Ok(through(map));
         }
-        // A dense pass goes one read cap per batch, a few batches in flight, and reads every page
-        // when the reader checks CRCs, so the map's CRC is still checked.
+        // A dense pass reads one read cap per batch, a few batches in flight. When the reader
+        // checks CRCs it reads every page, so the map's CRC is still checked.
         let reads = match self.verify_crc {
             true => self.every_page(),
             false => reads,
@@ -1387,7 +1387,7 @@ impl FtsReader {
         Ok((batch, bytes, permit))
     }
 
-    /// One read of the map's `read`, and of the CRC stored right after it when `with_crc`.
+    /// Reads the map's `read` range, plus the CRC stored right after it when `with_crc`.
     async fn map_read(&self, read: &Range<usize>, with_crc: bool) -> Result<Bytes, FtsError> {
         let region = self.map_region();
         let crc_len = if with_crc { format::CRC_BYTES } else { 0 };
@@ -1412,10 +1412,9 @@ impl FtsReader {
         }
     }
 
-    /// The rows of `ids` through the pages `reads` cover. Each read is made once, as when nothing
-    /// is kept, unless every page in it is kept already; then the pages an id falls in are kept,
-    /// charged to the heap budget, so a later translation landing on them reads nothing. A page
-    /// the budget has no room for is not kept.
+    /// The rows of `ids` through the map pages `reads` cover. A read is skipped when the pages its
+    /// ids fall in are all kept; otherwise it is made once, as without keeping, and those pages
+    /// are then kept while the heap budget has room.
     async fn rows_through_kept_pages(
         &self,
         ids: &[FtsDocId],
@@ -1453,8 +1452,8 @@ impl FtsReader {
             .collect()
     }
 
-    /// The pages of `read` that `wanted` names, by page number: the kept ones when every one is
-    /// kept, the whole map's when it is kept, or else one read of `read`, after which they are kept.
+    /// The pages of `read` that `wanted` names, by page number: from the kept pages if all are
+    /// kept, else from the whole map if it is kept, else from one read of `read`, which keeps them.
     async fn read_pages(
         &self,
         read: &Range<usize>,
@@ -1487,7 +1486,8 @@ impl FtsReader {
         Ok(pages)
     }
 
-    /// Keeps `pages` not kept yet, each charged to the heap budget, until the budget has no room.
+    /// Keeps each of `pages` not kept yet, reserving its bytes against the heap budget, and stops
+    /// at the first one the budget has no room for.
     fn keep_pages(&self, pages: &[(usize, Bytes)]) {
         let mut kept_any = false;
         for (page, bytes) in pages {
@@ -4937,9 +4937,9 @@ mod tests {
         (Bytes::from(damaged), json)
     }
 
-    /// Ranked hits in the first page of [`dense_translation`]'s map, a full page far after it, and
-    /// its short last page, all clear of the middle page [`damaged_dense_blob`] breaks: a sparse
-    /// translation of [`SPARSE_READS`] one-page reads.
+    /// Ranked hits in three pages of [`dense_translation`]'s map: the first, a full page near the
+    /// end, and the short last one. None is in the middle page [`damaged_dense_blob`] breaks, and
+    /// each takes one read ([`SPARSE_READS`]).
     fn sparse_hits() -> Vec<(FtsDocId, f32)> {
         vec![
             (FtsDocId::new(999), 3.0),
@@ -4948,11 +4948,11 @@ mod tests {
         ]
     }
 
-    /// One-page reads [`sparse_hits`] makes.
+    /// Map reads [`sparse_hits`] makes, one per page.
     const SPARSE_READS: usize = 3;
 
-    /// A heap budget with room for [`sparse_hits`]' pages, whose maps' share (half of it) does not
-    /// hold [`dense_translation`]'s whole map.
+    /// A heap budget with room for [`sparse_hits`]' pages but not for [`dense_translation`]'s whole
+    /// map, since maps get only half the budget.
     const ROOM_FOR_PAGES_NOT_MAP: u64 = 1000;
 
     /// A heap budget with room for any two of [`sparse_hits`]' three pages, not all three.
@@ -4961,8 +4961,7 @@ mod tests {
     /// Translations the concurrency test runs at once.
     const CONCURRENT: usize = 8;
 
-    /// Bytes of the pages [`sparse_hits`] falls in on `r`'s map: two full pages and the last,
-    /// which is short.
+    /// Bytes of [`sparse_hits`]' pages on `r`'s map: two full pages and the short last one.
     fn sparse_page_bytes(r: &FtsReader) -> u64 {
         let tail = r.doc_map_len() % DOC_MAP_PAGE_BYTES;
         assert!(tail > 0, "the fixture's last page must be short");
@@ -4978,8 +4977,8 @@ mod tests {
 
     #[tokio::test]
     async fn with_room_a_sparse_translation_keeps_its_pages_and_a_repeat_reads_none() {
-        // Setup: two hits in two far-apart pages of a reordered blob's map; a budget with room.
-        //  - The first translation reads the two pages, keeps them and is charged for them.
+        // Setup: hits in three far-apart pages of a reordered blob's map; a budget with room.
+        //  - The first translation reads the three pages and keeps them, reserving their bytes.
         //  - The same translation again reads nothing and answers the same rows.
         // This test pins that a warm ranked search reads no map page it read before.
         let (blob, json, order, _) = dense_translation();
@@ -5008,12 +5007,11 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_sparse_translations_keep_one_copy_of_each_page() {
-        // Setup: the same hits translated eight times at once while the source holds reads.
-        //  - Each translation reads at most its own pages, as it would with nothing kept, and
-        //    answers the same rows; one copy of each page is kept and charged, so a repeat reads
-        //    none.
-        // This test pins that queries racing on a page never read more than they would without
-        // keeping it, and never keep it twice.
+        // Setup: the same hits translated eight times at once while the source holds every read.
+        //  - Each reads at most its own pages, as with nothing kept, and answers the same rows.
+        //  - One copy of each page is kept and reserved, so a repeat reads none.
+        // This test pins that searches racing on a page read no more than without keeping, and
+        // keep it once.
         let (blob, json, order, _) = dense_translation();
         let budget = roomy(None);
         let src = Arc::new(GatedSource::new(blob));
@@ -5048,9 +5046,9 @@ mod tests {
 
     #[tokio::test]
     async fn without_room_a_sparse_translation_keeps_no_page_and_reads_again() {
-        // Setup: two hits in two pages; a budget with no room.
-        //  - Each translation reads both pages and keeps nothing, so a repeat reads them again.
-        // This test pins that a full budget keeps no page and charges nothing.
+        // Setup: hits in three pages; a budget with no room.
+        //  - Each translation reads every page and keeps nothing, so a repeat reads them again.
+        // This test pins that a full budget keeps no page and reserves nothing.
         let (blob, json, order, _) = dense_translation();
         let budget = roomy(Some(0));
         let r = open_charged(blob, &json, budget).await;
@@ -5072,8 +5070,8 @@ mod tests {
 
     #[tokio::test]
     async fn short_of_memory_a_sparse_translation_keeps_no_page_and_reads_again() {
-        // Setup: two hits in two pages; a budget with no limit, in a process short of memory.
-        //  - Each translation reads both pages and keeps nothing, so a repeat reads them again.
+        // Setup: three hits in three pages, a budget with no limit, a process short of memory.
+        //  - Each translation reads its pages and keeps none, so a repeat reads them again.
         // This test pins that memory pressure alone refuses page keeps the budget has room for.
         let (blob, json, order, _) = dense_translation();
         let budget = roomy(None);
@@ -5097,9 +5095,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_page_read_while_the_whole_map_is_kept_is_refused() {
-        // Setup: the whole map kept, then a page offered for keeping, as a translation whose read
-        // was in flight when the map was kept offers it.
-        //  - The page is refused and its reservation given back: only the map stays charged.
+        // Setup: the whole map is kept, then a page is offered, as by a search whose read was in
+        // flight when the map was kept.
+        //  - The page is refused and its reservation given back; only the map stays reserved.
         // This test pins that a reader never holds pages beside its whole map.
         let (blob, json, _, hits) = dense_translation();
         let budget = roomy(None);
@@ -5114,10 +5112,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_translation_racing_the_whole_map_keep_keeps_no_page() {
-        // Setup: the whole map kept by a dense translation, then a sparse translation that missed
-        // it, as one that checked for the map just before it was kept does.
-        //  - It reads its pages and answers its rows, but keeps none: only the map stays charged.
-        // This test pins that a reader never holds pages beside its whole map.
+        // Setup: a dense translation keeps the whole map, then a sparse one takes the page path,
+        // as one that checked for the map just before it was kept does.
+        //  - It takes its pages from the kept map, reads nothing and answers the right rows.
+        //  - It keeps no page; only the map stays reserved.
+        // This test pins that a search racing the whole-map keep reads nothing and keeps no page.
         let (blob, json, order, hits) = dense_translation();
         let budget = roomy(None);
         let r = open_charged(blob, &json, budget).await;
@@ -5156,10 +5155,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_map_kept_for_a_row_check_gives_its_pages_back() {
-        // Setup: a sparse translation that keeps pages, then the whole map read for a filter that
-        // checks rows, which keeps it whatever the budget says.
-        //  - Only the whole map stays charged: the pages are given back and none is left.
-        // This test pins that every way the whole map is kept drops the pages.
+        // Setup: a sparse translation keeps pages, then a filter that checks rows reads the whole
+        // map, which keeps it whatever the budget says.
+        //  - The pages drop and give back their reservation; only the whole map stays reserved.
+        // This test pins that every way of keeping the whole map drops the pages.
         let (blob, json, _, _) = dense_translation();
         let budget = roomy(None);
         let r = open_charged(blob, &json, budget).await;
@@ -5176,11 +5175,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_whole_map_refused_by_the_budget_keeps_the_pages() {
-        // Setup: a sparse translation that keeps pages, then a dense one whose whole map does not
-        // fit the budget's map share even with nothing else kept.
-        //  - The dense one is refused the map and answers through its pages; the sparse pages
-        //    stay kept, so a repeat reads none.
-        // This test pins that a refused whole-map keep does not throw this reader's pages away.
+        // Setup: a sparse translation keeps pages, then a dense one whose whole map does not fit
+        // the budget's map share even with nothing else kept.
+        //  - The budget refuses the map, and the dense one answers by reading pages.
+        //  - The sparse pages stay kept, so repeating the sparse translation reads none.
+        // This test pins that a refused whole-map keep leaves the kept pages alone.
         let (blob, json, order, hits) = dense_translation();
         let budget = roomy(Some(ROOM_FOR_PAGES_NOT_MAP));
         let r = open_charged(blob, &json, budget).await;
@@ -5203,8 +5202,7 @@ mod tests {
     #[tokio::test]
     async fn a_budget_with_room_for_some_pages_reads_each_page_once() {
         // Setup: a budget with room for two of the three pages a sparse translation needs.
-        //  - Two pages are kept, the third is read without keeping it: one read per page, no
-        //    page read twice.
+        //  - Two pages are kept and the third is only read: one read per page, none read twice.
         // This test pins that a budget refusing a page costs no extra read.
         let (blob, json, order, _) = dense_translation();
         let budget = roomy(Some(ROOM_FOR_TWO_PAGES));
@@ -5224,10 +5222,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_across_a_gap_keeps_only_the_pages_hit() {
-        // Setup: hits in two pages one page apart, which one read covers, gap page and all.
-        //  - The read is made once, and only the two pages a hit falls in are kept.
-        //  - A repeat translation reads nothing: its hit pages are kept, though the gap page is not.
-        // This test pins that a merged read's gap pages are not held and do not block reuse.
+        // Setup: hits in pages 0 and 2, which one read covers, page 1 included.
+        //  - The read is made once, and only pages 0 and 2 are kept.
+        //  - A repeat reads nothing, though page 1 is not kept.
+        // This test pins that a merged read keeps only the pages hit, and a repeat still reuses
+        // them.
         let (blob, json, order, _) = dense_translation();
         let budget = roomy(None);
         let r = open_charged(blob, &json, budget).await;
@@ -5249,8 +5248,8 @@ mod tests {
 
     #[tokio::test]
     async fn kept_pages_go_once_the_whole_map_is_kept() {
-        // Setup: a sparse translation that keeps two pages, then a dense one with room for the map.
-        //  - The map is kept whole and only it is charged: the pages' charge is given back.
+        // Setup: a sparse translation keeps its pages, then a dense one with room for the map.
+        //  - The dense one keeps the whole map, and the pages drop and give back their reservation.
         // This test pins that a reader never holds a page and the whole map at once.
         let (blob, json, order, hits) = dense_translation();
         let budget = roomy(None);
@@ -5269,12 +5268,11 @@ mod tests {
 
     #[tokio::test]
     async fn kept_pages_leave_a_dense_translation_checking_the_map_crc() {
-        // Setup: a damaged map, a reader that checks CRCs, and pages two sparse hits kept, outside
+        // Setup: a damaged map, a reader that checks CRCs, and pages kept by sparse hits clear of
         // the damage.
         //  - With room for the map, a dense translation reads it whole and refuses it.
-        //  - Without room for it (room for a few pages only), the dense pass reads every page and
-        //    refuses it.
-        // This test pins that kept pages never stand in for a translation that checks the CRC.
+        //  - With room for a few pages only, the dense pass reads every page and refuses the map.
+        // This test pins that kept pages never let a dense translation skip the CRC check.
         let (damaged, json) = damaged_dense_blob().await;
         let (_, _, _, dense) = dense_translation();
         for budget in [None, Some(ROOM_FOR_PAGES_NOT_MAP)] {
