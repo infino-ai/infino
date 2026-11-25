@@ -276,6 +276,11 @@ vector:
   # On by default.
   global_fine_per_cluster_budget: true
 
+  # For ivf_router = centroid_graph: store the graph as a full copy plus one
+  # small change per drain, instead of whole after every drain. Turn on only
+  # after every reader runs a version that can load it. Off by default.
+  centroid_graph_as_steps: false
+
   # For ivf_router = centroid_graph (per-cluster budget on): minimum pooled,
   # fully reranked candidate count. Boosts the per-cluster budget at small N
   # so recall does not turn depth-limited; a no-op at large N. Higher trades

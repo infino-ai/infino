@@ -30,6 +30,7 @@ use crate::{
             summaries::MANIFEST_SUMMARIES_DIR,
             term_index::{self, STORAGE_PREFIX as TERM_INDEX_STORAGE_PREFIX},
         },
+        query::fine_graph_store::GraphHead,
         slow_vector_state::{self, STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX},
         wal::persistence::{SUPERFILES_DIR, WalStore},
     },
@@ -143,12 +144,43 @@ fn list_refs(manifest: &ManifestSnapshot) -> impl Iterator<Item = &str> {
         manifest
             .slow_vector_state_centroid_graph_blob()
             .map(|r| r.uri.as_str()),
+        manifest
+            .slow_vector_state_centroid_graph_last_blob()
+            .map(|r| r.uri.as_str()),
         manifest.term_index_ref().map(|r| r.uri.as_str()),
     ]
     .into_iter()
     .flatten();
 
     parts.chain(blobs)
+}
+
+/// The base and steps a stored centroid graph names, when `reference` is the head of one. A
+/// graph stored whole, or a head that is gone, names nothing.
+async fn centroid_graph_objects(
+    storage: &dyn StorageProvider,
+    reference: &RoutingRef,
+) -> Result<Vec<String>, GcError> {
+    let magic = 0..GraphHead::MAGIC_BYTES as u64;
+    let prefix = match storage.get_range(&reference.uri, magic).await {
+        Ok(prefix) => prefix,
+        Err(StorageError::NotFound { .. }) => return Ok(Vec::new()),
+        Err(error) => return Err(GcError::Storage(error)),
+    };
+    if !GraphHead::is_head(&prefix) {
+        return Ok(Vec::new());
+    }
+    let (bytes, _) = storage
+        .get(&reference.uri)
+        .await
+        .map_err(GcError::Storage)?;
+    let Some(head) = GraphHead::from_bytes(&bytes) else {
+        return Ok(Vec::new());
+    };
+    Ok(iter::once(head.base.0)
+        .chain(head.steps.iter().map(|(step, _)| *step))
+        .map(|hash| slow_vector_state::storage_path(&hash))
+        .collect())
 }
 
 /// The slices a term-index root names, which takes reading the root, one small object. A root
@@ -355,6 +387,14 @@ async fn live_set(
         if let Some(pending) = state.pending_drain {
             uris.extend(pending.entries.iter().map(|entry| entry.storage_path()));
         }
+    }
+
+    let stamped = manifest.slow_vector_state_centroid_graph_blob();
+    let last = manifest
+        .slow_vector_state_centroid_graph_last_blob()
+        .filter(|last| Some(*last) != stamped);
+    for reference in stamped.into_iter().chain(last) {
+        uris.extend(centroid_graph_objects(storage.as_ref(), reference).await?);
     }
 
     // Every slice the term-index root names (the root itself is a list ref, already in).
@@ -687,6 +727,7 @@ mod tests {
     use super::*;
     use crate::{
         storage::{LocalFsStorageProvider, PrefixedStorageProvider, StorageProvider},
+        superfile::vector::hnsw::{Hnsw, HnswParams, Sq16Scorer},
         supertable::{
             SupertableOptions,
             manifest::{
@@ -698,6 +739,8 @@ mod tests {
                 rollups::{RollupsAt, RollupsRef, rollups_uri},
                 summaries::{SummariesRef, summaries_uri},
             },
+            query::{fine_graph_cache::GraphRole, fine_graph_store::GraphBase},
+            schema::FieldId,
             slow_vector_state,
         },
         test_helpers::{capture_logs, default_supertable_options},
@@ -849,6 +892,7 @@ mod tests {
                 slow_vector_state_centroids: None,
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
+                slow_vector_state_centroid_graph_last: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: vec![ManifestPartEntry {
@@ -1009,6 +1053,7 @@ mod tests {
                 }),
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
+                slow_vector_state_centroid_graph_last: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: Vec::new(),
@@ -1074,6 +1119,65 @@ mod tests {
         }
     }
 
+    /// A head names its base and steps; a graph stored whole and a missing
+    /// object name nothing.
+    #[tokio::test]
+    async fn a_centroid_graph_head_names_its_base_and_steps() {
+        let dir = tempdir().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+        let vectors: Vec<Vec<f32>> = (0..4)
+            .map(|i| {
+                let mut v = vec![0.0; 4];
+                v[i] = 1.0;
+                v
+            })
+            .collect();
+        let graph = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&vectors, 4),
+            HnswParams::default(),
+        );
+        let keys = (0..4)
+            .map(|i| Some((Uuid::from_u128(1), None, i)))
+            .collect();
+        let base = GraphBase::new(keys, graph).expect("base");
+        let base_hash = ContentHash::of(b"base");
+        let step_hash = ContentHash::of(b"step");
+        let mut head = GraphHead::of_base(GraphRole::Router, FieldId(1), 4, base_hash, 1, &base);
+        head.steps.push((step_hash, 1));
+        let head_ref = slow_vector_state::write_resident_index_blob(&storage, head.to_bytes())
+            .await
+            .expect("write head");
+        assert_eq!(
+            centroid_graph_objects(&storage, &head_ref)
+                .await
+                .expect("head"),
+            vec![
+                slow_vector_state::storage_path(&base_hash),
+                slow_vector_state::storage_path(&step_hash)
+            ]
+        );
+
+        let whole = slow_vector_state::write_resident_index_blob(&storage, b"INFCGR01...".to_vec())
+            .await
+            .expect("write section");
+        assert!(
+            centroid_graph_objects(&storage, &whole)
+                .await
+                .expect("section")
+                .is_empty()
+        );
+        let missing = RoutingRef {
+            uri: slow_vector_state::storage_path(&ContentHash::of(b"missing")),
+            content_hash: ContentHash::of(b"missing"),
+        };
+        assert!(
+            centroid_graph_objects(&storage, &missing)
+                .await
+                .expect("missing")
+                .is_empty()
+        );
+    }
+
     /// A referenced centroid-router section is live and survives a sweep. The
     /// section lives under the swept `slow-vector-state/` prefix, so if it were
     /// omitted from the live set GC would delete a referenced section and every
@@ -1121,6 +1225,7 @@ mod tests {
                     uri: centroid_graph_uri.clone(),
                     content_hash: centroid_graph_hash,
                 }),
+                slow_vector_state_centroid_graph_last: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: Vec::new(),

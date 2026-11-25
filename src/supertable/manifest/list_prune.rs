@@ -313,6 +313,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: entries,

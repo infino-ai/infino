@@ -213,6 +213,7 @@ use crate::{
         options::SupertableOptions,
         query::{
             dispatch::{open_reader, open_whole_superfile},
+            fine_graph_publish,
             vector::{IndexOutcome, serves_via_graph, stable_ids_by_local_for_routing},
         },
         reader_cache::{
@@ -13540,29 +13541,19 @@ async fn build_and_publish_centroid_router_section(
             return None;
         }
     };
-    // Build the router graph + open readers ONCE and encode the section.
-    // Best-effort: a `None` just leaves the ref unstamped, and queries
-    // reconstruct the router in memory.
-    let bytes = crate::supertable::query::vector::compose_centroid_router_section(
+    crate::supertable::query::vector::publish_centroid_router_section(
+        storage,
         &inner.manifest.load(),
         entries,
         &section,
         &column,
         dim,
+        vcfg.centroid_graph_as_steps,
     )
-    .await;
-    match bytes {
-        Some(bytes) => slow_vector_state::write_resident_index_blob(storage, bytes)
-            .await
-            .inspect(|reference| {
-                tracing::debug!(uri = %reference.uri, "centroid-router: published section");
-            })
-            .map_err(
-                |error| tracing::warn!(%error, "centroid-router publish: section write failed"),
-            )
-            .ok(),
-        None => None,
-    }
+    .await
+    .inspect(|reference| {
+        tracing::debug!(uri = %reference.uri, "centroid-router: published");
+    })
 }
 
 /// The PREVIOUS generation's centroid section for `manifest`, through the
@@ -14763,13 +14754,24 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
                 {
                     return Ok(None);
                 }
-                Ok(Some(old.with_slow_vector_state(
+                // A graph stored as a base plus steps stays named across
+                // membership changes, so gc keeps its base and steps.
+                let last = centroid_graph.clone().map(|graph| {
+                    let kept = fine_graph_publish::wrote(&graph)
+                        || old.slow_vector_state_centroid_graph_last_blob() == Some(&graph);
+                    kept.then_some(graph)
+                });
+                let stamped = old.with_slow_vector_state(
                     published.uri,
                     published.content_hash,
                     published.centroids,
                     graphs_ref,
                     centroid_graph,
-                )))
+                );
+                Ok(Some(match last {
+                    Some(last) => stamped.with_centroid_graph_last(last),
+                    None => stamped,
+                }))
             }
         },
     )
