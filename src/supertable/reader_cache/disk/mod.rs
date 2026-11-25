@@ -423,8 +423,9 @@ struct UnindexedFile {
     size_bytes: u64,
     /// File mtime in microseconds since the unix epoch; eviction drops the oldest first. mtime and
     /// not atime: relatime/noatime mounts make atime undependable, and for a file no read has
-    /// opened the two match anyway, so oldest-mtime is oldest-copy, the likeliest dead one. A
-    /// release moves a `.blocks` file's mtime up to its last use, so a restart ranks it the same.
+    /// opened the two match anyway, so oldest-mtime is oldest-copy, the likeliest dead one. Reads
+    /// move a `.blocks` file's mtime to within a minute of the last read, and a release up to its
+    /// last use, so a restart ranks it the same, even after a crash.
     mtime_us: u64,
 }
 

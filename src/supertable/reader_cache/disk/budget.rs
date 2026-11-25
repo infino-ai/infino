@@ -1563,6 +1563,44 @@ mod tests {
         assert_evicted_in_order(&store, &[opened_between, scanned]);
     }
 
+    /// A file filled long ago and then read only from its cached blocks, never written again nor
+    /// released, up to a stop: after the restart it ranks by that read, not its last write, so it
+    /// outlives a file released just before its read.
+    #[tokio::test]
+    async fn a_file_read_only_from_cache_until_a_restart_ranks_by_the_read() {
+        let (_dir, store) = test_store_with(lazy_streaming);
+        let (read_last, released) = (SuperfileUri::new_v4(), SuperfileUri::new_v4());
+        put_superfile(&store, &read_last, tiny_superfile_bytes()).await;
+        put_superfile(&store, &released, tiny_superfile_bytes()).await;
+
+        open_and_fill_a_block(&store, &read_last).await;
+        let source = open_lazily(&store, &read_last).await;
+        // Filled long ago, and its reads since have not moved the mtime for over the step.
+        fs::File::options()
+            .write(true)
+            .open(store.blocks_path(&read_last))
+            .expect("open blocks")
+            .set_modified(SystemTime::now() - LAST_RUN_AGE)
+            .expect("set mtime");
+        source.forget_mtime_mark_for_test();
+
+        open_and_fill_a_block(&store, &released).await;
+        drop(store.release_lazy_entry(&released));
+        sleep(STEP).await;
+        let filled = source.filled_bytes_handle().load(Ordering::Acquire);
+        source.try_get_range_sync(0, 1).expect("cached block read");
+        store.block_writes_settled().await;
+        assert_eq!(
+            source.filled_bytes_handle().load(Ordering::Acquire),
+            filled,
+            "no write"
+        );
+
+        // The stop releases nothing: the restart sees the files as they are on disk.
+        let restarted = reopen_store(&store, lazy_streaming);
+        assert_evicted_in_order(&restarted, &[released, read_last]);
+    }
+
     /// A Stream lazy entry with one block filled, released while its reader is still alive, as
     /// one waiting on the freeing thread is.
     ///  - the block file is counted once, by its record, while the reader lives;

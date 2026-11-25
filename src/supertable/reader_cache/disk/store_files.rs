@@ -465,10 +465,10 @@ impl DiskCacheStore {
         last_used: Option<SystemTime>,
     ) {
         let filled = source.filled_bytes_handle().load(Ordering::Acquire);
-        if filled == 0 || !source.path_names_its_file() {
+        if filled == 0 {
             return;
         }
-        let Some(file) = source.opened_file() else {
+        let Some(file) = source.named_file() else {
             return;
         };
         let written = file.metadata().and_then(|meta| meta.modified()).ok();
