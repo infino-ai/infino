@@ -3487,6 +3487,7 @@ mod tests {
         // - with positions, the scan walks the phrase;
         // - without, it checks the rows holding the words;
         // - under a stemmer, DataFusion calls the function on each row.
+        // So no path changes which rows a quoted query returns.
         let rt = Runtime::new().expect("runtime");
         for (stemmer, positions) in [
             (Stemmer::None, true),

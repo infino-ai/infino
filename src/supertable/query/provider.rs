@@ -1000,9 +1000,9 @@ impl SupertableProvider {
             .collect()
     }
 
-    /// `filter` as a conjunct this provider answers exactly from the term
-    /// dictionary (see [`ExactFilter`]), or `None` for one the index only
-    /// bounds and DataFusion verifies. The one classification
+    /// `filter` as a conjunct the index answers or narrows (see
+    /// [`ExactFilter`]; [`Self::exact_conjunct`] says which), or `None` for
+    /// one the index only bounds and DataFusion verifies. The one classification
     /// [`supports_filters_pushdown`](TableProvider::supports_filters_pushdown),
     /// [`scan`](TableProvider::scan) and the covered-aggregate rewrite
     /// share, so what DataFusion is told is exact is what the scan answers
@@ -1058,15 +1058,17 @@ impl SupertableProvider {
     /// [`Self::exact_filter`], and whether the scan answers it exactly. A quoted
     /// `text_match` on a column without positions is not exact: the scan narrows
     /// the rows by its words and DataFusion checks the phrase on the rows read.
-    /// That costs about a scan of the text, a few times less than checking each
-    /// row by id when the words are common.
     fn exact_conjunct(
         &self,
         filter: &Expr,
         fts_cols: &HashSet<&str>,
-        positional: &HashSet<String>,
     ) -> Option<(ExactFilter, bool)> {
         let exact = self.exact_filter(filter, fts_cols)?;
+        // Only a phrase needs the columns' positions; other queries skip reading them.
+        if exact.texts().is_empty() {
+            return Some((exact, true));
+        }
+        let positional = self.positional_columns();
         Some(exact.read_without_positions(&|column| positional.contains(column)))
     }
 
@@ -1184,7 +1186,7 @@ impl SupertableProvider {
 
     /// Each of `filters` as an exact interval on a range-indexed column
     /// ([`exact_range`]), or `None`. Only beside a conjunct the dictionary
-    /// answers or bounds (`with_text`): the scan then intersects the range
+    /// answers or narrows (`with_text`): the scan then intersects the range
     /// index's rows with the dictionary's, and with every conjunct exact
     /// DataFusion hands the scan its `LIMIT`. Alone, a range stays a bound
     /// that a `FilterExec` verifies, which the covered-aggregate rewrite and
@@ -1208,9 +1210,10 @@ impl SupertableProvider {
 
     /// The rows of one superfile its exact conjuncts hold for, within
     /// `bound` (the other conjuncts' candidate rows, when the index bounded
-    /// them). Every leaf's rows come from the dictionary
+    /// them). A word leaf's rows come from the dictionary
     /// ([`SuperfileReader::contains_rows`]), each column walked once for
-    /// all its needles; the leaves combine through the conjuncts' `AND` /
+    /// all its needles, and a phrase leaf's from the positions
+    /// ([`SuperfileReader::text_rows`]); the leaves combine through the conjuncts' `AND` /
     /// `OR` tree ([`ExactFilter::rows`]), and the rows that leaves doubtful
     /// are checked against their stored text, tombstoned ones left out
     /// first since the scan skips them anyway.
@@ -1450,13 +1453,24 @@ impl SupertableProvider {
         }
         drop(dict);
         // Every leaf the tree reads has its rows; checked up front so the
-        // lookup below cannot miss.
+        // lookups below cannot miss.
         if let Some(leaf) = check.filter.leaves().into_iter().find(|leaf| {
             !leaf_rows.contains_key(&(leaf.column.as_str(), leaf.needle.as_str(), leaf.whole))
         }) {
             return Err(DataFusionError::Internal(format!(
                 "exact rows of column {:?}: no result for needle {:?}",
                 leaf.column, leaf.needle
+            )));
+        }
+        if let Some(text) = check
+            .filter
+            .texts()
+            .into_iter()
+            .find(|text| !text_rows.iter().any(|(seen, _)| seen == text))
+        {
+            return Err(DataFusionError::Internal(format!(
+                "exact rows of column {:?}: no result for a phrase",
+                text.column
             )));
         }
         let mut rows = check.filter.rows(
@@ -2647,7 +2661,7 @@ pub(crate) fn holds_no_postings(e: &ReadError) -> bool {
     }
 }
 
-/// A scan's exact conjuncts ([`SupertableProvider::exact_filter`]),
+/// A scan's conjuncts the index answers or narrows ([`SupertableProvider::exact_filter`]),
 /// compiled once per scan together with the check their doubtful rows get.
 struct ExactCheck {
     /// The conjunction as the dictionary answers it: an `AND` of the
@@ -2760,8 +2774,8 @@ impl ExactCheck {
                 }
             };
             for token in text.query.tokens() {
-                if !out[at].1.contains(&token) {
-                    out[at].1.push(token);
+                if !out[at].1.contains(token) {
+                    out[at].1.push(token.clone());
                 }
             }
         }
@@ -2901,11 +2915,10 @@ impl TableProvider for SupertableProvider {
             return Ok(vec![TableProviderFilterPushDown::Exact; filters.len()]);
         }
         let fts_cols = self.fts_cols_set();
-        let positional = self.positional_columns();
         let text: Vec<Option<bool>> = filters
             .iter()
             .map(|filter| {
-                self.exact_conjunct(filter, &fts_cols, &positional)
+                self.exact_conjunct(filter, &fts_cols)
                     .map(|(_, exact)| exact)
             })
             .collect();
@@ -3104,13 +3117,12 @@ impl TableProvider for SupertableProvider {
         let mut exact_filters: Vec<Expr> = Vec::new();
         let mut exact_conjuncts: Vec<ExactFilter> = Vec::new();
         let mut bounded_filters: Vec<Expr> = Vec::new();
-        // DataFusion checks a conjunct the scan only narrows again above the scan,
-        // so the scan must not stop at the LIMIT.
+        // A conjunct the scan only narrows is checked again above it, so the scan
+        // must not stop at the LIMIT.
         let mut every_exact = true;
-        let positional = self.positional_columns();
         let text: Vec<Option<(ExactFilter, bool)>> = filters
             .iter()
-            .map(|filter| self.exact_conjunct(filter, &fts_cols, &positional))
+            .map(|filter| self.exact_conjunct(filter, &fts_cols))
             .collect();
         let ranges = self.exact_ranges(filters.iter(), text.iter().any(Option::is_some));
         let mut exact_ranges = Vec::new();

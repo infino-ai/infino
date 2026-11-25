@@ -1697,16 +1697,19 @@ fn whole_token_leaf(column: &str, needle: String) -> ExactFilter {
 }
 
 impl ExactText {
-    /// The rows that may hold this query, from the postings alone: each phrase
-    /// counts as all of its words. The scan checks the phrase on these rows.
+    /// A word filter whose rows include every row holding this query: each
+    /// phrase stands for all of its words. The phrase itself must still be
+    /// checked on those rows.
     pub(crate) fn superset(&self) -> ExactFilter {
         let word = |needle: &String| whole_token_leaf(&self.column, needle.clone());
-        let words = self.query.words.iter().map(word);
         match self.mode {
             BoolMode::And => ExactFilter::And(self.query.tokens().iter().map(word).collect()),
             BoolMode::Or => {
                 ExactFilter::Or(
-                    words
+                    self.query
+                        .words
+                        .iter()
+                        .map(word)
                         .chain(self.query.phrases.iter().map(|phrase| {
                             ExactFilter::And(phrase.terms.iter().map(word).collect())
                         }))
@@ -1777,14 +1780,10 @@ fn exact_text_match(
         return None;
     }
     if !query.phrases.is_empty() {
-        let mode = match mode {
-            TextMatchMode::All => BoolMode::And,
-            TextMatchMode::Any => BoolMode::Or,
-        };
         return Some(ExactFilter::Text(ExactText {
             column,
             query,
-            mode,
+            mode: BoolMode::from(mode),
         }));
     }
     let mut leaves: Vec<ExactFilter> = query

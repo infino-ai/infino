@@ -673,10 +673,10 @@ impl FtsReader {
         Ok(())
     }
 
-    /// The rows of `column` that hold `words` and `phrases` under `mode`, read
-    /// from the positions. A column without positions is
-    /// [`FtsError::PositionsUnavailable`]. Where the term index has not located a
-    /// term, this reads its own copy of the dictionary.
+    /// The rows of `column` that hold `words` and `phrases` under `mode`, all
+    /// proven; phrases are read from the positions. A column without positions
+    /// is [`FtsError::PositionsUnavailable`]. Where the term index has not
+    /// located a term, this reads its own copy of the dictionary.
     pub(crate) async fn text_rows(
         &self,
         column: &str,

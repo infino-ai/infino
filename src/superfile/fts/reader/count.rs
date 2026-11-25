@@ -95,8 +95,8 @@ impl FtsReader {
     /// Unranked doc-at-a-time walk over heterogeneous atoms, calling
     /// `on_doc` for every matching doc in ascending order. `And` walks
     /// the atoms' intersection (a phrase atom's own verification is
-    /// part of its cursor); `Or` walks their union. The shared spine
-    /// of the phrase-aware `token_match` / `count` entries.
+    /// part of its cursor); `Or` walks their union. `n_docs` is the file's
+    /// doc count, which picks how `Or` walks.
     pub(super) fn walk_atoms_match(
         n_docs: u32,
         mut atoms: Vec<AnyCursor>,
@@ -254,7 +254,7 @@ impl FtsReader {
     /// phrase member the memo holds is not looked up in the dictionary. With
     /// a `pool`, the phrase cursors' first seek and the walk run on it, while
     /// the reads stay on this task. Without one they run here, for callers
-    /// that poll this future to completion in one go.
+    /// that block on this future.
     pub(crate) async fn atoms_match_ids_prefetched(
         &self,
         column: &str,

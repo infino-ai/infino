@@ -1614,6 +1614,8 @@ mod tests {
     /// - 200 docs: a quarter hold `pope leo`, a quarter `leo the pope`.
     /// - With the pool's one thread held, the match cannot finish.
     /// - Released, it finds the same rows as a match without a pool.
+    ///
+    /// So the walk really runs on the pool, and the pool changes no row.
     #[tokio::test]
     async fn a_phrase_match_on_the_pool_finds_the_rows_it_finds_here() {
         let r = open_positional((0..200).map(|i| match i % 4 {

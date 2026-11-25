@@ -1659,11 +1659,14 @@ fn a_reader_running_while_the_schema_grows_sees_only_coherent_snapshots() {
     );
 }
 
-/// A quoted `text_match` on a text column added later: the superfile written
-/// before the column holds no postings for it, and its rows are checked
-/// against their (null) text; the later ones read the phrase from positions,
-/// or, without them, check the rows holding its words. Every answer is the
-/// phrase's rows, as `token_match` gives them where it can.
+/// A quoted `text_match` on a text column added later, with and without
+/// positions.
+/// - The file written before the column holds no postings for it; its rows
+///   are checked against their (null) text.
+/// - Later files read the phrase from positions, or, without them, check the
+///   rows holding its words.
+///
+/// So every answer is the phrase's rows, as `token_match` gives them.
 #[test]
 fn a_quoted_text_match_on_a_text_column_added_later_matches_the_phrase() {
     for positions in [true, false] {
@@ -1732,6 +1735,9 @@ fn a_quoted_text_match_on_a_text_column_added_later_matches_the_phrase() {
 ///   the same name.
 /// - Their rows hold no value for the new column, so none of them match.
 /// - Files written after hold positions, and only the phrase's rows match.
+///
+/// So the old index is read, its rows are checked against their text, and
+/// none of them comes back.
 #[test]
 fn a_quoted_text_match_on_a_column_added_again_with_positions_matches_the_phrase() {
     let db = connect("memory://").expect("connect");

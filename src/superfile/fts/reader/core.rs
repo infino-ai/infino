@@ -2358,7 +2358,7 @@ impl FtsReader {
                 positions[member] = group;
             }
             // Building the cursor seeks its first verified match, which can
-            // decode many position runs.
+            // decode many position runs, so it runs on the pool.
             let offsets = phrase.offsets().to_vec();
             let cursor = on_pool_or_here(pool, "phrase cursor", move || {
                 PhraseCursor::new(cursors, positions, positional, member_at, offsets)
@@ -3650,9 +3650,8 @@ fn check_version(version: u32) -> Result<(), FtsError> {
     }
 }
 
-/// `f` on `pool` behind a oneshot when given, else on this thread. A job the
-/// caller stopped waiting for before it started is skipped, as only the
-/// caller needs its result.
+/// Runs `f` on `pool` when given, else here. If the caller stops waiting
+/// before `f` starts, `f` is skipped.
 pub(super) async fn on_pool_or_here<R, F>(
     pool: Option<&ThreadPool>,
     what: &'static str,

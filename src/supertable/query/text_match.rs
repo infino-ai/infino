@@ -32,9 +32,10 @@
 //! term dictionary and the postings: each query token is one dictionary
 //! key, and its postings are the rows (see `candidate::ExactFilter`). The
 //! scan then decodes only those rows, intersects them with whatever else
-//! the `WHERE` bounds, and stops at the `LIMIT`. A phrase is read from the
-//! column's token positions. Without positions, the rows holding its words
-//! are checked against their text, which costs about a scan of that text.
+//! the `WHERE` bounds, and stops at the `LIMIT`. A phrase is answered
+//! exactly from the column's token positions. Without positions, the scan
+//! returns the rows holding its words and DataFusion checks the phrase on
+//! them, which costs about a scan of that text.
 //!
 //! ## What it means
 //!
@@ -71,7 +72,10 @@ use datafusion::{
     },
 };
 
-use crate::superfile::fts::tokenize::{Phrase, StandardTokenizer, Tokenizer, quoted_phrase};
+use crate::superfile::fts::{
+    reader::BoolMode,
+    tokenize::{Phrase, StandardTokenizer, Tokenizer, quoted_phrase},
+};
 
 /// SQL name of the token-match predicate.
 pub(crate) const TEXT_MATCH_UDF: &str = "text_match";
@@ -80,10 +84,19 @@ pub(crate) const TEXT_MATCH_UDF: &str = "text_match";
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextMatchMode {
-    /// Every token (`'and'`).
+    /// Every word and phrase (`'and'`).
     All,
-    /// Any token (`'or'`, the default).
+    /// Any word or phrase (`'or'`, the default).
     Any,
+}
+
+impl From<TextMatchMode> for BoolMode {
+    fn from(mode: TextMatchMode) -> Self {
+        match mode {
+            TextMatchMode::All => BoolMode::And,
+            TextMatchMode::Any => BoolMode::Or,
+        }
+    }
 }
 
 impl TextMatchMode {
@@ -99,8 +112,7 @@ impl TextMatchMode {
     }
 }
 
-/// A `text_match` query read by `standard`: its loose words and its quoted
-/// phrases.
+/// A `text_match` query read by `standard`: its words and its quoted phrases.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TextQuery {
     /// The distinct tokens outside quotes, and the lone token of a quote
@@ -108,74 +120,77 @@ pub(crate) struct TextQuery {
     pub(crate) words: Vec<String>,
     /// The distinct quoted runs of two or more tokens.
     pub(crate) phrases: Vec<Phrase<String>>,
-    /// `words` as a set, to skip repeats.
-    seen: HashSet<String>,
-    /// `phrases` as a set, to skip repeats.
-    seen_phrases: HashSet<Phrase<String>>,
+    /// Every distinct token, words then phrase terms.
+    tokens: Vec<String>,
 }
 
 impl TextQuery {
     /// `query` split by `standard`. Each pair of double quotes, paired left to
-    /// right, holds a phrase, or a word if it holds one token. Everything else is
-    /// split as the text is, so a query without a pair gives exactly its words.
+    /// right, holds a phrase, or a word if it holds one token. Everything else
+    /// is split as the text is, so a query with fewer than two quotes gives
+    /// exactly its words. Quotes pair wherever they stand, as in
+    /// `token_match`, so two quotes inside words (`צה"ל ארה"ב`) hold a phrase.
     /// For example, `pope "leo xiv" -rome` gives the words `pope` and `rome` and
     /// the phrase `leo xiv`.
     pub(crate) fn parse(query: &str) -> Self {
         let tokenizer = StandardTokenizer::new();
+        let mut words = Distinct::default();
+        let mut phrases = HashSet::new();
         let mut out = Self::default();
         let mut rest = query;
         while let Some(open) = rest.find('"') {
             let Some(len) = rest[open + 1..].find('"') else {
                 break;
             };
-            out.add_words(&tokenizer, &rest[..open]);
+            tokenizer.tokenize_each_inline(&rest[..open], |token| words.add(token));
             let phrase = quoted_phrase(&tokenizer, &rest[open + 1..open + 1 + len]);
             match phrase.terms.as_slice() {
                 [] => {}
-                [word] => out.add_word(word),
-                _ => out.add_phrase(Phrase {
-                    terms: phrase.terms.into_iter().map(Cow::into_owned).collect(),
-                    offsets: phrase.offsets,
-                }),
+                [word] => words.add(word),
+                _ => {
+                    let phrase = Phrase {
+                        terms: phrase.terms.into_iter().map(Cow::into_owned).collect(),
+                        offsets: phrase.offsets,
+                    };
+                    if phrases.insert(phrase.clone()) {
+                        out.phrases.push(phrase);
+                    }
+                }
             }
             rest = &rest[open + len + 2..];
         }
-        out.add_words(&tokenizer, rest);
+        tokenizer.tokenize_each_inline(rest, |token| words.add(token));
+        out.words = words.list.clone();
+        for term in out.phrases.iter().flat_map(|phrase| &phrase.terms) {
+            words.add(term);
+        }
+        out.tokens = words.list;
         out
-    }
-
-    fn add_words(&mut self, tokenizer: &StandardTokenizer, text: &str) {
-        tokenizer.tokenize_each_inline(text, |token| self.add_word(token));
-    }
-
-    fn add_phrase(&mut self, phrase: Phrase<String>) {
-        if self.seen_phrases.insert(phrase.clone()) {
-            self.phrases.push(phrase);
-        }
-    }
-
-    fn add_word(&mut self, token: &str) {
-        if !self.seen.contains(token) {
-            self.seen.insert(token.to_owned());
-            self.words.push(token.to_owned());
-        }
     }
 
     fn is_empty(&self) -> bool {
         self.words.is_empty() && self.phrases.is_empty()
     }
 
-    /// Every distinct token, words and phrase terms: a matching row holds all of
-    /// them under `'and'`, and at least one under `'or'`.
-    pub(crate) fn tokens(&self) -> Vec<String> {
-        let mut seen = self.seen.clone();
-        let mut out = self.words.clone();
-        for term in self.phrases.iter().flat_map(|phrase| &phrase.terms) {
-            if seen.insert(term.clone()) {
-                out.push(term.clone());
-            }
+    /// Every distinct token, words then phrase terms: a matching row holds all
+    /// of them under `'and'`, and at least one under `'or'`.
+    pub(crate) fn tokens(&self) -> &[String] {
+        &self.tokens
+    }
+}
+
+/// Strings in first-seen order, each once.
+#[derive(Default)]
+struct Distinct {
+    list: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl Distinct {
+    fn add(&mut self, token: &str) {
+        if self.seen.insert(token.to_owned()) {
+            self.list.push(token.to_owned());
         }
-        out
     }
 }
 
@@ -307,7 +322,7 @@ impl Positioned {
 /// check.
 struct Matcher<'q> {
     query: &'q TextQuery,
-    tokens: Vec<String>,
+    tokens: &'q [String],
     mode: TextMatchMode,
 }
 
@@ -337,7 +352,7 @@ impl<'q> Matcher<'q> {
         // substring is no token of it, and most values are decided without
         // being tokenized. (Non-ASCII text can lowercase into an ASCII token,
         // the Kelvin sign into `k`, so it is always tokenized.) A phrase's
-        // terms are among the tokens, so the check holds for phrases too.
+        // terms are among the tokens, so this check is safe for phrases too.
         if value.is_ascii() && self.tokens.iter().all(|t| t.is_ascii()) {
             lowered.clear();
             lowered.push_str(value);
@@ -622,7 +637,7 @@ mod tests {
             vec![phrase(&["leo", "xiv"]), phrase(&["a", "b"])]
         );
         assert_eq!(
-            parsed.tokens(),
+            parsed.tokens().to_vec(),
             vec!["pope", "visit", "rome", "c", "leo", "xiv", "a", "b"]
         );
     }
