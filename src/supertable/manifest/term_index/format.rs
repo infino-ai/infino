@@ -1410,40 +1410,22 @@ impl SliceIndex {
         Some((b, at + range.start as u64..at + range.end as u64))
     }
 
-    /// Where `key`'s run sits in the slice, from block `b`'s `bytes` once they match their crc32c;
-    /// `None` when the block has no such term.
-    pub(crate) fn run_range(
-        &self,
+    /// Block `b` of this slice from its `bytes`, once they match their crc32c: checked once, then
+    /// asked for any number of its terms.
+    pub(crate) fn block<'a>(
+        &'a self,
         b: usize,
-        bytes: &[u8],
-        key: &[u8],
-    ) -> Result<Option<Range<u64>>, TermIndexError> {
+        bytes: &'a [u8],
+    ) -> Result<CheckedBlock<'a>, TermIndexError> {
         if b >= self.n_blocks {
             return Err(malformed("slice dictionary block past the index"));
         }
         let checks = &self.bytes[self.index_len..];
         check_crc(checks, CRC_LEN * (1 + b), bytes, "slice dictionary block")?;
-        match lookup_in_block(bytes, key) {
-            None => Ok(None),
-            Some(DictEntry::Pfor {
-                metadata_offset,
-                postings_length,
-                ..
-            }) => {
-                let run = self
-                    .postings
-                    .start
-                    .checked_add(metadata_offset)
-                    .and_then(|start| Some(start..start.checked_add(u64::from(postings_length))?))
-                    .filter(|run| run.end <= self.postings.end)
-                    .ok_or_else(|| malformed("slice entry range past postings region"))?;
-                Ok(Some(run))
-            }
-            Some(_) => Err(malformed("slice entry is not a postings range")),
-        }
+        Ok(CheckedBlock { index: self, bytes })
     }
 
-    /// Decode a run this slice's [`Self::run_range`] located, once it matches its crc32c.
+    /// Decode a run this slice's [`CheckedBlock::run_range`] located, once it matches its crc32c.
     pub(crate) fn decode_run(&self, bytes: &[u8]) -> Result<Run, TermIndexError> {
         decode_run_of(CHECKED_SLICE_FORMAT_VERSION, bytes)
     }
@@ -1451,6 +1433,37 @@ impl SliceIndex {
     /// Bytes this index holds, for the resident set's budget.
     pub(crate) fn weight(&self) -> usize {
         self.bytes.len()
+    }
+}
+
+/// One dictionary block of a checked slice whose bytes matched their crc32c.
+pub(crate) struct CheckedBlock<'a> {
+    index: &'a SliceIndex,
+    bytes: &'a [u8],
+}
+
+impl CheckedBlock<'_> {
+    /// Where `key`'s run sits in the slice; `None` when the block has no such term.
+    pub(crate) fn run_range(&self, key: &[u8]) -> Result<Option<Range<u64>>, TermIndexError> {
+        match lookup_in_block(self.bytes, key) {
+            None => Ok(None),
+            Some(DictEntry::Pfor {
+                metadata_offset,
+                postings_length,
+                ..
+            }) => {
+                let run = self
+                    .index
+                    .postings
+                    .start
+                    .checked_add(metadata_offset)
+                    .and_then(|start| Some(start..start.checked_add(u64::from(postings_length))?))
+                    .filter(|run| run.end <= self.index.postings.end)
+                    .ok_or_else(|| malformed("slice entry range past postings region"))?;
+                Ok(Some(run))
+            }
+            Some(_) => Err(malformed("slice entry is not a postings range")),
+        }
     }
 }
 
@@ -2340,7 +2353,11 @@ mod tests {
         let index = ranged_index(&slice);
         let ranged = |key: &[u8]| -> Option<Run> {
             let (b, block) = index.block_for(key)?;
-            let run = index.run_range(b, at(&slice, block), key).expect("block")?;
+            let run = index
+                .block(b, at(&slice, block))
+                .expect("block")
+                .run_range(key)
+                .expect("entry")?;
             Some(index.decode_run(at(&slice, run)).expect("run"))
         };
         for key in &keys {
@@ -2365,8 +2382,10 @@ mod tests {
         let index = ranged_index(&slice);
         let (b, block) = index.block_for(key).expect("a block");
         let run = index
-            .run_range(b, at(&slice, block.clone()), key)
+            .block(b, at(&slice, block.clone()))
             .expect("block")
+            .run_range(key)
+            .expect("entry")
             .expect("present");
 
         let range = header.index_range().expect("a checked slice");
@@ -2376,7 +2395,7 @@ mod tests {
 
         let mut bad = slice.clone();
         bad[block.start as usize] ^= 1;
-        assert!(index.run_range(b, at(&bad, block), key).is_err());
+        assert!(index.block(b, at(&bad, block)).is_err());
 
         let mut bad = slice.clone();
         bad[run.start as usize] ^= 1;

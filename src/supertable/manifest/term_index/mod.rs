@@ -3596,6 +3596,9 @@ impl TermIndex {
             &header,
             &head[range.start as usize..range.end as usize],
         )?);
+        // The index copied what it keeps; the rest of the read, its permit already returned, must
+        // not stay alive across the ranged reads below.
+        drop(head);
         let evicted = self
             .tier_chunks
             .lock()
@@ -3632,13 +3635,16 @@ impl TermIndex {
         let block_bytes = self.read_merged(hash, &block_ranges, budget).await?;
         let mut runs = Vec::new();
         for ((b, _, terms), bytes) in blocks.iter().zip(&block_bytes) {
+            let block = index.block(*b, bytes)?;
             for &i in terms {
-                match index.run_range(*b, bytes, &keys[i])? {
+                match block.run_range(&keys[i])? {
                     None => out.push((i, None)),
                     Some(range) => runs.push((i, range)),
                 }
             }
         }
+        // Their permits are returned: the blocks must not stay alive across the run reads.
+        drop(block_bytes);
         let run_ranges: Vec<Range<u64>> = runs.iter().map(|(_, r)| r.clone()).collect();
         let run_bytes = self.read_merged(hash, &run_ranges, budget).await?;
         for ((i, _), bytes) in runs.iter().zip(&run_bytes) {
@@ -9700,10 +9706,11 @@ mod tests {
     /// A lookup budget a few of a test index's slice reads wide.
     const FEW_READS_BUDGET_BYTES: u32 = 4 * BATCH_SLICE_TARGET_BYTES as u32;
 
-    /// A provider that watches slice reads: the most in flight at once, and the most bytes they
-    /// ask for together. With `spoil` it flips the first byte of every ranged slice read past the
-    /// header, so a checked slice's pieces fail their checks while whole reads stay sound, and
-    /// counts them.
+    /// A provider that watches slice reads: the most in flight at once, the most bytes they
+    /// ask for together, and the most bytes ranged reads already returned still held alive when
+    /// another starts, on top of those in flight. With `spoil` it flips the first byte of every
+    /// ranged slice read past the header, so a checked slice's pieces fail their checks while
+    /// whole reads stay sound, and counts them.
     #[derive(Debug)]
     struct WatchedReads {
         inner: Arc<dyn StorageProvider>,
@@ -9713,6 +9720,28 @@ mod tests {
         most_requests: AtomicUsize,
         bytes: AtomicU64,
         most_bytes: AtomicU64,
+        /// Bytes of ranged reads returned and not yet dropped.
+        live: Arc<AtomicU64>,
+        most_held: AtomicU64,
+    }
+
+    /// The bytes of one ranged read, counted in [`WatchedReads::live`] until dropped.
+    struct LiveBytes {
+        bytes: Bytes,
+        live: Arc<AtomicU64>,
+    }
+
+    impl AsRef<[u8]> for LiveBytes {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for LiveBytes {
+        fn drop(&mut self) {
+            self.live
+                .fetch_sub(self.bytes.len() as u64, Ordering::SeqCst);
+        }
     }
 
     impl WatchedReads {
@@ -9725,6 +9754,8 @@ mod tests {
                 most_requests: AtomicUsize::new(0),
                 bytes: AtomicU64::new(0),
                 most_bytes: AtomicU64::new(0),
+                live: Arc::new(AtomicU64::new(0)),
+                most_held: AtomicU64::new(0),
             })
         }
 
@@ -9734,6 +9765,8 @@ mod tests {
             self.most_requests.fetch_max(requests, Ordering::SeqCst);
             let bytes = self.bytes.fetch_add(len, Ordering::SeqCst) + len;
             self.most_bytes.fetch_max(bytes, Ordering::SeqCst);
+            let held = bytes + self.live.load(Ordering::SeqCst);
+            self.most_held.fetch_max(held, Ordering::SeqCst);
             sleep(WATCHED_READ_HOLD).await;
             let out = read.await;
             self.requests.fetch_sub(1, Ordering::SeqCst);
@@ -9760,14 +9793,18 @@ mod tests {
             }
             let start = range.start;
             let len = range.end - range.start;
-            let bytes = self.watch(len, self.inner.get_range(uri, range)).await?;
-            if !self.spoil || start == 0 || bytes.is_empty() {
-                return Ok(bytes);
+            let mut bytes = self.watch(len, self.inner.get_range(uri, range)).await?;
+            if self.spoil && start != 0 && !bytes.is_empty() {
+                self.spoiled.fetch_add(1, Ordering::SeqCst);
+                let mut spoiled = bytes.to_vec();
+                spoiled[0] ^= 1;
+                bytes = Bytes::from(spoiled);
             }
-            self.spoiled.fetch_add(1, Ordering::SeqCst);
-            let mut spoiled = bytes.to_vec();
-            spoiled[0] ^= 1;
-            Ok(Bytes::from(spoiled))
+            self.live.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            Ok(Bytes::from_owner(LiveBytes {
+                bytes,
+                live: Arc::clone(&self.live),
+            }))
         }
         async fn put_atomic(
             &self,
@@ -10432,7 +10469,9 @@ mod tests {
         // and no tighter cap on reads, on storage that holds each read open a moment: first by
         // range, then through a root without index ends, whose slices are read whole.
         //  - the bytes the reads in flight ask for never pass the budget, by range or whole;
-        //  - more than one read overlaps.
+        //  - more than one read overlaps;
+        //  - by range, the bytes in flight and those already read still held never pass it
+        //    together when a read starts.
         // This test pins the byte budget on both kinds of read.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let mut unindexed = root.clone();
@@ -10464,6 +10503,21 @@ mod tests {
                 "{what}: reads overlap"
             );
         }
+        let watched = WatchedReads::wrap(Arc::clone(&local), false);
+        look_up_watched(
+            &root,
+            &local,
+            &watched,
+            &terms,
+            FEW_READS_BUDGET_BYTES,
+            SLICE_REQUESTS_AT_ONCE,
+        )
+        .await;
+        let most_held = watched.most_held.load(Ordering::SeqCst);
+        assert!(
+            most_held <= u64::from(FEW_READS_BUDGET_BYTES),
+            "{most_held} bytes held or in flight"
+        );
     }
 
     #[tokio::test]
@@ -10950,6 +11004,63 @@ mod tests {
             slow.reads_of(SLICE_URI_FRAGMENT),
             refused + COLD_RANGED_READS * layers,
             "no whole read again"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_promotions_read_a_few_slices_whole_at_once() {
+        // More distinct slices than may be read whole in the background at once are each queued for
+        // promotion to the local disk cache, on storage that holds every slice read.
+        //  - while held, only the cap's worth of whole reads start, and they stay at the cap;
+        //  - once released, the queued rest are read too and every slice lands on disk.
+        // This test pins the cap on background whole reads, which the queue's byte bound alone
+        // would not hold.
+        let (local, root, _terms, _store) = two_layer_checked_index().await;
+        let slices: HashMap<ContentHash, Option<u64>> = root
+            .layers
+            .iter()
+            .flat_map(|l| &l.slices)
+            .map(|slice| (slice.content_hash, SliceSpan::of(slice).len))
+            .collect();
+        assert!(
+            slices.len() > SLICE_PROMOTION_CONCURRENCY,
+            "{} slices",
+            slices.len()
+        );
+        let dir = TempDir::new().expect("cache dir");
+        let disk = MetadataDiskCache::new(dir.path().to_path_buf(), DISK_CACHE_BYTES, None)
+            .expect("cache");
+        let slow = SlowStorage::wrap(local, Duration::ZERO);
+        slow.hold_reads_of(SLICE_URI_FRAGMENT);
+        let cache = new_tier_chunk_cache();
+        let index = disk_index(&root, slow.clone(), &disk, &cache);
+        assert_eq!(index.promote, Promote::Disk);
+        for (hash, len) in &slices {
+            index.promote_slice(hash, *len, false).await;
+        }
+        for _ in 0..PROMOTION_WAIT_POLLS {
+            if slow.in_flight() >= SLICE_PROMOTION_CONCURRENCY {
+                break;
+            }
+            sleep(PROMOTION_WAIT_POLL).await;
+        }
+        // Give any whole read past the cap the chance to start.
+        sleep(PROMOTION_WAIT_POLL).await;
+        assert_eq!(
+            slow.in_flight(),
+            SLICE_PROMOTION_CONCURRENCY,
+            "whole reads in flight"
+        );
+        assert_eq!(
+            slow.reads_of(SLICE_URI_FRAGMENT),
+            SLICE_PROMOTION_CONCURRENCY
+        );
+        slow.release_reads();
+        promotions_settle(&cache).await;
+        assert_eq!(slow.reads_of(SLICE_URI_FRAGMENT), slices.len());
+        assert!(
+            slices.keys().all(|hash| disk.contains(hash)),
+            "every slice on disk"
         );
     }
 
