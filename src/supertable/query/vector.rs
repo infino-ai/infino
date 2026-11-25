@@ -1496,6 +1496,52 @@ pub(crate) fn auto_router_choice(
     }
 }
 
+test_visible! {
+    /// Fine clusters an unfiltered `k`-NN query on this hidden-vector table
+    /// reads through the centroid graph, or `None` when the stamped router
+    /// serves it. `auto` resolves per table by scale and concentration;
+    /// explicit `stamped` / `centroid_graph` are honored verbatim. The default
+    /// fanout config (or `0`) reads the table's calibrated fanout, falling back
+    /// to `graph_fanout_for_fine_clusters` on an unstamped table; any other
+    /// value overrides it. Either way it is capped at
+    /// `centroid_graph_max_fanout`, so one config line cannot drive
+    /// `fanout × rerank_mult` into a runaway exact rerank.
+    fn graph_fanout_for_query(
+        manifest: &ManifestSnapshot,
+        column: &str,
+        k: usize,
+        vcfg: &config::VectorSettings,
+    ) -> Option<usize> {
+        if vcfg.search_mode != config::VectorSearchMode::Ivf {
+            return None;
+        }
+        let routing = manifest.vector_cell_routing();
+        let router = resolve_ivf_router(vcfg.ivf_router, || {
+            auto_router_choice(
+                routing.as_ref().and_then(|routing| routing.fanout_for_k_at(k)),
+                total_fine_clusters(manifest, column),
+                manifest.n_docs_total(),
+                vcfg.centroid_graph_concentration_ratio,
+                vcfg.centroid_graph_scale_floor_docs,
+            )
+        });
+        if router != config::IvfRouter::CentroidGraph {
+            return None;
+        }
+        let default_fanout = config::DEFAULT_VECTOR_GLOBAL_FINE_FANOUT;
+        let fanout =
+            if vcfg.global_fine_fanout == 0 || vcfg.global_fine_fanout == default_fanout {
+                calibrated_graph_fanout(routing.as_ref(), k, manifest.n_docs_total())
+                    .unwrap_or_else(|| {
+                        graph_fanout_for_fine_clusters(total_fine_clusters(manifest, column))
+                    })
+            } else {
+                vcfg.global_fine_fanout
+            };
+        Some(fanout.min(vcfg.centroid_graph_max_fanout)).filter(|&fanout| fanout > 0)
+    }
+}
+
 /// The router a query actually uses. Only `auto` consults the per-table gate
 /// (`auto`, evaluated lazily so its inputs are computed only when needed); every
 /// explicit mode is returned verbatim — `stamped` and `centroid_graph` are
@@ -5879,58 +5925,14 @@ impl SupertableReader {
         // The centroid router scores per the column's configured metric
         // (Cosine unit-normalizes and ranks by −dot; NegDot ranks by raw −dot;
         // L2Sq by squared distance), so it engages for any metric.
-        // Fanout precedence. The default config value
-        // ([`config::DEFAULT_VECTOR_GLOBAL_FINE_FANOUT`]) and an explicit `0`
-        // both resolve to a DETERMINISTIC coverage fanout from the table's
-        // fine-cluster count (`graph_fanout_for_fine_clusters` ≈ c·√n_fine) —
-        // no per-table calibration, which optimize no longer runs under graph
-        // serving. Any OTHER explicit value overrides it (manual tuning /
-        // fanout sweeps), capped at `centroid_graph_max_fanout` so one config
-        // line cannot drive `fanout × rerank_mult` into a runaway exact rerank.
-        let stamped_fanout = manifest
-            .vector_cell_routing()
-            .and_then(|routing| routing.fanout_for_k_at(k));
-        let default_fanout = config::DEFAULT_VECTOR_GLOBAL_FINE_FANOUT;
-        let resolved_fanout =
-            if vcfg.global_fine_fanout == 0 || vcfg.global_fine_fanout == default_fanout {
-                calibrated_graph_fanout(
-                    manifest.vector_cell_routing().as_ref(),
-                    k,
-                    manifest.n_docs_total(),
-                )
-                .unwrap_or_else(|| {
-                    graph_fanout_for_fine_clusters(total_fine_clusters(manifest, column))
-                })
-                .min(vcfg.centroid_graph_max_fanout)
-            } else {
-                vcfg.global_fine_fanout.min(vcfg.centroid_graph_max_fanout)
-            };
-        // `auto` picks the router per hidden-vector table by scale +
-        // concentration; explicit `stamped` / `centroid_graph` are honored
-        // verbatim (no gating). The per-table inputs are resident (no I/O) and
-        // computed only on the hidden path under `auto`.
-        let effective_router = if hidden_vector_index {
-            resolve_ivf_router(vcfg.ivf_router, || {
-                auto_router_choice(
-                    stamped_fanout,
-                    total_fine_clusters(manifest, column),
-                    manifest.n_docs_total(),
-                    vcfg.centroid_graph_concentration_ratio,
-                    vcfg.centroid_graph_scale_floor_docs,
-                )
-            })
+        let graph_fanout = if !filtered && hidden_vector_index {
+            graph_fanout_for_query(manifest, column, k, vcfg)
         } else {
-            vcfg.ivf_router
+            None
         };
-        if !filtered
-            && hidden_vector_index
-            && vcfg.search_mode == config::VectorSearchMode::Ivf
-            && effective_router == config::IvfRouter::CentroidGraph
-            && resolved_fanout > 0
-        {
+        if let Some(resolved_fanout) = graph_fanout {
             tracing::debug!(
                 target: "infino::gfc",
-                stamped_fanout = ?stamped_fanout,
                 config_fanout = vcfg.global_fine_fanout,
                 resolved_fanout,
                 k,

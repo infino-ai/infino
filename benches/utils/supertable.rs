@@ -2571,8 +2571,10 @@ pub mod vector {
     };
 
     use infino::{
-        VectorFilter, roaring::RoaringBitmap, storage::io_counters,
-        supertable::manifest::list::PartitionStrategy,
+        VectorFilter, config,
+        roaring::RoaringBitmap,
+        storage::io_counters,
+        supertable::{manifest::list::PartitionStrategy, query::vector::graph_fanout_for_query},
     };
 
     use super::*;
@@ -3362,14 +3364,23 @@ pub mod vector {
     /// query runs at.
     const WIDTH_LAW_K10_IDX: usize = 1;
 
-    /// The stamped width law at the battery's `TOP_K`, read from the
-    /// hidden manifest exactly as the default query path resolves it
-    /// (1 when the table has no hidden index or no calibrated law).
-    fn stamped_width_law_at_top_k(consumer: &Supertable) -> u64 {
+    /// How many units a default `TOP_K` query reads on the hidden index, as
+    /// the query path resolves it: the fine clusters the centroid graph
+    /// reads when it serves the table, else the stamped width law (1 when
+    /// the table has no hidden index or no calibrated law).
+    fn routed_width_at_top_k(consumer: &Supertable) -> u64 {
         let Some(hidden) = consumer.vector_index_table() else {
             return 1;
         };
-        match hidden.pinned_reader().manifest().get_partition_strategy() {
+        let reader = hidden.pinned_reader();
+        let manifest = reader.manifest();
+        let column = &hidden.options().vector_columns[0].column;
+        if let Some(fanout) =
+            graph_fanout_for_query(manifest, column, TOP_K, &config::global().vector)
+        {
+            return fanout as u64;
+        }
+        match manifest.get_partition_strategy() {
             PartitionStrategy::VectorCell { routing, .. } => {
                 u64::from(routing.width_for_k[WIDTH_LAW_K10_IDX].max(1))
             }
@@ -3826,7 +3837,7 @@ pub mod vector {
                 expected,
                 ceilings_first: super::VECTOR_COLD_GET_CEILINGS_FIRST,
                 ceilings_second: super::VECTOR_COLD_GET_CEILINGS_SECOND,
-                steady_law_width: stamped_width_law_at_top_k(consumer),
+                steady_law_width: routed_width_at_top_k(consumer),
             }),
         )
     }
