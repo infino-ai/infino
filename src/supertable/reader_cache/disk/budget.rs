@@ -8,13 +8,13 @@
 use std::time::Duration;
 use std::{
     fs, mem,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, MutexGuard, PoisonError, atomic::Ordering},
 };
 
 use dashmap::mapref::entry::Entry;
 use memmap2::{Mmap, UncheckedAdvice};
-use tokio::sync::OwnedSemaphorePermit;
 #[cfg(test)]
 use tokio::time::timeout;
 
@@ -23,10 +23,11 @@ use crate::{
     memory::ConnectionMemoryBudget,
     supertable::reader_cache::{
         block_source::BlockCachedSource,
-        disk::test_support::{cache_entry, tiny_superfile_bytes},
+        disk::test_support::{Gate, cache_entry, tiny_superfile_bytes},
     },
 };
 use crate::{
+    runtime_bridge::shared_io_runtime,
     superfile::SuperfileReader,
     supertable::{
         manifest::SuperfileUri,
@@ -627,12 +628,64 @@ impl DiskCacheStore {
         self.write_behind_bytes.fetch_add(bytes, Ordering::AcqRel);
     }
 
-    /// Waits for one of the store's [`BLOCK_WRITERS`] slots. Waiting holds no thread.
-    pub(crate) async fn block_writer(&self) -> OwnedSemaphorePermit {
-        Arc::clone(&self.block_writers)
-            .acquire_owned()
-            .await
-            .expect("invariant: the block-writer semaphore is never closed")
+    /// Queues `job`, and starts a writer if fewer than [`BLOCK_WRITERS`] run. Which
+    /// job runs next: [`BlockWriteQueue::next_job`].
+    pub(crate) fn submit_block_job(self: &Arc<Self>, kind: BlockJob, job: BlockWrite) {
+        let start = {
+            let mut queue = self.lock_block_write_queue();
+            match kind {
+                BlockJob::Write => queue.writes.push_back(job),
+                BlockJob::Flush => queue.flushes.push_back(job),
+            }
+            queue.claim_writer()
+        };
+        if start {
+            self.start_block_writer();
+        }
+    }
+
+    /// Starts a claimed writer on the shared runtime's blocking pool, which never shuts down. If
+    /// the OS refuses a thread, tokio keeps the writer queued to run once a thread exists, and
+    /// panics; the panic stops here, so it can't cut short the caller, and the claim stays.
+    fn start_block_writer(self: &Arc<Self>) {
+        let store = Arc::clone(self);
+        drop(catch_unwind(AssertUnwindSafe(|| {
+            drop(shared_io_runtime().spawn_blocking(move || store.run_block_writes()));
+        })));
+    }
+
+    /// One writer: runs queued jobs until none is left. A job that panics ends the writer, and
+    /// its [`BlockWriter`] starts another for the jobs behind it.
+    fn run_block_writes(self: Arc<Self>) {
+        let writer = BlockWriter(self);
+        loop {
+            // Taken before the job runs: a write queues its file's flush, which takes the lock.
+            let next = writer.0.lock_block_write_queue().next_job();
+            let Some((kind, job)) = next else {
+                return;
+            };
+            let _flushing = matches!(kind, BlockJob::Flush).then(|| RunningFlush(&writer.0));
+            job();
+        }
+    }
+
+    /// No code panics while holding the lock, so a poisoned lock still holds a valid queue.
+    fn lock_block_write_queue(&self) -> MutexGuard<'_, BlockWriteQueue> {
+        self.block_write_queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes `writers` of the store's block writers until the returned gate drops: each runs a
+    /// write that waits for it. Jobs queued after this wait for a writer; the held writes don't
+    /// count as running flushes.
+    #[cfg(test)]
+    pub(crate) fn hold_block_writers(self: &Arc<Self>, writers: usize) -> Gate {
+        let gate = Gate::new();
+        for _ in 0..writers {
+            self.submit_block_job(BlockJob::Write, Box::new(gate.waiter()));
+        }
+        gate
     }
 
     /// Gives back what admitting a run took, once the run is written or dropped.
@@ -818,7 +871,7 @@ impl DiskCacheStore {
         self.config.fill_memory_budget.as_ref()
     }
 
-    /// Counts a queued block-file write until the returned ticket drops; see
+    /// Counts a queued block-file write or flush until the returned ticket drops; see
     /// [`Self::block_writes_settled`].
     #[cfg(test)]
     pub(crate) fn block_write_started(self: &Arc<Self>) -> BlockWriteTicket {
@@ -910,8 +963,63 @@ impl DiskCacheStore {
     }
 }
 
-/// One queued block-file write, counted by [`DiskCacheStore::block_writes_settled`] until it
-/// drops.
+/// A running block writer. Dropping it counts the writer out, however it ends, and starts a
+/// new one if a job is still queued: one queued after this writer found the queue empty.
+struct BlockWriter(Arc<DiskCacheStore>);
+
+impl Drop for BlockWriter {
+    fn drop(&mut self) {
+        let restart = {
+            let mut queue = self.0.lock_block_write_queue();
+            queue.writers -= 1;
+            let queued = !queue.writes.is_empty() || !queue.flushes.is_empty();
+            queued && queue.claim_writer()
+        };
+        if restart {
+            self.0.start_block_writer();
+        }
+    }
+}
+
+/// A flush a writer runs. Dropping it counts the flush out, however it ends.
+struct RunningFlush<'a>(&'a DiskCacheStore);
+
+impl Drop for RunningFlush<'_> {
+    fn drop(&mut self) {
+        self.0.lock_block_write_queue().running_flushes -= 1;
+    }
+}
+
+impl BlockWriteQueue {
+    /// Counts one more writer if fewer than [`BLOCK_WRITERS`] run.
+    fn claim_writer(&mut self) -> bool {
+        let room = self.writers < BLOCK_WRITERS;
+        if room {
+            self.writers += 1;
+        }
+        room
+    }
+
+    /// The next job to run. A waiting write goes first: its run holds write-behind
+    /// bytes until it lands, and on a slow disk queued fsyncs would hold the
+    /// writers meanwhile. But a flush goes first when none runs, so flushes still
+    /// progress under a steady stream of writes. A flush taken counts in
+    /// `running_flushes`.
+    fn next_job(&mut self) -> Option<(BlockJob, BlockWrite)> {
+        if (self.running_flushes == 0 || self.writes.is_empty())
+            && let Some(flush) = self.flushes.pop_front()
+        {
+            self.running_flushes += 1;
+            return Some((BlockJob::Flush, flush));
+        }
+        self.writes
+            .pop_front()
+            .map(|write| (BlockJob::Write, write))
+    }
+}
+
+/// One queued block-file write or flush, counted by [`DiskCacheStore::block_writes_settled`]
+/// until it drops.
 #[cfg(test)]
 pub(crate) struct BlockWriteTicket(Arc<DiskCacheStore>);
 

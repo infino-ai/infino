@@ -26,6 +26,8 @@
 
 pub mod brute_force_bm25;
 pub mod cas_conformance;
+#[cfg(test)]
+pub(crate) mod child_process;
 pub mod fault_storage;
 #[cfg(unix)]
 pub mod links;
