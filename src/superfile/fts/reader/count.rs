@@ -516,8 +516,8 @@ impl FtsReader {
             .into_iter()
             .flatten()
             .collect();
-        // The cursors are built; a dictionary `dict` did not keep is not held through the walk and
-        // a caller's doc-id map read after it.
+        // The cursors are built, so a dictionary `dict` did not keep is let go before the walk and
+        // any doc-id map read after it.
         drop(dict_bytes);
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.

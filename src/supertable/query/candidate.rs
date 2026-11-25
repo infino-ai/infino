@@ -170,7 +170,8 @@ const MIN_FILES_PER_POOL_JOB: usize = 2;
 // `allow: None`, which reads as "no files, but every row of every file is
 // admitted" — the opposite polarity from [`CandidateScope::empty`], and a
 // silent way for a future `..Default::default()` to drop the row bound.
-// Construct one through `empty()` or `SupertableReader::candidate_scope`.
+// Construct one through `empty()`, `SupertableReader::candidate_scope` or
+// `SupertableReader::rank_scope`.
 //
 // By default `S` is a row bitmap, which every caller can use. A ranked
 // text search uses a [`RankScope`], whose sets may be blob ids.
@@ -187,8 +188,9 @@ pub(crate) struct CandidateScope<S = Arc<RoaringBitmap>> {
     pub(crate) allow: Option<HashMap<SuperfileUri, S>>,
 }
 
-/// A [`CandidateScope`] for a ranked text search. A superfile's set is in blob ids when its own
-/// text index bounds the `WHERE` alone, so the search needs no doc-id map; otherwise it is rows.
+/// A [`CandidateScope`] for a ranked text search. A superfile's set is in blob ids when
+/// [`SupertableReader::rank_scope`] chooses them, so checking it needs no doc-id map; otherwise it
+/// is rows.
 pub(crate) type RankScope = CandidateScope<Admitted>;
 
 impl From<CandidateScope> for RankScope {
@@ -517,9 +519,10 @@ impl CandidatePlan {
                         return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
                     };
                     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-                    let column = (file_column, memos.get(column));
+                    let memo = memos.get(column).map(Arc::as_ref);
                     let (set, work) =
-                        term_match(space, reader, column, &refs, BoolMode::And, dict).await?;
+                        term_match(space, reader, file_column, memo, &refs, BoolMode::And, dict)
+                            .await?;
                     Ok((Some(set), work))
                 }
                 CandidatePlan::TermsAny {
@@ -537,9 +540,10 @@ impl CandidatePlan {
                         return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
                     };
                     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-                    let column = (file_column, memos.get(column));
+                    let memo = memos.get(column).map(Arc::as_ref);
                     let (set, work) =
-                        term_match(space, reader, column, &refs, BoolMode::Or, dict).await?;
+                        term_match(space, reader, file_column, memo, &refs, BoolMode::Or, dict)
+                            .await?;
                     Ok((Some(set), work))
                 }
                 CandidatePlan::TermsLike {
@@ -567,7 +571,9 @@ impl CandidatePlan {
                         let rows = reader.range_rows(*field, data_type, *lo, *hi, pool).await?;
                         Ok((rows, MatchWork::default()))
                     }
-                    // Callers never ask for blob ids on a plan with a range leaf.
+                    // Callers never ask for blob ids on a plan with a range leaf. If one did,
+                    // `None` bounds nothing, so every document stays a candidate and the answer
+                    // is still right.
                     SetSpace::BlobIds => {
                         debug_assert!(false, "a range leaf evaluated in blob ids");
                         Ok((None, MatchWork::default()))
@@ -628,12 +634,12 @@ pub(crate) enum SetSpace {
 async fn term_match(
     space: SetSpace,
     reader: &SuperfileReader,
-    (column, memo): (&str, Option<&Arc<FetchedTermMemo>>),
+    column: &str,
+    memo: Option<&FetchedTermMemo>,
     terms: &[&str],
     mode: BoolMode,
     dict: &QueryDict,
 ) -> Result<(RoaringBitmap, MatchWork), ReadError> {
-    let memo = memo.map(Arc::as_ref);
     Ok(match space {
         SetSpace::Rows => {
             let (rows, work) = reader
@@ -4218,5 +4224,41 @@ mod tests {
             resolved_rows(enough),
             vec![Some(Some(vec![0, 2])); THREADS + 1]
         );
+    }
+
+    #[test]
+    fn has_range_finds_a_range_leaf_at_any_depth() {
+        // Plans with and without a range leaf, nested under `And` and `Or`.
+        // - Only the plans holding a range leaf say so.
+        // This test pins the check that keeps a range leaf out of blob ids.
+        let terms = || CandidatePlan::TermsAll {
+            column: "title".to_owned(),
+            field: None,
+            tokens: vec!["red".to_owned()],
+        };
+        let range = || CandidatePlan::Range {
+            field: FieldId(1),
+            data_type: DataType::Int32,
+            lo: 1,
+            hi: 5,
+        };
+        let cases = [
+            (range(), true),
+            (CandidatePlan::And(vec![terms(), range()]), true),
+            (
+                CandidatePlan::Or(vec![terms(), CandidatePlan::And(vec![range()])]),
+                true,
+            ),
+            (terms(), false),
+            (CandidatePlan::And(vec![terms(), terms()]), false),
+            (
+                CandidatePlan::Or(vec![terms(), CandidatePlan::Unbounded]),
+                false,
+            ),
+            (CandidatePlan::Unbounded, false),
+        ];
+        for (plan, want) in cases {
+            assert_eq!(plan.has_range(), want, "{plan:?}");
+        }
     }
 }

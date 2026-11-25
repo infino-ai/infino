@@ -288,7 +288,7 @@ impl RowSet {
 }
 
 /// The blob ids a pushed-down SQL `WHERE` admits, when one superfile's own text index bounds it
-/// alone. A kernel checks the blob id it walks directly, so the blob's [`DocMap`] is never read.
+/// alone. A kernel checks the blob id it walks directly, with no [`DocMap`].
 /// [`RowSet`] is the same gate in rows.
 #[derive(Clone, Debug)]
 pub(crate) struct BlobIdSet(Arc<RoaringBitmap>);

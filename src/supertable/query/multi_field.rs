@@ -63,7 +63,10 @@ use tracing::{Instrument, debug};
 use crate::supertable::query::{exec::common::SCORE_COLUMN, sorted::quote};
 use crate::{
     InfinoError,
-    superfile::fts::reader::{Bm25SearchOptions, BoolMode},
+    superfile::{
+        fts::reader::{Bm25SearchOptions, BoolMode},
+        id_space::Admitted,
+    },
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
@@ -669,15 +672,15 @@ impl SupertableReader {
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            let scope = RankScope::from(CandidateScope {
+            let scope = RankScope {
                 superfiles,
                 allow: Some(
                     allow
                         .into_iter()
-                        .map(|(uri, rows)| (uri, Arc::new(rows)))
+                        .map(|(uri, rows)| (uri, Admitted::Rows(Arc::new(rows))))
                         .collect(),
                 ),
-            });
+            };
             searches.push((p, pair, unknown, scope));
         }
         let searches: Vec<_> = searches

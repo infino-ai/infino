@@ -807,7 +807,7 @@ impl FtsReader {
                 });
             }
             // The gate exists when there is anything to gate on: a negated
-            // atom, or a pushed-down row set.
+            // atom, or a pushed-down set.
             let filter = match (negative_atoms.is_empty(), lists.allow.clone()) {
                 (true, None) => None,
                 (_, allow) => Some(AtomExcludeFilter::with_allow(
@@ -867,10 +867,9 @@ impl FtsReader {
             .is_some_and(|m| lists.negatives.iter().all(|t| m.contains(t)));
         let mut dict_ranges = u64::from(!lists.negatives.is_empty() && !negatives_from_memo);
         // The gate exists when there is anything to gate on: a negated
-        // term present in this superfile, or a pushed-down row set.
+        // term present in this superfile, or a pushed-down set.
         let neg_filter = match (neg_cursors.is_empty(), lists.allow.clone()) {
             (true, None) => None,
-            // The positive terms are resolved below, after the filter.
             (_, allow) => Some(ExcludeFilter::with_allow(
                 neg_cursors,
                 self.allow_gate(allow).await?,

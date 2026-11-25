@@ -2070,7 +2070,7 @@ impl SupertableReader {
             let row_counts = Arc::clone(&row_counts);
             let total = Arc::clone(&total);
             let check = check.clone();
-            // This superfile's admitted rows under a bounded scope. `kept`
+            // This superfile's admitted documents under a bounded scope. `kept`
             // holds only superfiles the scope admits, so the lookup
             // succeeds; an absent entry would mean no row and is treated
             // as exactly that rather than as "every row". An empty blob-id
@@ -2311,8 +2311,9 @@ impl SupertableReader {
                                     "superfile {suid} row count exceeds a local id"
                                 ))
                             })?;
-                            // Deletes are rows, so a blob-id set is turned into rows here,
-                            // through the doc-id map.
+                            // Deletes are rows. A file with deletes already has a row set; a
+                            // blob-id set here (a delete seen since the scope was built) is
+                            // turned into rows through the doc-id map.
                             let mut live = match &allow {
                                 Some(set) => Arc::unwrap_or_clone(r.admitted_rows(set).await?),
                                 None => {
@@ -2509,9 +2510,9 @@ impl SupertableReader {
                                 "a checked search needs a scope that bounds rows".to_owned(),
                             ));
                         };
-                        // The check and its rounds work in rows. A checked search's scope is
-                        // already the rows its terms match, so nothing is turned into rows
-                        // here; the rounds' row gate still reads the whole doc-id map.
+                        // The check works in rows. A checked search's scope is the rows its
+                        // search terms match (from `match_scope`), so nothing is turned into rows
+                        // here; each round's row gate still reads the whole doc-id map.
                         let mut admitted = r.admitted_rows(&set).await?;
                         // The unit's best `want` admitted rows, checked where
                         // not checked before. Rows that fail leave the

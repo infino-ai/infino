@@ -431,7 +431,7 @@ impl ExecutionPlan for Bm25Exec {
             // What the pushed-down `WHERE` admits: the superfiles the
             // manifest keeps and, under an index-bounded predicate, the
             // documents in each (in blob ids where the file's own text index
-            // bounds it alone, so no doc-id map is read). Prefix search has no
+            // bounds it alone, so the whole doc-id map is not read). Prefix search has no
             // scoped kernel (its term set is only known per superfile), so it
             // fills its `k` under the exact predicate alone.
             let scope = match &query {
@@ -633,7 +633,7 @@ mod tests {
         FieldPatch, SchemaPatch,
         config::{CompactionSettings, OptimizeOptions},
         storage::{LocalFsStorageProvider, StorageProvider},
-        superfile::{SuperfileReader, builder::FtsConfig},
+        superfile::{SuperfileReader, builder::FtsConfig, id_space::Admitted},
         supertable::{
             Supertable, SupertableOptions,
             query::{
@@ -2063,7 +2063,8 @@ mod tests {
         format!("SELECT body FROM bm25_search('body', 'shared', {k}) WHERE {filter}")
     }
 
-    /// Each `WHERE` shape the text indexes bound, with the rows it keeps.
+    /// Each `WHERE` the search runs under, with the rows it keeps. The text indexes bound all but
+    /// the `NOT`, which the exact predicate fills.
     fn mapped_wheres() -> Vec<(&'static str, Box<dyn Fn(usize) -> bool>)> {
         vec![
             ("tag = 'red'", Box::new(|n| mapped_tag(n) == "red")),
@@ -2113,7 +2114,7 @@ mod tests {
         // `OR`, `NOT`, an `AND` across two columns, none kept and all kept.
         // - With `k` above the row count, the hits are exactly the kept rows.
         // - With a small `k`, every hit is a kept row.
-        // This test pins that checking in blob ids keeps the same rows as rows.
+        // This test pins that a bounded `WHERE` checked in blob ids keeps the same rows as rows.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
         let reader = st.reader().expect("reader");
         for (filter, keep) in mapped_wheres() {
@@ -2156,7 +2157,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_searches_with_and_without_a_where_each_rank_their_rows() {
         // Queries at once on one reader, half under `tag = 'red'` and half not.
-        // - All of them share the superfile's doc-id map pages.
+        // - All of them translate their hits through the one reader's doc-id map.
         // This test pins that each query still ranks exactly its own rows.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
         let reader = Arc::new(st.reader().expect("reader"));
@@ -2200,5 +2201,86 @@ mod tests {
             bodies_of(&reader, &shared_search(MAPPED_EVERY_HIT, "tag = 'red'")),
             bodies_kept(|n| mapped_tag(n) == "red" && !MAPPED_DELETED.contains(&n)),
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_where_in_blob_ids_ranks_the_same_hits_as_in_rows() {
+        // A reordered superfile under `tag = 'red'`, ranked with the scope in blob ids and with
+        // the same scope in rows, for a query whose hits score one, two or three terms.
+        // - For each `k`, both give the same hits, scores and order.
+        // This test pins that checking in blob ids changes no hit, tie or cut at `k`.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
+        let reader = st.reader().expect("reader");
+        let filters = vec![col("tag").eq(lit("red"))];
+        let plan = candidate_plan_for_filters(reader.manifest(), &filters);
+        let red = (0..MAPPED_ROWS).filter(|&n| mapped_tag(n) == "red").count();
+        reader.block_on(async {
+            let in_blob_ids = reader.rank_scope(&filters, &plan).await.expect("scope");
+            let in_rows = RankScope::from(
+                reader
+                    .candidate_scope(&filters, &plan)
+                    .await
+                    .expect("scope"),
+            );
+            let sets = in_blob_ids.allow.as_ref().expect("a bounded scope");
+            assert!(sets.values().all(|set| matches!(set, Admitted::BlobIds(_))));
+            for k in [1, MAPPED_FEW_HITS, red - 1, red, red + 1] {
+                let mut hits = Vec::new();
+                for scope in [&in_blob_ids, &in_rows] {
+                    let opts = Bm25SearchOptions::new();
+                    let search = reader.bm25_search_scoped_async(
+                        "body",
+                        "shared t1 t2",
+                        k,
+                        opts,
+                        Some(scope),
+                    );
+                    hits.push(search.await.expect("search"));
+                }
+                assert_eq!(hits[0], hits[1], "k = {k}");
+            }
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_id_scope_meeting_new_deletes_ranks_only_live_rows() {
+        // A reordered superfile's scope under `tag = 'red'` built in blob ids, then three rows
+        // deleted, then a search on the new snapshot under that scope.
+        // - The search turns the blob ids into rows and takes the deleted rows out.
+        // - It ranks the same hits as a scope built after the deletes, which is in rows.
+        // This test pins that a delete seen after the scope was built is never ranked.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
+        let before = st.reader().expect("reader");
+        let filters = vec![col("tag").eq(lit("red"))];
+        let plan = candidate_plan_for_filters(before.manifest(), &filters);
+        let scope = before
+            .block_on(before.rank_scope(&filters, &plan))
+            .expect("scope");
+        let sets = scope.allow.as_ref().expect("a bounded scope");
+        assert!(sets.values().all(|set| matches!(set, Admitted::BlobIds(_))));
+        for n in MAPPED_DELETED {
+            st.delete(col("body").eq(lit(mapped_body(n))))
+                .expect("delete");
+        }
+        let after = st.reader().expect("reader");
+        let fresh = after
+            .block_on(after.rank_scope(&filters, &plan))
+            .expect("scope");
+        let mut hits = Vec::new();
+        for scope in [&scope, &fresh] {
+            let search = after.bm25_search_scoped_async(
+                "body",
+                "shared",
+                MAPPED_EVERY_HIT,
+                Bm25SearchOptions::new(),
+                Some(scope),
+            );
+            hits.push(after.block_on(search).expect("search"));
+        }
+        let want = (0..MAPPED_ROWS)
+            .filter(|n| mapped_tag(*n) == "red" && !MAPPED_DELETED.contains(n))
+            .count();
+        assert_eq!(hits[0].len(), want, "every live red row, no deleted one");
+        assert_eq!(hits[0], hits[1]);
     }
 }

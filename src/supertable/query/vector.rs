@@ -8849,7 +8849,7 @@ impl PlanEvaluation {
             .await
             .map_err(QueryError::from)?;
         // The SQL predicate's posting walks, summed across the
-        // plan tree: the pushdown leg of the vector TVF.
+        // plan tree: the pushdown leg of the vector or text search TVF.
         work.add_to(self.op_stats.as_deref());
         match bitmap {
             Some(bitmap) => Ok(bitmap),

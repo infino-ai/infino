@@ -2963,7 +2963,6 @@ impl SuperfileReader {
     }
 
     /// [`Self::token_match_prefetched`] in blob ids, ascending, without reading the doc-id map.
-    /// See [`FtsReader::token_match_prefetched_in_blob_ids`].
     pub(crate) async fn token_match_prefetched_in_blob_ids(
         &self,
         column: &str,
