@@ -83,7 +83,7 @@ use tokio::{
     runtime::Handle,
     select,
     sync::{
-        Notify, Semaphore, SemaphorePermit,
+        Notify, OnceCell, Semaphore, SemaphorePermit,
         mpsc::{UnboundedReceiver, unbounded_channel},
     },
     task,
@@ -480,6 +480,10 @@ pub(crate) struct TierChunks {
     /// Slices a lookup is reading whole from local disk, each with the notify
     /// that wakes lookups waiting on that read instead of reading it again.
     disk_reads: HashMap<ContentHash, Arc<Notify>>,
+    /// Block indexes being read for the first time, one read per slice:
+    /// lookups racing for a slice wait for that read rather than each read
+    /// the index. A read that fails or is cancelled passes to the next waiter.
+    index_reads: HashMap<ContentHash, Arc<OnceCell<Arc<SliceIndex>>>>,
 }
 
 /// One lookup's whole read of a slice from local disk. On drop, finished or
@@ -614,8 +618,10 @@ impl FetchBudget {
 /// the query path, and kept as a whole read keeps them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Promote {
-    /// A disk cache is attached: every slice not on disk yet, also written
-    /// there.
+    /// A disk cache is attached: every slice. One not on disk yet is
+    /// downloaded and also written there; one on disk is read from there, its
+    /// hash checked once. Later lookups then read it from memory, as when
+    /// every slice was read whole.
     Disk,
     /// No disk cache: a slice read by range a second time, while its block
     /// index is still resident. So a hot slice ends up whole in memory, as
@@ -700,6 +706,7 @@ pub(crate) fn new_tier_chunk_cache() -> TierChunkCache {
         }),
         unpromotable: Resident::new(READ_WHOLE_SLICES, |_| 1),
         disk_reads: HashMap::new(),
+        index_reads: HashMap::new(),
     }))
 }
 
@@ -3509,8 +3516,9 @@ impl TermIndex {
     /// - Resident whole: read from memory.
     /// - Checked and over [`SMALL_SLICE_BYTES`]: read by range, from local
     ///   disk when it is there, else from the object store: header and block
-    ///   index (kept), then the terms' blocks, then their runs, each checked by
-    ///   its crc. Then read whole in the background as [`Promote`] says.
+    ///   index (kept, one read however many lookups race for it), then the
+    ///   terms' blocks, then their runs, each checked by its crc. Then read
+    ///   whole in the background as [`Promote`] says.
     /// - An older layout, a small slice, or one that once failed its checks:
     ///   read whole, from local disk when it is there, its hash checked.
     /// - A piece failing its checks marks the slice to be read whole from then
@@ -3575,7 +3583,8 @@ impl TermIndex {
     }
 
     /// [`Self::slice_runs`] for checked slice `hash` with nothing resident:
-    /// read its first `index_end` bytes, keep its block index, then read its
+    /// read its block index once however many lookups race for it (see
+    /// `index_reads` in [`TierChunks`]), keep it, then read its
     /// terms by range.
     async fn first_read_runs(
         &self,
@@ -3591,6 +3600,40 @@ impl TermIndex {
                 "slice block index ends past the slice".into(),
             ));
         }
+        let reading = Arc::clone(
+            self.tier_chunks
+                .lock()
+                .expect("tier chunk cache lock")
+                .index_reads
+                .entry(*hash)
+                .or_default(),
+        );
+        let read = reading
+            .get_or_try_init(|| self.read_index(hash, index_end, budget))
+            .await
+            .cloned();
+        {
+            let mut chunks = self.tier_chunks.lock().expect("tier chunk cache lock");
+            if chunks
+                .index_reads
+                .get(hash)
+                .is_some_and(|r| Arc::ptr_eq(r, &reading))
+            {
+                chunks.index_reads.remove(hash);
+            }
+        }
+        let index = read?;
+        self.ranged_runs(hash, &index, keys, wanted, budget).await
+    }
+
+    /// Reads checked slice `hash`'s header and block index, its first
+    /// `index_end` bytes, and keeps the index resident.
+    async fn read_index(
+        &self,
+        hash: &ContentHash,
+        index_end: u64,
+        budget: &FetchBudget,
+    ) -> Result<Arc<SliceIndex>, TermIndexError> {
         let index = self
             .read_exact(hash, 0..index_end, budget, |head| {
                 let header = SliceHeader::decode(head)?;
@@ -3615,7 +3658,7 @@ impl TermIndex {
             .slices
             .insert(*hash, ResidentSlice::Index(Arc::clone(&index)));
         drop(evicted);
-        self.ranged_runs(hash, &index, keys, wanted, budget).await
+        Ok(index)
     }
 
     /// The runs of `keys[i]` for each of `wanted` in slice `hash`, given its
@@ -3844,7 +3887,7 @@ impl TermIndex {
     /// earlier whole read failed its hash or could never fit on disk.
     async fn promote_slice(&self, hash: &ContentHash, len: Option<u64>, reused: bool) {
         let wanted = match self.promote {
-            Promote::Disk => !self.disk_cache.as_ref().is_some_and(|c| c.contains(hash)),
+            Promote::Disk => true,
             Promote::Resident => reused,
             #[cfg(test)]
             Promote::Never => false,
@@ -3884,8 +3927,13 @@ impl TermIndex {
                 return;
             };
             let hash = promoting.hash;
-            // A whole read may have put it on disk while this one waited.
-            if disk_cache.as_ref().is_some_and(|c| c.contains(&hash)) {
+            // Another read may have kept it whole while this one waited.
+            let kept = tier_chunks
+                .lock()
+                .expect("tier chunk cache lock")
+                .slices
+                .get(&hash);
+            if matches!(kept, Some(ResidentSlice::Whole(_))) {
                 return;
             }
             let read = fetch_verified(
@@ -10693,6 +10741,61 @@ mod tests {
         (local, root, terms, store_dir)
     }
 
+    /// Polls of a pinned lookup a test makes so every racing lookup reaches its
+    /// first slice read.
+    const RACE_POLLS: usize = 32;
+
+    #[tokio::test]
+    async fn lookups_racing_for_a_cold_slice_share_one_read_of_its_block_index() {
+        // Sixteen lookups of one term at once, nothing resident, slice reads
+        // held until all have started.
+        //  - while held, one block index read per slice is in flight, not one
+        //    per lookup;
+        //  - once released, each lookup reads only its block and run, and every
+        //    lookup answers as whole-slice reads do.
+        // This test pins the shared first read of a block index.
+        const LOOKUPS: usize = 16;
+        let (local, root, terms, _store) = two_layer_checked_index().await;
+        let slow = SlowStorage::wrap(Arc::clone(&local), Duration::ZERO);
+        slow.hold_reads_of(SLICE_URI_FRAGMENT);
+        let index = ranged_index(&root, Arc::clone(&slow) as Arc<dyn StorageProvider>);
+        let asked = [terms[0].as_str()];
+        let touched = root
+            .slices_for_key(&fid("body").term_key(&terms[0]))
+            .map(|s| s.content_hash)
+            .collect::<HashSet<_>>()
+            .len();
+        let mut lookups = pin!(join_all(
+            (0..LOOKUPS).map(|_| index.runs_many(fid("body"), &asked))
+        ));
+        for _ in 0..RACE_POLLS {
+            assert!(poll!(lookups.as_mut()).is_pending(), "reads are held");
+            task::yield_now().await;
+        }
+        assert_eq!(
+            slow.reads_of(SLICE_URI_FRAGMENT),
+            touched,
+            "one block index read per slice"
+        );
+        slow.release_reads();
+        let runs = timeout(BUDGET_DEADLOCK_TIMEOUT, lookups)
+            .await
+            .expect("the lookups finish");
+        let whole = TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None)
+            .with_small_slice_bytes(u64::MAX)
+            .runs_many(fid("body"), &asked)
+            .await
+            .expect("whole");
+        for run in runs {
+            assert_eq!(found(&run.expect("lookup")), found(&whole));
+        }
+        assert_eq!(
+            slow.reads_of(SLICE_URI_FRAGMENT),
+            touched * (1 + LOOKUPS * WARM_RANGED_READS),
+            "then a block and a run read per lookup"
+        );
+    }
+
     #[tokio::test]
     async fn a_short_ranged_read_reads_the_slice_whole_from_then_on() {
         // One slice, read by range on storage that returns its first block or
@@ -11061,11 +11164,12 @@ mod tests {
         // A two-layer index whose slices are all in the local disk cache, every
         // term looked up.
         //  - no slice is read from the object store;
-        //  - every slice is kept as its block index, none whole, and none is
-        //    read whole in the background;
-        //  - the answers equal whole-slice reads.
+        //  - the answers equal whole-slice reads;
+        //  - each slice is then read whole from disk in the background, once,
+        //    and kept, so the next lookup reads nothing from disk.
         // This test pins that a slice on disk is read from there by range, so a
-        // lookup reads a few pieces of it, not the whole copy and its hash.
+        // lookup reads a few pieces of it, not the whole copy and its hash, and
+        // that later lookups still read it from memory.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let asked: Vec<&str> = terms.iter().map(String::as_str).collect();
         let dir = TempDir::new().expect("cache dir");
@@ -11091,10 +11195,18 @@ mod tests {
         );
         promotions_settle(&cache).await;
         let slices = root.layers.iter().map(|l| l.slices.len()).sum::<usize>();
+        assert_eq!(kept(&cache).await, (slices, 0), "every slice kept whole");
+        let hits = disk.stats().n_hits;
+        let again = disk_index(&root, slow.clone(), &disk, &cache)
+            .runs_many(fid("body"), &asked)
+            .await
+            .expect("again");
+        assert_eq!(found(&again), found(&whole));
+        assert_eq!(disk.stats().n_hits, hits, "nothing read from disk");
         assert_eq!(
-            kept(&cache).await,
-            (0, slices),
-            "every slice kept as its block index"
+            slow.reads_of(SLICE_URI_FRAGMENT),
+            0,
+            "nothing from the store"
         );
     }
 
@@ -11108,7 +11220,8 @@ mod tests {
         //  - every lookup answers as whole-slice reads do.
         // This test pins that lookups racing for a slice on disk read a few small
         // pieces each, never a whole copy each, which is what a shared whole
-        // read used to bound.
+        // read used to bound. Background whole reads are off, so what is kept
+        // is what the lookups read.
         const LOOKUPS: usize = 16;
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let dir = TempDir::new().expect("cache dir");
@@ -11117,7 +11230,7 @@ mod tests {
         put_slices_on_disk(&root, &local, &disk, |_, bytes| bytes).await;
         let slow = SlowStorage::wrap(Arc::clone(&local), Duration::ZERO);
         let cache = new_tier_chunk_cache();
-        let index = disk_index(&root, slow.clone(), &disk, &cache);
+        let index = disk_index(&root, slow.clone(), &disk, &cache).with_promote(Promote::Never);
         let asked = [terms[0].as_str()];
         let runs = join_all((0..LOOKUPS).map(|_| index.runs_many(fid("body"), &asked))).await;
         let whole = TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None)
