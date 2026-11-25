@@ -18,13 +18,13 @@ cargo add infino                # Rust
 or in Cargo.toml:
 
 [dependencies]
-infino = "0.11"
+infino = "0.12"
 ```
 
 Note: infino installs the [mimalloc](https://github.com/microsoft/mimalloc)
 global allocator by default. If you embed infino in a process that already
 sets a global allocator, turn it off to avoid a second one:
-`infino = { version = "0.11", default-features = false }`.
+`infino = { version = "0.12", default-features = false }`.
 
 ## Quickstart
 
