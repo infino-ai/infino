@@ -2745,6 +2745,21 @@ pub mod sql {
                 "vector_search",
                 format!("SELECT _id FROM vector_search('emb', '{qv}', 10)"),
             ),
+            // A scalar `WHERE` no index bounds: the search widens until 10
+            // rows pass, so each filter prices the rounds its selectivity
+            // costs. `rating` is `doc_id % 100`, independent of the vectors.
+            (
+                "vector_search WHERE rating < 50 (keeps 50%)",
+                format!("SELECT _id FROM vector_search('emb', '{qv}', 10) WHERE rating < 50"),
+            ),
+            (
+                "vector_search WHERE rating < 10 (keeps 10%)",
+                format!("SELECT _id FROM vector_search('emb', '{qv}', 10) WHERE rating < 10"),
+            ),
+            (
+                "vector_search WHERE rating < 1 (keeps 1%)",
+                format!("SELECT _id FROM vector_search('emb', '{qv}', 10) WHERE rating < 1"),
+            ),
             (
                 "hybrid_search",
                 format!("SELECT _id FROM hybrid_search('title', 'term00001', 'emb', '{qv}', 10)"),
