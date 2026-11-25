@@ -1500,8 +1500,10 @@ pub(crate) fn auto_router_choice(
 test_visible! {
     /// Fine clusters an unfiltered `k`-NN query on this hidden-vector table
     /// reads through the centroid graph, or `None` when the stamped router
-    /// serves it. `auto` resolves per table by scale and concentration;
-    /// explicit `stamped` / `centroid_graph` are honored verbatim. The default
+    /// serves it. `auto` resolves per table by scale and concentration, and
+    /// picks `stamped` when the caller pins `nprobe`, since only the stamped
+    /// router reads a cell width. Explicit `stamped` / `centroid_graph` are
+    /// honored verbatim; `centroid_graph` ignores `nprobe`. The default
     /// fanout config (or `0`) reads the table's calibrated fanout, falling back
     /// to `graph_fanout_for_fine_clusters` on an unstamped table; any other
     /// value overrides it. Either way it is capped at
@@ -1511,6 +1513,7 @@ test_visible! {
         manifest: &ManifestSnapshot,
         column: &str,
         k: usize,
+        nprobe: Option<usize>,
         vcfg: &config::VectorSettings,
     ) -> Option<usize> {
         if vcfg.search_mode != config::VectorSearchMode::Ivf {
@@ -1518,6 +1521,9 @@ test_visible! {
         }
         let routing = manifest.vector_cell_routing();
         let router = resolve_ivf_router(vcfg.ivf_router, || {
+            if nprobe.is_some() {
+                return config::IvfRouter::Stamped;
+            }
             auto_router_choice(
                 routing.as_ref().and_then(|routing| routing.fanout_for_k_at(k)),
                 total_fine_clusters(manifest, column),
@@ -1606,9 +1612,8 @@ fn calibrated_graph_fanout(
 
 /// Deterministic coverage fanout for the centroid-graph path: scan about
 /// `CENTROID_GRAPH_FANOUT_SQRT_COEFF · √n_fine` fine clusters, clamped to
-/// `[floor, n_fine]`. Replaces the calibrated `fanout_for_k` stamp — optimize
-/// no longer recalibrates under graph serving — so fanout needs no per-table
-/// measurement. The coverage knee scales ~√(fine clusters) (measured: ~56% of
+/// `[floor, n_fine]`. The fallback for a table that carries no calibrated
+/// `fanout_for_k` stamp. The coverage knee scales ~√(fine clusters) (measured: ~56% of
 /// clusters at 1M, ~22% at 10M, ~1.8% at 1B); the coefficient is fit to the
 /// hard case (deep1b) so easier data is over-provisioned — recall met, a
 /// little more latency, the safe direction.
@@ -5927,7 +5932,7 @@ impl SupertableReader {
         // (Cosine unit-normalizes and ranks by −dot; NegDot ranks by raw −dot;
         // L2Sq by squared distance), so it engages for any metric.
         let graph_fanout = if !filtered && hidden_vector_index {
-            graph_fanout_for_query(manifest, column, k, vcfg)
+            graph_fanout_for_query(manifest, column, k, options.nprobe, vcfg)
         } else {
             None
         };
@@ -8826,7 +8831,8 @@ fn undrained_nprobe_max(stamped_width: Option<usize>, metric: Metric) -> usize {
 /// Per-cluster rerank depth on the centroid-graph path, as a multiple of `k`. A
 /// caller-set value wins. Otherwise each selected cluster gets the share of the
 /// calibrated rerank law (rows the stamped router reranks per query) that one
-/// probed cell gets on the stamped path, never below the configured default.
+/// fine cluster gets on the stamped path, which reads `fine_for_k` clusters in
+/// each of `width_for_k` cells. Never below the configured default.
 fn graph_rerank_mult(
     caller: Option<usize>,
     configured: usize,
@@ -8837,7 +8843,9 @@ fn graph_rerank_mult(
         let calibrated = routing.and_then(|routing| {
             let rows = routing.rerank_for_k_at(k)?;
             let cells = routing.width_for_k_at(k)?;
-            Some(rows.div_ceil(cells.max(1)).div_ceil(k.max(1)))
+            let fine = routing.fine_for_k_at(k)?;
+            let clusters = cells.max(1) * fine.max(1);
+            Some(rows.div_ceil(clusters).div_ceil(k.max(1)))
         });
         calibrated.map_or(configured, |mult| mult.max(configured))
     })
@@ -13548,13 +13556,15 @@ mod tests {
     fn graph_rerank_mult_follows_the_calibrated_law() {
         use super::graph_rerank_mult;
         const CONFIGURED: usize = 12;
-        // 900 rows over 1 probed cell: 900 rows per cluster, 90 x k.
+        // 900 rows over 1 cell read 3 fine clusters deep: 300 rows per
+        // cluster, 30 x k.
         let routing = CellRoutingParams {
             rerank_for_k: [900, 900, 900, 900],
             width_for_k: [1, 1, 1, 1],
+            fine_for_k: [3, 3, 3, 3],
             ..CellRoutingParams::default()
         };
-        assert_eq!(graph_rerank_mult(None, CONFIGURED, Some(&routing), 10), 90);
+        assert_eq!(graph_rerank_mult(None, CONFIGURED, Some(&routing), 10), 30);
         assert_eq!(
             graph_rerank_mult(Some(4), CONFIGURED, Some(&routing), 10),
             4
@@ -13564,6 +13574,7 @@ mod tests {
         let shallow = CellRoutingParams {
             rerank_for_k: [900, 900, 900, 900],
             width_for_k: [100, 100, 100, 100],
+            fine_for_k: [3, 3, 3, 3],
             ..CellRoutingParams::default()
         };
         assert_eq!(
