@@ -3073,6 +3073,25 @@ impl SuperfileReader {
             .await?)
     }
 
+    /// The rows of `column` that hold `words` and `phrases` under `mode`.
+    /// Delegates to [`FtsReader::text_rows`].
+    pub(crate) async fn text_rows(
+        &self,
+        column: &str,
+        analyzer: &'static str,
+        words: &[&str],
+        phrases: &[Phrase<String>],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(ContainsRows, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .text_rows(column, analyzer, words, phrases, mode, prefetched)
+            .await?)
+    }
+
     /// Unranked token-match **count**: the number of `local_doc_id`s
     /// [`token_match`](Self::token_match) would return under `mode`,
     /// without materializing the id `Vec`. Delegates to

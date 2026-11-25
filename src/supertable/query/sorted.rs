@@ -454,7 +454,8 @@ impl SupertableReader {
         conjunct: &Expr,
         files: &[Arc<SuperfileEntry>],
     ) -> Option<Vec<u64>> {
-        let (column, tokens, mode) = text_match_call(conjunct)?;
+        let (column, query, mode) = text_match_call(conjunct)?;
+        let tokens = query.tokens();
         let manifest = self.manifest();
         if tokens.is_empty()
             || manifest.try_fts_tokenizer_for(&column)?.name() != STANDARD_TOKENIZER
@@ -477,13 +478,23 @@ impl SupertableReader {
                 .get(&entry.superfile_id)
                 .map_or(&[][..], Vec::as_slice);
             // A token the file does not hold counts 0; one held with no count may be in every row.
-            let dfs = terms.iter().map(|term| {
-                match file_terms.iter().find(|(listed, _, _)| listed == term) {
-                    Some((_, 0, _)) => entry.n_docs,
-                    Some((_, df, _)) => *df,
-                    None => 0,
-                }
-            });
+            let df = |term: &str| match file_terms.iter().find(|(listed, _, _)| listed == term) {
+                Some((_, 0, _)) => entry.n_docs,
+                Some((_, df, _)) => *df,
+                None => 0,
+            };
+            // A phrase holds no more rows than its rarest term.
+            let dfs = query
+                .words
+                .iter()
+                .map(|word| df(word))
+                .chain(query.phrases.iter().map(|phrase| {
+                    phrase
+                        .terms
+                        .iter()
+                        .map(|term| df(term))
+                        .fold(u64::MAX, u64::min)
+                }));
             let count = match mode {
                 TextMatchMode::All => dfs.fold(u64::MAX, u64::min),
                 TextMatchMode::Any => dfs.fold(0, u64::saturating_add),

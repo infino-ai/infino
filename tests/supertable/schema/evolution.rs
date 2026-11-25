@@ -1659,6 +1659,73 @@ fn a_reader_running_while_the_schema_grows_sees_only_coherent_snapshots() {
     );
 }
 
+/// A quoted `text_match` on a text column added later: the superfile written
+/// before the column holds no postings for it, and its rows are checked
+/// against their (null) text; the later ones read the phrase from positions,
+/// or, without them, check the rows holding its words. Every answer is the
+/// phrase's rows, as `token_match` gives them where it can.
+#[test]
+fn a_quoted_text_match_on_a_text_column_added_later_matches_the_phrase() {
+    for positions in [true, false] {
+        let db = connect("memory://").expect("connect");
+        let docs = db
+            .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
+            .expect("create");
+        docs.append(
+            &batch(vec![("title", titles(&["pope leo one", "leo pope two"]))]),
+            None,
+        )
+        .expect("append before the column");
+        let mut index = ColumnIndex::fts(Analyzer::Standard);
+        if let ColumnIndex::Fts { positions: p, .. } = &mut index {
+            *p = positions;
+        }
+        db.apply_schema(
+            TABLE,
+            &SchemaPatch::new(vec![
+                FieldPatch::named("body")
+                    .with_type(DataType::LargeUtf8)
+                    .with_index(index),
+            ]),
+            None,
+        )
+        .expect("add an indexed text column");
+        docs.append_rows(
+            &[
+                serde_json::json!({"title": "three", "body": "Pope Leo XIV"}),
+                serde_json::json!({"title": "four", "body": "leo the pope"}),
+                serde_json::json!({"title": "five", "body": "rome"}),
+            ],
+            None,
+        )
+        .expect("append with the column");
+
+        for (query, mode, want) in [
+            ("\"pope leo\"", "and", &["three"][..]),
+            ("\"leo pope\"", "or", &[][..]),
+            ("\"pope leo\" rome", "or", &["five", "three"][..]),
+            ("\"pope leo\" xiv", "and", &["three"][..]),
+        ] {
+            let predicate = format!(
+                "SELECT title FROM {TABLE} WHERE text_match(body, '{query}', '{mode}') ORDER BY title"
+            );
+            assert_eq!(
+                rows(&db, &predicate),
+                want,
+                "positions {positions}: {predicate}"
+            );
+            if positions {
+                let function = format!(
+                    "SELECT title FROM {TABLE} WHERE _id IN \
+                     (SELECT _id FROM token_match('{TABLE}', 'body', '{query}', '{mode}')) \
+                     ORDER BY title"
+                );
+                assert_eq!(rows(&db, &function), want, "{function}");
+            }
+        }
+    }
+}
+
 /// A text column added after the table was created is not among the FTS
 /// columns the table was created with, yet `text_match` on it is answered
 /// from its postings, and a superfile written before the column existed,

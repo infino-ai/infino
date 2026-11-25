@@ -136,6 +136,7 @@ use crate::{
         query::{
             fts::{IndexedSuperfile, PlanLocations, memos_from_plan_locations},
             prune::PruneLeaf,
+            text_match::{TextMatchMode, TextQuery, text_match_call},
         },
         schema::FieldId,
     },
@@ -1635,6 +1636,19 @@ pub(crate) struct ExactContains {
     pub(crate) whole: bool,
 }
 
+/// A `text_match` whose query holds a quoted phrase: its rows are those
+/// whose tokens hold the query's words and phrases under `mode`, a phrase
+/// read from the positions (see the provider's `exact_rows`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactText {
+    /// The FTS column, indexed by `standard`.
+    pub(crate) column: String,
+    /// The query's words and phrases.
+    pub(crate) query: TextQuery,
+    /// `And` for `'and'`, `Or` for `'or'`.
+    pub(crate) mode: BoolMode,
+}
+
 /// `filter` as an [`ExactContains`], or `None` when it stays a bounded,
 /// verified filter.
 ///
@@ -1675,9 +1689,82 @@ pub(crate) fn exact_contains(
     })
 }
 
+/// The leaf of the rows holding `needle` as one whole token of `column`.
+fn whole_token_leaf(column: &str, needle: String) -> ExactFilter {
+    ExactFilter::Contains(ExactContains {
+        column: column.to_owned(),
+        needle,
+        whole: true,
+    })
+}
+
+impl ExactText {
+    /// The rows that may hold this query, from the postings alone: its words
+    /// and each phrase's terms under the mode, every phrase read as the
+    /// `AND` of its terms. Exact when the query has no phrase; a superset
+    /// otherwise, for a scan that checks the phrase on the rows it reads.
+    pub(crate) fn superset(&self) -> ExactFilter {
+        let word = |needle: &String| whole_token_leaf(&self.column, needle.clone());
+        let words = self.query.words.iter().map(word);
+        match self.mode {
+            BoolMode::And => ExactFilter::And(self.query.tokens().iter().map(word).collect()),
+            BoolMode::Or => {
+                ExactFilter::Or(
+                    words
+                        .chain(self.query.phrases.iter().map(|phrase| {
+                            ExactFilter::And(phrase.terms.iter().map(word).collect())
+                        }))
+                        .collect(),
+                )
+            }
+        }
+    }
+}
+
+impl ExactFilter {
+    /// This tree with each [`ExactText`] leaf on a column without positions
+    /// replaced by its [`ExactText::superset`], and whether the tree is
+    /// still exact (no leaf was replaced).
+    pub(crate) fn read_without_positions(
+        self,
+        has_positions: &dyn Fn(&str) -> bool,
+    ) -> (ExactFilter, bool) {
+        match self {
+            ExactFilter::Text(text) if !has_positions(&text.column) => (text.superset(), false),
+            ExactFilter::And(children) => {
+                let (children, exact) = read_children(children, has_positions);
+                (ExactFilter::And(children), exact)
+            }
+            ExactFilter::Or(children) => {
+                let (children, exact) = read_children(children, has_positions);
+                (ExactFilter::Or(children), exact)
+            }
+            leaf => (leaf, true),
+        }
+    }
+}
+
+/// [`ExactFilter::read_without_positions`] of each of `children`.
+fn read_children(
+    children: Vec<ExactFilter>,
+    has_positions: &dyn Fn(&str) -> bool,
+) -> (Vec<ExactFilter>, bool) {
+    let mut exact = true;
+    let children = children
+        .into_iter()
+        .map(|child| {
+            let (child, child_exact) = child.read_without_positions(has_positions);
+            exact &= child_exact;
+            child
+        })
+        .collect();
+    (children, exact)
+}
+
 /// `filter` as the [`ExactFilter`] of a `text_match(column, query, mode)`
-/// call: one whole-token leaf per query token, under `AND` for `'and'` and
-/// `OR` for `'or'`. `None` when it is no such call, the table's schema does
+/// call: one whole-token leaf per query word, under `AND` for `'and'` and
+/// `OR` for `'or'`, or one [`ExactText`] leaf when the query holds a
+/// phrase. `None` when it is no such call, the table's schema does
 /// not index its column by `standard` (the function's own analyzer, so the
 /// postings agree with it), or its query holds no token (no row matches;
 /// the function says so row by row).
@@ -1691,26 +1778,32 @@ fn exact_text_match(
     filter: &Expr,
     resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> Option<ExactFilter> {
-    let (column, tokens, mode) = crate::supertable::query::text_match::text_match_call(filter)?;
+    let (column, query, mode) = text_match_call(filter)?;
     if resolve(&column)?.name() != STANDARD_TOKENIZER {
         return None;
     }
-    let mut leaves: Vec<ExactFilter> = tokens
+    if !query.phrases.is_empty() {
+        let mode = match mode {
+            TextMatchMode::All => BoolMode::And,
+            TextMatchMode::Any => BoolMode::Or,
+        };
+        return Some(ExactFilter::Text(ExactText {
+            column,
+            query,
+            mode,
+        }));
+    }
+    let mut leaves: Vec<ExactFilter> = query
+        .words
         .into_iter()
-        .map(|needle| {
-            ExactFilter::Contains(ExactContains {
-                column: column.clone(),
-                needle,
-                whole: true,
-            })
-        })
+        .map(|needle| whole_token_leaf(&column, needle))
         .collect();
     match leaves.len() {
         0 => None,
         1 => leaves.pop(),
         _ => Some(match mode {
-            crate::supertable::query::text_match::TextMatchMode::All => ExactFilter::And(leaves),
-            crate::supertable::query::text_match::TextMatchMode::Any => ExactFilter::Or(leaves),
+            TextMatchMode::All => ExactFilter::And(leaves),
+            TextMatchMode::Any => ExactFilter::Or(leaves),
         }),
     }
 }
@@ -1775,8 +1868,8 @@ fn exact_keyword_equality(
     }
 }
 
-/// An `AND` / `OR` tree of [`ExactContains`] leaves, e.g. `title ILIKE
-/// '%japan%' OR title ILIKE '%japanese%'`.
+/// An `AND` / `OR` tree of [`ExactContains`] and [`ExactText`] leaves, e.g.
+/// `title ILIKE '%japan%' OR title ILIKE '%japanese%'`.
 ///
 /// Leaves combine row by row ([`Self::rows`]). A NULL holds no term, so
 /// every leaf reads it as false, which matches SQL only while there is no
@@ -1784,40 +1877,63 @@ fn exact_keyword_equality(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExactFilter {
     Contains(ExactContains),
+    Text(ExactText),
     And(Vec<ExactFilter>),
     Or(Vec<ExactFilter>),
 }
 
 impl ExactFilter {
-    /// Every leaf of the tree, in order, repeats included.
+    /// Every [`ExactContains`] leaf of the tree, in order, repeats included.
     pub(crate) fn leaves(&self) -> Vec<&ExactContains> {
-        fn walk<'a>(filter: &'a ExactFilter, out: &mut Vec<&'a ExactContains>) {
-            match filter {
-                ExactFilter::Contains(leaf) => out.push(leaf),
-                ExactFilter::And(children) | ExactFilter::Or(children) => {
-                    for child in children {
-                        walk(child, out);
-                    }
-                }
-            }
-        }
         let mut out = Vec::new();
-        walk(self, &mut out);
+        self.for_each_leaf(&mut |leaf| {
+            if let ExactFilter::Contains(contains) = leaf {
+                out.push(contains);
+            }
+        });
         out
     }
 
-    /// The tree's rows in one superfile, from each leaf's
-    /// (`leaf_rows`). A row is proven when the tree holds with every
+    /// Every [`ExactText`] leaf of the tree, in order, repeats included.
+    pub(crate) fn texts(&self) -> Vec<&ExactText> {
+        let mut out = Vec::new();
+        self.for_each_leaf(&mut |leaf| {
+            if let ExactFilter::Text(text) = leaf {
+                out.push(text);
+            }
+        });
+        out
+    }
+
+    /// Call `f` on each leaf of the tree, in order.
+    fn for_each_leaf<'a>(&'a self, f: &mut dyn FnMut(&'a ExactFilter)) {
+        match self {
+            ExactFilter::And(children) | ExactFilter::Or(children) => {
+                for child in children {
+                    child.for_each_leaf(f);
+                }
+            }
+            leaf => f(leaf),
+        }
+    }
+
+    /// The tree's rows in one superfile, from each leaf's (`leaf_rows`,
+    /// `text_rows`). A row is proven when the tree holds with every
     /// doubtful leaf read as false, and admitted when it holds with every
     /// doubtful leaf read as true; the admitted rows that are not proven
     /// are the doubtful ones. Under `AND` that is the intersection of the
     /// children's proven rows, and of their admitted rows; under `OR` the
     /// union of each.
-    pub(crate) fn rows(&self, leaf_rows: &dyn Fn(&ExactContains) -> ContainsRows) -> ContainsRows {
+    pub(crate) fn rows(
+        &self,
+        leaf_rows: &dyn Fn(&ExactContains) -> ContainsRows,
+        text_rows: &dyn Fn(&ExactText) -> ContainsRows,
+    ) -> ContainsRows {
         match self {
             ExactFilter::Contains(leaf) => leaf_rows(leaf),
-            ExactFilter::And(children) => combine_rows(children, leaf_rows, true),
-            ExactFilter::Or(children) => combine_rows(children, leaf_rows, false),
+            ExactFilter::Text(text) => text_rows(text),
+            ExactFilter::And(children) => combine_rows(children, leaf_rows, text_rows, true),
+            ExactFilter::Or(children) => combine_rows(children, leaf_rows, text_rows, false),
         }
     }
 }
@@ -1826,12 +1942,13 @@ impl ExactFilter {
 fn combine_rows(
     children: &[ExactFilter],
     leaf_rows: &dyn Fn(&ExactContains) -> ContainsRows,
+    text_rows: &dyn Fn(&ExactText) -> ContainsRows,
     and: bool,
 ) -> ContainsRows {
     let mut proven: Option<RoaringBitmap> = None;
     let mut admitted: Option<RoaringBitmap> = None;
     for child in children {
-        let rows = child.rows(leaf_rows);
+        let rows = child.rows(leaf_rows, text_rows);
         let child_admitted = &rows.proven | &rows.doubtful;
         let merge = |acc: Option<RoaringBitmap>, next: RoaringBitmap| match acc {
             Some(acc) if and => acc & next,
@@ -3319,17 +3436,20 @@ mod tests {
         let (a, b) = (leaf("title", "a"), leaf("title", "b"));
         // AND: proven in both; admitted in both, less the proven.
         assert_eq!(
-            ExactFilter::And(vec![a.clone(), b.clone()]).rows(&leaf_rows),
+            ExactFilter::And(vec![a.clone(), b.clone()])
+                .rows(&leaf_rows, &|_| ContainsRows::default()),
             rows(&[2], &[1])
         );
         // OR: proven in either; admitted in either, less the proven.
         assert_eq!(
-            ExactFilter::Or(vec![a.clone(), b.clone()]).rows(&leaf_rows),
+            ExactFilter::Or(vec![a.clone(), b.clone()])
+                .rows(&leaf_rows, &|_| ContainsRows::default()),
             rows(&[1, 2, 4], &[3, 5])
         );
         // Nested: (a AND b) OR a.
         assert_eq!(
-            ExactFilter::Or(vec![ExactFilter::And(vec![a.clone(), b]), a]).rows(&leaf_rows),
+            ExactFilter::Or(vec![ExactFilter::And(vec![a.clone(), b]), a])
+                .rows(&leaf_rows, &|_| ContainsRows::default()),
             rows(&[1, 2], &[3])
         );
     }

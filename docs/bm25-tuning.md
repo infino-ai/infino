@@ -556,7 +556,7 @@ text.
 | Analyzer | `FtsField::analyzer` | No | `standard` splits text into lowercased words; `keyword` keeps each value as one exact term. See [Base tokenizer](#base-tokenizer). |
 | Stopwords | `FtsField::stopwords` | No | Drops very common words from index and query. See [Stopwords](#stopwords). |
 | Stemmer | `FtsField::stemmer` | No | Folds inflections onto one term, so one form finds the others. See [Stemming](#stemming). |
-| Positions | `FtsField::positions` | No | Required for exact phrase queries. Roughly doubles the column's index footprint. A phrase against a positionless column is a typed error, never a silent bag-of-words fallback. |
+| Positions | `FtsField::positions` | No | Required for exact phrase queries. Roughly doubles the column's index footprint. A search phrase against a positionless column is a typed error, never a silent bag-of-words fallback. SQL `text_match` still matches a quoted phrase there, by checking the text of the rows holding its words, which costs about a scan of that text. |
 | Boolean mode and sigils | Per search | Yes | `BoolMode::And` makes bare terms mandatory, `Or` makes them scoring-only once any `+must` exists. `+term` is a must, `-term` a hard exclusion, and `"quoted words"` is a phrase atom scored as one term whose `tf` is the phrase count and whose IDF is the sum of its members'. |
 | Query shape | Per search | Yes | Prefix search expands a trailing prefix to the indexed terms beginning with it and runs an OR over them. `hybrid_search` fuses text and vector results; do not fuse raw BM25 scores with distances by hand. |
 

@@ -32,16 +32,23 @@
 //! term dictionary and the postings: each query token is one dictionary
 //! key, and its postings are the rows (see `candidate::ExactFilter`). The
 //! scan then decodes only those rows, intersects them with whatever else
-//! the `WHERE` bounds, and stops at the `LIMIT`.
+//! the `WHERE` bounds, and stops at the `LIMIT`. A phrase is read from the
+//! column's token positions. Where the column was indexed without them, the
+//! rows holding the phrase's tokens are checked against their text instead,
+//! which costs about a scan of that text over the rows the rest of the
+//! `WHERE` keeps.
 //!
 //! ## What it means
 //!
 //! `text_match(column, query, mode)` is true when the value of `column`,
 //! split by the `standard` analyzer, holds every (`'and'`) or any (`'or'`,
-//! the default, as `token_match`'s) of the tokens `standard` splits `query`
-//! into. `query` is plain words: no phrases or `+` / `-` operators (a quote
-//! or a sign is a separator, as in the text). A query with no token matches
-//! nothing, and a NULL value is NULL, so `WHERE` drops it.
+//! the default, as `token_match`'s) of the words and phrases of `query`. A
+//! phrase is a pair of double quotes around two or more tokens, and a value
+//! holds it where its tokens stand in that order, next to each other:
+//! `'"pope leo"'` holds for `Pope Leo XIV` and not for `leo the pope`. Each
+//! other token of `query` is a word; an unpaired quote, and `+` or `-`, are
+//! separators, as in the text. A query with no token matches nothing, and a
+//! NULL value is NULL, so `WHERE` drops it.
 //!
 //! Row by row, the function tokenizes each value with `standard`. The scan
 //! uses the postings instead only where they give the same answer: a column
@@ -67,12 +74,13 @@ use datafusion::{
     },
 };
 
-use crate::superfile::fts::tokenize::StandardTokenizer;
+use crate::superfile::fts::tokenize::{Phrase, StandardTokenizer, Tokenizer};
 
 /// SQL name of the token-match predicate.
 pub(crate) const TEXT_MATCH_UDF: &str = "text_match";
 
-/// Whether a value must hold every query token or any of them.
+/// Whether a value must hold every word and phrase of the query or any of
+/// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextMatchMode {
     /// Every token (`'and'`).
@@ -94,24 +102,98 @@ impl TextMatchMode {
     }
 }
 
-/// The distinct tokens `standard` splits `query` into, in first-seen order.
-pub(crate) fn query_tokens(query: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    StandardTokenizer::new().tokenize_each_inline(query, |token| {
-        if seen.insert(token.to_owned()) {
-            out.push(token.to_owned());
+/// A `text_match` query read by `standard`: its loose words and its quoted
+/// phrases.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TextQuery {
+    /// The distinct tokens outside quotes, and the lone token of a quote
+    /// that holds one.
+    pub(crate) words: Vec<String>,
+    /// The distinct quoted runs of two or more tokens.
+    pub(crate) phrases: Vec<Phrase<String>>,
+    /// `words`, for telling a repeat apart in constant time.
+    seen: HashSet<String>,
+}
+
+impl TextQuery {
+    /// `query` split by `standard`. Each pair of double quotes, paired left to
+    /// right, holds a phrase, or a word when it holds one token, and empty
+    /// quotes hold nothing. Everything outside the pairs is split as the text
+    /// is, so an unpaired quote, `+` and `-` are what they are in the text
+    /// (separators, or part of a word where `standard` keeps them, as in
+    /// `צה"ל`), and a query without a pair is exactly its words.
+    pub(crate) fn parse(query: &str) -> Self {
+        let tokenizer = StandardTokenizer::new();
+        let mut out = Self::default();
+        let mut rest = query;
+        while let Some(open) = rest.find('"') {
+            let Some(len) = rest[open + 1..].find('"') else {
+                break;
+            };
+            out.add_words(&tokenizer, &rest[..open]);
+            let mut phrase = Phrase::default();
+            let mut first = None;
+            tokenizer.tokenize_each_query_positioned(
+                &rest[open + 1..open + 1 + len],
+                &mut |token, position| {
+                    let first = *first.get_or_insert(position);
+                    phrase.terms.push(token.into_owned());
+                    phrase
+                        .offsets
+                        .push(u32::try_from(position.saturating_sub(first)).unwrap_or(u32::MAX));
+                },
+            );
+            match phrase.terms.as_slice() {
+                [] => {}
+                [word] => out.add_word(word),
+                _ if out.phrases.contains(&phrase) => {}
+                _ => out.phrases.push(phrase),
+            }
+            rest = &rest[open + len + 2..];
         }
-    });
-    out
+        out.add_words(&tokenizer, rest);
+        out
+    }
+
+    /// Add `text`'s tokens as words, each once.
+    fn add_words(&mut self, tokenizer: &StandardTokenizer, text: &str) {
+        tokenizer.tokenize_each_inline(text, |token| self.add_word(token));
+    }
+
+    /// Add `token` as a word, once.
+    fn add_word(&mut self, token: &str) {
+        if !self.seen.contains(token) {
+            self.seen.insert(token.to_owned());
+            self.words.push(token.to_owned());
+        }
+    }
+
+    /// Whether the query holds no token.
+    fn is_empty(&self) -> bool {
+        self.words.is_empty() && self.phrases.is_empty()
+    }
+
+    /// Every distinct token the query names, its words' and its phrases': a
+    /// row the query holds holds every one of them
+    /// under `'and'`, and one of them under `'or'`.
+    pub(crate) fn tokens(&self) -> Vec<String> {
+        let mut seen = self.seen.clone();
+        let mut out = self.words.clone();
+        for term in self.phrases.iter().flat_map(|phrase| &phrase.terms) {
+            if seen.insert(term.clone()) {
+                out.push(term.clone());
+            }
+        }
+        out
+    }
 }
 
 /// A `text_match(column, query [, mode])` call read off a logical
-/// expression: its column's name, its query's tokens and its mode. `None`
-/// when `expr` is not such a call, or its column is not a bare column, or
-/// its query or mode is not a string literal (DataFusion then evaluates
-/// it, and the function reports what is wrong).
-pub(crate) fn text_match_call(expr: &Expr) -> Option<(String, Vec<String>, TextMatchMode)> {
+/// expression: its column's name, its query and its mode. `None` when
+/// `expr` is not such a call, or its column is not a bare column, or its
+/// query or mode is not a string literal (DataFusion then evaluates it, and
+/// the function reports what is wrong).
+pub(crate) fn text_match_call(expr: &Expr) -> Option<(String, TextQuery, TextMatchMode)> {
     let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
         return None;
     };
@@ -126,7 +208,7 @@ pub(crate) fn text_match_call(expr: &Expr) -> Option<(String, Vec<String>, TextM
         Some(mode) => TextMatchMode::parse(string_literal(mode)?)?,
         None => TextMatchMode::Any,
     };
-    Some((column.name.clone(), query_tokens(query), mode))
+    Some((column.name.clone(), TextQuery::parse(query), mode))
 }
 
 /// Whether `expr` calls `text_match` anywhere in it.
@@ -193,68 +275,163 @@ fn literal_arg<'a>(value: &'a ColumnarValue, what: &str) -> DfResult<Option<&'a 
     }
 }
 
-/// Whether `value` holds the `tokens` under `mode`.
-fn holds(
-    tokenizer: &StandardTokenizer,
-    value: &str,
-    tokens: &[String],
-    mode: TextMatchMode,
-    lowered: &mut String,
-) -> bool {
-    if tokens.is_empty() {
-        return false;
+/// A value's tokens and their positions, kept in one buffer that is reused
+/// from value to value, so checking a phrase allocates nothing per token.
+#[derive(Default)]
+struct Positioned {
+    /// The tokens, one after another.
+    text: String,
+    /// Each token's position and its byte range in `text`, by position.
+    spans: Vec<(u64, usize, usize)>,
+}
+
+impl Positioned {
+    /// Hold `value`'s tokens under `tokenizer`, in place of the last value's.
+    fn fill(&mut self, tokenizer: &StandardTokenizer, value: &str) {
+        self.text.clear();
+        self.spans.clear();
+        tokenizer.tokenize_each_positioned(value, &mut |token, position| {
+            let start = self.text.len();
+            self.text.push_str(token);
+            self.spans.push((position, start, self.text.len()));
+        });
     }
-    // Every token `standard` takes from ASCII text is that text's piece,
-    // lowercased: so a query token missing from the lowercased value as a
-    // substring is no token of it, and most values are decided without
-    // being tokenized. (Non-ASCII text can lowercase into an ASCII token,
-    // the Kelvin sign into `k`, so it is always tokenized.)
-    if value.is_ascii() && tokens.iter().all(|t| t.is_ascii()) {
-        lowered.clear();
-        lowered.push_str(value);
-        lowered.make_ascii_lowercase();
-        let present = |t: &String| lowered.contains(t.as_str());
-        let possible = match mode {
-            TextMatchMode::Any => tokens.iter().any(present),
-            TextMatchMode::All => tokens.iter().all(present),
-        };
-        if !possible {
+
+    /// Each token with its position, in order.
+    fn tokens(&self) -> impl Iterator<Item = (u64, &str)> {
+        self.spans
+            .iter()
+            .map(|&(position, start, end)| (position, &self.text[start..end]))
+    }
+
+    /// The token at `position`, if any.
+    fn at(&self, position: u64) -> Option<&str> {
+        let i = self
+            .spans
+            .binary_search_by_key(&position, |&(p, _, _)| p)
+            .ok()?;
+        let (_, start, end) = self.spans[i];
+        Some(&self.text[start..end])
+    }
+}
+
+/// A query compiled for checking values: the query and every token it names
+/// ([`TextQuery::tokens`]), which the substring check reads.
+struct Matcher<'q> {
+    query: &'q TextQuery,
+    tokens: Vec<String>,
+    mode: TextMatchMode,
+}
+
+impl<'q> Matcher<'q> {
+    fn new(query: &'q TextQuery, mode: TextMatchMode) -> Self {
+        Self {
+            query,
+            tokens: query.tokens(),
+            mode,
+        }
+    }
+
+    /// Whether `value` holds the query under the mode: every word and phrase
+    /// for `'and'`, any for `'or'`. A phrase holds where its terms stand at
+    /// its offsets from one position.
+    fn holds(
+        &self,
+        tokenizer: &StandardTokenizer,
+        value: &str,
+        lowered: &mut String,
+        positioned: &mut Positioned,
+    ) -> bool {
+        if self.query.is_empty() {
             return false;
         }
-    }
-    let mut found = vec![false; tokens.len()];
-    let mut left = tokens.len();
-    let mut done = false;
-    tokenizer.tokenize_each_inline(value, |token| {
-        if done {
-            return;
-        }
-        if let Some(i) = tokens.iter().position(|t| t == token) {
-            if !found[i] {
-                found[i] = true;
-                left -= 1;
+        // Every token `standard` takes from ASCII text is that text's piece,
+        // lowercased: so a query token missing from the lowercased value as a
+        // substring is no token of it, and most values are decided without
+        // being tokenized. (Non-ASCII text can lowercase into an ASCII token,
+        // the Kelvin sign into `k`, so it is always tokenized.) A phrase's
+        // terms are among the tokens, so the check holds for phrases too.
+        if value.is_ascii() && self.tokens.iter().all(|t| t.is_ascii()) {
+            lowered.clear();
+            lowered.push_str(value);
+            lowered.make_ascii_lowercase();
+            let present = |t: &String| lowered.contains(t.as_str());
+            let possible = match self.mode {
+                TextMatchMode::Any => self.tokens.iter().any(present),
+                TextMatchMode::All => self.tokens.iter().all(present),
+            };
+            if !possible {
+                return false;
             }
-            done = mode == TextMatchMode::Any || left == 0;
         }
-    });
-    match mode {
-        TextMatchMode::Any => left < tokens.len(),
-        TextMatchMode::All => left == 0,
+        if self.query.phrases.is_empty() {
+            return self.holds_words(tokenizer, value);
+        }
+        positioned.fill(tokenizer, value);
+        let has_word = |word: &String| positioned.tokens().any(|(_, token)| token == word);
+        let has_phrase =
+            |phrase: &Phrase<String>| {
+                positioned.tokens().any(|(start, token)| {
+                    token == phrase.terms[0]
+                        && phrase.terms.iter().zip(&phrase.offsets).skip(1).all(
+                            |(term, &offset)| {
+                                positioned.at(start + u64::from(offset)) == Some(term.as_str())
+                            },
+                        )
+                })
+            };
+        match self.mode {
+            TextMatchMode::Any => {
+                self.query.words.iter().any(has_word) || self.query.phrases.iter().any(has_phrase)
+            }
+            TextMatchMode::All => {
+                self.query.words.iter().all(has_word) && self.query.phrases.iter().all(has_phrase)
+            }
+        }
+    }
+
+    /// [`Self::holds`] for a query of words alone, in one pass that stops as
+    /// soon as the answer is known.
+    fn holds_words(&self, tokenizer: &StandardTokenizer, value: &str) -> bool {
+        let words = &self.query.words;
+        let mut found = vec![false; words.len()];
+        let mut left = words.len();
+        let mut done = false;
+        tokenizer.tokenize_each_inline(value, |token| {
+            if done {
+                return;
+            }
+            if let Some(i) = words.iter().position(|t| t == token) {
+                if !found[i] {
+                    found[i] = true;
+                    left -= 1;
+                }
+                done = self.mode == TextMatchMode::Any || left == 0;
+            }
+        });
+        match self.mode {
+            TextMatchMode::Any => left < words.len(),
+            TextMatchMode::All => left == 0,
+        }
     }
 }
 
 fn match_strings<'a>(
     values: impl Iterator<Item = Option<&'a str>>,
     len: usize,
-    tokens: &[String],
+    query: &TextQuery,
     mode: TextMatchMode,
 ) -> BooleanArray {
     let tokenizer = StandardTokenizer::new();
+    let matcher = Matcher::new(query, mode);
     let mut out = BooleanBuilder::with_capacity(len);
     let mut lowered = String::new();
+    let mut positioned = Positioned::default();
     for value in values {
         match value {
-            Some(value) => out.append_value(holds(&tokenizer, value, tokens, mode, &mut lowered)),
+            Some(value) => {
+                out.append_value(matcher.holds(&tokenizer, value, &mut lowered, &mut positioned))
+            }
             None => out.append_null(),
         }
     }
@@ -302,7 +479,7 @@ impl ScalarUDFImpl for TextMatchFunc {
         let Some(query) = query else {
             return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None)));
         };
-        let tokens = query_tokens(query);
+        let query = TextQuery::parse(query);
         let column: ArrayRef = match &args[0] {
             ColumnarValue::Array(array) => Arc::clone(array),
             ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(number_rows.max(1))?,
@@ -310,21 +487,21 @@ impl ScalarUDFImpl for TextMatchFunc {
         let result = match column.data_type() {
             DataType::Utf8 => {
                 let a = column.as_any().downcast_ref::<StringArray>().expect("utf8");
-                match_strings(a.iter(), a.len(), &tokens, mode)
+                match_strings(a.iter(), a.len(), &query, mode)
             }
             DataType::LargeUtf8 => {
                 let a = column
                     .as_any()
                     .downcast_ref::<LargeStringArray>()
                     .expect("large utf8");
-                match_strings(a.iter(), a.len(), &tokens, mode)
+                match_strings(a.iter(), a.len(), &query, mode)
             }
             DataType::Utf8View => {
                 let a = column
                     .as_any()
                     .downcast_ref::<StringViewArray>()
                     .expect("utf8 view");
-                match_strings(a.iter(), a.len(), &tokens, mode)
+                match_strings(a.iter(), a.len(), &query, mode)
             }
             DataType::Null => BooleanArray::new_null(column.len()),
             other => {
@@ -345,10 +522,14 @@ mod tests {
     use super::*;
 
     fn eval(values: &[Option<&str>], query: &str, mode: TextMatchMode) -> Vec<Option<bool>> {
-        let tokens = query_tokens(query);
-        match_strings(values.iter().copied(), values.len(), &tokens, mode)
-            .iter()
-            .collect()
+        match_strings(
+            values.iter().copied(),
+            values.len(),
+            &TextQuery::parse(query),
+            mode,
+        )
+        .iter()
+        .collect()
     }
 
     #[test]
@@ -416,11 +597,124 @@ mod tests {
         );
     }
 
+    fn phrase(terms: &[&str]) -> Phrase<String> {
+        Phrase::adjacent(terms.iter().map(|t| (*t).to_owned()).collect())
+    }
+
     #[test]
-    fn query_tokens_are_the_standard_tokens_once_each() {
+    fn a_quoted_run_of_two_tokens_or_more_is_a_phrase() {
+        let parsed =
+            TextQuery::parse("Pope \"Leo XIV\" visit \"leo xiv\" \"rome\" \"\" +\"a b\" -c");
+        assert_eq!(parsed.words, vec!["pope", "visit", "rome", "c"]);
         assert_eq!(
-            query_tokens("Rust rust, \"async\" +runtime"),
+            parsed.phrases,
+            vec![phrase(&["leo", "xiv"]), phrase(&["a", "b"])]
+        );
+        assert_eq!(
+            parsed.tokens(),
+            vec!["pope", "visit", "rome", "c", "leo", "xiv", "a", "b"]
+        );
+    }
+
+    #[test]
+    fn an_unpaired_quote_is_a_separator() {
+        let parsed = TextQuery::parse("\"pope leo\" \"leo");
+        assert_eq!(parsed.phrases, vec![phrase(&["pope", "leo"])]);
+        assert_eq!(parsed.words, vec!["leo"]);
+        let parsed = TextQuery::parse("pope\"leo");
+        assert!(parsed.phrases.is_empty());
+        assert_eq!(parsed.words, vec!["pope", "leo"]);
+    }
+
+    #[test]
+    fn a_phrase_holds_its_terms_in_order_and_adjacent() {
+        let values = [
+            Some("Pope Leo XIV"),
+            Some("Leo, the pope"),
+            Some("pope and leo"),
+            Some("POPE-LEO"),
+            Some("pope leo"),
+            Some("the leo leo pope"),
+            None,
+        ];
+        assert_eq!(
+            eval(&values, "\"pope leo\"", TextMatchMode::All),
+            vec![
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(true),
+                Some(false),
+                None
+            ]
+        );
+        // A repeated term must stand at each of its offsets.
+        assert_eq!(
+            eval(&values, "\"leo leo pope\"", TextMatchMode::Any),
+            vec![
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn phrases_and_words_combine_under_the_mode() {
+        let values = [
+            Some("pope leo in rome"),
+            Some("pope leo"),
+            Some("rome"),
+            Some("leo pope rome"),
+        ];
+        assert_eq!(
+            eval(&values, "\"pope leo\" rome", TextMatchMode::All),
+            vec![Some(true), Some(false), Some(false), Some(false)]
+        );
+        assert_eq!(
+            eval(&values, "\"pope leo\" rome", TextMatchMode::Any),
+            vec![Some(true), Some(true), Some(true), Some(true)]
+        );
+        assert_eq!(
+            eval(&values, "\"pope leo\" \"in rome\"", TextMatchMode::Any),
+            vec![Some(true), Some(true), Some(false), Some(false)]
+        );
+    }
+
+    #[test]
+    fn a_phrase_in_non_ascii_text_is_tokenized_not_skipped() {
+        // The Kelvin sign lowercases into `k`: the substring check cannot rule
+        // the value out, so it is tokenized.
+        assert_eq!(
+            eval(
+                &[Some("\u{212A}elvin scale")],
+                "\"kelvin scale\"",
+                TextMatchMode::All
+            ),
+            vec![Some(true)]
+        );
+    }
+
+    #[test]
+    fn query_words_are_the_standard_tokens_once_each() {
+        assert_eq!(
+            TextQuery::parse("Rust rust, \"async\" +runtime").words,
             vec!["rust", "async", "runtime"]
         );
+        // Outside a pair of quotes the query is split as the text is: a lone
+        // quote inside a word keeps the word whole, and so does a narrow
+        // no-break space inside a number, beside a phrase or not.
+        assert_eq!(
+            TextQuery::parse("\u{5E6}\u{5D4}\"\u{5DC} 10\u{202F}000").words,
+            vec!["\u{5E6}\u{5D4}\"\u{5DC}", "10\u{202F}000"]
+        );
+        let quoted = TextQuery::parse("10\u{202F}000 \"pope leo\"");
+        assert_eq!(quoted.words, vec!["10\u{202F}000"]);
+        assert_eq!(quoted.phrases, vec![phrase(&["pope", "leo"])]);
     }
 }
