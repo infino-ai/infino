@@ -609,32 +609,25 @@ impl FetchBudget {
 /// the query path, and kept as a whole read keeps them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Promote {
-    /// A disk cache is attached: every slice, also written to disk.
+    /// A disk cache is attached: every slice not on disk yet, also written
+    /// there.
     Disk,
-    /// No disk cache, and all slices fit the resident budget: a slice read by
-    /// range again while its block index is resident.
+    /// No disk cache: a slice read by range a second time, while its block
+    /// index is still resident. So a hot slice ends up whole in memory, as
+    /// when every slice was read whole, and the resident budget bounds what
+    /// stays, whatever the index's size.
     Resident,
-    /// No disk cache, and the slices outgrow the resident budget: none.
+    /// None, so a test counts a lookup's reads without background ones.
+    #[cfg(test)]
     Never,
 }
 
 impl Promote {
-    /// The rule for `root`'s slices, given the table's manifest `disk_cache`.
-    /// A slice of unknown length counts as not fitting.
-    fn for_root(root: &Root, disk_cache: Option<&Arc<MetadataDiskCache>>) -> Self {
-        if disk_cache.is_some() {
-            return Self::Disk;
-        }
-        let total = root
-            .layers
-            .iter()
-            .flat_map(|layer| &layer.slices)
-            .try_fold(0u64, |sum, slice| {
-                (slice.len > 0).then(|| sum.saturating_add(slice.len))
-            });
-        match total {
-            Some(total) if total <= RESIDENT_SLICE_BUDGET_BYTES as u64 => Self::Resident,
-            _ => Self::Never,
+    /// The rule for a table with the manifest `disk_cache`, or none.
+    fn for_cache(disk_cache: Option<&Arc<MetadataDiskCache>>) -> Self {
+        match disk_cache {
+            Some(_) => Self::Disk,
+            None => Self::Resident,
         }
     }
 }
@@ -3103,7 +3096,7 @@ impl TermIndex {
             .copied()
             .zip(root.id_mins.iter().copied())
             .collect();
-        let promote = Promote::for_root(&root, disk_cache.as_ref());
+        let promote = Promote::for_cache(disk_cache.as_ref());
         Self {
             root,
             root_uri,
@@ -3834,6 +3827,7 @@ impl TermIndex {
         let wanted = match self.promote {
             Promote::Disk => !self.disk_cache.as_ref().is_some_and(|c| c.contains(hash)),
             Promote::Resident => reused,
+            #[cfg(test)]
             Promote::Never => false,
         };
         if !wanted {
@@ -10349,98 +10343,70 @@ mod tests {
 
     #[tokio::test]
     async fn a_slice_reused_by_range_is_kept_whole_in_the_background() {
-        // Three indexes sharing one tier chunk cache, as the indexes of
-        // successive roots do, look up a term in both layers in turn; the index
-        // fits the resident budget.
+        // With no disk cache (the default), three indexes sharing one tier chunk
+        // cache, as the indexes of successive roots do, look up a term in both
+        // layers in turn, once on the index as built and once with its root also
+        // listing a slice no lookup reaches, past the resident budget:
         //  - the first reads each slice by range;
         //  - the second finds the block indexes resident, reads by range again,
         //    and starts one background whole read of each slice;
         //  - once those land, the third reads no slice at all.
-        // This test pins promotion on reuse: repeated lookups end up reading
-        // nothing.
+        // This test pins promotion on reuse at any index size: repeated lookups
+        // end up reading nothing, as whole reads of a hot slice always did.
         let (local, root, terms, _store) = two_layer_checked_index().await;
-        let slow = SlowStorage::wrap(local, Duration::ZERO);
-        let cache = new_tier_chunk_cache();
-        let index = || {
-            ranged_index(&root, Arc::clone(&slow) as Arc<dyn StorageProvider>)
-                .with_promote(Promote::for_root(&root, None))
-                .with_tier_chunk_cache(Arc::clone(&cache))
-        };
-        let first = index();
-        assert_eq!(first.promote, Promote::Resident);
-        first
-            .runs_many(fid("body"), &[terms[0].as_str()])
-            .await
-            .expect("first");
-        assert_eq!(
-            slow.reads_of(SLICE_URI_FRAGMENT),
-            COLD_RANGED_READS * root.layers.len()
-        );
-        let second = index();
-        second
-            .runs_many(fid("body"), &[terms[0].as_str()])
-            .await
-            .expect("second");
-        promotions_settle(&cache).await;
-        let promoted = slow.reads_of(SLICE_URI_FRAGMENT);
-        assert_eq!(
-            promoted,
-            (COLD_RANGED_READS + WARM_RANGED_READS + 1) * root.layers.len(),
-            "one whole read per slice in the background"
-        );
-        let third = index()
-            .runs_many(fid("body"), &[terms[0].as_str()])
-            .await
-            .expect("third");
-        assert!(!third[0].is_empty());
-        assert_eq!(slow.reads_of(SLICE_URI_FRAGMENT), promoted, "no slice read");
-    }
-
-    #[test]
-    fn slices_read_by_range_are_kept_on_disk_or_where_the_whole_index_fits() {
-        // Roots whose slices total within the resident budget, past it, and of
-        // unknown size (a slice with no recorded length), each with and without
-        // a disk cache.
-        //  - with a disk cache, every slice read by range is promoted;
-        //  - without, a reused slice is promoted only when all slices fit the
-        //    budget.
-        // This test pins that without a disk cache, promotion never reads whole
-        // what cannot stay resident.
-        let root_of = |lens: &[u64]| Root {
-            layers: vec![Layer {
-                slices: lens
-                    .iter()
-                    .map(|&len| SliceRef {
-                        first_key: Vec::new(),
-                        last_key: Vec::new(),
-                        content_hash: ContentHash([0; 32]),
-                        tier: None,
-                        len,
-                        index_end: 0,
-                    })
-                    .collect(),
-                ..Layer::default()
+        let layers = root.layers.len();
+        let mut past_budget = root.clone();
+        past_budget.layers.push(Layer {
+            slices: vec![SliceRef {
+                first_key: vec![u8::MAX; 8],
+                last_key: vec![u8::MAX; 8],
+                content_hash: ContentHash([u8::MAX; 32]),
+                tier: None,
+                len: RESIDENT_SLICE_BUDGET_BYTES as u64,
+                index_end: 0,
             }],
-            ..Root::default()
-        };
-        let half = RESIDENT_SLICE_BUDGET_BYTES as u64 / 2;
-        let dir = TempDir::new().expect("cache dir");
-        let disk = MetadataDiskCache::new(dir.path().to_path_buf(), 4 * half, None).expect("cache");
-        for lens in [&[half, half][..], &[half; 9], &[1, 0]] {
+            ..Layer::default()
+        });
+        for (what, root) in [("as built", &root), ("past the budget", &past_budget)] {
+            let slow = SlowStorage::wrap(Arc::clone(&local), Duration::ZERO);
+            let cache = new_tier_chunk_cache();
+            let index = || {
+                let storage = Arc::clone(&slow) as Arc<dyn StorageProvider>;
+                TermIndex::new(root.clone(), String::new(), storage, None)
+                    .with_small_slice_bytes(NO_SMALL_SLICES)
+                    .with_tier_chunk_cache(Arc::clone(&cache))
+            };
+            index()
+                .runs_many(fid("body"), &[terms[0].as_str()])
+                .await
+                .expect("first");
             assert_eq!(
-                Promote::for_root(&root_of(lens), Some(&disk)),
-                Promote::Disk
+                slow.reads_of(SLICE_URI_FRAGMENT),
+                COLD_RANGED_READS * layers,
+                "{what}"
+            );
+            index()
+                .runs_many(fid("body"), &[terms[0].as_str()])
+                .await
+                .expect("second");
+            promotions_settle(&cache).await;
+            let promoted = slow.reads_of(SLICE_URI_FRAGMENT);
+            assert_eq!(
+                promoted,
+                (COLD_RANGED_READS + WARM_RANGED_READS + 1) * layers,
+                "{what}: one whole read per slice in the background"
+            );
+            let third = index()
+                .runs_many(fid("body"), &[terms[0].as_str()])
+                .await
+                .expect("third");
+            assert!(!third[0].is_empty(), "{what}");
+            assert_eq!(
+                slow.reads_of(SLICE_URI_FRAGMENT),
+                promoted,
+                "{what}: no slice read"
             );
         }
-        assert_eq!(
-            Promote::for_root(&root_of(&[half, half]), None),
-            Promote::Resident
-        );
-        assert_eq!(
-            Promote::for_root(&root_of(&[half, half, half]), None),
-            Promote::Never
-        );
-        assert_eq!(Promote::for_root(&root_of(&[1, 0]), None), Promote::Never);
     }
 
     #[tokio::test]
