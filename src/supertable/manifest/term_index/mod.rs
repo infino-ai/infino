@@ -3609,21 +3609,23 @@ impl TermIndex {
                 "slice block index ends past the slice".into(),
             ));
         }
-        let head = self.read_exact(hash, 0..index_end, budget).await?;
-        let header = SliceHeader::decode(&head)?;
-        let range = header
-            .index_range()
-            .filter(|range| range.end == index_end)
-            .ok_or_else(|| {
-                TermIndexError::Malformed("slice block index differs from the root's".into())
-            })?;
-        let index = Arc::new(SliceIndex::open(
-            &header,
-            &head[range.start as usize..range.end as usize],
-        )?);
-        // The index copied what it keeps. Drop the rest of the read: its permit
-        // is already returned, so it must not stay alive across the reads below.
-        drop(head);
+        let index = self
+            .read_exact(hash, 0..index_end, budget, |head| {
+                let header = SliceHeader::decode(head)?;
+                let range = header
+                    .index_range()
+                    .filter(|range| range.end == index_end)
+                    .ok_or_else(|| {
+                        TermIndexError::Malformed(
+                            "slice block index differs from the root's".into(),
+                        )
+                    })?;
+                Ok(Arc::new(SliceIndex::open(
+                    &header,
+                    &head[range.start as usize..range.end as usize],
+                )?))
+            })
+            .await?;
         let evicted = self
             .tier_chunks
             .lock()
@@ -3658,55 +3660,70 @@ impl TermIndex {
             .map(|(b, (range, terms))| (b, range, terms))
             .collect();
         let block_ranges: Vec<Range<u64>> = blocks.iter().map(|(_, r, _)| r.clone()).collect();
-        let block_bytes = self.read_merged(hash, &block_ranges, budget).await?;
+        let found = self
+            .read_merged(hash, &block_ranges, budget, |k, bytes| {
+                let (b, _, terms) = &blocks[k];
+                let block = index.block(*b, bytes)?;
+                terms
+                    .iter()
+                    .map(|&i| Ok((i, block.run_range(&keys[i])?)))
+                    .collect::<Result<Vec<_>, TermIndexError>>()
+            })
+            .await?;
         let mut runs = Vec::new();
-        for ((b, _, terms), bytes) in blocks.iter().zip(&block_bytes) {
-            let block = index.block(*b, bytes)?;
-            for &i in terms {
-                match block.run_range(&keys[i])? {
-                    None => out.push((i, None)),
-                    Some(range) => runs.push((i, range)),
-                }
+        for (i, range) in found.into_iter().flatten() {
+            match range {
+                None => out.push((i, None)),
+                Some(range) => runs.push((i, range)),
             }
         }
-        // Their permits are returned, so the blocks must not stay alive across
-        // the run reads.
-        drop(block_bytes);
         let run_ranges: Vec<Range<u64>> = runs.iter().map(|(_, r)| r.clone()).collect();
-        let run_bytes = self.read_merged(hash, &run_ranges, budget).await?;
-        for ((i, _), bytes) in runs.iter().zip(&run_bytes) {
-            out.push((*i, Some(index.decode_run(bytes)?)));
-        }
+        let decoded = self
+            .read_merged(hash, &run_ranges, budget, |_, bytes| {
+                index.decode_run(bytes)
+            })
+            .await?;
+        out.extend(
+            runs.iter()
+                .zip(decoded)
+                .map(|((i, _), run)| (*i, Some(run))),
+        );
         Ok(out)
     }
 
-    /// Bytes `range` of slice `hash` from the object store, holding their size
-    /// of `budget` while read. A short read is an error: the slice is shorter
-    /// than the root says.
-    async fn read_exact(
+    /// Reads bytes `range` of slice `hash` and returns `decode` of them, run
+    /// while the read still holds `budget`. A short read is an error: the
+    /// slice is shorter than the root says.
+    async fn read_exact<T>(
         &self,
         hash: &ContentHash,
         range: Range<u64>,
         budget: &FetchBudget,
-    ) -> Result<Bytes, TermIndexError> {
+        decode: impl FnOnce(&[u8]) -> Result<T, TermIndexError>,
+    ) -> Result<T, TermIndexError> {
         let len = range.end - range.start;
         let _reading = budget.hold(len).await;
-        let _turn = budget.request().await;
-        let bytes = self.storage.get_range(&slice_uri(hash), range).await?;
+        let bytes = {
+            let _turn = budget.request().await;
+            self.storage.get_range(&slice_uri(hash), range).await?
+        };
         match bytes.len() as u64 == len {
-            true => Ok(bytes),
+            true => decode(&bytes),
             false => Err(TermIndexError::Malformed("short slice read".into())),
         }
     }
 
-    /// `ranges` of slice `hash`, in order, nearby ones sharing a read (see
-    /// [`SLICE_READ_MERGE_GAP_BYTES`]).
-    async fn read_merged(
+    /// `decode` of each of `ranges` of slice `hash`, given the range's index
+    /// and bytes, in the order of `ranges`. Nearby ranges share one read (see
+    /// [`SLICE_READ_MERGE_GAP_BYTES`]); `decode` runs while that read holds
+    /// `budget`.
+    async fn read_merged<T>(
         &self,
         hash: &ContentHash,
         ranges: &[Range<u64>],
         budget: &FetchBudget,
-    ) -> Result<Vec<Bytes>, TermIndexError> {
+        decode: impl Fn(usize, &[u8]) -> Result<T, TermIndexError>,
+    ) -> Result<Vec<T>, TermIndexError> {
         let ranges: Vec<Range<usize>> = ranges
             .iter()
             .map(|r| r.start as usize..r.end as usize)
@@ -3716,13 +3733,30 @@ impl TermIndex {
             SLICE_READ_MERGE_GAP_BYTES,
             SLICE_READ_MERGE_OVERFETCH_BYTES,
         );
-        let fetched = try_join_all(
-            plan.fetch_ranges()
-                .iter()
-                .map(|r| self.read_exact(hash, r.start as u64..r.end as u64, budget)),
-        )
+        let decode = &decode;
+        let taken = try_join_all(plan.fetch_ranges().iter().zip(plan.members()).map(
+            |(fetch, members)| {
+                self.read_exact(
+                    hash,
+                    fetch.start as u64..fetch.end as u64,
+                    budget,
+                    move |bytes| {
+                        members
+                            .into_iter()
+                            .map(|(i, piece)| Ok((i, decode(i, &bytes[piece])?)))
+                            .collect::<Result<Vec<_>, TermIndexError>>()
+                    },
+                )
+            },
+        ))
         .await?;
-        Ok(plan.restore(&fetched))
+        let mut out: Vec<Option<T>> = (0..ranges.len()).map(|_| None).collect();
+        for (i, value) in taken.into_iter().flatten() {
+            out[i] = Some(value);
+        }
+        out.into_iter()
+            .collect::<Option<Vec<T>>>()
+            .ok_or_else(|| TermIndexError::Malformed("a merged slice read missed a range".into()))
     }
 
     /// Slice `hash` (`len` bytes, when known) read whole: from local disk when
@@ -9741,6 +9775,16 @@ mod tests {
 
     /// A lookup budget that fits a few of a test index's slice reads.
     const FEW_READS_BUDGET_BYTES: u32 = 4 * BATCH_SLICE_TARGET_BYTES as u32;
+    /// Terms in one slice: enough that its first, middle and last terms'
+    /// blocks and runs are too far apart to share a read.
+    const SEPARATED_TERMS: usize = 90_000;
+    /// The small-slice size the default lookup is meant to use, written out so
+    /// a test pins [`SMALL_SLICE_BYTES`] to it.
+    const PINNED_SMALL_SLICE_BYTES: u64 = 256 * 1024;
+    /// Terms in one slice just under [`PINNED_SMALL_SLICE_BYTES`].
+    const UNDER_SMALL_SLICE_TERMS: usize = 8_000;
+    /// Terms in one slice just over [`PINNED_SMALL_SLICE_BYTES`].
+    const OVER_SMALL_SLICE_TERMS: usize = 9_000;
 
     /// A provider that records, for slice reads: the most in flight at once,
     /// the most bytes they ask for together, and the most bytes that ranged
@@ -9760,6 +9804,12 @@ mod tests {
         /// Bytes of ranged reads returned and not yet dropped.
         live: Arc<AtomicU64>,
         most_held: AtomicU64,
+        /// The largest block or run read: any read not from the slice's start.
+        most_len_past_head: AtomicU64,
+        /// The most bytes held or in flight when a block or run read starts.
+        most_held_past_head: AtomicU64,
+        /// Block and run reads made.
+        reads_past_head: AtomicUsize,
     }
 
     /// The bytes of one ranged read, counted in [`WatchedReads::live`] until
@@ -9794,17 +9844,26 @@ mod tests {
                 most_bytes: AtomicU64::new(0),
                 live: Arc::new(AtomicU64::new(0)),
                 most_held: AtomicU64::new(0),
+                most_len_past_head: AtomicU64::new(0),
+                most_held_past_head: AtomicU64::new(0),
+                reads_past_head: AtomicUsize::new(0),
             })
         }
 
-        /// `read`, counted as one request of `len` bytes in flight while it runs.
-        async fn watch<T>(&self, len: u64, read: impl Future<Output = T>) -> T {
+        /// `read` of `len` bytes from `start`, counted as one request in
+        /// flight while it runs.
+        async fn watch<T>(&self, start: u64, len: u64, read: impl Future<Output = T>) -> T {
             let requests = self.requests.fetch_add(1, Ordering::SeqCst) + 1;
             self.most_requests.fetch_max(requests, Ordering::SeqCst);
             let bytes = self.bytes.fetch_add(len, Ordering::SeqCst) + len;
             self.most_bytes.fetch_max(bytes, Ordering::SeqCst);
             let held = bytes + self.live.load(Ordering::SeqCst);
             self.most_held.fetch_max(held, Ordering::SeqCst);
+            if start > 0 {
+                self.reads_past_head.fetch_add(1, Ordering::SeqCst);
+                self.most_len_past_head.fetch_max(len, Ordering::SeqCst);
+                self.most_held_past_head.fetch_max(held, Ordering::SeqCst);
+            }
             sleep(WATCHED_READ_HOLD).await;
             let out = read.await;
             self.requests.fetch_sub(1, Ordering::SeqCst);
@@ -9823,7 +9882,7 @@ mod tests {
                 return self.inner.get(uri).await;
             }
             let len = self.inner.head(uri).await?.size;
-            self.watch(len, self.inner.get(uri)).await
+            self.watch(0, len, self.inner.get(uri)).await
         }
         async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
             if !uri.contains(SLICE_URI_FRAGMENT) {
@@ -9831,7 +9890,9 @@ mod tests {
             }
             let start = range.start;
             let len = range.end - range.start;
-            let mut bytes = self.watch(len, self.inner.get_range(uri, range)).await?;
+            let mut bytes = self
+                .watch(start, len, self.inner.get_range(uri, range))
+                .await?;
             if self.spoil && start != 0 && !bytes.is_empty() {
                 self.spoiled.fetch_add(1, Ordering::SeqCst);
                 let mut spoiled = bytes.to_vec();
@@ -10200,6 +10261,54 @@ mod tests {
             .expect("lookup");
         }
         assert_eq!(slow.reads_of(SLICE_URI_FRAGMENT), root.layers.len());
+    }
+
+    #[tokio::test]
+    async fn a_default_lookup_reads_a_slice_whole_or_by_range_by_its_size() {
+        // Two one-slice indexes, one just under the small-slice size and one
+        // just over, looked up at the default settings with ranged reads
+        // failing on the small one and whole reads on the large one.
+        //  - both answer as whole reads do, and no fault fires: the small
+        //    slice is read whole, the large one by range.
+        // This test pins the size up to which a lookup reads a slice whole.
+        assert_eq!(SMALL_SLICE_BYTES, PINNED_SMALL_SLICE_BYTES);
+        for (n, refused) in [
+            (UNDER_SMALL_SLICE_TERMS, FaultOp::GetRange),
+            (OVER_SMALL_SLICE_TERMS, FaultOp::Get),
+        ] {
+            let (local, root, terms, _store) = one_slice_index(n).await;
+            let len = root.layers[0].slices[0].len;
+            let small = matches!(refused, FaultOp::GetRange);
+            assert_eq!(
+                len <= PINNED_SMALL_SLICE_BYTES,
+                small,
+                "a slice of {len} bytes"
+            );
+            let faults = FaultStorage::wrap(Arc::clone(&local));
+            faults.fail(refused, SLICE_URI_FRAGMENT, usize::MAX);
+            let asked = [terms[0].as_str(), terms[n - 1].as_str()];
+            let runs = TermIndex::new(
+                root.clone(),
+                String::new(),
+                Arc::clone(&faults) as Arc<dyn StorageProvider>,
+                None,
+            )
+            .with_promote(Promote::Never)
+            .runs_many(fid("body"), &asked)
+            .await
+            .expect("lookup");
+            assert_eq!(
+                faults.fired(),
+                0,
+                "a slice of {len} bytes read the other way"
+            );
+            let whole = TermIndex::new(root, String::new(), local, None)
+                .with_small_slice_bytes(u64::MAX)
+                .runs_many(fid("body"), &asked)
+                .await
+                .expect("whole");
+            assert_eq!(found(&runs), found(&whole));
+        }
     }
 
     #[tokio::test]
@@ -10575,6 +10684,61 @@ mod tests {
         assert!(
             most_held <= u64::from(FEW_READS_BUDGET_BYTES),
             "{most_held} bytes held or in flight"
+        );
+    }
+
+    /// An index of one checked slice of `n` terms, each in one superfile.
+    async fn one_slice_index(n: usize) -> (Arc<dyn StorageProvider>, Root, Vec<String>, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let terms: Vec<String> = (0..n).map(|i| format!("k{i:06}")).collect();
+        let rows: Vec<(&str, &str, u64)> = terms.iter().map(|t| ("body", t.as_str(), 2)).collect();
+        let store_dir = TempDir::new().expect("store dir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
+        let built = build(&[contribution(&dir, 1, &rows)], &BuildPolicy::default()).expect("build");
+        let root = built.root.clone();
+        write_built(&local, built).await.expect("write");
+        (local, root, terms, store_dir)
+    }
+
+    #[tokio::test]
+    async fn a_lookup_holds_each_ranged_read_within_its_budget_until_done_with_it() {
+        // One slice; its first, middle and last terms looked up, each read apart.
+        //  - first on a full budget, to learn the largest block or run read;
+        //  - then on a budget of just that, each read held open a moment;
+        //  - no block or run read starts while earlier reads pass the budget.
+        // This test pins that a read's bytes are freed with its budget.
+        let (local, root, terms, _store) = one_slice_index(SEPARATED_TERMS).await;
+        let slices: usize = root.layers.iter().map(|l| l.slices.len()).sum();
+        assert_eq!(slices, 1, "one slice");
+        let asked = [
+            terms[0].clone(),
+            terms[SEPARATED_TERMS / 2].clone(),
+            terms[SEPARATED_TERMS - 1].clone(),
+        ];
+        let watched = WatchedReads::wrap(Arc::clone(&local), false);
+        look_up_watched(&root, &local, &watched, &asked, SLICE_FETCH_BUDGET_BYTES, 1).await;
+        let largest = watched.most_len_past_head.load(Ordering::SeqCst);
+        let reads = watched.reads_past_head.load(Ordering::SeqCst);
+        assert_eq!(
+            reads,
+            2 * asked.len(),
+            "each term's block and run read apart"
+        );
+        let watched = WatchedReads::wrap(Arc::clone(&local), false);
+        look_up_watched(
+            &root,
+            &local,
+            &watched,
+            &asked,
+            u32::try_from(largest).expect("a read fits a budget"),
+            SLICE_REQUESTS_AT_ONCE,
+        )
+        .await;
+        let most_held = watched.most_held_past_head.load(Ordering::SeqCst);
+        assert!(
+            most_held <= largest,
+            "{most_held} bytes held or in flight on a budget of {largest}"
         );
     }
 
