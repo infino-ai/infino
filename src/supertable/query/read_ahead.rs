@@ -63,6 +63,13 @@
 //! are waited for, not downloaded again. Waiting for room instead would put
 //! the scan back to one GET at a time.
 //!
+//! A download that isn't kept is shared only while it runs. So while another
+//! scan reads the same file (the same query from several dashboard panels,
+//! say), no batch is downloaded past the cache: each scan reads its row groups
+//! itself, the scans reach them at about the same time, and they share those
+//! GETs. A batch read ahead by one would be over before the others got there,
+//! and each would download it again (see [`FileScan`]).
+//!
 //! When anything else on the connection needs memory the budget can't give, a
 //! join's build side say, read-ahead gives back everything it holds and stays
 //! off for the rest of the scan (see [`Reclaim`]). The scan then reads those
@@ -74,12 +81,12 @@
 //! are counted as usual, so `sql_page_bytes` is the same with or without it.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt, mem,
     ops::Range,
     panic::resume_unwind,
     sync::{
-        Arc, Mutex, MutexGuard, Once, OnceLock, PoisonError, Weak,
+        Arc, LazyLock, Mutex, MutexGuard, Once, OnceLock, PoisonError, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -295,7 +302,6 @@ impl ScanReadAhead {
     ) -> ReadAhead {
         ReadAhead {
             scan: Arc::clone(self),
-            file,
             meta,
             order: None,
             state: if self.is_enabled() {
@@ -306,6 +312,11 @@ impl ScanReadAhead {
             batches: Vec::new(),
             columns: BTreeSet::new(),
             read_in_order: 0,
+            file_scan: self
+                .store
+                .file_id(&file.object_meta.location)
+                .map(|id| FileScan::join(id, Arc::as_ptr(self) as usize)),
+            file,
         }
     }
 
@@ -718,6 +729,72 @@ pub(crate) struct ReadAhead {
     /// more row groups unread than this (at least
     /// [`READ_AHEAD_MIN_ROW_GROUPS`]).
     read_in_order: usize,
+    /// This reader's place among the scans reading its file, so a batch past
+    /// the cache can wait while another scan reads it. `None` if the store
+    /// has no source for the file.
+    file_scan: Option<FileScan>,
+}
+
+/// Scans reading each file right now: by [`SuperfileObjectStore::file_id`],
+/// each scan (by its [`ScanReadAhead`]'s address) with how many of its readers
+/// have the file open. Every query in the process shares it, since the scans
+/// that share a file's downloads are different queries'.
+///
+/// The file id is its byte source's address. That is safe while counted: a
+/// reader holds its scan, which holds the store, which holds the source, so
+/// no other file's source can take the address. One limit: if the reader
+/// cache evicts and reopens a file while a scan still reads it, the two scans
+/// hold different sources, don't see each other, and both read ahead past
+/// the cache as before.
+static FILE_SCANS: LazyLock<Mutex<HashMap<usize, HashMap<usize, usize>>>> =
+    LazyLock::new(Default::default);
+
+/// [`FILE_SCANS`], locked. A panic while it was held left the counts whole,
+/// since each change is one step, so a poisoned lock is used as is.
+fn file_scans() -> MutexGuard<'static, HashMap<usize, HashMap<usize, usize>>> {
+    FILE_SCANS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A reader's place in [`FILE_SCANS`], given up on drop.
+struct FileScan {
+    file: usize,
+    scan: usize,
+}
+
+impl FileScan {
+    fn join(file: usize, scan: usize) -> Self {
+        *file_scans()
+            .entry(file)
+            .or_default()
+            .entry(scan)
+            .or_default() += 1;
+        Self { file, scan }
+    }
+
+    /// Whether a scan other than this reader's reads the file.
+    fn shared(&self) -> bool {
+        file_scans()
+            .get(&self.file)
+            .is_some_and(|scans| scans.keys().any(|&scan| scan != self.scan))
+    }
+}
+
+impl Drop for FileScan {
+    fn drop(&mut self) {
+        let mut files = file_scans();
+        let Some(scans) = files.get_mut(&self.file) else {
+            return;
+        };
+        if let Some(readers) = scans.get_mut(&self.scan) {
+            *readers -= 1;
+            if *readers == 0 {
+                scans.remove(&self.scan);
+            }
+        }
+        if scans.is_empty() {
+            files.remove(&self.file);
+        }
+    }
 }
 
 impl AsyncFileReader for ReadAhead {
@@ -967,7 +1044,7 @@ impl ReadAhead {
     /// - It drops row groups from the end until the batch fits the reader's
     ///   cap, and starts nothing if the budget has no room. With no room under
     ///   the cache's write-behind cap, it still downloads, and nothing is
-    ///   kept.
+    ///   kept, unless another scan reads the file (see [`FileScan`]).
     /// - It does nothing until the scan has read from the newest batch, even
     ///   one done downloading. That is what lets the next batch grow by what
     ///   the scan read meanwhile.
@@ -1058,6 +1135,13 @@ impl ReadAhead {
             return;
         };
         let kept = room.is_some();
+        // A download past the cache is shared only while it runs: another scan
+        // of this file would get to these row groups after it ends and download
+        // them again. Each scan reads them itself instead, and they share those
+        // GETs.
+        if !kept && self.file_scan.as_ref().is_some_and(FileScan::shared) {
+            return;
+        }
         // Reserve what the cache downloads, not just the spans: a read of a
         // whole download is served as a slice of it, which keeps all of it in
         // memory. Past the cache that's just the spans' blocks.
@@ -1780,7 +1864,7 @@ mod tests {
             read_ahead::{
                 Batch, Held, MAX_READ_THROUGH_SPAN_BYTES, PAGE_READ_THROUGH_BYTES,
                 READ_AHEAD_BATCHES_IN_FLIGHT, READ_AHEAD_MIN_ROW_GROUPS, ReadAhead, ScanReadAhead,
-                Span, chunk_range, cut, download_bytes, fetch_spans,
+                Span, chunk_range, cut, download_bytes, fetch_spans, file_scans,
                 fixture::{
                     GROUPS, ROWS_PER_GROUP, Superfile, block_cached, long_file, schema, small_file,
                     wide_file,
@@ -2838,6 +2922,89 @@ mod tests {
         .await
         .expect("the scan's own reads are written");
         assert!(!local(2), "the batch was not written");
+    }
+
+    #[tokio::test]
+    async fn a_scan_cancelled_mid_read_leaves_no_count_for_its_file() {
+        // A scan's place among those reading its file is given back however
+        // it ends: here its read is cancelled while it downloads, then the
+        // reader is dropped. A count left behind would stop every later scan
+        // of the file from reading ahead past the cache.
+        let (_superfile, store, path, meta) = setup_slow();
+        let file = store.file_id(&path).expect("a source");
+        let scan = Arc::new(ScanReadAhead::new(
+            Arc::clone(&store),
+            ConnectionMemoryBudget::measured(),
+            schema(),
+        ));
+        let mut reader = reader_of(&scan, &path, &meta);
+        assert!(file_scans().contains_key(&file), "the open scan is counted");
+        let read = reader.get_byte_ranges(chunks(&meta, 0));
+        assert!(
+            timeout(Duration::ZERO, read).await.is_err(),
+            "the read was cancelled while it downloaded"
+        );
+        drop(reader);
+        assert!(!file_scans().contains_key(&file), "no count is left behind");
+    }
+
+    #[tokio::test]
+    async fn past_the_cache_a_batch_waits_while_another_scan_reads_the_file() {
+        // A real block cache with read-ahead's share of its write-behind cap
+        // used up, and two scans of one file:
+        //  - while the other scan has the file open, reading row groups 0 and
+        //    1 starts no batch: 2 is left to the scan, which can share its GET
+        //    with the other scan's;
+        //  - once the other scan is gone, reading 2 alone starts one past the
+        //    cache, for 3.
+        let (bytes, meta) = wide_file(WIDE_ROWS, WIDE_ROWS);
+        let superfile = Superfile::new(bytes, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_cache, source) = block_cached(&superfile, dir.path());
+        let mut taken = Vec::new();
+        let mut step = SHARE_FIRST_STEP_BYTES;
+        while step > 0 {
+            while let Some(room) = source.cache_room_ahead(step) {
+                taken.push(room);
+            }
+            step /= 2;
+        }
+        let path = ObjPath::from("t/sf.parquet");
+        let store = Arc::new(SuperfileObjectStore::from_sources(HashMap::from([(
+            path.clone(),
+            Arc::clone(&source),
+        )])));
+        let scan = || {
+            Arc::new(
+                ScanReadAhead::new(
+                    Arc::clone(&store),
+                    ConnectionMemoryBudget::measured(),
+                    schema(),
+                )
+                .with_reader_cap(two_row_groups_cap_for(&meta)),
+            )
+        };
+        let (mine, other) = (scan(), scan());
+        let mut reader = reader_of(&mine, &path, &meta);
+        let other_reader = reader_of(&other, &path, &meta);
+        read_row_groups(&mut reader, &meta, &[0, 1]).await;
+        settle(&reader).await;
+        assert!(
+            reader.batches.is_empty(),
+            "no batch while another scan reads"
+        );
+
+        drop(other_reader);
+        read_row_groups(&mut reader, &meta, &[2]).await;
+        settle(&reader).await;
+        assert!(
+            reader
+                .batches
+                .iter()
+                .any(|batch| batch.position(3).is_some()),
+            "alone again, it reads ahead past the cache"
+        );
+        assert!(touched(&superfile.reads(), &meta, 3));
     }
 
     #[tokio::test]

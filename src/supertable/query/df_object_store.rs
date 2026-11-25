@@ -172,6 +172,16 @@ impl SuperfileObjectStore {
                 .is_ok_and(|source| source.is_local(range.start, range.end - range.start))
     }
 
+    /// An id for the file at `location` that every query reading it shares:
+    /// the address of its byte source, which the reader cache shares between
+    /// the queries that have the file open. `None` if `location` has no
+    /// source.
+    pub(crate) fn file_id(&self, location: &ObjPath) -> Option<usize> {
+        self.source(location)
+            .ok()
+            .map(|source| Arc::as_ptr(&source) as *const () as usize)
+    }
+
     /// Whether no byte of `range` in `location` is local or being downloaded by
     /// another read. See [`LazyByteSource::is_untouched`]: `false` for a file
     /// whose source can't tell.
