@@ -23,7 +23,7 @@ use crate::{
     memory::ConnectionMemoryBudget,
     supertable::reader_cache::{
         block_source::BlockCachedSource,
-        disk::test_support::{Gate, cache_entry, tiny_superfile_bytes},
+        disk::test_support::{Gate, StallGuard, cache_entry, tiny_superfile_bytes},
     },
 };
 use crate::{
@@ -644,9 +644,10 @@ impl DiskCacheStore {
         }
     }
 
-    /// Starts a claimed writer on the shared runtime's blocking pool, which never shuts down. If
-    /// the OS refuses a thread, tokio keeps the writer queued to run once a thread exists, and
-    /// panics; the panic stops here, so it can't cut short the caller, and the claim stays.
+    /// Starts a claimed writer on the query runtime's blocking pool, which never shuts down.
+    /// If the OS refuses a thread, tokio keeps the writer queued and panics. The panic stops
+    /// here, since one caller is `BlockWriter`'s drop mid-unwind, where a second panic would
+    /// abort. The claim stays for the queued writer.
     fn start_block_writer(self: &Arc<Self>) {
         let store = Arc::clone(self);
         drop(catch_unwind(AssertUnwindSafe(|| {
@@ -659,9 +660,12 @@ impl DiskCacheStore {
     fn run_block_writes(self: Arc<Self>) {
         let writer = BlockWriter(self);
         loop {
-            // Taken before the job runs: a write queues its file's flush, which takes the lock.
+            // Let go of the lock before the job runs: a write queues its file's flush, which
+            // takes it again.
             let next = writer.0.lock_block_write_queue().next_job();
             let Some((kind, job)) = next else {
+                #[cfg(test)]
+                writer.0.writer_exit_stall.wait_while_held();
                 return;
             };
             let _flushing = matches!(kind, BlockJob::Flush).then(|| RunningFlush(&writer.0));
@@ -676,16 +680,22 @@ impl DiskCacheStore {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Takes `writers` of the store's block writers until the returned gate drops: each runs a
-    /// write that waits for it. Jobs queued after this wait for a writer; the held writes don't
-    /// count as running flushes.
+    /// Queues `writers` jobs of `kind` that block until the returned gate drops. Each holds a
+    /// writer once it starts, and a held flush counts as running.
     #[cfg(test)]
-    pub(crate) fn hold_block_writers(self: &Arc<Self>, writers: usize) -> Gate {
+    pub(crate) fn hold_block_writers(self: &Arc<Self>, kind: BlockJob, writers: usize) -> Gate {
         let gate = Gate::new();
         for _ in 0..writers {
-            self.submit_block_job(BlockJob::Write, Box::new(gate.waiter()));
+            self.submit_block_job(kind, Box::new(gate.waiter()));
         }
         gate
+    }
+
+    /// Holds every writer that finds the queue empty, before it counts itself out, until the
+    /// guard drops.
+    #[cfg(test)]
+    pub(crate) fn stall_writer_exits(&self) -> StallGuard<'_> {
+        self.writer_exit_stall.hold()
     }
 
     /// Gives back what admitting a run took, once the run is written or dropped.

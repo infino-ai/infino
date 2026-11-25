@@ -7,12 +7,13 @@
 
 use std::{env, process::Command};
 
-/// What the test harness prints when it ran one test and it passed.
+/// What the test harness prints when it ran one test and it passed. A wrong `path` runs no
+/// test and still exits 0, so the exit code alone proves nothing.
 const ONE_PASSED: &str = "1 passed";
 
 /// In the test process, reruns the test at `path` alone in a child process with `env_var` set,
 /// asserts it passed, and returns `false`; in the child, returns `true` so the test runs its body.
-/// `path` is the test's `module_path!()` path, crate first.
+/// `path` is `module_path!()` plus `::` and the test's name.
 pub(crate) fn in_child_process(path: &str, env_var: &str) -> bool {
     if env::var_os(env_var).is_some() {
         return true;

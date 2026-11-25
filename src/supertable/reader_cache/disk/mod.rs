@@ -25,6 +25,8 @@ use memmap2::Mmap;
 use thiserror::Error;
 use tokio::sync::{Notify, OnceCell, Semaphore};
 
+#[cfg(test)]
+use crate::supertable::reader_cache::disk::test_support::Stall;
 use crate::{
     storage::{StorageError, StorageProvider},
     superfile::reader::SuperfileReader,
@@ -80,15 +82,15 @@ pub(crate) enum BlockJob {
 }
 
 /// A store's queued block-file writes and index flushes, and how many writers run them. Writers
-/// run on the blocking pool, not the query runtime, whose workers a scan keeps busy for seconds
-/// while the disk idles.
+/// run on the query runtime's blocking pool, not on its workers, which a scan keeps busy for
+/// seconds while the disk idles.
 #[derive(Default)]
-pub(super) struct BlockWriteQueue {
-    pub(super) writes: VecDeque<BlockWrite>,
-    pub(super) flushes: VecDeque<BlockWrite>,
-    pub(super) writers: usize,
+struct BlockWriteQueue {
+    writes: VecDeque<BlockWrite>,
+    flushes: VecDeque<BlockWrite>,
+    writers: usize,
     /// Writers running a flush.
-    pub(super) running_flushes: usize,
+    running_flushes: usize,
 }
 
 /// Filename suffix for per-superfile sparse block-cache files.
@@ -479,6 +481,9 @@ pub struct DiskCacheStore {
     /// Block-file writes and index flushes not started yet, run by at most [`BLOCK_WRITERS`]
     /// writers.
     block_write_queue: Mutex<BlockWriteQueue>,
+    /// Where a test holds writers on their way out; see [`Self::stall_writer_exits`].
+    #[cfg(test)]
+    writer_exit_stall: Stall,
     /// Queued block-file writes not finished yet (index write included), and a wake-up when it
     /// reaches zero; see [`Self::block_writes_settled`].
     #[cfg(test)]
@@ -640,6 +645,8 @@ impl DiskCacheStore {
             write_behind_bytes: AtomicU64::new(0),
             ahead_bytes: AtomicU64::new(0),
             block_write_queue: Mutex::default(),
+            #[cfg(test)]
+            writer_exit_stall: Stall::default(),
             #[cfg(test)]
             block_writes: AtomicUsize::new(0),
             #[cfg(test)]
@@ -1123,6 +1130,55 @@ pub(crate) mod test_support {
         permit
     }
 
+    /// A point where a test holds threads until the guard drops.
+    #[derive(Default)]
+    pub(crate) struct Stall {
+        state: Mutex<StallState>,
+        resume: Condvar,
+    }
+
+    /// Whether a [`Stall`] holds, and how many wait there.
+    #[derive(Default)]
+    struct StallState {
+        on: bool,
+        waiting: usize,
+    }
+
+    impl Stall {
+        /// Holds whatever reaches the stall until the guard drops.
+        pub(crate) fn hold(&self) -> StallGuard<'_> {
+            self.state.lock().expect("stall poisoned").on = true;
+            StallGuard(self)
+        }
+
+        /// Blocks while the stall is held.
+        pub(crate) fn wait_while_held(&self) {
+            let mut state = self.state.lock().expect("stall poisoned");
+            state.waiting += 1;
+            while state.on {
+                state = self.resume.wait(state).expect("stall poisoned");
+            }
+            state.waiting -= 1;
+        }
+    }
+
+    /// Lets a [`Stall`] go on drop, even when an assert fails, so a failing test can't hang.
+    pub(crate) struct StallGuard<'a>(&'a Stall);
+
+    impl StallGuard<'_> {
+        /// How many wait at the stall now.
+        pub(crate) fn waiting(&self) -> usize {
+            self.0.state.lock().expect("stall poisoned").waiting
+        }
+    }
+
+    impl Drop for StallGuard<'_> {
+        fn drop(&mut self) {
+            self.0.state.lock().expect("stall poisoned").on = false;
+            self.0.resume.notify_all();
+        }
+    }
+
     /// How long [`wait_until`] waits before it fails.
     pub(crate) const WAIT_UNTIL_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -1134,7 +1190,7 @@ pub(crate) mod test_support {
             Self(Arc::new((Mutex::new(false), Condvar::new())))
         }
 
-        /// Blocks the calling thread until the gate drops.
+        /// Returns a closure that blocks its caller until the gate drops.
         pub(crate) fn waiter(&self) -> impl FnOnce() + Send + 'static {
             let gate = Arc::clone(&self.0);
             move || {

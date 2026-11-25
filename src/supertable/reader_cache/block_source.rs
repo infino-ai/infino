@@ -90,8 +90,9 @@
 //!   its own, and every run that lands before it starts shares it.
 //! - Each store runs at most [`BLOCK_WRITERS`] writes and flushes at once, so a
 //!   slow disk can't take the blocking threads a query needs.
-//! - A waiting write goes before a waiting flush, so slow fsyncs don't keep runs
-//!   waiting to land. One flush still runs at a time while writes wait.
+//! - A waiting write goes before a waiting flush, unless no flush runs, so slow
+//!   fsyncs don't keep runs waiting to land and flushes still progress. A write
+//!   that comes in while flushes run may still wait for one fsync to end.
 //! - Each store holds up to [`WRITE_BEHIND_CAP_BYTES`] of fetched runs not
 //!   written yet. Past that, a read still gets its bytes, but they are not
 //!   cached. A run bigger than the cap is still let in when nothing else is
@@ -111,8 +112,6 @@
 //! last reader, queued write or queued index flush lets go of it; the sparse file and its
 //! index stay on disk so a later generation can adopt them.
 
-#[cfg(test)]
-use std::sync::Condvar;
 use std::{
     any::Any,
     array,
@@ -144,6 +143,8 @@ use tokio::{select, sync::oneshot, task::JoinHandle, time::timeout};
 use tracing::Instrument;
 
 use super::disk::{ArcMmapOwner, BlockJob, DiskCacheStore, Reservation, unix_us};
+#[cfg(test)]
+use crate::supertable::reader_cache::disk::test_support::{Stall, StallGuard};
 use crate::{
     runtime_bridge::shared_io_runtime,
     storage::{StorageError, stuck_after},
@@ -323,7 +324,7 @@ pub(crate) struct BlockCachedSource {
     /// Set when blocks are marked filled after the last index write. A failed
     /// fsync sets it again, so the next flush retries.
     dirty: AtomicBool,
-    /// Set while an index flush runs; see [`Self::flush_index`].
+    /// Set while a flush pass runs; see [`Self::flush_once`].
     flushing: AtomicBool,
     /// Set while a flush is queued and not started; see [`Self::queue_flush`].
     flush_queued: AtomicBool,
@@ -1432,8 +1433,8 @@ impl BlockCachedSource {
         }
     }
 
-    /// Marks `[b0, b1]` filled and flags the index for the next
-    /// [`Self::flush_index`]. Returns the bytes of blocks newly marked (another
+    /// Marks `[b0, b1]` filled and flags the index for the next flush pass
+    /// ([`Self::flush_once`]). Returns the bytes of blocks newly marked (another
     /// fill may have marked some first). Their bytes must already be written.
     fn mark_filled(&self, size: u64, b0: u32, b1: u32) -> u64 {
         let mut filled = self.filled.lock().expect("filled bitmap mutex poisoned");
@@ -1483,8 +1484,8 @@ impl BlockCachedSource {
 
     /// One flush pass: fsyncs the block file, then saves the index of the blocks
     /// marked filled. Blocking; runs on a block writer, or in `Drop`.
-    /// - Returns `true` if it synced. Blocks marked during the fsync need one more
-    ///   pass.
+    /// - Returns `true` if it synced, so the caller runs one more pass for blocks
+    ///   marked during the fsync.
     /// - One pass runs per source at a time. A call that finds one running
     ///   returns `false`; the running pass covers its blocks.
     /// - A failed fsync leaves the blocks for the next flush, or for `Drop`.
@@ -2087,8 +2088,7 @@ impl BlockCachedSource {
     }
 
     /// Holds this source's block-file writes until the returned guard drops, so a
-    /// test can look at a run before it is written. The guard lets them go even
-    /// if an assert fails, so a failing test can't hang.
+    /// test can look at a run before it is written.
     #[cfg(test)]
     pub(crate) fn stall_writes(&self) -> StallGuard<'_> {
         self.write_stall.hold()
@@ -2218,63 +2218,6 @@ impl BlockCachedSource {
                 }
             }
         }
-    }
-}
-
-/// Where a test holds a source's writes or flushes; see
-/// [`BlockCachedSource::stall_writes`].
-#[cfg(test)]
-#[derive(Default)]
-struct Stall {
-    state: Mutex<StallState>,
-    resume: Condvar,
-}
-
-/// Whether a [`Stall`] holds, and how many wait there.
-#[cfg(test)]
-#[derive(Default)]
-struct StallState {
-    on: bool,
-    waiting: usize,
-}
-
-#[cfg(test)]
-impl Stall {
-    /// Holds whatever reaches the stall until the guard drops.
-    fn hold(&self) -> StallGuard<'_> {
-        self.state.lock().expect("stall poisoned").on = true;
-        StallGuard(self)
-    }
-
-    /// Blocks while the stall is held.
-    fn wait_while_held(&self) {
-        let mut state = self.state.lock().expect("stall poisoned");
-        state.waiting += 1;
-        while state.on {
-            state = self.resume.wait(state).expect("stall poisoned");
-        }
-        state.waiting -= 1;
-    }
-}
-
-/// Lets a [`Stall`] go on drop, even when an assert fails, so a failing test
-/// can't hang.
-#[cfg(test)]
-pub(crate) struct StallGuard<'a>(&'a Stall);
-
-#[cfg(test)]
-impl StallGuard<'_> {
-    /// How many wait at the stall now.
-    pub(crate) fn waiting(&self) -> usize {
-        self.0.state.lock().expect("stall poisoned").waiting
-    }
-}
-
-#[cfg(test)]
-impl Drop for StallGuard<'_> {
-    fn drop(&mut self) {
-        self.0.state.lock().expect("stall poisoned").on = false;
-        self.0.resume.notify_all();
     }
 }
 
@@ -5227,14 +5170,9 @@ mod tests {
         src: &Arc<BlockCachedSource>,
     ) -> [Gate; 3] {
         let b = CACHE_BLOCK_BYTES;
-        let others = store.hold_block_writers(BLOCK_WRITERS - 2);
+        let others = store.hold_block_writers(BlockJob::Write, BLOCK_WRITERS - 2);
         // A running flush, so the flush this write queues waits behind writes.
-        let running_flush = Gate::new();
-        drop(on_block_writer(
-            store,
-            BlockJob::Flush,
-            running_flush.waiter(),
-        ));
+        let running_flush = store.hold_block_writers(BlockJob::Flush, 1);
         let stall = src.stall_writes();
         let prefetch = tokio::spawn({
             let src = Arc::clone(src);
@@ -5243,7 +5181,7 @@ mod tests {
         wait_until(|| stall.waiting() == 1, "the write").await;
         // Queued while the write runs on the last writer: that writer takes it
         // next, ahead of the flush the write queues as it lands.
-        let last = store.hold_block_writers(1);
+        let last = store.hold_block_writers(BlockJob::Write, 1);
         drop(stall);
         prefetch.await.expect("prefetch task").expect("prefetch");
         assert_eq!(
@@ -6054,7 +5992,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
         // One writer left, so both writes below run on it, in order.
-        let others = store.hold_block_writers(BLOCK_WRITERS - 1);
+        let others = store.hold_block_writers(BlockJob::Write, BLOCK_WRITERS - 1);
         let failed = on_block_writer(&store, BlockJob::Write, || -> u32 {
             panic_any("a failing write")
         });
@@ -6068,28 +6006,54 @@ mod tests {
         store.block_writes_settled().await;
     }
 
-    /// Queues a flush and then a write behind the held writers, frees one
-    /// writer, and returns the order the two ran in on it.
-    async fn order_behind_one_freed_writer(flush_running: bool) -> Vec<&'static str> {
+    /// What another flush does while the ordering tests queue theirs.
+    enum FlushBefore {
+        /// Still running, on one of the held writers.
+        Running,
+        /// Ran and ended, so it must not count as running.
+        Finished,
+    }
+
+    /// A job queued while every writer is on its way out still runs.
+    /// - every writer finds the queue empty and waits before counting itself out.
+    /// - a write comes in: no writer is free to claim, so none starts.
+    /// - the writers count out: the first to see the write starts one for it.
+    /// This pins the re-check when a writer counts itself out.
+    #[tokio::test]
+    async fn a_job_queued_as_every_writer_exits_still_runs() {
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
-        let held = usize::from(flush_running);
-        let others = store.hold_block_writers(BLOCK_WRITERS - 1 - held);
-        let running_flush = flush_running.then(|| {
-            let gate = Gate::new();
-            drop(on_block_writer(&store, BlockJob::Flush, gate.waiter()));
-            gate
-        });
-        if !flush_running {
-            // Run one flush to the end first: a finished flush must not count
-            // as running.
-            let ended = on_block_writer(&store, BlockJob::Flush, || ());
-            timeout(NO_WAIT_DEADLINE, ended)
-                .await
-                .expect("ran")
-                .expect("no panic");
+        let exits = store.stall_writer_exits();
+        for _ in 0..BLOCK_WRITERS {
+            drop(on_block_writer(&store, BlockJob::Write, || ()));
         }
-        let freed = store.hold_block_writers(1);
+        wait_until(|| exits.waiting() == BLOCK_WRITERS, "every writer exiting").await;
+        let late = on_block_writer(&store, BlockJob::Write, || WRITE_RESULT);
+        drop(exits);
+
+        let late = timeout(NO_WAIT_DEADLINE, late).await.expect("ran");
+        assert_eq!(late.expect("no panic"), WRITE_RESULT);
+        store.block_writes_settled().await;
+    }
+
+    /// Queues a flush, then a write, frees one writer, and returns the order the
+    /// two ran in on it.
+    async fn order_behind_one_freed_writer(before: FlushBefore) -> Vec<&'static str> {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let others = store.hold_block_writers(BlockJob::Write, BLOCK_WRITERS - 2);
+        let third = match before {
+            FlushBefore::Running => store.hold_block_writers(BlockJob::Flush, 1),
+            FlushBefore::Finished => {
+                let ended = on_block_writer(&store, BlockJob::Flush, || ());
+                timeout(NO_WAIT_DEADLINE, ended)
+                    .await
+                    .expect("ran")
+                    .expect("no panic");
+                store.hold_block_writers(BlockJob::Write, 1)
+            }
+        };
+        let freed = store.hold_block_writers(BlockJob::Write, 1);
         let order = Arc::new(Mutex::new(Vec::new()));
         let record = |kind: BlockJob, name: &'static str| {
             let order = Arc::clone(&order);
@@ -6107,7 +6071,7 @@ mod tests {
                 .expect("ran")
                 .expect("no panic");
         }
-        drop((others, running_flush));
+        drop((others, third));
         store.block_writes_settled().await;
         order.lock().expect("order").clone()
     }
@@ -6117,7 +6081,7 @@ mod tests {
     #[tokio::test]
     async fn a_waiting_write_goes_before_a_waiting_flush() {
         assert_eq!(
-            order_behind_one_freed_writer(true).await,
+            order_behind_one_freed_writer(FlushBefore::Running).await,
             ["write", "flush"]
         );
     }
@@ -6128,7 +6092,7 @@ mod tests {
     #[tokio::test]
     async fn a_flush_runs_when_none_does_despite_waiting_writes() {
         assert_eq!(
-            order_behind_one_freed_writer(false).await,
+            order_behind_one_freed_writer(FlushBefore::Finished).await,
             ["flush", "write"]
         );
     }
@@ -6138,7 +6102,7 @@ mod tests {
     /// - another file's run lands; its flush queues behind waiting writes.
     /// - the busy file's fsync ends: the other file's flush runs before its next
     ///   pass.
-    /// So one busy file can't hold the flush slot while writes keep coming.
+    /// So one busy file can't keep other files' flushes waiting.
     #[tokio::test]
     async fn a_busy_files_next_pass_waits_behind_other_files_flushes() {
         let b = CACHE_BLOCK_BYTES;
@@ -6151,7 +6115,7 @@ mod tests {
         });
         let (busy_uri, _, busy) = counting_source(&busy_dir, &store, 2 * b as usize);
         let (other_uri, _, other) = counting_source(&other_dir, &store, b as usize);
-        let others = store.hold_block_writers(BLOCK_WRITERS - 2);
+        let others = store.hold_block_writers(BlockJob::Write, BLOCK_WRITERS - 2);
 
         // The busy file's flush waits in its fsync while its next run lands.
         let busy_fsync = busy.fsync_stall.hold();
@@ -6167,10 +6131,10 @@ mod tests {
             async move { other.prefetch(0, b, b, 1).await }
         });
         wait_until(|| other_write.waiting() == 1, "the other file's write").await;
-        let last = store.hold_block_writers(1);
+        let last = store.hold_block_writers(BlockJob::Write, 1);
         drop(other_write);
         landing.await.expect("prefetch task").expect("prefetch");
-        let waiting = store.hold_block_writers(1);
+        let waiting = store.hold_block_writers(BlockJob::Write, 1);
 
         let other_fsync = other.fsync_stall.hold();
         drop(busy_fsync);
