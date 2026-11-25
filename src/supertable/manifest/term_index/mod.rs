@@ -3763,7 +3763,13 @@ impl TermIndex {
         budget: &'b FetchBudget,
     ) -> Result<(Bytes, SemaphorePermit<'b>), TermIndexError> {
         let held = budget.hold(len.unwrap_or(SLICE_TARGET_BYTES as u64)).await;
-        let _turn = budget.whole().await;
+        // A small slice is one short request, so it goes as many at once as
+        // ranged reads do; eight at a time would cost a table of many small
+        // layers a wave of requests per eight slices.
+        let _turn = match len.is_some_and(|len| len <= self.small_slice_bytes) {
+            true => budget.request().await,
+            false => budget.whole().await,
+        };
         let from_disk = self.disk_cache.as_ref().is_some_and(|c| c.contains(hash));
         // Checked after the turn is taken: another lookup may have kept the
         // slice meanwhile, or be reading it from local disk, which this one
@@ -10712,11 +10718,15 @@ mod tests {
     async fn a_lookup_keeps_its_reads_in_flight_within_its_caps() {
         // Every term of a two-layer index looked up at once on the full byte
         // budget, on storage that holds each read open a moment: by range with
-        // a cap of a few requests, then through a root without index ends,
-        // whose many slices are read whole.
+        // a cap of a few requests; through a root without index ends, whose
+        // many slices are read whole; and with every slice small enough to be
+        // read whole in one request.
         //  - ranged requests in flight stay within their cap, and overlap;
-        //  - whole reads in flight stay within theirs, and overlap.
-        // This test pins both caps, which the byte budget alone would not hold.
+        //  - whole reads in flight stay within theirs, and overlap;
+        //  - small slices go more at once than whole reads: they take request
+        //    turns.
+        // This test pins both caps, which the byte budget alone would not hold,
+        // and that small slices are not held to the whole-read cap.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let watched = WatchedReads::wrap(Arc::clone(&local), false);
         let requests = 3;
@@ -10760,6 +10770,21 @@ mod tests {
             (2..=WHOLE_SLICES_AT_ONCE).contains(&most),
             "{most} whole reads in flight"
         );
+        let watched = WatchedReads::wrap(Arc::clone(&local), false);
+        let asked: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let small = ranged_index(&root, Arc::clone(&watched) as Arc<dyn StorageProvider>)
+            .with_small_slice_bytes(u64::MAX)
+            .runs_many(fid("body"), &asked)
+            .await
+            .expect("small slices");
+        let whole = TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None)
+            .with_small_slice_bytes(u64::MAX)
+            .runs_many(fid("body"), &asked)
+            .await
+            .expect("whole");
+        assert_eq!(found(&small), found(&whole));
+        let most = watched.most_requests.load(Ordering::SeqCst);
+        assert!(most > WHOLE_SLICES_AT_ONCE, "{most} small slices in flight");
     }
 
     #[tokio::test]
