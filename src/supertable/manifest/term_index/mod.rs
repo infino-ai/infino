@@ -119,8 +119,9 @@ use crate::{
 /// superfile data and manifest-parts prefixes.
 pub(crate) const STORAGE_PREFIX: &str = "term-index/";
 
-/// Bytes of slices kept resident per table, whole or as block indexes, least recently used first
-/// out: about 64 whole slices, or the block indexes of thousands.
+/// Bytes of slices kept resident per table, whole or as block indexes,
+/// least recently used first out: about 64 whole slices, or the block
+/// indexes of thousands.
 const RESIDENT_SLICE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Most bytes one ranged read of a tier takes: a term's chunks lie back to
@@ -151,44 +152,50 @@ const REASSOCIATION_ULPS_PER_TERM: f32 = 2.0;
 /// count bound, not a byte budget.
 const RESIDENT_RUNS: usize = 4096;
 
-/// Whole slices one batched lookup reads at once, from local disk or the object store: each is
-/// hashed whole on a blocking thread and held until its terms are decoded.
+/// Whole slices one batched lookup reads at once, from local disk or the
+/// object store. Each is hashed on a blocking thread and held until its
+/// terms are decoded.
 const WHOLE_SLICES_AT_ONCE: usize = 8;
 
-/// Room left per whole slice over the target size: the cut counts runs and dictionary only, so a
-/// finished slice ends a little over it with its header, block index and checks.
+/// Room per whole slice beyond the target size: a build cuts a slice by its
+/// runs and dictionary alone, so its header, block index and checks take it
+/// a little over.
 const SLICE_OVERSHOOT_BYTES: usize = SLICE_TARGET_BYTES / 8;
 
-/// Slice bytes one batched lookup has in flight at once: a piece from its read until it lands, a
-/// whole slice until its terms are decoded.
+/// Slice bytes one batched lookup holds at once: a piece from its read until
+/// it lands, a whole slice until its terms are decoded.
 const SLICE_FETCH_BUDGET_BYTES: u32 =
     (WHOLE_SLICES_AT_ONCE * (SLICE_TARGET_BYTES + SLICE_OVERSHOOT_BYTES)) as u32;
 
-/// Ranged object store requests one batched lookup has in flight at once. A slice's pieces are
-/// small, so the byte budget alone would let thousands out together.
+/// Ranged object store requests one batched lookup has in flight at once.
+/// Pieces are small, so the byte budget alone would allow thousands.
 const SLICE_REQUESTS_AT_ONCE: usize = 64;
 
-/// Slices one table's index reads whole in the background at once, after reading them by range,
-/// to keep them resident and on local disk: as many as one lookup reads whole at once.
+/// Slices one table reads whole at once in the background, after reading
+/// them by range, to keep them resident and on local disk. As many as one
+/// lookup reads whole at once.
 const SLICE_PROMOTION_CONCURRENCY: usize = WHOLE_SLICES_AT_ONCE;
 
-/// Slices one batched lookup works on at once: a slice read by range holds a few small pieces, so
-/// far more fit than whole slices; [`FetchBudget`] bounds what they read.
+/// Slices one batched lookup works on at once. A slice read by range holds
+/// a few small pieces, so far more fit than whole slices; [`FetchBudget`]
+/// bounds what they read.
 const SLICE_LOOKUP_CONCURRENCY: usize = 64;
 
-/// A checked slice this small is read whole, in one request: its header and block index alone
-/// would take a request, and its blocks and runs one or two more.
+/// A checked slice this small is read whole, in one request. By range it
+/// would take one request for its header and block index, and one or two
+/// more for its blocks and runs.
 const SMALL_SLICE_BYTES: u64 = 256 * 1024;
 
-/// Slices remembered as read whole (their pieces failed their checks), or as not to promote, at
-/// 32 bytes each.
+/// Most slices remembered in each of `read_whole` and `unpromotable`
+/// ([`TierChunks`]), at 32 bytes each.
 const READ_WHOLE_SLICES: usize = 1 << 16;
 
-/// Largest gap between two pieces of one slice that one read spans: reading 256 KiB more costs less
-/// than the first byte of another request, so neighbouring terms share a read.
+/// Largest gap between two pieces of a slice that one read spans. Reading
+/// 256 KiB more costs less than the first byte of another request, so
+/// neighbouring terms share a read.
 const SLICE_READ_MERGE_GAP_BYTES: usize = 256 * 1024;
 
-/// Most bytes one merged ranged read of a slice fetches beyond the pieces it serves.
+/// Most bytes a merged read of a slice fetches beyond the pieces it serves.
 const SLICE_READ_MERGE_OVERFETCH_BYTES: usize = 1024 * 1024;
 
 /// Objects a merge downloads at once. A rebuild at a billion documents
@@ -441,37 +448,41 @@ impl TierChunkData {
     }
 }
 
-/// What a table's term index keeps resident: tier chunks, head levels and slices (whole or as block
-/// indexes), content-addressed, so shared across the roots a table goes through. A std mutex: nothing
-/// awaits while it is held, and a tokio one queues every lookup of a busy table behind the scheduler.
+/// What a table's term index keeps resident: tier chunks, head levels and
+/// slices (whole or as block indexes). All are content-addressed, so the
+/// cache is shared across the roots a table goes through. A std mutex:
+/// nothing awaits while it is held, and a tokio one would queue every lookup
+/// of a busy table behind the scheduler.
 pub(crate) type TierChunkCache = Arc<Mutex<TierChunks>>;
 
-/// The term index's resident objects. Tier chunks a read in flight is about to put here count as
-/// resident: a query of a term whose chunks another query is reading waits for that read rather
-/// than overlapping its opens.
+/// The term index's resident objects. Tier chunks a read in flight is about
+/// to put here count as resident: a query of a term whose chunks another
+/// query is reading waits for that read rather than overlapping its opens.
 pub(crate) struct TierChunks {
     resident: Resident<(ContentHash, u64), Arc<TierChunkData>>,
     in_flight: HashSet<(ContentHash, u64)>,
     /// Decoded head levels, keyed by object and the level's offset in it.
     head_levels: Resident<(ContentHash, u64), Arc<Vec<LevelBlock>>>,
-    /// Slices by content hash, each whole or as its block index, under one byte budget and kept
-    /// across roots, as tier chunks and head levels are.
+    /// Slices by content hash, each whole or as its block index, under one
+    /// byte budget. Kept across roots, like tier chunks and head levels.
     slices: Resident<ContentHash, ResidentSlice>,
-    /// Checked slices read whole from now on, never by range: their pieces failed their checks.
-    /// Kept apart from `slices`, so a slice evicted from there is not tried by range again.
+    /// Checked slices to read whole from now on, because a piece failed its
+    /// check. Kept apart from `slices`, so eviction there does not bring back
+    /// ranged reads.
     read_whole: Resident<ContentHash, ()>,
     /// Slices being read whole in the background after a read by range.
     promotions: Arc<Promotions>,
-    /// Slices whose whole copy failed its hash or is larger than the whole disk cache, so a later
-    /// read by range does not read it whole again.
+    /// Slices whose whole copy failed its hash or is larger than the whole
+    /// disk cache, so later ranged reads do not promote them again.
     unpromotable: Resident<ContentHash, ()>,
-    /// Slices a lookup is reading whole from local disk, each with what wakes the lookups waiting
-    /// on that read instead of reading it again.
+    /// Slices a lookup is reading whole from local disk, each with the notify
+    /// that wakes lookups waiting on that read instead of reading it again.
     disk_reads: HashMap<ContentHash, Arc<Notify>>,
 }
 
-/// One lookup's whole read of a slice from local disk. Dropped, read or not (an error, a panic, a
-/// cancelled lookup), it wakes the lookups waiting on it, which find the slice kept or read it.
+/// One lookup's whole read of a slice from local disk. On drop, finished or
+/// not (an error, a panic, a cancelled lookup), it wakes the lookups waiting
+/// on it; each then finds the slice kept, or reads it itself.
 struct DiskRead {
     tier_chunks: TierChunkCache,
     hash: ContentHash,
@@ -479,7 +490,8 @@ struct DiskRead {
 }
 
 impl DiskRead {
-    /// Registers a whole read of `hash` from local disk in `chunks`, the set `tier_chunks` guards.
+    /// Register a whole read of `hash` from local disk in `chunks`, the set
+    /// `tier_chunks` guards.
     fn begin(chunks: &mut TierChunks, tier_chunks: &TierChunkCache, hash: ContentHash) -> Self {
         let done = Arc::new(Notify::new());
         chunks.disk_reads.insert(hash, Arc::clone(&done));
@@ -494,7 +506,7 @@ impl DiskRead {
 
 impl Drop for DiskRead {
     fn drop(&mut self) {
-        // Only this read put its entry there, and nothing replaces it while it stands.
+        // This read's own entry: nothing replaces it while the read stands.
         let mut chunks = self
             .tier_chunks
             .lock()
@@ -510,12 +522,14 @@ impl Drop for DiskRead {
 enum ResidentSlice {
     /// The whole slice, read and hash-checked.
     Whole(Bytes),
-    /// A checked slice's block index: a lookup reads only the term's block and run.
+    /// A checked slice's block index; a lookup then reads only the term's
+    /// block and run.
     Index(Arc<SliceIndex>),
 }
 
-/// What the root records of a slice a lookup reads: its byte length, and where a checked slice's
-/// header and block index end; `None` where the root records neither.
+/// What the root records of a slice: its length, and where a checked
+/// slice's header and block index end. Each is `None` when the root does not
+/// record it.
 #[derive(Debug, Clone, Copy)]
 struct SliceSpan {
     len: Option<u64>,
@@ -544,9 +558,10 @@ fn runs_in(
         .collect()
 }
 
-/// What one batched lookup has in flight: slice bytes, ranged requests and whole slice reads. A
-/// read takes its bytes first and its turn second, and waits on nothing but its read while holding
-/// a turn, so nothing deadlocks.
+/// Limits on what one batched lookup has in flight: slice bytes, ranged
+/// requests and whole slice reads. A read takes its bytes first and its turn
+/// second, and while holding a turn waits only on its own read, so the
+/// limits cannot deadlock.
 struct FetchBudget {
     bytes: Semaphore,
     most_bytes: u32,
@@ -564,7 +579,7 @@ impl FetchBudget {
         }
     }
 
-    /// Hold `len` bytes of the budget, or all of it for a read larger than the whole.
+    /// Hold `len` bytes of the budget, or all of it for a larger read.
     async fn hold(&self, len: u64) -> SemaphorePermit<'_> {
         let permits = len.clamp(1, u64::from(self.most_bytes)) as u32;
         self.bytes
@@ -590,20 +605,22 @@ impl FetchBudget {
     }
 }
 
-/// Which slices read by range are read whole in the background, off the query path, and kept
-/// resident as a whole read keeps them.
+/// Which slices read by range are then read whole in the background, off
+/// the query path, and kept as a whole read keeps them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Promote {
-    /// A disk cache is attached: every one, written to disk too, as a whole read writes it.
+    /// A disk cache is attached: every slice, also written to disk.
     Disk,
-    /// No disk cache, and every slice fits the resident budget: one reused by range.
+    /// No disk cache, and all slices fit the resident budget: a slice read by
+    /// range again while its block index is resident.
     Resident,
-    /// No disk cache, and the slices outgrow the resident budget: read by range only.
+    /// No disk cache, and the slices outgrow the resident budget: none.
     Never,
 }
 
 impl Promote {
-    /// The rule for `root`'s slices, `disk_cache` the table's manifest disk cache.
+    /// The rule for `root`'s slices, given the table's manifest `disk_cache`.
+    /// A slice of unknown length counts as not fitting.
     fn for_root(root: &Root, disk_cache: Option<&Arc<MetadataDiskCache>>) -> Self {
         if disk_cache.is_some() {
             return Self::Disk;
@@ -629,14 +646,16 @@ struct Promotions {
     permits: Semaphore,
 }
 
-/// Slices waiting for or in a background whole read, with their bytes.
+/// Slices queued for, or in, a background whole read: each one's length,
+/// and their total.
 #[derive(Debug, Default)]
 struct Queued {
     slices: HashMap<ContentHash, u64>,
     bytes: u64,
 }
 
-/// A slice's place in [`Promotions::queued`], given up when its read ends or is dropped.
+/// A slice's place in [`Promotions::queued`], given up on drop: when its
+/// read ends or is cancelled.
 struct Promoting {
     promotions: Arc<Promotions>,
     hash: ContentHash,
@@ -2942,8 +2961,9 @@ pub(crate) fn postings_of(runs: &[SliceRun]) -> impl Iterator<Item = &Posting> {
     runs.iter().flat_map(|r| r.run.postings.iter())
 }
 
-/// The resident half of the index, plus the slices it keeps in its tier chunk cache, whole or as
-/// block indexes; slices are immutable and content-addressed, so nothing kept goes stale.
+/// The resident half of the index, plus the slices kept in its tier chunk
+/// cache, whole or as block indexes. Slices are immutable and
+/// content-addressed, so nothing kept goes stale.
 pub(crate) struct TermIndex {
     root: Root,
     /// The root's storage URI — the identity a manifest pins, and what a
@@ -3011,7 +3031,8 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone> Resident<K, V> {
         Some(value.clone())
     }
 
-    /// Insert `value` for `key`, in place of what `key` held, returning what it pushed out.
+    /// Insert `value` for `key`, replacing what `key` held, and return every
+    /// value that left the set.
     fn replace(&mut self, key: K, value: V) -> Vec<V> {
         let mut gone: Vec<V> = self.remove(&key).into_iter().collect();
         gone.extend(self.insert(key, value));
@@ -3026,8 +3047,9 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone> Resident<K, V> {
         Some(gone)
     }
 
-    /// Insert unless resident, evicting least recently used until it fits. Returns the evicted
-    /// values, for a caller holding a lock over the set to free after letting go of it.
+    /// Insert unless resident, evicting least recently used until it fits.
+    /// Returns the evicted values, so a caller holding a lock over the set can
+    /// free them after releasing it.
     fn insert(&mut self, key: K, value: V) -> Vec<V> {
         let mut evicted = Vec::new();
         if self.map.contains_key(&key) {
@@ -3097,32 +3119,32 @@ impl TermIndex {
         }
     }
 
-    /// This index reading checked slices up to `bytes` whole, so a test's small slices can be
-    /// read by range.
+    /// This index reading checked slices up to `bytes` whole, so a test's
+    /// small slices can be read by range.
     #[cfg(test)]
     fn with_small_slice_bytes(mut self, bytes: u64) -> Self {
         self.small_slice_bytes = bytes;
         self
     }
 
-    /// This index's batched lookups having `bytes` in flight at most, so a test reaches a full
-    /// budget with small slices.
+    /// This index's lookups holding at most `bytes` at once, so a test fills
+    /// the budget with small slices.
     #[cfg(test)]
     fn with_fetch_budget_bytes(mut self, bytes: u32) -> Self {
         self.fetch_budget_bytes = bytes;
         self
     }
 
-    /// This index's batched lookups having `reads` slice reads in flight at most, so a test reaches
-    /// the cap with few slices.
+    /// This index's lookups having at most `reads` ranged requests in flight,
+    /// so a test reaches the cap with few slices.
     #[cfg(test)]
     fn with_requests_at_once(mut self, reads: usize) -> Self {
         self.requests_at_once = reads;
         self
     }
 
-    /// This index keeping slices read by range as `promote` says, whatever its size and cache, so
-    /// a test can count a lookup's reads without background ones.
+    /// This index promoting as `promote` says, whatever its size and cache,
+    /// so a test can count a lookup's reads without background ones.
     #[cfg(test)]
     fn with_promote(mut self, promote: Promote) -> Self {
         self.promote = promote;
@@ -3482,11 +3504,13 @@ impl TermIndex {
         self.root.superfiles.get(ordinal as usize).copied()
     }
 
-    /// The runs of `keys[i]` for each of `wanted` in slice `hash` (`span` in the root): resident
-    /// first, then whole from local disk when there; else by range from the object store (header
-    /// and block index, kept; blocks; runs), the whole slice kept later as [`Promote`] says. An
-    /// older layout, a small slice or one that failed its checks reads whole; a storage error
-    /// falls back to one whole read without marking the slice.
+    /// The runs of `keys[i]` for each of `wanted` in slice `hash`, whose root
+    /// entry is `span`. A slice resident whole, or on local disk, is read
+    /// whole. Otherwise a checked slice is read by range from the object store
+    /// (header and block index, kept; then blocks; then runs), and later read
+    /// whole in the background as [`Promote`] says. An older layout or a small
+    /// slice is read whole. A slice failing its checks is read whole from then
+    /// on; a storage error falls back to one whole read and marks nothing.
     async fn slice_runs(
         &self,
         hash: &ContentHash,
@@ -3538,8 +3562,8 @@ impl TermIndex {
         runs_in(&bytes, keys, wanted)
     }
 
-    /// One ranged read of slice `hash`'s terms: through its resident block index, else from its
-    /// first read.
+    /// Read slice `hash`'s terms by range, through its resident block index
+    /// or, without one, a first read of the slice.
     async fn ranged_attempt(
         &self,
         hash: &ContentHash,
@@ -3568,8 +3592,9 @@ impl TermIndex {
         }
     }
 
-    /// [`Self::slice_runs`] for checked slice `hash` with nothing resident: its first `index_end`
-    /// bytes, its block index kept, then its terms by range.
+    /// [`Self::slice_runs`] for checked slice `hash` with nothing resident:
+    /// read its first `index_end` bytes, keep its block index, then read its
+    /// terms by range.
     async fn first_read_runs(
         &self,
         hash: &ContentHash,
@@ -3596,8 +3621,8 @@ impl TermIndex {
             &header,
             &head[range.start as usize..range.end as usize],
         )?);
-        // The index copied what it keeps; the rest of the read, its permit already returned, must
-        // not stay alive across the ranged reads below.
+        // The index copied what it keeps. Drop the rest of the read: its permit
+        // is already returned, so it must not stay alive across the reads below.
         drop(head);
         let evicted = self
             .tier_chunks
@@ -3609,8 +3634,9 @@ impl TermIndex {
         self.ranged_runs(hash, &index, keys, wanted, budget).await
     }
 
-    /// The runs of `keys[i]` for each of `wanted` in slice `hash`, whose block `index` is at
-    /// hand: the terms' blocks, then their runs, each read once, nearby ones sharing a request.
+    /// The runs of `keys[i]` for each of `wanted` in slice `hash`, given its
+    /// block `index`: the terms' blocks, then their runs, each read once and
+    /// nearby ones sharing a request.
     async fn ranged_runs(
         &self,
         hash: &ContentHash,
@@ -3643,7 +3669,8 @@ impl TermIndex {
                 }
             }
         }
-        // Their permits are returned: the blocks must not stay alive across the run reads.
+        // Their permits are returned, so the blocks must not stay alive across
+        // the run reads.
         drop(block_bytes);
         let run_ranges: Vec<Range<u64>> = runs.iter().map(|(_, r)| r.clone()).collect();
         let run_bytes = self.read_merged(hash, &run_ranges, budget).await?;
@@ -3653,8 +3680,9 @@ impl TermIndex {
         Ok(out)
     }
 
-    /// Bytes `range` of slice `hash` from the object store, exactly, holding their size of `budget`
-    /// while read. A short read is a slice shorter than the root says.
+    /// Bytes `range` of slice `hash` from the object store, holding their size
+    /// of `budget` while read. A short read is an error: the slice is shorter
+    /// than the root says.
     async fn read_exact(
         &self,
         hash: &ContentHash,
@@ -3697,9 +3725,10 @@ impl TermIndex {
         Ok(plan.restore(&fetched))
     }
 
-    /// Slice `hash` (`len` bytes, when known) whole: from local disk when there, else from the
-    /// object store and written there, its hash checked; kept resident. Holds its size of `budget`
-    /// until the caller drops the permit.
+    /// Slice `hash` (`len` bytes, when known) read whole: from local disk when
+    /// there, else from the object store and written to the disk cache, its
+    /// hash checked; then kept resident. Holds its size of `budget` until the
+    /// caller drops the returned permit.
     async fn whole_slice<'b>(
         &self,
         hash: &ContentHash,
@@ -3709,8 +3738,9 @@ impl TermIndex {
         let held = budget.hold(len.unwrap_or(SLICE_TARGET_BYTES as u64)).await;
         let _turn = budget.whole().await;
         let from_disk = self.disk_cache.as_ref().is_some_and(|c| c.contains(hash));
-        // Looked up once the turn is taken: another lookup may have kept the slice meanwhile, or be
-        // reading it from local disk, which this one waits for rather than reads again.
+        // Checked after the turn is taken: another lookup may have kept the
+        // slice meanwhile, or be reading it from local disk, which this one
+        // waits for rather than reading it again.
         let _reading = loop {
             let done = {
                 let mut chunks = self.tier_chunks.lock().expect("tier chunk cache lock");
@@ -3727,7 +3757,8 @@ impl TermIndex {
             };
             let mut woken = pin!(done.notified());
             woken.as_mut().enable();
-            // Waited on only while that read is still the one in flight: a later read is another.
+            // Wait only if that read is still in flight: one that ended before
+            // this waiter registered has already sent its wake-up.
             let reading = (self.tier_chunks.lock().expect("tier chunk cache lock"))
                 .disk_reads
                 .get(hash)
@@ -3744,25 +3775,27 @@ impl TermIndex {
         )
         .await?;
         let mut chunks = self.tier_chunks.lock().expect("tier chunk cache lock");
-        // Another lookup may have kept the slice while this one read it: its copy stays, and this
-        // one is dropped now rather than held through the decode.
+        // Another lookup may have kept the slice while this one read it: keep
+        // that copy and drop this one now, rather than hold both through the
+        // decode.
         if let Some(ResidentSlice::Whole(kept)) = chunks.slices.get(hash) {
             return Ok((kept, held));
         }
         let evicted = chunks
             .slices
             .replace(*hash, ResidentSlice::Whole(bytes.clone()));
-        // Freed once the lock is let go, so no lookup waits on the free of a slice.
+        // Free evicted slices after releasing the lock, so no lookup waits on it.
         drop(chunks);
         drop(evicted);
         Ok((bytes, held))
     }
 
-    /// Slice `hash` of `len` bytes, just read by range (`reused`: its block index was resident), read
-    /// whole in the background as [`Promote`] says and kept resident, never holding up the lookup.
-    /// Skipped while a read of it is queued, when the queue would pass what the disk cache or the
-    /// resident set can keep, whichever is larger, or after one failed its hash or could never fit
-    /// on disk.
+    /// After slice `hash` (`len` bytes) is read by range, start a background
+    /// whole read of it as [`Promote`] says and keep the result resident; the
+    /// lookup never waits for it. `reused` says its block index was resident.
+    /// Skipped when a read of it is already queued, when the queue would pass
+    /// the larger of the disk cache and the resident budget, or when an
+    /// earlier whole read failed its hash or could never fit on disk.
     async fn promote_slice(&self, hash: &ContentHash, len: Option<u64>, reused: bool) {
         let wanted = match self.promote {
             Promote::Disk => !self.disk_cache.as_ref().is_some_and(|c| c.contains(hash)),
@@ -3815,8 +3848,9 @@ impl TermIndex {
                 &hash,
             )
             .await;
-            // A storage error, or a disk cache momentarily full, leaves the slice to a later read; a
-            // slice failing its hash, or one larger than the whole disk cache, would fail again.
+            // A storage error or a briefly full disk cache leaves the slice to a
+            // later read. A slice failing its hash, or larger than the whole disk
+            // cache, would fail again, so it is marked unpromotable.
             let mut chunks = tier_chunks.lock().expect("tier chunk cache lock");
             let unkept = match read {
                 Ok(bytes) => {
@@ -5633,15 +5667,14 @@ mod tests {
 
     #[test]
     fn a_root_mixing_old_and_checked_layers_answers_from_every_layer() {
-        // Two layers this engine commits (checked slices, read by range), then a layer whose
-        // slice has the layout before checks and one whose slice has the layout before tiers
-        // (both read whole), as a table upgraded mid-life holds; the root records the old slices'
-        // lengths or, as roots before lengths did, not; checked slices are read by range, or
-        // whole as small slices are.
-        //  - every lookup answers from all four layers, the oldest one's bound marked as its
-        //    layout's;
+        // A root of four layers, as a table upgraded mid-life holds: two of
+        // checked slices, one of a slice before checks and one of a slice
+        // before tiers. Run with and without the old slices' lengths recorded,
+        // and with the checked slices read by range or whole as small slices.
+        //  - every lookup answers from all four layers, the pre-tier one's
+        //    bound marked as a legacy bound;
         //  - every answer equals the one whole-slice reads give.
-        // This test pins that older layers keep answering beside checked ones, by every path.
+        // This test pins that older layers keep answering beside checked ones.
         let (_dir, storage, st) = fresh_table();
         commit_layer(&st, 0);
         commit_layer(&st, 1);
@@ -5819,13 +5852,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_fold_reads_the_slices_the_layout_before_checks_wrote() {
-        // The committed fixture's term index, written by the engine before slices carried checks
-        // (root 6, slices 3 with tiers and heads), its layers folded into one.
-        //  - the old slices name tier objects and their runs carry level heads, and the fold reads
-        //    them all;
-        //  - every term's postings in the folded layer are its postings across the old layers,
-        //    in slices of the current layout.
-        // This test pins the first fold every table indexed before checks runs after an upgrade.
+        // The committed fixture's term index, written before slices had checks
+        // (root version 6, slice version 3 with tiers and heads), folded into
+        // one layer.
+        //  - the old slices name tier objects and their runs carry level heads;
+        //  - the fold writes slices of the current layout;
+        //  - each term's folded postings are its postings across the old
+        //    layers.
+        // This test pins the first fold an older table runs after an upgrade.
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/pre_checked_term_index_table");
         let storage: Arc<dyn StorageProvider> =
@@ -7098,10 +7132,9 @@ mod tests {
         maintenance_only_optimize(&st);
         let (_, mut root) = live_and_covered(&st, &storage, &rt);
         // The planted root is from before ordinal ranges and bases and the
-        // rewrite keeps its layers as they are, so neither is compared. It is
-        // also from before block index ends: its slices stay read whole, as
-        // every slice a root of that version names is, until a fold rewrites
-        // them.
+        // rewrite keeps its layers as they are, so neither is compared. It
+        // also predates block index ends, so its slices stay read whole until
+        // a fold rewrites them.
         let mut sized = sized;
         for layer in root.layers.iter_mut().chain(&mut sized.layers) {
             layer.ordinals = None;
@@ -7765,11 +7798,10 @@ mod tests {
         assert!(index.is_indexed(&newest), "the new superfile is listed");
     }
 
-    /// A slice fetched whole once is served from the manifest disk cache
-    /// afterwards, before any ranged read: with the object gone from
-    /// storage, a fresh index over the same cache still answers, and one
-    /// without the cache does not. The first fetch is whole because its
-    /// ranged reads fail.
+    /// A slice fetched whole once (its ranged reads failing) is served from
+    /// the manifest disk cache afterwards, before any ranged read: with the
+    /// object gone from storage, a fresh index over the same cache still
+    /// answers, and one without the cache does not.
     #[test]
     fn slices_are_served_from_the_metadata_disk_cache_once_fetched() {
         let (dir, storage, st) = fresh_table();
@@ -9656,17 +9688,18 @@ mod tests {
     /// Where slices sit in storage, for faults aimed at slice reads only.
     const SLICE_URI_FRAGMENT: &str = "term-index/slice-";
 
-    /// No checked slice counts as small, so a test's small slices are read by range.
+    /// No checked slice counts as small, so tests read small slices by range.
     const NO_SMALL_SLICES: u64 = 0;
 
-    /// Reads of a slice a ranged lookup makes with nothing of it resident: its header and block
-    /// index, its blocks, its runs.
+    /// Reads a ranged lookup makes of a slice with nothing of it resident:
+    /// header and block index, blocks, runs.
     const COLD_RANGED_READS: usize = 3;
 
-    /// A lookup budget far smaller than the reads a test index's lookup has in flight at once.
+    /// A lookup budget far smaller than what a test index's lookup would read
+    /// at once.
     const SMALL_BUDGET_BYTES: u32 = 4 * SliceHeader::MAX_LEN as u32;
 
-    /// Reads of a slice whose block index is resident: its blocks, then its runs.
+    /// Reads of a slice whose block index is resident: blocks, then runs.
     const WARM_RANGED_READS: usize = 2;
 
     /// A disk cache every test index fits in.
@@ -9678,15 +9711,17 @@ mod tests {
     /// Where an object's format version sits: after its magic.
     const VERSION_BYTES: Range<usize> = 8..12;
 
-    /// How often, and how many times, a test checks whether background promotions are done.
+    /// How often, and how many times, a test checks that background
+    /// promotions are done.
     const PROMOTION_WAIT_POLL: Duration = Duration::from_millis(5);
     const PROMOTION_WAIT_POLLS: usize = 1000;
 
-    /// Longer than any lookup of a test index takes; a lookup past it has deadlocked.
+    /// Longer than any lookup of a test index takes; one that runs past it
+    /// has deadlocked.
     const BUDGET_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(20);
 
-    /// An index over `root` read through `storage`, reading even small checked slices by range,
-    /// promoting nothing.
+    /// An index over `root` read through `storage` that reads even small
+    /// checked slices by range and promotes nothing.
     fn ranged_index(root: &Root, storage: Arc<dyn StorageProvider>) -> TermIndex {
         TermIndex::new(root.clone(), String::new(), storage, None)
             .with_small_slice_bytes(NO_SMALL_SLICES)
@@ -9700,17 +9735,19 @@ mod tests {
             .collect()
     }
 
-    /// How long [`WatchedReads`] holds each slice read open, so reads issued together overlap.
+    /// How long [`WatchedReads`] holds each slice read open, so reads issued
+    /// together overlap.
     const WATCHED_READ_HOLD: Duration = Duration::from_millis(1);
 
-    /// A lookup budget a few of a test index's slice reads wide.
+    /// A lookup budget that fits a few of a test index's slice reads.
     const FEW_READS_BUDGET_BYTES: u32 = 4 * BATCH_SLICE_TARGET_BYTES as u32;
 
-    /// A provider that watches slice reads: the most in flight at once, the most bytes they
-    /// ask for together, and the most bytes ranged reads already returned still held alive when
-    /// another starts, on top of those in flight. With `spoil` it flips the first byte of every
-    /// ranged slice read past the header, so a checked slice's pieces fail their checks while
-    /// whole reads stay sound, and counts them.
+    /// A provider that records, for slice reads: the most in flight at once,
+    /// the most bytes they ask for together, and the most bytes that ranged
+    /// reads already returned still hold when another starts, on top of those
+    /// in flight. With `spoil` it flips, and counts, the first byte of every
+    /// ranged slice read past the header, so a checked slice's pieces fail
+    /// their checks while whole reads stay sound.
     #[derive(Debug)]
     struct WatchedReads {
         inner: Arc<dyn StorageProvider>,
@@ -9725,7 +9762,8 @@ mod tests {
         most_held: AtomicU64,
     }
 
-    /// The bytes of one ranged read, counted in [`WatchedReads::live`] until dropped.
+    /// The bytes of one ranged read, counted in [`WatchedReads::live`] until
+    /// dropped.
     struct LiveBytes {
         bytes: Bytes,
         live: Arc<AtomicU64>,
@@ -9832,8 +9870,8 @@ mod tests {
         }
     }
 
-    /// A two-layer index of checked slices over local storage, and its terms: the base layer
-    /// holds every term, the delta every third term again.
+    /// A two-layer index of checked slices over local storage, and its terms.
+    /// The base layer holds every term; the delta every third term again.
     async fn two_layer_checked_index() -> (Arc<dyn StorageProvider>, Root, Vec<String>, TempDir) {
         let dir = TempDir::new().expect("tempdir");
         let terms: Vec<String> = (0..BATCH_TERMS).map(|i| format!("k{i:04}")).collect();
@@ -9868,11 +9906,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_lookup_reads_checked_slices_by_range_and_falls_back_to_whole_slices() {
-        // A two-layer index of checked slices, looked up with whole-slice reads failing, then
-        // with ranged reads failing.
-        //  - with whole reads failing, every term is answered by range, as a default index answers;
-        //  - with ranged reads failing, every term is answered from whole slices, the same again.
-        // This test pins the ranged read and its fall back to the whole slice.
+        // A two-layer index of checked slices, looked up with whole-slice reads
+        // failing, then with ranged reads failing.
+        //  - with whole reads failing, every term is answered by range, as a
+        //    default index answers it;
+        //  - with ranged reads failing, every term is answered the same from
+        //    whole slices.
+        // This test pins the ranged read and its fallback to the whole slice.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let mut asked: Vec<&str> = terms.iter().map(String::as_str).collect();
         asked.push("absent");
@@ -9893,11 +9933,12 @@ mod tests {
 
     #[tokio::test]
     async fn block_indexes_stay_resident_for_the_next_roots_index() {
-        // Two indexes over one root sharing one tier chunk cache, as the indexes of successive
-        // roots do, each looking up a term held in both layers.
-        //  - the first reads each slice's header, block index, block and run;
+        // Two indexes over one root sharing one tier chunk cache, as the
+        // indexes of successive roots do, each looking up a term in both layers.
+        //  - the first reads each slice's header and block index, block and run;
         //  - the second reads only the block and the run.
-        // This test pins block indexes kept across commits, as tier chunks and head levels are.
+        // This test pins block indexes kept across commits, like tier chunks
+        // and head levels.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let slow = SlowStorage::wrap(local, Duration::ZERO);
         let cache = new_tier_chunk_cache();
@@ -9920,12 +9961,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_slice_failing_its_checks_is_read_whole_from_then_on() {
-        // Three indexes sharing one tier chunk cache look up a term held in both layers: the
-        // first with storage sound; for the second and the third every ranged slice read comes
-        // back spoiled, and the resident slices are dropped before the third.
-        //  - the second, whose block indexes are resident, spoils one block read per slice, then
-        //    reads each slice whole;
-        //  - the third, though nothing of the slices is resident, tries no ranged read;
+        // Three indexes sharing one tier chunk cache look up a term in both
+        // layers. The first reads sound storage; for the other two every ranged
+        // slice read comes back spoiled, and the resident slices are dropped
+        // before the third.
+        //  - the second, its block indexes resident, gets one spoiled block
+        //    read per slice, then reads each slice whole;
+        //  - the third, with nothing resident, tries no ranged read;
         //  - all three answer the same.
         // This test pins one failed attempt per bad slice, not one per lookup.
         let (local, root, terms, _store) = two_layer_checked_index().await;
@@ -9968,10 +10010,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_storage_error_falls_back_once_and_marks_nothing() {
-        // Ranged slice reads fail with a storage error for one lookup, then storage recovers.
+        // Ranged slice reads fail with a storage error for one lookup, then
+        // storage recovers.
         //  - the failing lookup answers from whole slices;
         //  - the next index, sharing the cache, reads by range again.
-        // This test pins that a transient error does not send a sound slice to whole reads.
+        // This test pins that a transient error does not leave a sound slice
+        // read whole for good.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let faults = FaultStorage::wrap(Arc::clone(&local));
         faults.fail(FaultOp::GetRange, SLICE_URI_FRAGMENT, root.layers.len());
@@ -9998,9 +10042,10 @@ mod tests {
 
     #[tokio::test]
     async fn neighbouring_terms_share_block_and_run_requests() {
-        // Every term of a two-layer index looked up at once, so each slice holds many asked
-        // terms, close together in its dictionary and its postings.
-        //  - each slice costs the three reads of one term: header and block index, blocks, runs;
+        // Every term of a two-layer index looked up at once, so each slice
+        // holds many asked terms, close together in its dictionary and postings.
+        //  - each slice costs the three reads one term would: header and block
+        //    index, blocks, runs;
         //  - the answers equal those of whole-slice reads.
         // This test pins merged block and run reads, not one request per term.
         let (local, root, terms, _store) = two_layer_checked_index().await;
@@ -10027,9 +10072,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_root_names_each_slices_block_index_end() {
-        // A two-layer index this engine wrote, its root loaded from storage; a term held in both
-        // layers looked up by range.
-        //  - each slice's recorded index end is where its header says its block index ends;
+        // A two-layer index loaded from storage; a term in both layers looked
+        // up by range.
+        //  - each slice's recorded index end matches its header;
         //  - each slice costs three reads: header and block index, block, run.
         // This test pins one exact first read per slice, sized by the root.
         let (local, root, terms, _store) = two_layer_checked_index().await;
@@ -10059,12 +10104,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_root_without_index_ends_reads_checked_slices_whole() {
-        // A two-layer index this engine wrote, its root rewritten as the version before index
-        // ends was, so it names checked slices but not where their block indexes end; a term
-        // held in both layers looked up.
+        // A two-layer index whose root is rewritten at the version before index
+        // ends, so it names checked slices without them; a term in both layers
+        // looked up.
         //  - each slice costs one whole read;
-        //  - the answer equals the one the root with index ends gives.
-        // This test pins that a root of the version before index ends reads its slices whole.
+        //  - the answer equals the current root's.
+        // This test pins that a root before index ends reads its slices whole.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let mut older = root.clone();
         for slice in older.layers.iter_mut().flat_map(|layer| &mut layer.slices) {
@@ -10086,15 +10131,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_root_naming_the_wrong_index_end_answers_from_whole_slices() {
-        // A two-layer index this engine wrote, its root naming each slice's block index end one
-        // byte short, one byte long, or past the slice's end; a term held in both layers looked
-        // up.
+        // A two-layer index whose root names each slice's block index end one
+        // byte short, one byte long, or past the slice's end; a term in both
+        // layers looked up.
         //  - each lookup answers as the sound root does;
         //  - each slice holding the term is read whole from then on;
-        //  - a slice whose index end is off by a byte costs a first read and a whole read; one
-        //    whose index end is past its end costs the whole read alone.
-        // This test pins that a root disagreeing with its slices never routes to fewer
-        // superfiles, and an index end past the slice spends no request.
+        //  - an index end off by a byte costs a first read and a whole read;
+        //    one past the slice's end costs the whole read alone.
+        // This test pins that a root disagreeing with its slices never routes
+        // to fewer superfiles, and an index end past the slice wastes no request.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let expected = found(
             &ranged_index(&root, Arc::clone(&local))
@@ -10138,7 +10183,7 @@ mod tests {
         // Small checked slices looked up at the default small-slice size.
         //  - each slice costs one read, hash-checked and kept whole;
         //  - a second index sharing the cache reads nothing.
-        // This test pins one request for a small slice, as a whole read takes.
+        // This test pins one request for a small slice.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let slow = SlowStorage::wrap(local, Duration::ZERO);
         let cache = new_tier_chunk_cache();
@@ -10159,11 +10204,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_corrupt_or_truncated_slice_is_an_error_never_absent() {
-        // The base layer's slice holding a term is replaced in storage, once with a byte of its
-        // first dictionary block flipped and once cut in half; the term is looked up by range
-        // and, as a small slice, whole.
+        // The base layer's slice holding a term is replaced in storage, once
+        // with a byte of its first dictionary block flipped and once cut in
+        // half. The term is looked up by range, and whole as a small slice.
         //  - every lookup fails loudly; none answers the term as absent.
-        // This test pins that bytes failing their checks never route to fewer superfiles.
+        // This test pins that bytes failing their checks never route to fewer
+        // superfiles.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let key = fid("body").term_key(&terms[0]);
         let (_, slice) = root.based_slices_for_key(&key).next().expect("a slice");
@@ -10194,13 +10240,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_slice_reused_by_range_is_kept_whole_in_the_background() {
-        // Three indexes sharing one tier chunk cache, as the indexes of successive roots do, look
-        // up a term held in both layers one after another; the index fits the resident budget.
+        // Three indexes sharing one tier chunk cache, as the indexes of
+        // successive roots do, look up a term in both layers in turn; the index
+        // fits the resident budget.
         //  - the first reads each slice by range;
-        //  - the second, finding the block indexes resident, reads by range again and starts one
-        //    whole read of each slice in the background;
+        //  - the second finds the block indexes resident, reads by range again,
+        //    and starts one background whole read of each slice;
         //  - once those land, the third reads no slice at all.
-        // This test pins promotion on reuse: repeated lookups end up reading nothing.
+        // This test pins promotion on reuse: repeated lookups end up reading
+        // nothing.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let slow = SlowStorage::wrap(local, Duration::ZERO);
         let cache = new_tier_chunk_cache();
@@ -10241,11 +10289,14 @@ mod tests {
 
     #[test]
     fn slices_read_by_range_are_kept_on_disk_or_where_the_whole_index_fits() {
-        // Roots whose slices total within the resident budget, past it, and of a size unknown (a
-        // slice the root records no length for), each with and without a disk cache.
+        // Roots whose slices total within the resident budget, past it, and of
+        // unknown size (a slice with no recorded length), each with and without
+        // a disk cache.
         //  - with a disk cache, every slice read by range is promoted;
-        //  - without, a reused one is when the slices fit the budget, else none is.
-        // This test pins that without a disk cache, promotion never reads whole what cannot stay.
+        //  - without, a reused slice is promoted only when all slices fit the
+        //    budget.
+        // This test pins that without a disk cache, promotion never reads whole
+        // what cannot stay resident.
         let root_of = |lens: &[u64]| Root {
             layers: vec![Layer {
                 slices: lens
@@ -10285,12 +10336,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_lookup_never_waits_on_its_budget_while_holding_some() {
-        // Every term of a two-layer index looked up at once, with a budget a few first reads fill:
-        // many slices hold their first read while their next reads wait. Then a root of one
-        // slice of the layout before checks, larger than the budget, its length recorded: its
-        // first read and its rest each want the budget.
-        //  - both lookups finish, and answer as whole-slice reads do.
-        // This test pins a budget that bounds bytes in flight without ever deadlocking.
+        // Two lookups on a budget smaller than they need:
+        //  - every term of a two-layer index at once, so many slices hold their
+        //    first read while their next reads wait;
+        //  - a root of one slice before checks, larger than the budget, its
+        //    length recorded.
+        // Both finish, and answer as whole-slice reads do.
+        // This test pins a budget that bounds bytes in flight without ever
+        // deadlocking.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let asked: Vec<&str> = terms.iter().map(String::as_str).collect();
         let budget = SMALL_BUDGET_BYTES;
@@ -10358,10 +10411,11 @@ mod tests {
 
     #[tokio::test]
     async fn whole_slices_and_block_indexes_share_one_budget() {
-        // A lookup leaves two block indexes resident; then two whole slices of over half the
-        // budget each are kept in the same set.
-        //  - the block indexes go first to make room;
-        //  - the set never holds more than the one budget whole slices alone had.
+        // A lookup leaves two block indexes resident; then two whole slices,
+        // each over half the budget, are kept in the same set.
+        //  - the block indexes are evicted first to make room;
+        //  - the set never passes the budget, so the two slices never fit
+        //    together.
         // This test pins one resident budget for both kinds.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let cache = new_tier_chunk_cache();
@@ -10393,7 +10447,8 @@ mod tests {
         );
     }
 
-    /// Wait for `cache`'s background promotions to finish, failing if they do not in a while.
+    /// Wait for `cache`'s background promotions to finish; panics if they
+    /// take too long.
     async fn promotions_settle(cache: &TierChunkCache) {
         for _ in 0..PROMOTION_WAIT_POLLS {
             let promotions = Arc::clone(&cache.lock().expect("tier chunk cache lock").promotions);
@@ -10417,7 +10472,8 @@ mod tests {
         (whole, chunks.slices.map.len() - whole)
     }
 
-    /// Every slice `root` names, each copied from `storage` into `disk` as `prepare` leaves it.
+    /// Copy every slice `root` names from `storage` into `disk`, as `prepare`
+    /// leaves its bytes.
     async fn put_slices_on_disk(
         root: &Root,
         storage: &Arc<dyn StorageProvider>,
@@ -10434,8 +10490,9 @@ mod tests {
         }
     }
 
-    /// Every term of `root` looked up at once through `watched`, with `bytes` of budget and `reads`
-    /// in flight at most, asserting it finishes and answers as whole-slice reads do.
+    /// Look up every term of `root` at once through `watched`, with a budget
+    /// of `bytes` and at most `reads` ranged requests in flight. Asserts the
+    /// lookup finishes and answers as whole-slice reads do.
     async fn look_up_watched(
         root: &Root,
         local: &Arc<dyn StorageProvider>,
@@ -10465,13 +10522,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_lookup_keeps_its_bytes_in_flight_within_its_budget() {
-        // Every term of a two-layer index looked up at once with a budget a few slice reads wide
-        // and no tighter cap on reads, on storage that holds each read open a moment: first by
-        // range, then through a root without index ends, whose slices are read whole.
-        //  - the bytes the reads in flight ask for never pass the budget, by range or whole;
+        // Every term of a two-layer index looked up at once on a budget that
+        // fits a few slice reads, with no tighter cap on reads, on storage that
+        // holds each read open a moment: first by range, then through a root
+        // without index ends, whose slices are read whole.
+        //  - the bytes in flight never pass the budget, by range or whole;
         //  - more than one read overlaps;
-        //  - by range, the bytes in flight and those already read still held never pass it
-        //    together when a read starts.
+        //  - by range, the bytes in flight plus those already read and still
+        //    held never pass it when a read starts.
         // This test pins the byte budget on both kinds of read.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let mut unindexed = root.clone();
@@ -10522,11 +10580,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_lookup_keeps_its_reads_in_flight_within_its_caps() {
-        // Every term of a two-layer index looked up at once with the full byte budget, on storage
-        // that holds each read open a moment: by range with a cap of a few requests, then through a
-        // root without index ends, whose many slices are read whole.
-        //  - the ranged requests in flight never pass their cap, and more than one overlaps;
-        //  - the whole reads in flight never pass theirs, and more than one overlaps.
+        // Every term of a two-layer index looked up at once on the full byte
+        // budget, on storage that holds each read open a moment: by range with
+        // a cap of a few requests, then through a root without index ends,
+        // whose many slices are read whole.
+        //  - ranged requests in flight stay within their cap, and overlap;
+        //  - whole reads in flight stay within theirs, and overlap.
         // This test pins both caps, which the byte budget alone would not hold.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let watched = WatchedReads::wrap(Arc::clone(&local), false);
@@ -10575,11 +10634,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_whole_read_waiting_for_its_turn_takes_a_slice_another_lookup_kept() {
-        // A whole read of a slice waits for a turn while its lookup's whole reads are all taken;
-        // meanwhile another lookup keeps that slice whole in memory, then the turns free.
-        //  - the waiting read answers with the kept slice and reads nothing from the store.
-        // This test pins the look once the turn is taken: a lookup starts many reads at once, and
-        // under concurrent lookups each would otherwise read again what another already kept.
+        // A whole read of a slice waits for a turn while all its lookup's turns
+        // are taken; meanwhile another lookup keeps that slice whole, then the
+        // turns free up.
+        //  - the waiting read answers with the kept slice and reads nothing
+        //    from the store.
+        // This test pins the check after the turn is taken: without it,
+        // concurrent lookups would each read again what another already kept.
         let (local, root, _terms, _store) = two_layer_checked_index().await;
         let slice = &root.layers[0].slices[0];
         let hash = slice.content_hash;
@@ -10615,11 +10676,13 @@ mod tests {
 
     #[tokio::test]
     async fn lookups_of_a_slice_on_local_disk_wait_for_one_read_of_it() {
-        // Sixteen lookups of one term at once, its slices all in the local disk cache and none in
-        // memory.
-        //  - each slice is read from disk once, the other lookups waiting for that read;
+        // Sixteen lookups of one term at once, its slices all in the local disk
+        // cache and none in memory.
+        //  - each slice is read from disk once, the other lookups waiting for
+        //    that read;
         //  - every lookup answers as whole-slice reads do.
-        // This test pins that lookups racing for a slice on disk hold one copy of it, not one each.
+        // This test pins that lookups racing for a slice on disk hold one copy
+        // of it, not one each.
         const LOOKUPS: usize = 16;
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let dir = TempDir::new().expect("cache dir");
@@ -10651,12 +10714,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_lookup_waiting_on_a_dropped_disk_read_reads_the_slice_itself() {
-        // A lookup of one term, its slices in the local disk cache, each slice already being read
-        // from disk by another lookup; then those reads are dropped unfinished.
-        //  - the lookup waits on the reads, then reads the slices itself and answers as
-        //    whole-slice reads do.
-        // This test pins that a cancelled read never leaves a lookup waiting on it. The reads in
-        // flight are made by hand: a real one can land within its first poll.
+        // A lookup of one term whose slices are on local disk, each already
+        // being read by another lookup; then those reads are dropped
+        // unfinished. The reads are made by hand: a real one can land within
+        // its first poll.
+        //  - the lookup waits on the reads;
+        //  - then it reads the slices itself and answers as whole-slice reads
+        //    do.
+        // This test pins that a cancelled read never leaves a lookup waiting.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let dir = TempDir::new().expect("cache dir");
         let disk = MetadataDiskCache::new(dir.path().to_path_buf(), DISK_CACHE_BYTES, None)
@@ -10680,7 +10745,8 @@ mod tests {
         let hits = disk.stats().n_hits;
         let mut lookup = pin!(index.runs_many(fid("body"), &asked));
         assert!(poll!(lookup.as_mut()).is_pending(), "the lookup is pending");
-        // A waiter holds a clone of the read's wake, beside the entry's and the read's own.
+        // A waiter holds a third clone of the read's notify, beside the
+        // entry's and the read's own.
         assert!(
             reads.iter().any(|read| Arc::strong_count(&read.done) > 2),
             "the lookup waits on a read in flight"
@@ -10713,11 +10779,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_whole_read_landing_after_another_lookup_kept_the_slice_answers_with_that_copy() {
-        // A whole read of a slice is in flight when another lookup keeps the same slice whole in
-        // memory, then the read lands.
-        //  - the read answers with the kept copy, and the kept copy stays resident.
-        // This test pins that a slice read twice at once is held once: concurrent lookups would
-        // otherwise each hold their own copy until their decodes end.
+        // A whole read of a slice is in flight when another lookup keeps the
+        // same slice whole in memory; then the read lands.
+        //  - the read answers with the kept copy, which stays resident.
+        // This test pins that a slice read twice at once is held once, not
+        // once per lookup until its decode ends.
         let (local, root, _terms, _store) = two_layer_checked_index().await;
         let slice = &root.layers[0].slices[0];
         let hash = slice.content_hash;
@@ -10750,8 +10816,9 @@ mod tests {
         );
     }
 
-    /// An index over `root` read through `storage`, with `disk` attached and slices read by range
-    /// written there in the background, reading even small checked slices by range.
+    /// An index over `root` read through `storage`, with `disk` attached. It
+    /// reads even small checked slices by range, and writes the slices it
+    /// reads by range to `disk` in the background.
     fn disk_index(
         root: &Root,
         storage: Arc<dyn StorageProvider>,
@@ -10765,11 +10832,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_slice_on_local_disk_is_read_whole_from_there() {
-        // A two-layer index whose slices are all in the local disk cache, every term looked up.
+        // A two-layer index whose slices are all in the local disk cache, every
+        // term looked up.
         //  - no slice is read from the object store;
         //  - every slice is kept whole, none as a block index;
         //  - the answers equal whole-slice reads.
-        // This test pins that a slice on disk is read as before slices were read by range.
+        // This test pins that a slice on disk is read whole from there, never
+        // by range.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let asked: Vec<&str> = terms.iter().map(String::as_str).collect();
         let dir = TempDir::new().expect("cache dir");
@@ -10799,12 +10868,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_corrupt_slice_on_local_disk_is_read_again_from_the_store() {
-        // A two-layer index whose slices are in the local disk cache with every byte past their
-        // block index flipped, one term looked up.
-        //  - each slice's copy on disk fails its hash, so it is read whole from the store once and
-        //    written back sound;
+        // A two-layer index whose slices are in the local disk cache with every
+        // byte past their block index flipped; one term looked up.
+        //  - each copy on disk fails its hash, so the slice is read whole from
+        //    the store once and written back sound;
         //  - the answers equal those of sound slices.
-        // This test pins that a bad copy on disk costs one whole read, never a wrong answer.
+        // This test pins that a bad copy on disk costs one whole read, never a
+        // wrong answer.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let dir = TempDir::new().expect("cache dir");
         let disk = MetadataDiskCache::new(dir.path().to_path_buf(), DISK_CACHE_BYTES, None)
@@ -10850,15 +10920,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_slice_read_by_range_is_written_to_disk_in_the_background() {
-        // Three indexes sharing one tier chunk cache and one disk cache look up one term one after
-        // another; the store fails the first whole read of each slice.
-        //  - the first reads each slice by range, and its background whole reads fail: nothing
-        //    lands on disk, so the second reads by range again, as a lookup before a write lands
-        //    does;
-        //  - the second's background whole reads land on disk and in memory, whole;
+        // Three indexes sharing one tier chunk cache and one disk cache look up
+        // one term in turn; the store fails the first whole read of each slice.
+        //  - the first reads each slice by range, and its background whole
+        //    reads fail, so nothing lands on disk;
+        //  - the second reads by range again, and its background whole reads
+        //    land on disk and in memory;
         //  - the third reads nothing from the store.
-        // This test pins that disk and memory end up holding every slice a lookup read, as whole
-        // reads left them, without a whole read on the query path.
+        // This test pins that disk and memory end up holding every slice a
+        // lookup read, with no whole read on the query path.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let layers = root.layers.len();
         let faults = FaultStorage::wrap(Arc::clone(&local));
@@ -10911,11 +10981,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_slice_read_by_range_waits_for_no_promotion_past_the_queue() {
-        // A lookup with a disk cache attached while the table's background queue holds as many bytes
-        // as the disk cache can keep, then the queue emptied.
-        //  - the lookup reads each slice by range and queues no whole read, so none reaches disk;
-        //  - the next lookup, with room in the queue, writes them to disk.
-        // This test pins the bound on background downloads, and that a skipped slice is not marked.
+        // A lookup with a disk cache attached while the table's background
+        // queue already holds as many bytes as the disk cache can keep.
+        //  - the lookup reads each slice by range and queues no whole read, so
+        //    none reaches disk;
+        //  - once the queue is emptied, the next lookup writes them to disk.
+        // This test pins the bound on background downloads, and that a skipped
+        // slice is not marked unpromotable.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let layers = root.layers.len();
         let dir = TempDir::new().expect("cache dir");
@@ -10969,13 +11041,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_slice_larger_than_the_disk_cache_is_not_promoted_again() {
-        // Two indexes sharing one tier chunk cache and a disk cache too small for any slice look up
-        // one term one after another.
-        //  - the first lookup's background reads read each slice whole, the disk refuses it, and it
-        //    is kept in memory;
-        //  - once memory lets those go, the second lookup reads by range and starts no whole read
-        //    again.
-        // This test pins that a slice that can never fit costs one whole read, not one per lookup.
+        // Two indexes sharing one tier chunk cache, and a disk cache too small
+        // for any slice, look up one term in turn.
+        //  - the first lookup's background reads read each slice whole; the
+        //    disk refuses it, and it is kept in memory;
+        //  - once memory drops those, the second lookup reads by range and
+        //    starts no whole read again.
+        // This test pins that a slice that can never fit costs one whole read,
+        // not one per lookup.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let dir = TempDir::new().expect("cache dir");
         let disk = MetadataDiskCache::new(dir.path().to_path_buf(), TINY_DISK_CACHE_BYTES, None)
@@ -11009,12 +11082,13 @@ mod tests {
 
     #[tokio::test]
     async fn background_promotions_read_a_few_slices_whole_at_once() {
-        // More distinct slices than may be read whole in the background at once are each queued for
-        // promotion to the local disk cache, on storage that holds every slice read.
-        //  - while held, only the cap's worth of whole reads start, and they stay at the cap;
-        //  - once released, the queued rest are read too and every slice lands on disk.
-        // This test pins the cap on background whole reads, which the queue's byte bound alone
-        // would not hold.
+        // More slices than may be read whole in the background at once, each
+        // queued for the local disk cache, on storage that holds every slice
+        // read open.
+        //  - while held, only the cap's worth of whole reads start;
+        //  - once released, the rest are read too and every slice lands on disk.
+        // This test pins the cap on background whole reads, which the queue's
+        // byte bound alone would not hold.
         let (local, root, _terms, _store) = two_layer_checked_index().await;
         let slices: HashMap<ContentHash, Option<u64>> = root
             .layers
@@ -11066,12 +11140,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_promotion_failing_on_storage_is_tried_again() {
-        // Four indexes sharing one tier chunk cache, keeping reused slices resident, look up one
-        // term one after another; the store fails the first whole read of each slice.
+        // Four indexes sharing one tier chunk cache, promoting reused slices,
+        // look up one term in turn; the store fails the first whole read of
+        // each slice.
         //  - the second lookup's promotions fail, and no slice is kept whole;
-        //  - the third lookup's promotions run again and land: each slice is kept whole;
+        //  - the third lookup's promotions run again and land, so each slice
+        //    is kept whole;
         //  - every lookup answers the same.
-        // This test pins that a transient error does not leave a slice read by range for good.
+        // This test pins that a transient error does not leave a slice read by
+        // range for good.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let faults = FaultStorage::wrap(Arc::clone(&local));
         faults.fail(FaultOp::Get, SLICE_URI_FRAGMENT, root.layers.len());
@@ -11102,11 +11179,11 @@ mod tests {
         assert_eq!(found(&lookup().await), first);
     }
 
-    /// A batched lookup answers exactly what one-by-one lookups do — runs
-    /// concatenated across layers in layer order, absent terms empty,
-    /// a repeated term answered twice — while reading each slice's block
-    /// index once and many slices at a time. Looked up one by one, a query
-    /// over many keys waited on one whole-slice fetch per key in series.
+    /// A batched lookup answers exactly what one-by-one lookups do (runs
+    /// concatenated across layers in layer order, absent terms empty, a
+    /// repeated term answered twice), while reading each slice's block index
+    /// once and many slices at a time. Looked up one by one, a query over many
+    /// keys waited on one whole-slice fetch per key in series.
     #[tokio::test]
     async fn batched_postings_match_single_lookups_and_fetch_slices_together() {
         let dir = TempDir::new().expect("tempdir");
@@ -11189,9 +11266,9 @@ mod tests {
             needed.len() > WHOLE_SLICES_AT_ONCE,
             "test spans many slices"
         );
-        // Each needed slice's header and block index in one request, then its blocks in one and,
-        // unless only the absent term falls in it, its runs in another: never the index again per
-        // term, never a request per term.
+        // Per needed slice: one request for its header and block index, one for
+        // its blocks, and one for its runs unless only the absent term falls in
+        // it. Never the index again per term, never a request per term.
         let (fewest, most) = (2 * needed.len(), COLD_RANGED_READS * needed.len());
         assert!(
             (fewest..=most).contains(&slow.reads()),

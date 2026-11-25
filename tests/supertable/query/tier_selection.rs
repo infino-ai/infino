@@ -29,10 +29,10 @@ use super::tier_harness::*;
 /// Where a term index root's format version sits: after its magic.
 const VERSION_BYTES: Range<usize> = 8..12;
 
-/// The term index root format before slices recorded where their block index ends.
+/// The term index root version before block index ends were recorded.
 const ROOT_WITHOUT_INDEX_ENDS: u32 = 6;
 
-/// The term index root format that records where each slice's block index ends.
+/// The term index root version that records each slice's block index end.
 const ROOT_WITH_INDEX_ENDS: u32 = 7;
 
 #[test]
@@ -958,11 +958,17 @@ fn current_term_index_root(dir: &Path) -> Vec<u8> {
     fs::read(dir.join(uri)).expect("root")
 }
 
-/// A table whose term index was written by the layout before checked slices (root at version 6,
-/// slices at version 3 with tiers and heads, the committed fixture): the current reader answers
-/// from it as a table without the index does, its tiers serving; then after a commit writes a root
-/// of the current layout naming the old slices beside a new layer; then after the maintenance pass.
-/// The fold over the old slices is pinned beside the fold itself.
+/// The committed fixture, a table indexed before checked slices (root
+/// version 6, slices version 3 with tiers and heads), beside a copy opened
+/// without its index.
+///  - on the old layout, the index answers as the copy does, its tiers
+///    serving;
+///  - a commit writes a current root naming the old slices beside a new
+///    layer, and both still answer the same;
+///  - after the maintenance pass, they still answer the same.
+///
+/// This test pins an upgrade in place; the fold over the old slices is
+/// pinned beside the fold itself.
 #[test]
 fn a_table_indexed_by_the_layout_before_checks_serves_beside_new_layers() {
     let fixture =

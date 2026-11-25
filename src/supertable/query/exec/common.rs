@@ -4989,7 +4989,7 @@ mod tests {
         assert!(after_first > 0, "the first take reads storage");
         assert_eq!(take(), first);
         // The FTS subsection is read through, never kept, by design; what the
-        // take read is kept. Only the superfile's reads count: with no metadata
+        // take read is kept. Only superfile reads are counted: with no metadata
         // disk cache, a fresh handle reads the term index from storage again.
         let reader = open().reader().expect("reader");
         let entry = &reader.manifest().superfiles[0];

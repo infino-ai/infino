@@ -930,7 +930,7 @@ pub(crate) mod test_support {
                 .collect()
         }
 
-        /// The ranged GETs from the `from`th on of objects whose key ends with `key`.
+        /// The ranges read from the `from`th GET on, for keys ending in `key`.
         pub(crate) fn ranges_of_since(&self, key: &str, from: usize) -> Vec<Range<u64>> {
             self.ranges.lock().expect("ranges")[from..]
                 .iter()

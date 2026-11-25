@@ -15,8 +15,8 @@
 //!                | content hash (32 B)
 //!                | tier object content hash (32 B, all zero when no run of the slice has one)
 //!                | slice length u64
-//!                | block index end u64 (where the slice's header, block index and checks end;
-//!                  zero for a slice of an older layout, which is read whole)
+//!                | block index end u64 (end of the header, block index and checks;
+//!                  zero for an older slice, which is read whole)
 //! ```
 //!
 //! A layer's *ordinal range* is the superfile ordinals its postings may
@@ -26,8 +26,9 @@
 //! built before its superfiles' place in the list was known is placed by
 //! recording where they landed, not rewritten. Earlier versions read with
 //! no range and base 0; the version before them carried no slice length,
-//! and the one before that a length in place of the tier object hash. A root
-//! before version 7 records no block index ends: all its slices are read whole.
+//! and the one before that a length in place of the tier object hash. A
+//! root before version 7 records no block index ends, so every slice it
+//! names is read whole.
 //!
 //! A slice's *tier object* holds its terms' tier chunks (`tier.rs`) back
 //! to back; a run names its chunks by offset into it. Both the slice and
@@ -43,7 +44,7 @@
 //! commit can append a delta (its own slice list, appending to the
 //! superfile list) without rewriting the base.
 //!
-//! **Slice** — one contiguous key range:
+//! **Slice**, one contiguous key range:
 //!
 //! ```text
 //! magic "INFTSLC1" | version u32
@@ -51,13 +52,17 @@
 //! | block index | checks | dictionary blocks | postings region
 //! ```
 //!
-//! The dictionary is front-coded term blocks (`utils::terms`); its block index (each block's
-//! first key and offset, and the footer) sits at the front, so a lookup reads the header and
-//! block index in one request and then only the term's block and run. `checks` is a crc32c of the
-//! block index, then one per block, and each run ends in its own crc32c: every piece a lookup
-//! reads is checked on its own, and a slice read whole is checked by its content hash. Slices
-//! before version 4 hold `dict_len u64 | postings_len u64 | dictionary | postings`, with the block
-//! index at the dictionary's end and no checks, and are read whole.
+//! The dictionary is front-coded term blocks (`utils::terms`). Its block
+//! index (each block's first key and offset, and the footer) sits at the
+//! front, so a lookup reads the header and block index in one request, then
+//! only the term's block and run. `checks` holds a crc32c of the block
+//! index, then one per block, and each run ends in its own crc32c, so each
+//! piece a lookup reads is checked on its own. A slice read whole is checked
+//! by its content hash.
+//!
+//! Slices before version 4 hold
+//! `dict_len u64 | postings_len u64 | dictionary | postings`, with the block
+//! index at the dictionary's end and no checks. They are read whole.
 //!
 //! The dictionary's value for a term is a byte range into the postings
 //! region, which holds that term's *run*:
@@ -134,13 +139,12 @@ pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
 /// at version `3` still decodes — its slices are at version 1 and serve
 /// ceilings until a fold rewrites them in the current layout; anything
 /// older does not, and the index is built again from the superfiles, not
-/// translated. `6` records each layer's ordinal range and base; `7` records
+/// translated. `6` records each layer's ordinal range and base. `7` records
 /// where each checked slice's header, block index and checks end
-/// ([`SliceRef::index_end`]), so a lookup reads them in one exact request
-/// and reads an older slice whole, without first asking which it is.
+/// ([`SliceRef::index_end`]), so a lookup reads them in one exact request,
+/// and knows to read an older slice whole without a request to find out.
 pub(crate) const ROOT_FORMAT_VERSION: u32 = 7;
-/// The root version without each slice's index end: every slice it names
-/// is read whole.
+/// The root version before index ends; every slice it names is read whole.
 pub(crate) const ROOT_WITHOUT_INDEX_ENDS_VERSION: u32 = 6;
 /// The root version with slice lengths but no ordinal range or base per
 /// layer: its layers' ordinals are absolute, which is base zero.
@@ -158,13 +162,15 @@ pub(crate) const LEGACY_ROOT_FORMAT_VERSION: u32 = 3;
 /// `3` adds the term's level head after the tier reference (see
 /// `level_head.rs`): one head per term and layer, its levels in the
 /// slice's head object beside the tier chunks.
-/// `4` puts the dictionary's block index at the front and checks each piece a lookup reads on its
-/// own (see [`SliceHeader`]), so a lookup reads the header and block index in one request, then
-/// only the term's dictionary block and run.
+/// `4` moves the dictionary's block index to the front and gives each piece
+/// a lookup reads its own crc32c ([`SliceHeader`]): a lookup reads the
+/// header and block index in one request, then only the term's block and
+/// run.
 pub(crate) const CHECKED_SLICE_FORMAT_VERSION: u32 = 4;
 /// The slice version written.
 pub(crate) const SLICE_FORMAT_VERSION: u32 = CHECKED_SLICE_FORMAT_VERSION;
-/// The slice version with level heads and no checks, its block index at the dictionary's end.
+/// The slice version with level heads, no checks, and the block index at
+/// the dictionary's end.
 pub(crate) const HEADS_SLICE_FORMAT_VERSION: u32 = 3;
 /// The slice version with tiers and no level heads.
 pub(crate) const TIERED_SLICE_FORMAT_VERSION: u32 = 2;
@@ -202,11 +208,11 @@ const HASH_LEN: usize = 32;
 const F32_LEN: usize = 4;
 /// Root fixed header: magic, version, superfile count.
 const ROOT_HEADER_LEN: usize = MAGIC_LEN + U32_LEN + U32_LEN;
-/// An unchecked slice's header: magic, version, dictionary length, postings length.
+/// An older slice's header: magic, version, dictionary and postings lengths.
 #[cfg(test)]
 const UNCHECKED_SLICE_HEADER_LEN: usize = MAGIC_LEN + U32_LEN + U64_LEN + U64_LEN;
-/// A slice's header: magic, version, then the lengths of its block index, checks, dictionary
-/// blocks and postings.
+/// A checked slice's header: magic, version, then the lengths of its block
+/// index, checks, dictionary blocks and postings.
 const SLICE_HEADER_LEN: usize = MAGIC_LEN + U32_LEN + U64_LEN + U64_LEN + U64_LEN + U64_LEN;
 /// Width of a crc32c.
 const CRC_LEN: usize = 4;
@@ -383,10 +389,9 @@ pub(crate) struct SliceRef {
     /// The slice object's byte length, as the root records it; zero in a
     /// root written before lengths were recorded beside tiers.
     pub(crate) len: u64,
-    /// Where a checked slice's header, block index and checks end: a read of
-    /// its first `index_end` bytes holds them. Zero for a slice of an older
-    /// layout, and for every slice of a root before version 7: such a slice
-    /// is read whole.
+    /// Where a checked slice's header, block index and checks end, so one
+    /// read of its first `index_end` bytes gets them all. Zero for an older
+    /// slice, or any slice of a root before version 7; those are read whole.
     pub(crate) index_end: u64,
 }
 
@@ -517,8 +522,8 @@ impl Root {
         self.encode_as(ROOT_FORMAT_VERSION)
     }
 
-    /// Serialize as a root of `version`, the current one or the one before, which records no
-    /// index ends.
+    /// Serialize at `version`: the current one, or the one before, which
+    /// records no index ends.
     fn encode_as(&self, version: u32) -> Vec<u8> {
         debug_assert!(
             version == ROOT_FORMAT_VERSION || version == ROOT_WITHOUT_INDEX_ENDS_VERSION,
@@ -948,7 +953,7 @@ fn decode_run_of(version: u32, run: &[u8]) -> Result<Run, TermIndexError> {
     }
 }
 
-/// `bytes` without their trailing crc32c, once it matches them.
+/// `bytes` without their trailing crc32c; an error when it does not match.
 fn checked<'a>(bytes: &'a [u8], what: &str) -> Result<&'a [u8], TermIndexError> {
     let body_len = bytes
         .len()
@@ -959,7 +964,8 @@ fn checked<'a>(bytes: &'a [u8], what: &str) -> Result<&'a [u8], TermIndexError> 
     Ok(body)
 }
 
-/// Whether the crc32c stored at `at` in `crcs` is `bytes`'; an error naming `what` when not.
+/// Check that the crc32c at `at` in `crcs` matches `bytes`; the error names
+/// `what`.
 fn check_crc(crcs: &[u8], at: usize, bytes: &[u8], what: &str) -> Result<(), TermIndexError> {
     match u32_le_at(crcs, at) == Some(crc32c(bytes)) {
         true => Ok(()),
@@ -967,7 +973,8 @@ fn check_crc(crcs: &[u8], at: usize, bytes: &[u8], what: &str) -> Result<(), Ter
     }
 }
 
-/// Append `run` and its crc32c to a checked slice's `postings`; returns the bytes appended.
+/// Append `run` and its crc32c to a checked slice's `postings`, returning
+/// the bytes appended.
 pub(crate) fn push_checked_run(postings: &mut Vec<u8>, run: &[u8]) -> usize {
     postings.extend_from_slice(run);
     postings.extend_from_slice(&crc32c(run).to_le_bytes());
@@ -1131,8 +1138,8 @@ pub(crate) fn encode_legacy_slice(terms: &[(Vec<u8>, Vec<(u32, u64, f32, Locatio
     unchecked_slice(LEGACY_SLICE_FORMAT_VERSION, &dict.finish(), &postings)
 }
 
-/// Encode a slice as the layout before checks wrote it: per term, a run of `postings` with no
-/// tier and no level head, its block index at the dictionary's end.
+/// A slice in the layout before checks: per term, a run of its postings
+/// with no tier and no level head, the block index at the dictionary's end.
 #[cfg(test)]
 pub(crate) fn encode_unchecked_slice(terms: &[(Vec<u8>, Vec<Posting>)]) -> Vec<u8> {
     let mut dict = TermDictBuilder::new();
@@ -1152,7 +1159,7 @@ pub(crate) fn encode_unchecked_slice(terms: &[(Vec<u8>, Vec<Posting>)]) -> Vec<u
     unchecked_slice(HEADS_SLICE_FORMAT_VERSION, &dict.finish(), &postings)
 }
 
-/// A slice of a layout before checks at `version`: header, `dict`, `postings`.
+/// A slice of an older layout at `version`: header, `dict`, `postings`.
 #[cfg(test)]
 fn unchecked_slice(version: u32, dict: &[u8], postings: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(UNCHECKED_SLICE_HEADER_LEN + dict.len() + postings.len());
@@ -1165,10 +1172,10 @@ fn unchecked_slice(version: u32, dict: &[u8], postings: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Assemble a slice from an encoded block dictionary and its postings region, whose runs
-/// [`push_checked_run`] wrote: the block index moves to the front, after the header, and each
-/// piece a lookup reads gets its own crc32c. Returns the slice and where its header, block index
-/// and checks end ([`SliceRef::index_end`]).
+/// Assemble a checked slice from an encoded block dictionary and a postings
+/// region whose runs [`push_checked_run`] wrote. The block index moves to
+/// the front, after the header, and gets a crc32c, as does each block.
+/// Returns the slice and its [`SliceRef::index_end`].
 pub(crate) fn encode_slice(dict: &[u8], postings: &[u8]) -> (Vec<u8>, u64) {
     let keys_offset = BlockIndex::start(dict).expect("a dictionary this build wrote has a footer");
     let (blocks, index_tail) = dict.split_at(keys_offset);
@@ -1199,14 +1206,13 @@ pub(crate) fn encode_slice(dict: &[u8], postings: &[u8]) -> (Vec<u8>, u64) {
 /// A slice's header: its layout version and where its regions sit.
 ///
 /// ```text
-/// checked:      header | block index | checks | dictionary blocks | postings (runs)
-/// before that:  header | dictionary (blocks, then block index) | postings (runs)
+/// checked:  header | block index | checks | dictionary blocks | postings
+/// older:    header | dictionary (blocks, then block index) | postings
 /// ```
 ///
-/// The block index is the dictionary's key area, table and footer (`utils::terms`). A checked
-/// slice's checks are a crc32c of the block index, then one per dictionary block, and each run
-/// ends in its own crc32c, so a lookup reads the header and block index in one request, then only
-/// the term's block and run, each checked on its own.
+/// The block index is the dictionary's key area, table and footer
+/// (`utils::terms`). A checked slice's checks are a crc32c of the block
+/// index, then one per dictionary block; each run ends in its own crc32c.
 #[derive(Debug, Clone)]
 pub(crate) struct SliceHeader {
     version: u32,
@@ -1231,7 +1237,7 @@ enum SliceLens {
 /// Where a slice's dictionary sits.
 #[derive(Debug, Clone)]
 enum Dictionary {
-    /// A checked slice's: its block index and checks at the front, its blocks after them.
+    /// A checked slice's: block index and checks first, then the blocks.
     Checked {
         index: Range<u64>,
         checks: Range<u64>,
@@ -1242,15 +1248,15 @@ enum Dictionary {
 }
 
 impl SliceHeader {
-    /// Enough of a slice's first bytes to hold its header, whatever its version.
+    /// Bytes from a slice's start that hold its header, whatever its version.
     pub(crate) const MAX_LEN: usize = SLICE_HEADER_LEN;
 
-    /// Parse the header at the front of `bytes`, refusing an unknown magic or version, or regions
-    /// whose offsets overflow.
+    /// Parse the header at the front of `bytes`. Refuses an unknown magic or
+    /// version, and region lengths whose offsets overflow.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, TermIndexError> {
         let mut c = Cursor { bytes, at: 0 };
         let version = check_magic_version(&mut c, SLICE_MAGIC, &SLICE_VERSIONS, "slice")?;
-        // Each version's region lengths, in the order its regions follow the header.
+        // Region lengths, in the order the regions follow the header.
         let lens = match version {
             CHECKED_SLICE_FORMAT_VERSION => SliceLens::Checked {
                 index: c.u64("slice block index length")?,
@@ -1304,18 +1310,19 @@ impl SliceHeader {
         })
     }
 
-    /// Where the dictionary ends and the postings start: the bytes a reader of the whole
-    /// dictionary needs from the front.
+    /// Where the postings start: a reader of the whole dictionary needs the
+    /// slice's bytes up to here.
     pub(crate) fn postings_start(&self) -> u64 {
         self.postings.start
     }
 
-    /// The object's length.
+    /// The slice's length in bytes.
     pub(crate) fn len(&self) -> u64 {
         self.postings.end
     }
 
-    /// A checked slice's block index and checks, back to back: what a lookup reads once per slice.
+    /// A checked slice's block index and checks, back to back: what a lookup
+    /// reads once per slice. `None` for an older slice.
     pub(crate) fn index_range(&self) -> Option<Range<u64>> {
         match &self.dictionary {
             Dictionary::Checked { index, checks, .. } => Some(index.start..checks.end),
@@ -1323,7 +1330,7 @@ impl SliceHeader {
         }
     }
 
-    /// The dictionary of a slice whose first [`Self::postings_start`] bytes are `bytes`.
+    /// The dictionary, from the slice's first [`Self::postings_start`] bytes.
     fn dictionary<'a>(&self, bytes: &'a [u8]) -> Result<TermBlocks<'a>, TermIndexError> {
         let part = |range: &Range<u64>| {
             bytes
@@ -1340,14 +1347,14 @@ impl SliceHeader {
     }
 }
 
-/// A checked slice's block index and checks, read once and kept, so a lookup reads only the
-/// term's dictionary block and run.
+/// A checked slice's block index and checks, read once and kept, so later
+/// lookups read only the term's dictionary block and run.
 #[derive(Debug, Clone)]
 pub(crate) struct SliceIndex {
-    /// The block index, then the checks: the bytes of [`SliceHeader::index_range`], copied, so a
-    /// resident index holds no more than its own bytes.
+    /// The bytes of [`SliceHeader::index_range`]: block index, then checks.
+    /// Copied, so a resident index never pins the larger read it came from.
     bytes: Bytes,
-    /// Bytes of the block index at the front of `bytes`.
+    /// Length of the block index at the front of `bytes`.
     index_len: usize,
     /// Where the dictionary blocks sit in the slice.
     blocks: Range<u64>,
@@ -1357,8 +1364,9 @@ pub(crate) struct SliceIndex {
 }
 
 impl SliceIndex {
-    /// The index of the checked slice `header` describes, from the bytes of its
-    /// [`SliceHeader::index_range`], once their sizes agree and the block index matches its crc32c.
+    /// Open the index of the checked slice `header` describes from the bytes
+    /// of its [`SliceHeader::index_range`]. Refuses bytes of the wrong size, a
+    /// block index failing its crc32c, or a check count not one per block.
     pub(crate) fn open(header: &SliceHeader, bytes: &[u8]) -> Result<Self, TermIndexError> {
         let Dictionary::Checked {
             index,
@@ -1391,7 +1399,7 @@ impl SliceIndex {
         })
     }
 
-    /// The block index; [`Self::open`] checked that it parses, and its bytes never change.
+    /// The block index. It cannot fail: [`Self::open`] parsed these bytes.
     fn block_index(&self) -> BlockIndex<'_> {
         BlockIndex::open(
             &self.bytes[..self.index_len],
@@ -1400,8 +1408,8 @@ impl SliceIndex {
         .expect("parsed when the index was opened")
     }
 
-    /// The block that holds `key` if any slice term does: its number and its byte range in the
-    /// slice.
+    /// The block `key` would be in: its number and its byte range in the
+    /// slice. `None` when `key` sorts before the first block.
     pub(crate) fn block_for(&self, key: &[u8]) -> Option<(usize, Range<u64>)> {
         let blocks = self.block_index();
         let b = blocks.block_for(key)?;
@@ -1410,8 +1418,8 @@ impl SliceIndex {
         Some((b, at + range.start as u64..at + range.end as u64))
     }
 
-    /// Block `b` of this slice from its `bytes`, once they match their crc32c: checked once, then
-    /// asked for any number of its terms.
+    /// Block `b` of this slice, from its `bytes` once they match their
+    /// crc32c. Checked once, then asked for any of its terms.
     pub(crate) fn block<'a>(
         &'a self,
         b: usize,
@@ -1425,7 +1433,8 @@ impl SliceIndex {
         Ok(CheckedBlock { index: self, bytes })
     }
 
-    /// Decode a run this slice's [`CheckedBlock::run_range`] located, once it matches its crc32c.
+    /// Decode a run that [`CheckedBlock::run_range`] located, once it
+    /// matches its crc32c.
     pub(crate) fn decode_run(&self, bytes: &[u8]) -> Result<Run, TermIndexError> {
         decode_run_of(CHECKED_SLICE_FORMAT_VERSION, bytes)
     }
@@ -1443,7 +1452,8 @@ pub(crate) struct CheckedBlock<'a> {
 }
 
 impl CheckedBlock<'_> {
-    /// Where `key`'s run sits in the slice; `None` when the block has no such term.
+    /// Where `key`'s run sits in the slice; `None` when the block has no such
+    /// term.
     pub(crate) fn run_range(&self, key: &[u8]) -> Result<Option<Range<u64>>, TermIndexError> {
         match lookup_in_block(self.bytes, key) {
             None => Ok(None),
@@ -1484,8 +1494,9 @@ pub(crate) struct SliceDictionary<'a> {
 }
 
 impl<'a> SliceDictionary<'a> {
-    /// The dictionary of the slice `header` describes, from its first [`SliceHeader::postings_start`]
-    /// bytes, `bytes`; bytes past the dictionary are ignored.
+    /// The dictionary of the slice `header` describes, from `bytes`, the
+    /// slice's first [`SliceHeader::postings_start`] bytes. Bytes past the
+    /// dictionary are ignored.
     pub(crate) fn open(header: SliceHeader, bytes: &'a [u8]) -> Result<Self, TermIndexError> {
         Ok(Self {
             dict: header.dictionary(bytes)?,
@@ -1903,10 +1914,11 @@ mod tests {
 
     #[test]
     fn a_root_records_each_slice_index_end_and_an_older_root_reads_as_zero() {
-        // A root whose slice records its block index end, encoded at the current version and at
-        // the version before it.
+        // A root whose slice records a block index end, encoded at the current
+        // version and at the one before.
         //  - the current version keeps the index end;
-        //  - the version before reads it as zero, so the slice is read whole, and keeps the rest.
+        //  - the one before reads it as zero (read the slice whole) and keeps
+        //    every other field.
         // This test pins the root field that sizes a lookup's first read.
         let mut root = Root {
             superfiles: vec![Uuid::from_u128(1)],
@@ -2330,7 +2342,8 @@ mod tests {
         (build_slice(&entries), keys)
     }
 
-    /// The index a ranged lookup reads from `slice`: its header, then its block index and checks.
+    /// The index a ranged lookup reads from `slice`: header, then block index
+    /// and checks.
     fn ranged_index(slice: &[u8]) -> SliceIndex {
         let header = SliceHeader::decode(&slice[..SliceHeader::MAX_LEN]).expect("header");
         let range = header.index_range().expect("a checked slice");
@@ -2343,11 +2356,11 @@ mod tests {
 
     #[test]
     fn a_checked_slice_answers_each_term_from_its_index_one_block_and_one_run() {
-        // A checked slice read the way a ranged lookup reads it: header, block index, then one
-        // dictionary block and one run per term.
-        //  - every term's run equals the whole-slice read;
-        //  - a term the slice lacks is absent.
-        // This test pins a lookup that needs only those pieces.
+        // A checked slice read as a ranged lookup reads it: header and block
+        // index, then one dictionary block and one run per term.
+        //  - every term's run equals the whole-slice read's;
+        //  - a term between two of its terms is absent.
+        // This test pins a lookup that reads only those pieces.
         let (slice, keys) = ranged_slice();
         let whole = Slice::open(&slice).expect("whole");
         let index = ranged_index(&slice);
@@ -2373,9 +2386,10 @@ mod tests {
     #[test]
     fn a_checked_slice_refuses_a_corrupt_index_block_or_run() {
         // One byte flipped in each piece a ranged lookup reads.
-        //  - a flipped block index, dictionary block or run is refused, never read as absent;
+        //  - a flipped block index, block or run is refused, never read as
+        //    absent;
         //  - the whole-slice read refuses the flipped run too.
-        // This test pins that a lookup never answers from bytes that fail their check.
+        // This test pins that a lookup never answers from bytes failing a check.
         let (slice, keys) = ranged_slice();
         let key = &keys[RANGED_TEST_TERMS / 2];
         let header = SliceHeader::decode(&slice).expect("header");
@@ -2405,10 +2419,10 @@ mod tests {
 
     #[test]
     fn a_slice_of_the_layout_before_checks_reads_whole() {
-        // A slice written with level heads and no checks, as the engine wrote it before.
-        //  - its header says it is not checked, so lookups read it whole;
-        //  - the whole read answers its terms.
-        // This test pins that older slices keep reading after the layout change.
+        // A slice in the layout before checks: level heads, no crc32c.
+        //  - its header has no block index range, so lookups read it whole;
+        //  - the whole read answers its term.
+        // This test pins that older slices still read after the layout change.
         let postings = sample_postings();
         let key = make_key("body", "alpha");
         let slice = encode_unchecked_slice(&[(key.clone(), postings.clone())]);
@@ -2424,8 +2438,8 @@ mod tests {
 
     #[test]
     fn a_slice_header_whose_regions_overflow_is_refused() {
-        // A checked header naming a dictionary of u64::MAX bytes.
-        //  - it is refused at decode, before any offset is computed from it.
+        // A checked header naming a block index of u64::MAX bytes.
+        //  - decode refuses it.
         // This test pins that a bad header cannot overflow the region offsets.
         let (mut slice, _) = ranged_slice();
         slice[MAGIC_LEN + U32_LEN..MAGIC_LEN + U32_LEN + U64_LEN]

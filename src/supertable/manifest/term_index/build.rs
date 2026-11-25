@@ -2389,8 +2389,8 @@ pub(crate) fn build(
 ///
 /// Optimize skips the rebuild when the current index already has a full
 /// build's shape, so a change to what this writes reaches an existing
-/// table's layers only as folds rewrite them; roots of older versions still
-/// load, and their slices are read as their layout allows.
+/// table only as folds rewrite its layers. Older roots and slices still
+/// load, and are read as their layout allows.
 #[cfg_attr(
     feature = "detailed-tracing",
     tracing::instrument(skip_all, fields(inputs = contributions.len()))

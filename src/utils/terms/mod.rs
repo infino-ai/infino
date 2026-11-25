@@ -262,8 +262,8 @@ impl<'a> TermBlocks<'a> {
         Self::from_parts(blocks, tail)
     }
 
-    /// A dictionary stored in two places: its `blocks`, and its index `tail` (key area, table and
-    /// footer), which a reader can then fetch without the blocks.
+    /// A dictionary stored in two parts: its `blocks`, and its index `tail`
+    /// (key area, table and footer), which a reader can fetch without them.
     pub(crate) fn from_parts(blocks: &'a [u8], tail: &'a [u8]) -> Result<Self, String> {
         let keys_offset = blocks.len();
         let index = BlockIndex::open(tail, keys_offset)?;
@@ -358,14 +358,15 @@ impl<'a> TermBlocks<'a> {
     }
 }
 
-/// A term-block dictionary's index on its own: each block's first key and byte range, read from
-/// the key area, table and footer, so a lookup can fetch only the one block it needs.
+/// A term-block dictionary's index on its own: each block's first key and
+/// byte range, read from the key area, table and footer, so a lookup can
+/// fetch only the one block it needs.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BlockIndex<'a> {
     /// The dictionary's bytes from its key area to its end.
     tail: &'a [u8],
     n_blocks: usize,
-    /// Where the key area starts in the dictionary, which is also where the blocks end.
+    /// Where the blocks end and the key area starts, in the dictionary.
     blocks_end: usize,
     /// Where the index table starts in `tail`.
     table_at: usize,
@@ -382,8 +383,8 @@ impl<'a> BlockIndex<'a> {
         Ok(u64_le_at(dict, f + 12).ok_or(footer)? as usize)
     }
 
-    /// The index of a dictionary from `tail`, its bytes from `blocks_end` (where [`Self::start`]
-    /// says the index starts) to its end.
+    /// The index of a dictionary from `tail`, its bytes from `blocks_end`
+    /// (where [`Self::start`] says the index starts) to its end.
     pub(crate) fn open(tail: &'a [u8], blocks_end: usize) -> Result<Self, String> {
         let footer = "term-block dictionary footer is malformed";
         let f = tail
@@ -419,8 +420,9 @@ impl<'a> BlockIndex<'a> {
         self.blocks_end + self.table_at
     }
 
-    /// Block `b`'s byte offset in the dictionary and the start of its first key within the key
-    /// area, straight from the table; `None` past the last block.
+    /// Block `b`'s byte offset in the dictionary and the start of its first
+    /// key within the key area, straight from the table; `None` past the last
+    /// block.
     fn entry(&self, b: usize) -> Option<(usize, usize)> {
         if b >= self.n_blocks {
             return None;
@@ -737,11 +739,13 @@ mod tests {
 
     #[test]
     fn a_block_index_finds_each_key_from_the_index_and_one_block() {
-        // A dictionary whose index is opened from its tail alone, as a ranged read would see it.
+        // A dictionary whose index is opened from its tail alone, as a ranged
+        // read sees it.
         //  - every key is found in the one block the index names;
         //  - a key between two terms is not found;
         //  - a tail opened at the wrong offset, or cut short, is refused.
-        // This test pins a lookup that needs the index and one block, not the whole dictionary.
+        // This test pins a lookup that needs the index and one block, not the
+        // whole dictionary.
         for n in [1u32, 32, 33, 1000] {
             let items = entries(n);
             let mut w = TermBlockWriter::new(Vec::new());
