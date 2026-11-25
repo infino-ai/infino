@@ -120,7 +120,7 @@ use tracing::Instrument;
 use crate::{
     memory::{ConnectionMemoryBudget, Reclaim, Reservation},
     superfile::CacheBlocks,
-    supertable::query::df_object_store::{SuperfileObjectStore, merged_ranges},
+    supertable::query::df_object_store::{SuperfileObjectStore, merged_ranges, merged_within},
 };
 
 /// Row groups in a reader's first batch, fewer if the byte cap cuts it. One
@@ -673,32 +673,29 @@ fn leave_shared_ends(
 /// [`CacheBlocks::download_len`], whichever is smaller.
 fn download_bytes(clusters: &[Vec<Range<u64>>], blocks: CacheBlocks) -> u64 {
     let spans = || clusters.iter().flatten();
-    let reached = covered_bytes(spans().map(|s| blocks.reach(s)).collect());
+    let reaches: Vec<Range<u64>> = spans().map(|s| blocks.reach(s)).collect();
+    let reached = covered_bytes(&reaches);
     let windows = spans().map(|s| blocks.download_len(s)).sum();
     reached.min(windows)
 }
 
-/// What the cache downloads for a batch it keeps none of: each span's blocks,
+/// What the cache downloads for a batch it doesn't keep: each span's blocks,
 /// a block two spans share once.
 fn uncached_bytes(clusters: &[Vec<Range<u64>>], blocks: CacheBlocks) -> u64 {
-    covered_bytes(
-        clusters
-            .iter()
-            .flatten()
-            .map(|s| blocks.rounded(s))
-            .collect(),
-    )
+    let rounded: Vec<Range<u64>> = clusters
+        .iter()
+        .flatten()
+        .map(|s| blocks.rounded(s))
+        .collect();
+    covered_bytes(&rounded)
 }
 
 /// Bytes in the union of `ranges`.
-fn covered_bytes(mut ranges: Vec<Range<u64>>) -> u64 {
-    ranges.sort_by_key(|r| r.start);
-    let (mut total, mut covered) = (0, 0);
-    for range in ranges {
-        total += range.end.saturating_sub(range.start.max(covered));
-        covered = covered.max(range.end);
-    }
-    total
+fn covered_bytes(ranges: &[Range<u64>]) -> u64 {
+    merged_within(ranges, 0)
+        .iter()
+        .map(|r| r.end - r.start)
+        .sum()
 }
 
 /// The [`AsyncFileReader`] for one superfile in one scan partition. It serves
@@ -1064,11 +1061,11 @@ impl ReadAhead {
         // Reserve what the cache downloads, not just the spans: a read of a
         // whole download is served as a slice of it, which keeps all of it in
         // memory. Past the cache that's just the spans' blocks.
-        let downloads = match (kept, blocks) {
+        let held_bytes = match (kept, blocks) {
             (false, Some(blocks)) => uncached_bytes(&clusters, blocks),
             _ => downloads,
         };
-        let Some(hold) = self.scan.reserve(charge.max(downloads as usize)) else {
+        let Some(hold) = self.scan.reserve(charge.max(held_bytes as usize)) else {
             return;
         };
         let spans: Vec<Range<u64>> = clusters.iter().flatten().cloned().collect();
@@ -2760,7 +2757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_write_queue_still_fetches_ahead_and_serves_the_batch() {
+    async fn a_full_write_behind_cap_still_fetches_ahead_and_serves_the_batch() {
         // The cache's write-behind cap has no room for what a batch downloads.
         //  - read-ahead still fetches the next batch;
         //  - the scan reads it from memory, not from the store again.

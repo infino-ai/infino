@@ -363,10 +363,11 @@ enum Fill {
     /// Ahead of reads: uses only free budget and waits for its own write, so
     /// the cap never refuses it; it holds the bytes until then either way.
     Prefetch,
-    /// For a read the cache has no room for: never cached, so it takes no
-    /// budget and no share of the cap. Its GET is still in `runs` while in
-    /// flight, so another read of those blocks waits for it instead of
-    /// downloading them again.
+    /// For a read the cache has no room for: takes no budget and no share of
+    /// the cap, and isn't written. Its GET is still in `runs` while in flight,
+    /// so another read of those blocks waits for it instead of downloading
+    /// them again. If one of those reads would have kept its own GET, the run
+    /// is kept as that GET would be (see [`MemoryRun::wanted`]).
     Pass,
 }
 
@@ -524,10 +525,6 @@ impl Drop for FetchTask {
 enum Fetched {
     /// The run's bytes, starting at its first block.
     Bytes(Bytes),
-    /// The same, from a GET the cache keeps none of ([`Fill::Pass`]). A read
-    /// that waited on it and would have kept its own GET keeps these instead
-    /// (see [`BlockCachedSource::keep_passed`]).
-    Passed(Bytes),
     /// Read elsewhere (the whole-file copy or object storage): the store is
     /// gone, the block file could not be created, this source is no longer the
     /// live entry, the budget is full, or the GET came back short.
@@ -634,6 +631,10 @@ struct MemoryRun {
     /// Last block of the run (inclusive).
     last: u32,
     bytes: RunBytes,
+    /// For a [`Fill::Pass`] run in flight: set when a read that would have
+    /// kept its own GET waits on it, so the run is kept after all, with one
+    /// reservation however many reads wait. Shared with the run's [`Claim`].
+    wanted: Option<Arc<AtomicBool>>,
 }
 
 impl MemoryRun {
@@ -664,6 +665,8 @@ struct Claim {
     first: u32,
     id: u64,
     handed_on: bool,
+    /// The run's [`MemoryRun::wanted`].
+    wanted: Option<Arc<AtomicBool>>,
 }
 
 impl Claim {
@@ -1642,11 +1645,13 @@ impl BlockCachedSource {
     ) -> RunFetch {
         let source = self.me.upgrade().expect("a read holds its source");
         let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+        let wanted = matches!(fill, Fill::Pass).then(|| Arc::new(AtomicBool::new(false)));
         let claim = Claim {
             source: Arc::clone(&source),
             first,
             id,
             handed_on: false,
+            wanted: wanted.clone(),
         };
         let fetch = async move {
             match source.block_file() {
@@ -1664,6 +1669,7 @@ impl BlockCachedSource {
                 id,
                 last,
                 bytes: RunBytes::Fetching(fetch.downgrade().expect("a fetch not polled yet")),
+                wanted,
             },
         );
         fetch
@@ -1756,7 +1762,7 @@ impl BlockCachedSource {
                     .await
             };
             match fetched {
-                Fetched::Bytes(bytes) | Fetched::Passed(bytes) => Ok(Segment::InMemory {
+                Fetched::Bytes(bytes) => Ok(Segment::InMemory {
                     first,
                     last,
                     run_first,
@@ -1802,51 +1808,15 @@ impl BlockCachedSource {
             Err(_) => select! {
                 fetched = &mut fetch => fetched,
                 hedged = self.fetch_now(bf, first, last, None, fill) => match hedged {
-                    Fetched::Bytes(_) | Fetched::Passed(_) => return (first, hedged),
+                    Fetched::Bytes(_) => return (first, hedged),
                     _ => fetch.await,
                 },
             },
         };
         match waited {
             Fetched::Elsewhere => (first, self.fetch_now(bf, first, last, None, fill).await),
-            Fetched::Passed(bytes) if !matches!(fill, Fill::Pass) => {
-                self.keep_passed(run_first, run_last, bytes.clone());
-                (run_first, Fetched::Bytes(bytes))
-            }
             fetched => (run_first, fetched),
         }
-    }
-
-    /// Keeps run `[first, last]`, which a read the cache had no room for
-    /// fetched, for a read that waited on it and would have kept its own GET:
-    /// as if that read had fetched it. In the background, so the read doesn't
-    /// wait for the room. Of several such reads, the first keeps it; the
-    /// others find it in `runs`, or on the block file.
-    fn keep_passed(&self, first: u32, last: u32, bytes: Bytes) {
-        let Some(source) = self.me.upgrade() else {
-            return;
-        };
-        let keep = async move {
-            let Some(store) = source.store_if_current() else {
-                return;
-            };
-            if source.all_filled(first, last) {
-                return;
-            }
-            let reservation = match source.owns_accounting {
-                true => match store.reserve(bytes.len() as u64).await {
-                    Ok(reserved) => Some(reserved),
-                    Err(_) => return,
-                },
-                false => None,
-            };
-            if let Some(run) =
-                source.admit_run(&store, first, last, &bytes, reservation, Fill::Read, None)
-            {
-                drop(run.spawn_write());
-            }
-        };
-        drop(shared_io_runtime().spawn(keep.in_current_span()));
     }
 
     /// How long a read waits on another read's GET of `bytes` before it GETs the
@@ -1868,15 +1838,13 @@ impl BlockCachedSource {
         fill: Fill,
     ) -> Fetched {
         match self.fetch_missing(bf, first, last, fill, claim).await {
-            Ok(Some((bytes, Some(run)))) => {
-                // Don't wait for the write: the reads already have their bytes.
-                drop(run.spawn_write());
+            Ok(Some((bytes, run))) => {
+                if let Some(run) = run {
+                    // Don't wait for the write: the reads already have their bytes.
+                    drop(run.spawn_write());
+                }
                 Fetched::Bytes(bytes)
             }
-            Ok(Some((bytes, None))) => match fill {
-                Fill::Pass => Fetched::Passed(bytes),
-                Fill::Read | Fill::Prefetch => Fetched::Bytes(bytes),
-            },
             Ok(None) => Fetched::Elsewhere,
             Err(error) => Fetched::Failed(FetchError::new(error)),
         }
@@ -1913,6 +1881,16 @@ impl BlockCachedSource {
     ) -> Vec<Segment> {
         let mut runs = self.runs.lock().expect("runs mutex poisoned");
         let segments = self.segments_in(&runs, b0, b1, InFlight::Fetching);
+        // A read that would keep its own GET wants the runs it waits on kept.
+        if !matches!(fill, Fill::Pass) {
+            for segment in &segments {
+                if let Segment::Fetching { run_first, .. } = segment
+                    && let Some(wanted) = runs.get(run_first).and_then(|run| run.wanted.as_ref())
+                {
+                    wanted.store(true, Ordering::Release);
+                }
+            }
+        }
         let missing: Vec<(u32, u32)> = segments
             .iter()
             .filter_map(|segment| match *segment {
@@ -2050,8 +2028,8 @@ impl BlockCachedSource {
         };
         let (run_start, run_len) = Self::run_bytes(bf.size, first, last);
 
-        // A pass-through run is never kept, so it takes no budget.
-        let reservation = match (fill, self.owns_accounting) {
+        // A pass-through run takes no budget unless a read wants it kept.
+        let mut reservation = match (fill, self.owns_accounting) {
             (Fill::Pass, _) | (_, false) => None,
             (Fill::Read, true) => match store.reserve(run_len).await {
                 Ok(reserved) => Some(reserved),
@@ -2066,6 +2044,23 @@ impl BlockCachedSource {
         let bytes = self.inner.range(run_start, run_len).await?;
         if bytes.len() as u64 != run_len {
             return Ok(None);
+        }
+
+        // A read that would have kept its own GET waited on this pass-through
+        // run, so it's kept as that GET would be.
+        let wanted = claim
+            .as_ref()
+            .and_then(|claim| claim.wanted.as_ref())
+            .is_some_and(|wanted| wanted.load(Ordering::Acquire));
+        let fill = match fill {
+            Fill::Pass if wanted => Fill::Read,
+            fill => fill,
+        };
+        if matches!(fill, Fill::Read) && reservation.is_none() && self.owns_accounting {
+            match store.reserve(run_len).await {
+                Ok(reserved) => reservation = Some(reserved),
+                Err(_) => return Ok(Some((bytes, None))),
+            }
         }
 
         let run = self.admit_run(&store, first, last, &bytes, reservation, fill, claim);
@@ -2132,6 +2127,7 @@ impl BlockCachedSource {
                         id,
                         last,
                         bytes: RunBytes::Fetched(bytes.clone()),
+                        wanted: None,
                     },
                 );
                 id
@@ -6988,6 +6984,7 @@ mod tests {
             first: 0,
             id: src.next_run_id.fetch_add(1, Ordering::Relaxed),
             handed_on: false,
+            wanted: None,
         };
 
         let mut sent = pin!(src.range(0, 64));

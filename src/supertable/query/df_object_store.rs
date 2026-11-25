@@ -204,11 +204,12 @@ impl SuperfileObjectStore {
     ///   ([`LazyByteSource::range_ahead`]). A cluster's spans download one
     ///   after another, so a cache block they share is downloaded once: the
     ///   second span finds it kept.
-    /// - Without, nothing is kept, so the write-behind cap is left to the
-    ///   scan's own reads ([`LazyByteSource::range_ahead_uncached`]). Blocks
-    ///   the cache holds come from it, and blocks another read is downloading
-    ///   are waited for. So a cluster's spans start together: a block two of
-    ///   them share is downloaded by one and waited for by the other.
+    /// - Without, the batch's own downloads are not kept, so the write-behind
+    ///   cap is left to the scan's own reads
+    ///   ([`LazyByteSource::range_ahead_uncached`]). Blocks the cache holds
+    ///   come from it, and blocks another read is downloading are waited for.
+    ///   So a cluster's spans start together: a block two of them share is
+    ///   downloaded by one and waited for by the other.
     /// - Clusters download [`FETCH_PARALLELISM`] at a time.
     pub(crate) async fn get_spans_ahead(
         &self,
@@ -225,7 +226,7 @@ impl SuperfileObjectStore {
                         true => {
                             let mut bytes = Vec::with_capacity(cluster.len());
                             for span in cluster {
-                                bytes.push(read_range_ahead(&source, span, kept).await?);
+                                bytes.push(read_range_ahead(&source, span, true).await?);
                             }
                             Ok::<_, OsError>(bytes)
                         }
@@ -233,7 +234,7 @@ impl SuperfileObjectStore {
                             try_join_all(
                                 cluster
                                     .into_iter()
-                                    .map(|span| read_range_ahead(&source, span, kept)),
+                                    .map(|span| read_range_ahead(&source, span, false)),
                             )
                             .await
                         }
