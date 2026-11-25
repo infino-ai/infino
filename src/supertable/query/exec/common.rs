@@ -4543,7 +4543,7 @@ mod tests {
         assert_eq!(take(Arc::clone(&full)).await, batch);
         assert_eq!(full.peak(), 0, "no room in the budget: nothing reserved");
 
-        source.keeps.store(false, Ordering::Relaxed);
+        source.has_room.store(false, Ordering::Relaxed);
         let roomy = ConnectionMemoryBudget::measured();
         assert_eq!(take(Arc::clone(&roomy)).await, batch);
         assert!(roomy.peak() > 0, "no room in the cache: still prefetched");

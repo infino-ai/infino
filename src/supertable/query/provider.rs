@@ -4637,7 +4637,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         config::{CompactionSettings, OptimizeOptions},
-        memory::ConnectionMemoryBudget,
+        memory::{ConnectionMemoryBudget, Reclaim},
         runtime_metrics::op_stats::{current, with_op_stats},
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
@@ -6710,7 +6710,7 @@ pub(crate) mod tests {
             Arc::clone(&schema),
         ));
         if !read_ahead {
-            read_ahead_state.disable();
+            read_ahead_state.reclaim();
         }
         let factory = ScanReaderFactory {
             read_ahead: Arc::clone(&read_ahead_state),

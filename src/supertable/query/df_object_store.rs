@@ -139,9 +139,14 @@ impl SuperfileObjectStore {
     }
 
     /// Reserve room in the cache in front of `location` for `bytes` downloaded
-    /// ahead (see [`LazyByteSource::cache_room_ahead`]).
-    pub(crate) fn cache_room_ahead(&self, location: &ObjPath, bytes: u64) -> Option<CacheRoom> {
-        self.source(location).ok()?.cache_room_ahead(bytes)
+    /// ahead (see [`LazyByteSource::cache_room_ahead`]): `None` when it has
+    /// none, an error when no source is registered for `location`.
+    pub(crate) fn cache_room_ahead(
+        &self,
+        location: &ObjPath,
+        bytes: u64,
+    ) -> OsResult<Option<CacheRoom>> {
+        Ok(self.source(location)?.cache_room_ahead(bytes))
     }
 
     /// Count `ranges` of `location` as read, for a reader served them from
@@ -190,9 +195,12 @@ impl SuperfileObjectStore {
         .await
     }
 
-    /// Download `clusters` of spans ahead of the scan, through
-    /// [`LazyByteSource::range_ahead`], and return every span's bytes in
-    /// order. Not counted as page reads.
+    /// Download `clusters` of spans ahead of the scan and return every span's
+    /// bytes in order. Not counted as page reads.
+    /// - With `kept`, through [`LazyByteSource::range_ahead`], so the cache
+    ///   keeps them. Without, through [`LazyByteSource::range_uncached`]: the
+    ///   cache has no room, so it serves what it holds and keeps none of the
+    ///   rest, and its write queue stays free for reads' own downloads.
     /// - Clusters download [`FETCH_PARALLELISM`] at a time.
     /// - A cluster's spans download one after another, so a cache block they
     ///   share is downloaded once.
@@ -200,6 +208,7 @@ impl SuperfileObjectStore {
         &self,
         location: &ObjPath,
         clusters: &[Vec<Range<u64>>],
+        kept: bool,
     ) -> OsResult<Vec<Bytes>> {
         let source = self.source(location)?;
         let per_cluster: Vec<Vec<Bytes>> = stream::iter(clusters.iter().cloned())
@@ -208,7 +217,7 @@ impl SuperfileObjectStore {
                 async move {
                     let mut bytes = Vec::with_capacity(cluster.len());
                     for span in cluster {
-                        bytes.push(read_range_ahead(&source, span).await?);
+                        bytes.push(read_range_ahead(&source, span, kept).await?);
                     }
                     Ok::<_, OsError>(bytes)
                 }
@@ -273,17 +282,23 @@ impl SuperfileObjectStore {
 
 /// `range` of `source`, downloaded ahead of the scan (see
 /// [`LazyByteSource::range_ahead`]).
-async fn read_range_ahead(source: &Arc<dyn LazyByteSource>, range: Range<u64>) -> OsResult<Bytes> {
+async fn read_range_ahead(
+    source: &Arc<dyn LazyByteSource>,
+    range: Range<u64>,
+    kept: bool,
+) -> OsResult<Bytes> {
     if range.is_empty() {
         return Ok(Bytes::new());
     }
-    source
-        .range_ahead(range.start, range.end - range.start)
-        .await
-        .map_err(|e| OsError::Generic {
-            store: "SuperfileObjectStore",
-            source: Box::new(e),
-        })
+    let (start, len) = (range.start, range.end - range.start);
+    match kept {
+        true => source.range_ahead(start, len).await,
+        false => source.range_uncached(start, len).await,
+    }
+    .map_err(|e| OsError::Generic {
+        store: "SuperfileObjectStore",
+        source: Box::new(e),
+    })
 }
 
 /// `range` of `source`. Goes through `range_async` so a warm, mmap/block-
