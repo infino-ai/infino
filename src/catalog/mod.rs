@@ -721,7 +721,7 @@ impl Connection {
 
     /// [`Self::open_table_handle`], opening a table without its per-column statistics unless
     /// `statistics`; with it, a cached handle without them reads them in place first.
-    fn open_table_handle_for(
+    pub(crate) fn open_table_handle_for(
         &self,
         name: &str,
         statistics: bool,
@@ -1492,7 +1492,7 @@ impl Connection {
         // Search TVFs resolve their leading table-name argument through
         // the catalog at call time (so a table named only inside a TVF —
         // not as a `FROM` relation — still resolves).
-        search_tvf::register_search_tvfs(&ctx, self.clone(), table_reads.clone());
+        search_tvf::register_search_tvfs(&ctx, self.clone(), table_reads.clone(), statistics);
         // The graph functions walk an edge table of this catalog by name, or
         // the one attached from another catalog with no name.
         #[cfg(feature = "graph-index")]
@@ -2355,7 +2355,8 @@ fn ensure_statistics(
 }
 
 /// Whether `statement` can use the per-column statistics: "no" only for a plain read of one table
-/// (no filter, grouping, ordering, join or subquery, no aggregate but a row count), "yes" if unsure.
+/// or one search function (no filter, grouping, ordering, join or subquery, no aggregate but a row
+/// count), "yes" if unsure.
 fn uses_statistics(statement: &DFStatement) -> bool {
     let DFStatement::Statement(statement) = statement else {
         return true;
@@ -2386,8 +2387,18 @@ fn uses_statistics(statement: &DFStatement) -> bool {
     let [from] = select.from.as_slice() else {
         return true;
     };
-    let one_table =
-        from.joins.is_empty() && matches!(&from.relation, TableFactor::Table { args: None, .. });
+    let one_table = from.joins.is_empty()
+        && match &from.relation {
+            TableFactor::Table { args: None, .. } => true,
+            TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            } => search_tvf::SEARCH_FUNCTIONS
+                .iter()
+                .any(|search| name.to_string().eq_ignore_ascii_case(search)),
+            _ => false,
+        };
     let plain = select.selection.is_none()
         && select.prewhere.is_none()
         && select.having.is_none()
@@ -5626,6 +5637,9 @@ mod tests {
         "SELECT t.* FROM t",
         "SELECT title, _id AS id FROM t",
         "SELECT title FROM t LIMIT 3",
+        "SELECT * FROM bm25_search('t', 'title', 'a', 10)",
+        "SELECT title, score FROM BM25_SEARCH('t', 'title', 'a', 10) LIMIT 3",
+        "SELECT count(*) FROM token_match('t', 'title', 'a')",
     ];
 
     /// Statements that may read the statistics: one for each reader of them (superfile pruning,
@@ -5649,7 +5663,10 @@ mod tests {
         "WITH s AS (SELECT * FROM t) SELECT * FROM s",
         "SELECT * FROM t UNION ALL SELECT * FROM t",
         "SELECT * FROM t, u",
-        "SELECT * FROM bm25_search('t', 'title', 'a', 10)",
+        "SELECT * FROM bm25_search('t', 'title', 'a', 10) WHERE title = 'a'",
+        "SELECT * FROM bm25_search('t', 'title', 'a', 10) ORDER BY title",
+        "SELECT * FROM bm25_search('t', 'title', 'a', 10) b JOIN u ON b.title = u.title",
+        "SELECT * FROM generate_series(1, 3)",
         "SELECT * FROM t LIMIT (SELECT count(*) FROM t WHERE title = 'a')",
         "SELECT * REPLACE ((SELECT count(*) FROM u WHERE title = 'a') AS title) FROM t",
         "EXPLAIN SELECT count(*) FROM t",
@@ -5734,6 +5751,46 @@ mod tests {
         assert_eq!(count_on(&conn, PLAIN_COUNT), CABS);
         assert_eq!(manifest_gets(&conn), (0, 0, parts));
         assert_eq!(cached_statistics(&conn, "cabs"), Some(false));
+    }
+
+    /// Rows `sql` returns on `conn`.
+    fn rows_on(conn: &Connection, sql: &str) -> usize {
+        conn.query_sql(sql)
+            .expect(sql)
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+    }
+
+    /// A cold plain search opens its table without statistics and downloads none; a filtered
+    /// search on the same connection then reads them into that handle and finds the same rows.
+    #[test]
+    fn a_plain_search_opens_its_table_without_statistics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_owned();
+        let table = connect(&uri)
+            .expect("connect")
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        table
+            .append(&build_title_batch(&["yellow", "green", "yellow"]), None)
+            .expect("append 1");
+        table
+            .append(&build_title_batch(&["fhv", "yellow"]), None)
+            .expect("append 2");
+
+        let conn = connect(&uri).expect("reconnect");
+        conn.usage_meter().start_trace();
+        let plain = "SELECT title, score FROM bm25_search('docs', 'title', 'yellow', 10)";
+        assert_eq!(rows_on(&conn, plain), YELLOW_CABS as usize);
+        let (summaries, rollups, _) = manifest_gets(&conn);
+        assert_eq!((summaries, rollups), (0, 0));
+        assert_eq!(cached_statistics(&conn, "docs"), Some(false));
+
+        let filtered =
+            "SELECT title FROM bm25_search('docs', 'title', 'yellow', 10) WHERE title = 'yellow'";
+        assert_eq!(rows_on(&conn, filtered), YELLOW_CABS as usize);
+        assert_eq!(cached_statistics(&conn, "docs"), Some(true));
     }
 
     /// Leaves a delete of the cab fixture's first row in its log at `state`, held by `lease`
