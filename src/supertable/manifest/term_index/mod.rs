@@ -478,6 +478,20 @@ struct DiskRead {
     done: Arc<Notify>,
 }
 
+impl DiskRead {
+    /// Registers a whole read of `hash` from local disk in `chunks`, the set `tier_chunks` guards.
+    fn begin(chunks: &mut TierChunks, tier_chunks: &TierChunkCache, hash: ContentHash) -> Self {
+        let done = Arc::new(Notify::new());
+        chunks.disk_reads.insert(hash, Arc::clone(&done));
+        let tier_chunks = Arc::clone(tier_chunks);
+        DiskRead {
+            tier_chunks,
+            hash,
+            done,
+        }
+    }
+}
+
 impl Drop for DiskRead {
     fn drop(&mut self) {
         // Only this read put its entry there, and nothing replaces it while it stands.
@@ -3702,16 +3716,7 @@ impl TermIndex {
                 }
                 match chunks.disk_reads.get(hash) {
                     Some(done) => Arc::clone(done),
-                    None => {
-                        let done = Arc::new(Notify::new());
-                        chunks.disk_reads.insert(*hash, Arc::clone(&done));
-                        let tier_chunks = Arc::clone(&self.tier_chunks);
-                        break Some(DiskRead {
-                            tier_chunks,
-                            hash: *hash,
-                            done,
-                        });
-                    }
+                    None => break Some(DiskRead::begin(&mut chunks, &self.tier_chunks, *hash)),
                 }
             };
             let mut woken = pin!(done.notified());
@@ -10606,31 +10611,30 @@ mod tests {
         let cache = new_tier_chunk_cache();
         let index = disk_index(&root, Arc::clone(&local), &disk, &cache);
         let asked = [terms[0].as_str()];
-        let reads: Vec<DiskRead> = root
+        // One read per slice object: layers may share one.
+        let hashes: HashSet<ContentHash> = root
             .slices_for_key(&fid("body").term_key(&terms[0]))
-            .map(|slice| {
-                let done = Arc::new(Notify::new());
-                let hash = slice.content_hash;
+            .map(|slice| slice.content_hash)
+            .collect();
+        let reads: Vec<DiskRead> = hashes
+            .into_iter()
+            .map(|hash| {
                 let mut chunks = cache.lock().expect("tier chunk cache lock");
-                chunks.disk_reads.insert(hash, Arc::clone(&done));
-                let tier_chunks = Arc::clone(&cache);
-                DiskRead {
-                    tier_chunks,
-                    hash,
-                    done,
-                }
+                DiskRead::begin(&mut chunks, &cache, hash)
             })
             .collect();
         let hits = disk.stats().n_hits;
         let mut lookup = pin!(index.runs_many(fid("body"), &asked));
+        assert!(poll!(lookup.as_mut()).is_pending(), "the lookup is pending");
+        // A waiter holds a clone of the read's wake, beside the entry's and the read's own.
         assert!(
-            poll!(lookup.as_mut()).is_pending(),
-            "the lookup waits on the reads in flight"
+            reads.iter().any(|read| Arc::strong_count(&read.done) > 2),
+            "the lookup waits on a read in flight"
         );
         assert_eq!(disk.stats().n_hits, hits, "nothing read while it waits");
         let touched = reads.len() as u64;
         drop(reads);
-        let runs = timeout(Duration::from_secs(10), lookup)
+        let runs = timeout(BUDGET_DEADLOCK_TIMEOUT, lookup)
             .await
             .expect("the lookup finishes")
             .expect("lookup");
@@ -10638,6 +10642,12 @@ mod tests {
             disk.stats().n_hits - hits,
             touched,
             "it reads each slice itself"
+        );
+        assert!(
+            (cache.lock().expect("tier chunk cache lock"))
+                .disk_reads
+                .is_empty(),
+            "no read left registered"
         );
         let whole = TermIndex::new(root.clone(), String::new(), local, None)
             .with_small_slice_bytes(u64::MAX)
