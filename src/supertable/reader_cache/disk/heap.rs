@@ -349,7 +349,8 @@ impl HeapBudget {
 
     /// Reserve `bytes` a reader keeps only to save a later read, such as a doc-id map page. `None`
     /// if the process is short of memory or the budget has no room; it never drops anything to
-    /// make room.
+    /// make room. The bytes count with file metadata, not in the maps' share, so the over-budget
+    /// pass frees them with their file.
     pub(crate) fn try_reserve_page(&'static self, bytes: u64) -> Option<HeapReservation> {
         if self.short_of_memory() {
             return None;
@@ -564,7 +565,7 @@ impl HeapBudget {
                     .map_or(0, |fts| fts.kept_page_bytes(self))
         });
         let unheld = oldest.iter().map(|&(_, _, _, bytes)| bytes).sum();
-        // Held file metadata: what is charged, less doc-id maps and the unheld files found here.
+        // Held bytes: what is reserved, less whole doc-id maps and the unheld files found here.
         let held = self.sql_bytes().saturating_sub(unheld);
         Scan {
             oldest,
@@ -592,7 +593,8 @@ impl HeapBudget {
         list.push(sessions);
     }
 
-    /// Bytes charged for file metadata: everything but doc-id maps, which the pass can't drop.
+    /// Bytes reserved for everything but whole doc-id maps, which the pass can't drop: file
+    /// metadata and kept map pages.
     fn sql_bytes(&self) -> u64 {
         let maps = self.maps.load(Ordering::Acquire);
         self.charged.load(Ordering::Acquire).saturating_sub(maps)
@@ -750,8 +752,9 @@ mod tests {
         uri
     }
 
-    /// `superfile` opened lazily against `budget`, after translating the doc ids `ids` returns for
-    /// its document count. Translating every document keeps the whole map; one keeps its page.
+    /// `superfile` opened lazily against `budget`, after a ranked search's translation of the doc
+    /// ids `ids` returns for its document count. Every document keeps the whole map; one keeps its
+    /// page.
     async fn reader_translating(
         superfile: &Bytes,
         budget: &'static HeapBudget,
@@ -763,9 +766,8 @@ mod tests {
             .expect("open lazily")
             .with_fts_heap_budget(budget);
         let fts = reader.fts().expect("a text index");
-        fts.ids_to_rows_async(ids(fts.n_docs()))
-            .await
-            .expect("translate");
+        let hits = ids(fts.n_docs()).into_iter().map(|id| (id, 0.0)).collect();
+        fts.hits_to_rows_async(hits).await.expect("translate");
         reader
     }
 
@@ -1131,7 +1133,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_keeping_only_map_pages_goes_on_the_pass_like_other_cached_bytes() {
         // Setup: a budget of one doc-id map page, kept by an idle file; a newer file's metadata
-        // then pushes the budget over while the process is short of memory.
+        // pushes it over, then the process turns short of memory.
         //  - The pass counts the page as the idle file's bytes and lets that file go.
         //  - The page's reservation comes back.
         // This test pins that kept pages count as an idle file's bytes, not as bytes running

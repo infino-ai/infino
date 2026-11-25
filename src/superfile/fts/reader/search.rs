@@ -249,15 +249,6 @@ fn in_flight_batches(reads: &[Range<usize>], cap: usize) -> Vec<&[Range<usize>]>
     batches
 }
 
-/// Cuts `bytes`, a read of `len` map bytes that starts on a page, into its pages. Each is
-/// [`DOC_MAP_PAGE_BYTES`] long except the map's last, which may be shorter.
-fn split_pages(bytes: &Bytes, len: usize) -> Vec<Bytes> {
-    (0..len)
-        .step_by(DOC_MAP_PAGE_BYTES)
-        .map(|at| bytes.slice(at..(at + DOC_MAP_PAGE_BYTES).min(len)))
-        .collect()
-}
-
 /// Returns `rows` in ascending order, read back from a bitset of the
 /// `n_rows` rows in which each is marked: the expansion the posting
 /// decoder uses for a presence block.
@@ -1095,7 +1086,7 @@ impl FtsReader {
         &self,
         ids: Vec<FtsDocId>,
     ) -> Result<Vec<RowId>, FtsError> {
-        let rows = self.rows_of_ids(&ids).await?;
+        let rows = self.rows_of_ids(&ids, false).await?;
         Ok(self.in_row_order(rows))
     }
 
@@ -1154,13 +1145,18 @@ impl FtsReader {
     /// ```text
     /// map already kept                             -> translate in memory
     /// reads > 1/8 of the map, heap budget has room -> read it whole, keep it, translate in memory
-    /// reads <= 1/8, heap budget has room           -> read the pages the ids fall in, keep them
+    /// reads <= 1/8, `keep_pages`                   -> read the pages not kept yet, keep them
     /// otherwise                                    -> read only the pages the ids fall in
     /// ```
     ///
     /// Keeping every file's whole map is what runs a query over hundreds of large files out of
-    /// memory, so a map is kept only while the budget has room.
-    pub(super) async fn rows_of_ids(&self, ids: &[FtsDocId]) -> Result<Vec<RowId>, FtsError> {
+    /// memory, so a map is kept only while the budget has room. Only a ranked search's top hits
+    /// set `keep_pages`: they touch a few pages, while an unranked lookup can touch 1/8 of the map.
+    pub(super) async fn rows_of_ids(
+        &self,
+        ids: &[FtsDocId],
+        keep_pages: bool,
+    ) -> Result<Vec<RowId>, FtsError> {
         let through =
             |map: &DocMap| -> Vec<RowId> { ids.iter().map(|&id| map.row_of(id)).collect() };
         if let Some(map) = self.checked_held_map(ids.iter().copied())? {
@@ -1181,26 +1177,23 @@ impl FtsReader {
         );
         let read_bytes: usize = reads.iter().map(Range::len).sum();
         let dense = self.reads_most_of_map(read_bytes);
-        if !dense {
+        if !dense && keep_pages {
             return self.rows_through_kept_pages(ids, &reads).await;
         }
-        if let Some(map) = self.kept_doc_map_within_budget().await? {
+        if dense && let Some(map) = self.kept_doc_map_within_budget().await? {
             return Ok(through(map));
         }
-        // A dense pass reads one read cap per batch, a few batches in flight. When the reader
-        // checks CRCs it reads every page, so the map's CRC is still checked.
-        let reads = match self.verify_crc {
-            true => self.every_page(),
-            false => reads,
+        // Sparse reads are few, so they go out at once. A dense pass goes one read cap per batch, a
+        // few batches in flight, and reads every page when the reader checks CRCs, so the map's
+        // CRC is still checked.
+        let cap = DOC_MAP_READ_CAP_BYTES;
+        let (reads, in_flight) = match dense {
+            false => (reads, read_bytes),
+            true if self.verify_crc => (self.every_page(), cap),
+            true => (reads, cap),
         };
-        self.rows_through_pages(
-            ids,
-            by_entry.as_deref(),
-            &reads,
-            DOC_MAP_READ_CAP_BYTES,
-            None,
-        )
-        .await
+        self.rows_through_pages(ids, by_entry.as_deref(), &reads, in_flight, None)
+            .await
     }
 
     /// Reads every page once to check the map's CRC when `matched` documents may touch most of it:
@@ -1414,7 +1407,8 @@ impl FtsReader {
 
     /// The rows of `ids` through the map pages `reads` cover. A read is skipped when the pages its
     /// ids fall in are all kept; otherwise it is made once, as without keeping, and those pages
-    /// are then kept while the heap budget has room.
+    /// are then kept while the heap budget has room. The reads cover at most 1/8 of the map, so
+    /// they all go out at once.
     async fn rows_through_kept_pages(
         &self,
         ids: &[FtsDocId],
@@ -1453,7 +1447,8 @@ impl FtsReader {
     }
 
     /// The pages of `read` that `wanted` names, by page number: from the kept pages if all are
-    /// kept, else from the whole map if it is kept, else from one read of `read`, which keeps them.
+    /// kept, else from the whole map if it is kept, else from one read of `read`, which keeps them
+    /// while the budget has room.
     async fn read_pages(
         &self,
         read: &Range<usize>,
@@ -1466,19 +1461,20 @@ impl FtsReader {
         if let Some(kept) = self.kept_pages.all(&hit) {
             return Ok(hit.into_iter().zip(kept).collect());
         }
-        let held = match self.doc_map.get() {
-            Some(DocMap::Permuted(map)) => Some(map.slice(read.clone())),
-            _ => None,
+        let (bytes, fresh) = match self.doc_map.get() {
+            Some(DocMap::Permuted(map)) => (map.slice(read.clone()), false),
+            _ => (self.map_read(read, false).await?, true),
         };
-        let fresh = held.is_none();
-        let bytes = match held {
-            Some(bytes) => bytes,
-            None => self.map_read(read, false).await?,
-        };
-        let read_pages = split_pages(&bytes, read.len());
+        // `read` starts on a page, so page `first + i` starts at `i` pages into `bytes`.
         let pages: Vec<(usize, Bytes)> = hit
             .into_iter()
-            .filter_map(|page| Some((page, read_pages.get(page - first)?.clone())))
+            .map(|page| {
+                let at = (page - first) * DOC_MAP_PAGE_BYTES;
+                (
+                    page,
+                    bytes.slice(at..(at + DOC_MAP_PAGE_BYTES).min(read.len())),
+                )
+            })
             .collect();
         if fresh {
             self.keep_pages(&pages);
@@ -1486,20 +1482,9 @@ impl FtsReader {
         Ok(pages)
     }
 
-    /// Keeps each of `pages` not kept yet, reserving its bytes against the heap budget, and stops
-    /// at the first one the budget has no room for.
+    /// Keeps `pages` while the heap budget has room ([`KeptPages::keep_all`]).
     fn keep_pages(&self, pages: &[(usize, Bytes)]) {
-        let mut kept_any = false;
-        for (page, bytes) in pages {
-            if self.kept_pages.has(*page) {
-                continue;
-            }
-            let Some(reservation) = self.heap_budget.try_reserve_page(bytes.len() as u64) else {
-                break;
-            };
-            kept_any |= self.kept_pages.keep(*page, kept_bytes(bytes, reservation));
-        }
-        if kept_any {
+        if self.kept_pages.keep_all(pages, self.heap_budget) {
             self.loads.loaded();
         }
     }
@@ -1629,7 +1614,7 @@ impl FtsReader {
                 .collect());
         }
         let ids: Vec<FtsDocId> = hits.iter().map(|&(doc, _)| doc).collect();
-        let rows = self.rows_of_ids(&ids).await?;
+        let rows = self.rows_of_ids(&ids, true).await?;
         Ok(rows
             .into_iter()
             .zip(hits)
@@ -4952,7 +4937,7 @@ mod tests {
     const SPARSE_READS: usize = 3;
 
     /// A heap budget with room for [`sparse_hits`]' pages but not for [`dense_translation`]'s whole
-    /// map, since maps get only half the budget.
+    /// map.
     const ROOM_FOR_PAGES_NOT_MAP: u64 = 1000;
 
     /// A heap budget with room for any two of [`sparse_hits`]' three pages, not all three.
@@ -4960,6 +4945,9 @@ mod tests {
 
     /// Translations the concurrency test runs at once.
     const CONCURRENT: usize = 8;
+
+    /// Pages between the cap test's hits: far enough apart that no two share a read.
+    const CAP_TEST_PAGE_STRIDE: u32 = 4;
 
     /// Bytes of [`sparse_hits`]' pages on `r`'s map: two full pages and the short last one.
     fn sparse_page_bytes(r: &FtsReader) -> u64 {
@@ -5203,6 +5191,7 @@ mod tests {
     async fn a_budget_with_room_for_some_pages_reads_each_page_once() {
         // Setup: a budget with room for two of the three pages a sparse translation needs.
         //  - Two pages are kept and the third is only read: one read per page, none read twice.
+        //  - A repeat reads only the page not kept, and reserves nothing more.
         // This test pins that a budget refusing a page costs no extra read.
         let (blob, json, order, _) = dense_translation();
         let budget = roomy(Some(ROOM_FOR_TWO_PAGES));
@@ -5218,6 +5207,97 @@ mod tests {
             charged > 0 && charged < sparse_page_bytes(&r),
             "some pages kept, not all: {charged} B"
         );
+        assert_eq!(
+            r.hits_to_rows_async(hits.clone()).await.expect("repeat"),
+            rows_of(&order, &hits)
+        );
+        assert_eq!(
+            r.doc_map_reads(),
+            SPARSE_READS + 1,
+            "only the page not kept"
+        );
+        assert_eq!(budget.charged(), charged, "nothing more reserved");
+    }
+
+    #[tokio::test]
+    async fn an_unranked_lookup_keeps_no_page() {
+        // Setup: sorted doc ids in three far-apart pages, looked up unranked; a budget with room.
+        //  - The lookup reads the three pages and keeps none of them.
+        //  - A repeat reads them again.
+        // This test pins that only a ranked search's few top hits keep pages: an unranked lookup
+        // can touch 1/8 of the map.
+        let (blob, json, order, _) = dense_translation();
+        let budget = roomy(None);
+        let r = open_charged(blob, &json, budget).await;
+        let mut ids: Vec<FtsDocId> = sparse_hits().into_iter().map(|(id, _)| id).collect();
+        ids.sort_unstable();
+        let mut want: Vec<RowId> = ids
+            .iter()
+            .map(|id| RowId::new(order[id.get() as usize]))
+            .collect();
+        want.sort_unstable();
+        for reads in [SPARSE_READS, 2 * SPARSE_READS] {
+            assert_eq!(
+                r.ids_to_rows_async(ids.clone()).await.expect("lookup"),
+                want
+            );
+            assert_eq!(r.doc_map_reads(), reads, "the pages are read every time");
+        }
+        assert_eq!(r.kept_pages.page_count(), 0);
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reader_keeps_at_most_its_page_cap() {
+        // Setup: ranked hits in one more far-apart page than a reader keeps, still a sparse
+        // translation; a budget with room.
+        //  - Every page is read once, and only the cap's worth is kept and reserved.
+        // This test pins that kept pages stay bounded per file.
+        let (blob, json, order, _) = dense_translation();
+        let budget = roomy(None);
+        let r = open_charged(blob, &json, budget).await;
+        let per_page = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
+        let hits: Vec<(FtsDocId, f32)> = (0..=DOC_MAP_KEPT_PAGES_MAX as u32)
+            .map(|i| (FtsDocId::new(i * CAP_TEST_PAGE_STRIDE * per_page), 1.0))
+            .collect();
+        assert_eq!(
+            r.hits_to_rows_async(hits.clone()).await.expect("translate"),
+            rows_of(&order, &hits)
+        );
+        assert_eq!(
+            r.doc_map_reads(),
+            DOC_MAP_KEPT_PAGES_MAX + 1,
+            "one read per page"
+        );
+        assert!(
+            !r.doc_map_is_read(),
+            "a sparse translation keeps no whole map"
+        );
+        assert_eq!(r.kept_pages.page_count(), DOC_MAP_KEPT_PAGES_MAX);
+        assert_eq!(
+            budget.charged(),
+            (DOC_MAP_KEPT_PAGES_MAX * DOC_MAP_PAGE_BYTES) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_memory_reader_keeps_no_page() {
+        // Setup: a reordered blob opened from memory, with a budget of its own; sparse hits.
+        //  - The map is a slice of the blob from open, so nothing is read and nothing is kept.
+        // This test pins that only a lazy reader copies map pages onto the heap.
+        let (blob, json, order, _) = dense_translation();
+        let budget = roomy(None);
+        let r = FtsReader::open_with(blob, &json, OpenOptions { verify_crc: true })
+            .expect("open")
+            .with_heap_budget(budget);
+        let hits = sparse_hits();
+        assert_eq!(
+            r.hits_to_rows_async(hits.clone()).await.expect("translate"),
+            rows_of(&order, &hits)
+        );
+        assert_eq!(r.doc_map_reads(), 0);
+        assert_eq!(r.kept_pages.page_count(), 0);
+        assert_eq!(budget.charged(), 0);
     }
 
     #[tokio::test]
@@ -5270,8 +5350,8 @@ mod tests {
     async fn kept_pages_leave_a_dense_translation_checking_the_map_crc() {
         // Setup: a damaged map, a reader that checks CRCs, and pages kept by sparse hits clear of
         // the damage.
-        //  - With room for the map, a dense translation reads it whole and refuses it.
-        //  - With room for a few pages only, the dense pass reads every page and refuses the map.
+        //  - With room for the map, a dense translation reads it whole and fails its CRC check.
+        //  - With room for a few pages only, the dense pass reads every page and fails the check.
         // This test pins that kept pages never let a dense translation skip the CRC check.
         let (damaged, json) = damaged_dense_blob().await;
         let (_, _, _, dense) = dense_translation();

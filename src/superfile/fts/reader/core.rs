@@ -92,6 +92,10 @@ const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
 /// Maximum total gap bytes tolerated in one coalesced postings request.
 const TERM_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
 
+/// The most doc-id map pages a reader keeps (1 MiB): room for the top hits of a few searches,
+/// small next to the whole map, which only a dense read keeps.
+pub(super) const DOC_MAP_KEPT_PAGES_MAX: usize = if cfg!(test) { 4 } else { 16 };
+
 /// What a query scores a superfile at in place of what its columns
 /// declare. The default changes nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -715,8 +719,8 @@ pub struct FtsReader {
     /// that can't keep it reads only the pages it needs. Shared by every view cloned from this
     /// reader.
     pub(super) doc_map: Arc<OnceCell<DocMap>>,
-    /// Doc-id map pages a search has read, kept so a later search on the same page reads nothing.
-    /// Empty once the whole map is kept. Shared by every view cloned from this reader.
+    /// Doc-id map pages a ranked search's top hits fell in, kept so a later search whose pages are
+    /// all kept reads nothing. Empty once the whole map is kept. Shared by every view cloned from this reader.
     pub(super) kept_pages: Arc<KeptPages>,
     /// Where the map's body lies, with its CRC right after it; `None` on a
     /// blob in row order.
@@ -726,7 +730,8 @@ pub struct FtsReader {
     /// Told when a read loads the doc-id map or its pages, a column's norms or a block table.
     /// Shared with `block_tables` and with every view cloned from this reader.
     pub(super) loads: LoadWatch,
-    /// The heap budget a kept doc-id map is charged to: the process one, or a test's own.
+    /// The heap budget a kept doc-id map or its kept pages are reserved against: the process one,
+    /// or a test's own.
     pub(super) heap_budget: &'static HeapBudget,
     /// Page reads of the map from the source, shared with this reader's views.
     #[cfg(test)]
@@ -1644,7 +1649,7 @@ impl FtsReader {
     }
 
     /// Bytes of doc-id map pages this reader keeps, reserved against `budget`. Like other cached
-    /// bytes, the over-budget pass frees them by letting go of this reader's file.
+    /// bytes, [`HeapBudget::release_over_budget`] frees them by letting go of this reader's file.
     pub(crate) fn kept_page_bytes(&self, budget: &HeapBudget) -> u64 {
         match ptr::eq(self.heap_budget, budget) {
             true => self.kept_pages.held_bytes() as u64,
@@ -2957,7 +2962,7 @@ fn kept_copy(body: &Bytes, reservation: HeapReservation) -> DocMap {
 
 /// A copy of `body` holding `reservation` until the last copy drops. It copies because a lazy
 /// source may hand back a window onto a bigger fetch, and keeping the window keeps all of it.
-pub(super) fn kept_bytes(body: &[u8], reservation: HeapReservation) -> Bytes {
+fn kept_bytes(body: &[u8], reservation: HeapReservation) -> Bytes {
     Bytes::from_owner(KeptMap {
         body: body.to_vec(),
         _reservation: reservation,
@@ -2971,7 +2976,7 @@ pub(super) struct KeptPages(Mutex<PageCache>);
 
 /// [`KeptPages`]' pages by page number, and whether the whole map is kept, after which none is.
 #[derive(Debug, Default)]
-pub(super) struct PageCache {
+struct PageCache {
     pages: HashMap<usize, Bytes>,
     closed: bool,
 }
@@ -2986,19 +2991,26 @@ impl KeptPages {
             .collect()
     }
 
-    /// Keeps `bytes` as `page` and returns true, unless the page or the whole map is kept already.
-    pub(super) fn keep(&self, page: usize, bytes: Bytes) -> bool {
+    /// Keeps a copy of each of `pages` not kept yet, reserving its bytes against `budget`. Stops
+    /// when the budget has no room, [`DOC_MAP_KEPT_PAGES_MAX`] pages are kept, or the whole map
+    /// is. Returns whether it kept any.
+    pub(super) fn keep_all(&self, pages: &[(usize, Bytes)], budget: &'static HeapBudget) -> bool {
         let mut kept = self.lock();
-        if kept.closed || kept.pages.contains_key(&page) {
-            return false;
+        let mut kept_any = false;
+        for (page, bytes) in pages {
+            if kept.closed || kept.pages.len() >= DOC_MAP_KEPT_PAGES_MAX {
+                break;
+            }
+            if kept.pages.contains_key(page) {
+                continue;
+            }
+            let Some(reservation) = budget.try_reserve_page(bytes.len() as u64) else {
+                break;
+            };
+            kept.pages.insert(*page, kept_bytes(bytes, reservation));
+            kept_any = true;
         }
-        kept.pages.insert(page, bytes);
-        true
-    }
-
-    /// Whether `page` is kept.
-    pub(super) fn has(&self, page: usize) -> bool {
-        self.lock().pages.contains_key(&page)
+        kept_any
     }
 
     /// Bytes of the pages kept.
