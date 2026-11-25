@@ -482,8 +482,65 @@ pub(crate) struct TierChunks {
     disk_reads: HashMap<ContentHash, Arc<Notify>>,
     /// Block indexes being read for the first time, one read per slice:
     /// lookups racing for a slice wait for that read rather than each read
-    /// the index. A read that fails or is cancelled passes to the next waiter.
-    index_reads: HashMap<ContentHash, Arc<OnceCell<Arc<SliceIndex>>>>,
+    /// the index (see [`IndexReading`]).
+    index_reads: HashMap<ContentHash, Arc<OnceCell<IndexRead>>>,
+}
+
+/// How a shared first read of a slice's block index ended. A failure is
+/// shared too, so the lookups waiting on it fall back at once instead of
+/// each trying the read again in turn.
+#[derive(Clone)]
+enum IndexRead {
+    Read(Arc<SliceIndex>),
+    /// `checks`: the bytes failed their checks, rather than the read failing.
+    Failed {
+        checks: bool,
+    },
+}
+
+/// A lookup's place in a shared first read of a block index. A read that is
+/// cancelled passes to the next waiter. On drop, finished or cancelled, it
+/// takes the read out of `index_reads` if it is still there, so a later
+/// lookup reads afresh rather than finding a failed or abandoned read.
+struct IndexReading {
+    tier_chunks: TierChunkCache,
+    hash: ContentHash,
+    read: Arc<OnceCell<IndexRead>>,
+}
+
+impl IndexReading {
+    /// Join the read of `hash`'s block index in flight, or start one.
+    fn join(tier_chunks: &TierChunkCache, hash: ContentHash) -> Self {
+        let read = Arc::clone(
+            tier_chunks
+                .lock()
+                .expect("tier chunk cache lock")
+                .index_reads
+                .entry(hash)
+                .or_default(),
+        );
+        IndexReading {
+            tier_chunks: Arc::clone(tier_chunks),
+            hash,
+            read,
+        }
+    }
+}
+
+impl Drop for IndexReading {
+    fn drop(&mut self) {
+        let mut chunks = self
+            .tier_chunks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if chunks
+            .index_reads
+            .get(&self.hash)
+            .is_some_and(|read| Arc::ptr_eq(read, &self.read))
+        {
+            chunks.index_reads.remove(&self.hash);
+        }
+    }
 }
 
 /// One lookup's whole read of a slice from local disk. On drop, finished or
@@ -3600,29 +3657,42 @@ impl TermIndex {
                 "slice block index ends past the slice".into(),
             ));
         }
-        let reading = Arc::clone(
-            self.tier_chunks
-                .lock()
-                .expect("tier chunk cache lock")
-                .index_reads
-                .entry(*hash)
-                .or_default(),
-        );
-        let read = reading
-            .get_or_try_init(|| self.read_index(hash, index_end, budget))
+        let reading = IndexReading::join(&self.tier_chunks, *hash);
+        // This lookup's own error, when it made the read: more telling than
+        // the shared outcome.
+        let mut own = None;
+        let outcome = reading
+            .read
+            .get_or_init(|| async {
+                match self.read_index(hash, index_end, budget).await {
+                    Ok(index) => IndexRead::Read(index),
+                    Err(error) => {
+                        let checks = matches!(
+                            error,
+                            TermIndexError::Malformed(_) | TermIndexError::HashMismatch
+                        );
+                        own = Some(error);
+                        IndexRead::Failed { checks }
+                    }
+                }
+            })
             .await
-            .cloned();
-        {
-            let mut chunks = self.tier_chunks.lock().expect("tier chunk cache lock");
-            if chunks
-                .index_reads
-                .get(hash)
-                .is_some_and(|r| Arc::ptr_eq(r, &reading))
-            {
-                chunks.index_reads.remove(hash);
+            .clone();
+        drop(reading);
+        let index = match (outcome, own) {
+            (_, Some(error)) => return Err(error),
+            (IndexRead::Read(index), None) => index,
+            (IndexRead::Failed { checks: true }, None) => {
+                return Err(TermIndexError::Malformed(
+                    "another lookup's read of the slice's block index failed its checks".into(),
+                ));
             }
-        }
-        let index = read?;
+            (IndexRead::Failed { checks: false }, None) => {
+                return Err(TermIndexError::Io(io::Error::other(
+                    "another lookup's read of the slice's block index failed",
+                )));
+            }
+        };
         self.ranged_runs(hash, &index, keys, wanted, budget).await
     }
 
@@ -3883,8 +3953,9 @@ impl TermIndex {
     /// whole read of it as [`Promote`] says and keep the result resident; the
     /// lookup never waits for it. `reused` says its block index was resident.
     /// Skipped when a read of it is already queued, when the queue would pass
-    /// the larger of the disk cache and the resident budget, or when an
-    /// earlier whole read failed its hash or could never fit on disk.
+    /// its bound (the resident budget for a slice on disk, else the larger of
+    /// the disk cache and the resident budget), or when an earlier whole read
+    /// failed its hash or could never fit on disk.
     async fn promote_slice(&self, hash: &ContentHash, len: Option<u64>, reused: bool) {
         let wanted = match self.promote {
             Promote::Disk => true,
@@ -3903,11 +3974,15 @@ impl TermIndex {
             Arc::clone(&chunks.promotions)
         };
         let len = len.unwrap_or(SLICE_TARGET_BYTES as u64);
-        let most = self
-            .disk_cache
-            .as_ref()
-            .map_or(0, |c| c.budget_bytes())
-            .max(RESIDENT_SLICE_BUDGET_BYTES as u64);
+        // A slice already on disk only comes into memory, so the resident
+        // budget bounds what is queued for it; one downloaded also goes to disk.
+        let most = match &self.disk_cache {
+            Some(cache) if cache.contains(hash) => RESIDENT_SLICE_BUDGET_BYTES as u64,
+            cache => cache
+                .as_ref()
+                .map_or(0, |c| c.budget_bytes())
+                .max(RESIDENT_SLICE_BUDGET_BYTES as u64),
+        };
         {
             let mut queued = promotions.queued.lock().expect("promotions lock");
             if queued.slices.contains_key(hash) || queued.bytes.saturating_add(len) > most {
@@ -10797,6 +10872,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lookups_racing_for_a_block_index_read_that_fails_all_fall_back_at_once() {
+        // Sixteen lookups of one term at once, nothing resident, on storage
+        // where every ranged slice read fails; slice reads held until all have
+        // started.
+        //  - one block index read per slice is tried, not one per lookup in
+        //    turn: the waiters share its failure;
+        //  - every lookup falls back to whole reads and answers as they do.
+        // This test pins that a failed shared read fails its waiters at once.
+        const LOOKUPS: usize = 16;
+        let (local, root, terms, _store) = two_layer_checked_index().await;
+        let faults = FaultStorage::wrap(Arc::clone(&local));
+        faults.fail(FaultOp::GetRange, SLICE_URI_FRAGMENT, usize::MAX);
+        let slow = SlowStorage::wrap(
+            Arc::clone(&faults) as Arc<dyn StorageProvider>,
+            Duration::ZERO,
+        );
+        slow.hold_reads_of(SLICE_URI_FRAGMENT);
+        let index = ranged_index(&root, Arc::clone(&slow) as Arc<dyn StorageProvider>);
+        let asked = [terms[0].as_str()];
+        let touched = root
+            .slices_for_key(&fid("body").term_key(&terms[0]))
+            .map(|s| s.content_hash)
+            .collect::<HashSet<_>>()
+            .len();
+        let mut lookups = pin!(join_all(
+            (0..LOOKUPS).map(|_| index.runs_many(fid("body"), &asked))
+        ));
+        for _ in 0..RACE_POLLS {
+            assert!(poll!(lookups.as_mut()).is_pending(), "reads are held");
+            task::yield_now().await;
+        }
+        slow.release_reads();
+        let runs = timeout(BUDGET_DEADLOCK_TIMEOUT, lookups)
+            .await
+            .expect("the lookups finish");
+        assert_eq!(faults.fired(), touched, "one failed index read per slice");
+        let whole = TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None)
+            .with_small_slice_bytes(u64::MAX)
+            .runs_many(fid("body"), &asked)
+            .await
+            .expect("whole");
+        for run in runs {
+            assert_eq!(found(&run.expect("lookup")), found(&whole));
+        }
+    }
+
+    #[tokio::test]
     async fn a_short_ranged_read_reads_the_slice_whole_from_then_on() {
         // One slice, read by range on storage that returns its first block or
         // run read one byte short, as a cloud store does for a truncated object.
@@ -11165,8 +11287,8 @@ mod tests {
         // term looked up.
         //  - no slice is read from the object store;
         //  - the answers equal whole-slice reads;
-        //  - each slice is then read whole from disk in the background, once,
-        //    and kept, so the next lookup reads nothing from disk.
+        //  - each slice is then read whole from disk in the background and
+        //    kept, so the next lookup reads nothing from disk.
         // This test pins that a slice on disk is read from there by range, so a
         // lookup reads a few pieces of it, not the whole copy and its hash, and
         // that later lookups still read it from memory.
