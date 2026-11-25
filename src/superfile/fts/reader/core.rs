@@ -1650,7 +1650,7 @@ impl FtsReader {
 
     /// Bytes of doc-id map pages this reader keeps, reserved against `budget`. For a file in the
     /// disk cache, [`HeapBudget::release_over_budget`] frees them by letting go of the file, like
-    /// other cached bytes; any other reader's pages go when the reader does.
+    /// other cached bytes; any other reader's pages go when it keeps the whole map or drops.
     pub(crate) fn kept_page_bytes(&self, budget: &HeapBudget) -> u64 {
         match ptr::eq(self.heap_budget, budget) {
             true => self.kept_pages.held_bytes() as u64,
