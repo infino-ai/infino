@@ -3498,12 +3498,16 @@ impl TermIndex {
     }
 
     /// The runs of `keys[i]` for each of `wanted` in slice `hash`, whose root
-    /// entry is `span`. A slice resident whole, or on local disk, is read
-    /// whole. Otherwise a checked slice is read by range from the object store
-    /// (header and block index, kept; then blocks; then runs), and later read
-    /// whole in the background as [`Promote`] says. An older layout or a small
-    /// slice is read whole. A slice failing its checks is read whole from then
-    /// on; a storage error falls back to one whole read and marks nothing.
+    /// entry is `span`.
+    /// - Resident whole: read from memory.
+    /// - Checked and over [`SMALL_SLICE_BYTES`]: read by range, from local
+    ///   disk when it is there, else from the object store: header and block
+    ///   index (kept), then the terms' blocks, then their runs, each checked by
+    ///   its crc. Then read whole in the background as [`Promote`] says.
+    /// - An older layout, a small slice, or one that once failed its checks:
+    ///   read whole, from local disk when it is there, its hash checked.
+    /// - A piece failing its checks marks the slice to be read whole from then
+    ///   on; a storage error falls back to one whole read and marks nothing.
     async fn slice_runs(
         &self,
         hash: &ContentHash,
@@ -3522,15 +3526,23 @@ impl TermIndex {
         if let Some(ResidentSlice::Whole(bytes)) = &resident {
             return runs_in(bytes, keys, wanted);
         }
-        let on_disk = self.disk_cache.as_ref().is_some_and(|c| c.contains(hash));
         let small = span.len.is_some_and(|len| len <= self.small_slice_bytes);
-        if let (false, false, false, Some(index_end)) = (on_disk, read_whole, small, span.index_end)
+        if let Some(index_end) = span.index_end
+            && !read_whole
+            && !small
         {
-            let reused = matches!(resident, Some(ResidentSlice::Index(_)));
-            match self
-                .ranged_attempt(hash, span.len, index_end, keys, wanted, budget)
-                .await
-            {
+            let (ranged, reused) = match &resident {
+                Some(ResidentSlice::Index(index)) => (
+                    self.ranged_runs(hash, index, keys, wanted, budget).await,
+                    true,
+                ),
+                _ => (
+                    self.first_read_runs(hash, span.len, index_end, keys, wanted, budget)
+                        .await,
+                    false,
+                ),
+            };
+            match ranged {
                 Ok(runs) => {
                     self.promote_slice(hash, span.len, reused).await;
                     return Ok(runs);
@@ -3553,36 +3565,6 @@ impl TermIndex {
         }
         let (bytes, _decoding) = self.whole_slice(hash, span.len, budget).await?;
         runs_in(&bytes, keys, wanted)
-    }
-
-    /// Read slice `hash`'s terms by range, through its resident block index
-    /// or, without one, a first read of the slice.
-    async fn ranged_attempt(
-        &self,
-        hash: &ContentHash,
-        len: Option<u64>,
-        index_end: u64,
-        keys: &[Vec<u8>],
-        wanted: &[usize],
-        budget: &FetchBudget,
-    ) -> Result<Vec<(usize, Option<Run>)>, TermIndexError> {
-        let index = match self
-            .tier_chunks
-            .lock()
-            .expect("tier chunk cache lock")
-            .slices
-            .get(hash)
-        {
-            Some(ResidentSlice::Index(index)) => Some(index),
-            _ => None,
-        };
-        match index {
-            Some(index) => self.ranged_runs(hash, &index, keys, wanted, budget).await,
-            None => {
-                self.first_read_runs(hash, len, index_end, keys, wanted, budget)
-                    .await
-            }
-        }
     }
 
     /// [`Self::slice_runs`] for checked slice `hash` with nothing resident:
@@ -3684,6 +3666,27 @@ impl TermIndex {
         Ok(out)
     }
 
+    /// Bytes `range` of slice `hash`: from its copy on local disk when there,
+    /// else from the object store. The caller checks them by their crc, so
+    /// the disk copy is not hashed whole for one piece; a copy evicted or
+    /// unreadable meanwhile is read from the object store instead.
+    async fn slice_range(
+        &self,
+        hash: &ContentHash,
+        range: Range<u64>,
+    ) -> Result<Bytes, TermIndexError> {
+        if let Some(cache) = self.disk_cache.as_ref().filter(|c| c.contains(hash)) {
+            let (cache, key, at) = (Arc::clone(cache), *hash, range.clone());
+            let len = (at.end - at.start) as usize;
+            if let Ok(Ok(bytes)) =
+                task::spawn_blocking(move || cache.read_range(&key, at.start, len)).await
+            {
+                return Ok(Bytes::from(bytes));
+            }
+        }
+        Ok(self.storage.get_range(&slice_uri(hash), range).await?)
+    }
+
     /// Reads bytes `range` of slice `hash` and returns `decode` of them, run
     /// while the read still holds `budget`. A short read is an error: the
     /// slice is shorter than the root says.
@@ -3698,7 +3701,7 @@ impl TermIndex {
         let _reading = budget.hold(len).await;
         let bytes = {
             let _turn = budget.request().await;
-            self.storage.get_range(&slice_uri(hash), range).await?
+            self.slice_range(hash, range).await?
         };
         match bytes.len() as u64 == len {
             true => decode(&bytes),
@@ -10832,7 +10835,7 @@ mod tests {
     #[tokio::test]
     async fn lookups_of_a_slice_on_local_disk_wait_for_one_read_of_it() {
         // Sixteen lookups of one term at once, its slices all in the local disk
-        // cache and none in memory.
+        // cache, small enough to be read whole, and none in memory.
         //  - each slice is read from disk once, the other lookups waiting for
         //    that read;
         //  - every lookup answers as whole-slice reads do.
@@ -10845,7 +10848,8 @@ mod tests {
             .expect("cache");
         put_slices_on_disk(&root, &local, &disk, |_, bytes| bytes).await;
         let cache = new_tier_chunk_cache();
-        let index = disk_index(&root, Arc::clone(&local), &disk, &cache);
+        let index =
+            disk_index(&root, Arc::clone(&local), &disk, &cache).with_small_slice_bytes(u64::MAX);
         let asked = [terms[0].as_str()];
         let hits = disk.stats().n_hits;
         let runs = join_all((0..LOOKUPS).map(|_| index.runs_many(fid("body"), &asked))).await;
@@ -10869,10 +10873,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_lookup_waiting_on_a_dropped_disk_read_reads_the_slice_itself() {
-        // A lookup of one term whose slices are on local disk, each already
-        // being read by another lookup; then those reads are dropped
-        // unfinished. The reads are made by hand: a real one can land within
-        // its first poll.
+        // A lookup of one term whose slices are on local disk, small enough to
+        // be read whole, each already being read whole by another lookup; then
+        // those reads are dropped unfinished. The reads are made by hand: a
+        // real one can land within its first poll.
         //  - the lookup waits on the reads;
         //  - then it reads the slices itself and answers as whole-slice reads
         //    do.
@@ -10883,7 +10887,8 @@ mod tests {
             .expect("cache");
         put_slices_on_disk(&root, &local, &disk, |_, bytes| bytes).await;
         let cache = new_tier_chunk_cache();
-        let index = disk_index(&root, Arc::clone(&local), &disk, &cache);
+        let index =
+            disk_index(&root, Arc::clone(&local), &disk, &cache).with_small_slice_bytes(u64::MAX);
         let asked = [terms[0].as_str()];
         // One read per slice object: layers may share one.
         let hashes: HashSet<ContentHash> = root
@@ -10986,14 +10991,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_slice_on_local_disk_is_read_whole_from_there() {
+    async fn a_slice_on_local_disk_is_read_by_range_from_there() {
         // A two-layer index whose slices are all in the local disk cache, every
         // term looked up.
         //  - no slice is read from the object store;
-        //  - every slice is kept whole, none as a block index;
+        //  - every slice is kept as its block index, none whole, and none is
+        //    read whole in the background;
         //  - the answers equal whole-slice reads.
-        // This test pins that a slice on disk is read whole from there, never
-        // by range.
+        // This test pins that a slice on disk is read from there by range, so a
+        // lookup reads a few pieces of it, not the whole copy and its hash.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let asked: Vec<&str> = terms.iter().map(String::as_str).collect();
         let dir = TempDir::new().expect("cache dir");
@@ -11017,16 +11023,22 @@ mod tests {
             0,
             "no slice from the store"
         );
+        promotions_settle(&cache).await;
         let slices = root.layers.iter().map(|l| l.slices.len()).sum::<usize>();
-        assert_eq!(kept(&cache).await, (slices, 0), "every slice kept whole");
+        assert_eq!(
+            kept(&cache).await,
+            (0, slices),
+            "every slice kept as its block index"
+        );
     }
 
     #[tokio::test]
     async fn a_corrupt_slice_on_local_disk_is_read_again_from_the_store() {
         // A two-layer index whose slices are in the local disk cache with every
         // byte past their block index flipped; one term looked up.
-        //  - each copy on disk fails its hash, so the slice is read whole from
-        //    the store once and written back sound;
+        //  - each copy's block fails its crc, so the slice is read whole; the
+        //    copy then fails its hash, so it is read from the store once and
+        //    written back sound;
         //  - the answers equal those of sound slices.
         // This test pins that a bad copy on disk costs one whole read, never a
         // wrong answer.
