@@ -2940,6 +2940,7 @@ pub(crate) async fn load_root(
 /// A term's run from one slice, with the slice's tier object when the
 /// slice has one: what a run's chunk offsets are relative to.
 #[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub(crate) struct SliceRun {
     pub(crate) tier_object: Option<ContentHash>,
     /// The run, its postings' and inline tier entries' ordinals made
@@ -9765,11 +9766,11 @@ mod tests {
             .with_promote(Promote::Never)
     }
 
-    /// Each lookup's postings, flattened across layers.
-    fn found(runs: &[Arc<Vec<SliceRun>>]) -> Vec<Vec<Posting>> {
-        runs.iter()
-            .map(|r| postings_of(r).cloned().collect())
-            .collect()
+    /// Each lookup's runs, whole: postings, tier refs, level heads, tier
+    /// object and base, so a ranged read that decoded any of them wrong
+    /// differs from a whole one.
+    fn found(runs: &[Arc<Vec<SliceRun>>]) -> Vec<Vec<SliceRun>> {
+        runs.iter().map(|r| r.as_ref().clone()).collect()
     }
 
     /// How long [`WatchedReads`] holds each slice read open, so reads issued
@@ -9813,6 +9814,9 @@ mod tests {
         most_held_past_head: AtomicU64,
         /// Block and run reads made.
         reads_past_head: AtomicUsize,
+        /// Set to return the next block or run read one byte short, as a cloud
+        /// store returns a range of a truncated object.
+        cut_next: AtomicBool,
     }
 
     /// The bytes of one ranged read, counted in [`WatchedReads::live`] until
@@ -9850,6 +9854,7 @@ mod tests {
                 most_len_past_head: AtomicU64::new(0),
                 most_held_past_head: AtomicU64::new(0),
                 reads_past_head: AtomicUsize::new(0),
+                cut_next: AtomicBool::new(false),
             })
         }
 
@@ -9896,6 +9901,9 @@ mod tests {
             let mut bytes = self
                 .watch(start, len, self.inner.get_range(uri, range))
                 .await?;
+            if start != 0 && !bytes.is_empty() && self.cut_next.swap(false, Ordering::SeqCst) {
+                bytes.truncate(bytes.len() - 1);
+            }
             if self.spoil && start != 0 && !bytes.is_empty() {
                 self.spoiled.fetch_add(1, Ordering::SeqCst);
                 let mut spoiled = bytes.to_vec();
@@ -10677,6 +10685,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_short_ranged_read_reads_the_slice_whole_from_then_on() {
+        // One slice, read by range on storage that returns its first block or
+        // run read one byte short, as a cloud store does for a truncated object.
+        //  - the lookup answers as a whole read does;
+        //  - the slice is marked to be read whole, so a lookup of another term
+        //    makes no ranged read.
+        // This test pins the short-read arm, which local storage, erroring on a
+        // range past the end, never reaches.
+        let (local, root, terms, _store) = one_slice_index(SEPARATED_TERMS).await;
+        let watched = WatchedReads::wrap(Arc::clone(&local), false);
+        watched.cut_next.store(true, Ordering::SeqCst);
+        let cache = new_tier_chunk_cache();
+        let index = || {
+            ranged_index(&root, Arc::clone(&watched) as Arc<dyn StorageProvider>)
+                .with_tier_chunk_cache(Arc::clone(&cache))
+        };
+        let looked_up = index()
+            .runs_many(fid("body"), &[terms[0].as_str()])
+            .await
+            .expect("lookup");
+        let whole = TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None)
+            .with_small_slice_bytes(u64::MAX)
+            .runs_many(fid("body"), &[terms[0].as_str()])
+            .await
+            .expect("whole");
+        assert!(!found(&whole).concat().is_empty());
+        assert_eq!(found(&looked_up), found(&whole));
+        assert!(!watched.cut_next.load(Ordering::SeqCst), "a read was cut");
+        let hash = root.layers[0].slices[0].content_hash;
+        let marked = cache
+            .lock()
+            .expect("tier chunk cache lock")
+            .read_whole
+            .get(&hash)
+            .is_some();
+        assert!(marked, "marked to be read whole");
+        let ranged = watched.reads_past_head.load(Ordering::SeqCst);
+        index()
+            .runs_many(fid("body"), &[terms[SEPARATED_TERMS - 1].as_str()])
+            .await
+            .expect("another term");
+        assert_eq!(
+            watched.reads_past_head.load(Ordering::SeqCst),
+            ranged,
+            "no ranged read"
+        );
+    }
+
+    #[tokio::test]
     async fn a_lookup_holds_each_ranged_read_within_its_budget_until_done_with_it() {
         // One slice; its first, middle and last terms looked up, each read apart.
         //  - first on a full budget, to learn the largest block or run read;
@@ -11203,6 +11260,65 @@ mod tests {
         assert!(
             touched.iter().all(|h| disk.contains(h)),
             "promoted on the next read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slice_failing_its_hash_in_the_background_is_not_promoted_again() {
+        // One slice whose stored copy has its last byte flipped, far from the
+        // first term's block and run, and a disk cache; the first term looked up
+        // twice by indexes sharing one tier chunk cache.
+        //  - the first lookup reads by range and answers right; its background
+        //    whole read fails the hash, so nothing reaches disk and the slice is
+        //    marked unpromotable;
+        //  - the second reads by range again and starts no whole read.
+        // This test pins that a slice corrupt outside a term's pieces costs one
+        // whole download, not one per lookup.
+        let (local, root, terms, _store) = one_slice_index(SEPARATED_TERMS).await;
+        let hash = root.layers[0].slices[0].content_hash;
+        let (stored, _) = local.get(&slice_uri(&hash)).await.expect("slice");
+        let sound = ranged_index(&root, Arc::clone(&local))
+            .runs_many(fid("body"), &[terms[0].as_str()])
+            .await
+            .expect("sound");
+        let mut corrupt = stored.to_vec();
+        *corrupt.last_mut().expect("a slice byte") ^= 1;
+        local
+            .put_overwrite(&slice_uri(&hash), Bytes::from(corrupt))
+            .await
+            .expect("corrupt the slice");
+        let dir = TempDir::new().expect("cache dir");
+        let disk = MetadataDiskCache::new(dir.path().to_path_buf(), DISK_CACHE_BYTES, None)
+            .expect("cache");
+        let slow = SlowStorage::wrap(local, Duration::ZERO);
+        let cache = new_tier_chunk_cache();
+        let lookup = || async {
+            let looked_up = disk_index(&root, slow.clone(), &disk, &cache)
+                .runs_many(fid("body"), &[terms[0].as_str()])
+                .await
+                .expect("lookup");
+            promotions_settle(&cache).await;
+            found(&looked_up)
+        };
+        assert_eq!(lookup().await, found(&sound));
+        assert_eq!(
+            slow.reads_of(SLICE_URI_FRAGMENT),
+            COLD_RANGED_READS + 1,
+            "ranged reads and one whole read"
+        );
+        assert!(!disk.contains(&hash), "nothing on disk");
+        let unpromotable = cache
+            .lock()
+            .expect("tier chunk cache lock")
+            .unpromotable
+            .get(&hash)
+            .is_some();
+        assert!(unpromotable, "marked unpromotable");
+        assert_eq!(lookup().await, found(&sound));
+        assert_eq!(
+            slow.reads_of(SLICE_URI_FRAGMENT),
+            COLD_RANGED_READS + 1 + WARM_RANGED_READS,
+            "no whole read again"
         );
     }
 

@@ -939,6 +939,17 @@ pub(crate) mod test_support {
                 .collect()
         }
 
+        /// Each ranged GET of a key holding `fragment`, with its key, in order.
+        pub(crate) fn ranges_containing(&self, fragment: &str) -> Vec<(String, Range<u64>)> {
+            self.ranges
+                .lock()
+                .expect("ranges")
+                .iter()
+                .filter(|(uri, _)| uri.contains(fragment))
+                .cloned()
+                .collect()
+        }
+
         pub(crate) fn pause_next_read(&self) {
             self.pause_read_after(0);
         }

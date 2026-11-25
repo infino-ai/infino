@@ -2957,6 +2957,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        runtime_bridge::shared_io_runtime,
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
@@ -2966,6 +2967,7 @@ mod tests {
         },
         supertable::{
             Supertable, SupertableOptions,
+            manifest::term_index::{STORAGE_PREFIX, slice_uri},
             query::{fts::TIE_NARROW_BATCH, read_ahead::fixture::Superfile},
             reader_cache::{
                 ColdFetchMode, DiskCacheConfig, DiskCacheStore,
@@ -5013,6 +5015,109 @@ mod tests {
             Vec::<Range<u64>>::new(),
             "the second take reads nothing again"
         );
+    }
+
+    /// Rows of the table whose term index slice is over the small-slice size.
+    const LARGE_SLICE_ROWS: usize = 30_000;
+    /// The size up to which a checked term index slice is read whole.
+    const SMALL_SLICE_BYTES_PINNED: u64 = 256 * 1024;
+    /// Rows that also hold [`RARE_WORD`].
+    const RARE_ROWS: [usize; 2] = [7, 20_000];
+    /// A word only [`RARE_ROWS`] hold.
+    const RARE_WORD: &str = "needle";
+
+    /// A search on a table whose term index slice is too large to read whole
+    /// reads it by range, and answers right.
+    #[test]
+    fn a_search_reads_a_large_term_index_slice_by_range() {
+        // One commit of rows that each hold two words no other row holds, so
+        // its term index slice is far over the small-slice size; two rows also
+        // hold a rare word. No disk cache, the default.
+        //  - a search for the rare word, and one for a row's own word, return
+        //    exactly the rows that hold it;
+        //  - the term index is read only by range, and no read covers a whole
+        //    slice over the small-slice size.
+        // This test pins the ranged slice read under a real search, where the
+        // index's runs, tiers and heads choose the superfiles it reads.
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        let titles: Vec<String> = (0..LARGE_SLICE_ROWS)
+            .map(|i| match RARE_ROWS.contains(&i) {
+                true => format!("row{i} word{} {RARE_WORD}", i * 7919),
+                false => format!("row{i} word{}", i * 7919),
+            })
+            .collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let producer =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&local)))
+                .expect("create producer");
+        let mut w = producer.writer().expect("writer");
+        w.append(&build_title_batch(&refs)).expect("append");
+        w.commit().expect("commit");
+        drop(producer);
+
+        let recording = RecordingStorage::over(local);
+        let table = Supertable::open(
+            default_supertable_options()
+                .with_storage(Arc::clone(&recording) as Arc<dyn StorageProvider>),
+        )
+        .expect("open");
+        let search = |word: &str| -> Vec<String> {
+            let batches = table
+                .reader()
+                .expect("reader")
+                .bm25_search(
+                    "title",
+                    word,
+                    10,
+                    Bm25SearchOptions::new(),
+                    Some(&["title"]),
+                )
+                .expect("bm25");
+            let mut found: Vec<String> = batches
+                .iter()
+                .flat_map(|b| {
+                    let column = b.column_by_name("title").expect("title");
+                    let titles = column
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .expect("large string titles");
+                    (0..titles.len()).map(|i| titles.value(i).to_string())
+                })
+                .collect();
+            found.sort();
+            found
+        };
+        let mut rare: Vec<String> = RARE_ROWS.iter().map(|&i| titles[i].clone()).collect();
+        rare.sort();
+        assert_eq!(search(RARE_WORD), rare);
+        assert_eq!(search("row123"), vec![titles[123].clone()]);
+
+        let reader = table.reader().expect("reader");
+        let index = shared_io_runtime()
+            .block_on(reader.manifest().term_index())
+            .expect("term index")
+            .expect("a term index");
+        let large: HashMap<String, u64> = index
+            .root()
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.slices)
+            .filter(|slice| slice.len > SMALL_SLICE_BYTES_PINNED)
+            .map(|slice| (slice_uri(&slice.content_hash), slice.len))
+            .collect();
+        assert!(!large.is_empty(), "a slice over the small-slice size");
+        let reads = recording.ranges_containing(&format!("{STORAGE_PREFIX}slice-"));
+        assert!(
+            reads.iter().any(|(uri, _)| large.contains_key(uri)),
+            "a large slice read by range"
+        );
+        for (uri, range) in &reads {
+            if let Some(&len) = large.get(uri) {
+                assert!(range.end - range.start < len, "{uri} read whole: {range:?}");
+            }
+        }
     }
 
     #[test]
