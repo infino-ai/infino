@@ -5021,12 +5021,14 @@ mod tests {
     const LARGE_SLICE_ROWS: usize = 30_000;
     /// The size up to which a checked term index slice is read whole.
     const SMALL_SLICE_BYTES_PINNED: u64 = 256 * 1024;
+    /// Spreads each row's own word over many values, so no two rows share it.
+    const WORD_SPREAD: usize = 7919;
     /// Rows that also hold [`RARE_WORD`].
     const RARE_ROWS: [usize; 2] = [7, 20_000];
     /// A word only [`RARE_ROWS`] hold.
     const RARE_WORD: &str = "needle";
 
-    /// A search on a table whose term index slice is too large to read whole
+    /// A search on a table whose term index slice is over the small-slice size
     /// reads it by range, and answers right.
     #[test]
     fn a_search_reads_a_large_term_index_slice_by_range() {
@@ -5035,17 +5037,18 @@ mod tests {
         // hold a rare word. No disk cache, the default.
         //  - a search for the rare word, and one for a row's own word, return
         //    exactly the rows that hold it;
-        //  - the first search reads every slice over the small-slice size only
-        //    by range: no whole GET, and no ranged read of all of it.
+        //  - no read of a slice over the small-slice size covers all of it, and
+        //    the first search makes no whole GET of one (the second reuses the
+        //    slice, which reads it whole in the background).
         // This test pins the ranged slice read under a real search, where the
-        // index's runs, tiers and heads choose the superfiles it reads.
+        // index's runs and level heads choose the superfiles it reads.
         let storage_dir = TempDir::new().expect("storage tempdir");
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
         let titles: Vec<String> = (0..LARGE_SLICE_ROWS)
             .map(|i| match RARE_ROWS.contains(&i) {
-                true => format!("row{i} word{} {RARE_WORD}", i * 7919),
-                false => format!("row{i} word{}", i * 7919),
+                true => format!("row{i} word{} {RARE_WORD}", i * WORD_SPREAD),
+                false => format!("row{i} word{}", i * WORD_SPREAD),
             })
             .collect();
         let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
