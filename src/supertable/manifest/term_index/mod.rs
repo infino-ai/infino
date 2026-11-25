@@ -11099,6 +11099,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn racing_lookups_of_a_slice_on_local_disk_each_read_only_its_pieces() {
+        // Sixteen lookups of one term at once, its slices all in the local disk
+        // cache and none in memory.
+        //  - none reads a slice from the object store;
+        //  - none holds a whole copy: each slice ends up resident as its block
+        //    index, none whole;
+        //  - every lookup answers as whole-slice reads do.
+        // This test pins that lookups racing for a slice on disk read a few small
+        // pieces each, never a whole copy each, which is what a shared whole
+        // read used to bound.
+        const LOOKUPS: usize = 16;
+        let (local, root, terms, _store) = two_layer_checked_index().await;
+        let dir = TempDir::new().expect("cache dir");
+        let disk = MetadataDiskCache::new(dir.path().to_path_buf(), DISK_CACHE_BYTES, None)
+            .expect("cache");
+        put_slices_on_disk(&root, &local, &disk, |_, bytes| bytes).await;
+        let slow = SlowStorage::wrap(Arc::clone(&local), Duration::ZERO);
+        let cache = new_tier_chunk_cache();
+        let index = disk_index(&root, slow.clone(), &disk, &cache);
+        let asked = [terms[0].as_str()];
+        let runs = join_all((0..LOOKUPS).map(|_| index.runs_many(fid("body"), &asked))).await;
+        let whole = TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None)
+            .with_small_slice_bytes(u64::MAX)
+            .runs_many(fid("body"), &asked)
+            .await
+            .expect("whole");
+        for run in runs {
+            assert_eq!(found(&run.expect("lookup")), found(&whole));
+        }
+        assert_eq!(
+            slow.reads_of(SLICE_URI_FRAGMENT),
+            0,
+            "no slice from the store"
+        );
+        promotions_settle(&cache).await;
+        let touched = root
+            .slices_for_key(&fid("body").term_key(&terms[0]))
+            .map(|s| s.content_hash)
+            .collect::<HashSet<_>>()
+            .len();
+        assert_eq!(
+            kept(&cache).await,
+            (0, touched),
+            "each slice resident as its block index"
+        );
+    }
+
+    #[tokio::test]
     async fn a_slice_cut_short_on_local_disk_is_dropped_and_written_back() {
         // A two-layer index whose slices are in the local disk cache cut short
         // just past their block index, as a torn write leaves them; one term
