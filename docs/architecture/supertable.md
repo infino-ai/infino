@@ -338,14 +338,14 @@ one request, kept in memory, then the key's block, then its run, each
 checked by a crc32c of its own. A slice of an older layout, or a
 checked one of 256 KiB or less, is read whole in one request and
 checked by its content hash; a prefix scan reads one slice or a few
-adjacent ones whole. A slice already on local disk is read the same
-way, from there. A slice read by range from the object store is then
-read whole in the background and kept in memory: with a disk cache,
-every such slice, also written to local disk; without one, a slice
-read by range a second time. Root and slices are content-addressed
-and immutable; slices on local disk are cached like manifest parts,
-and all are kept live by garbage collection for as long as a manifest
-names them.
+adjacent ones whole. A slice already on local disk is read from there,
+by range or whole by the same rule. A slice read by range from the
+object store is then read whole in the background and kept in memory:
+with a disk cache, every such slice, also written to local disk;
+without one, a slice read by range a second time. Root and slices are
+content-addressed and immutable; slices on local disk are cached like
+manifest parts, and all are kept live by garbage collection for as
+long as a manifest names them.
 
 Every commit publishes its superfiles' postings in the same atomic
 step as their entries: the writer already holds each new superfile's

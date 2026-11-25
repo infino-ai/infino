@@ -902,6 +902,8 @@ pub(crate) mod test_support {
         inner: Arc<dyn StorageProvider>,
         /// Each ranged GET's object key and range, in order.
         ranges: Mutex<Vec<(String, Range<u64>)>>,
+        /// Each whole GET's object key, in order.
+        gets: Mutex<Vec<String>>,
         /// Ranged GETs to let through before parking one; `None` parks none.
         pause_after: Mutex<Option<usize>>,
         paused: AtomicBool,
@@ -913,6 +915,7 @@ pub(crate) mod test_support {
             Arc::new(Self {
                 inner,
                 ranges: Mutex::new(Vec::new()),
+                gets: Mutex::new(Vec::new()),
                 pause_after: Mutex::new(None),
                 paused: AtomicBool::new(false),
                 resume: Notify::new(),
@@ -937,6 +940,11 @@ pub(crate) mod test_support {
                 .filter(|(uri, _)| uri.ends_with(key))
                 .map(|(_, range)| range.clone())
                 .collect()
+        }
+
+        /// The keys of whole GETs so far.
+        pub(crate) fn gets(&self) -> Vec<String> {
+            self.gets.lock().expect("gets").clone()
         }
 
         /// Each ranged GET of a key holding `fragment`, with its key, in order.
@@ -990,6 +998,7 @@ pub(crate) mod test_support {
             self.inner.head(uri).await
         }
         async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            self.gets.lock().expect("gets").push(uri.to_string());
             self.inner.get(uri).await
         }
         async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {

@@ -563,8 +563,9 @@ fn runs_in(
 /// Limits on what one batched lookup has in flight: slice bytes, ranged
 /// requests and whole slice reads. A read takes its bytes first and its turn
 /// second. A read holding a turn waits only on its own read, or on another
-/// lookup's whole read of the same slice from local disk, which already
-/// holds every permit it needs. So the limits cannot deadlock.
+/// whole read of the same slice from local disk (by another lookup, or by
+/// this one for a second layer naming the slice), which already holds every
+/// permit it needs. So the limits cannot deadlock.
 struct FetchBudget {
     bytes: Semaphore,
     most_bytes: u32,
@@ -3674,20 +3675,23 @@ impl TermIndex {
 
     /// Bytes `range` of slice `hash`: from its copy on local disk when there,
     /// else from the object store. The caller checks them by their crc, so
-    /// the disk copy is not hashed whole for one piece; a copy evicted or
-    /// unreadable meanwhile is read from the object store instead.
+    /// the disk copy is not hashed whole for one piece.
+    /// - A copy evicted meanwhile: read from the object store.
+    /// - A copy cut short or unreadable: dropped from the disk cache, so the
+    ///   next lookup doesn't pay for it again and a promotion writes it back
+    ///   sound; read from the object store.
     async fn slice_range(
         &self,
         hash: &ContentHash,
         range: Range<u64>,
     ) -> Result<Bytes, TermIndexError> {
         if let Some(cache) = self.disk_cache.as_ref().filter(|c| c.contains(hash)) {
-            let (cache, key, at) = (Arc::clone(cache), *hash, range.clone());
+            let (reader, key, at) = (Arc::clone(cache), *hash, range.clone());
             let len = (at.end - at.start) as usize;
-            if let Ok(Ok(bytes)) =
-                task::spawn_blocking(move || cache.read_range(&key, at.start, len)).await
-            {
-                return Ok(Bytes::from(bytes));
+            match task::spawn_blocking(move || reader.read_range(&key, at.start, len)).await {
+                Ok(Ok(bytes)) => return Ok(Bytes::from(bytes)),
+                Ok(Err(_)) => cache.remove(hash),
+                Err(_) => {}
             }
         }
         Ok(self.storage.get_range(&slice_uri(hash), range).await?)
@@ -11092,6 +11096,51 @@ mod tests {
             (0, slices),
             "every slice kept as its block index"
         );
+    }
+
+    #[tokio::test]
+    async fn a_slice_cut_short_on_local_disk_is_dropped_and_written_back() {
+        // A two-layer index whose slices are in the local disk cache cut short
+        // just past their block index, as a torn write leaves them; one term
+        // looked up.
+        //  - the block read past the copy's end fails, so the copy is dropped
+        //    and the read goes to the store; the answers equal sound ones;
+        //  - the background whole read then writes each slice back sound.
+        // This test pins that a short copy costs one read from the store, not
+        // a failed disk read and a GET on every lookup.
+        let (local, root, terms, _store) = two_layer_checked_index().await;
+        let dir = TempDir::new().expect("cache dir");
+        let disk = MetadataDiskCache::new(dir.path().to_path_buf(), DISK_CACHE_BYTES, None)
+            .expect("cache");
+        put_slices_on_disk(&root, &local, &disk, |slice, mut bytes| {
+            bytes.truncate(slice.index_end as usize);
+            bytes
+        })
+        .await;
+        let cache = new_tier_chunk_cache();
+        let looked_up = disk_index(&root, Arc::clone(&local), &disk, &cache)
+            .runs_many(fid("body"), &[terms[0].as_str()])
+            .await
+            .expect("lookup");
+        let sound = ranged_index(&root, Arc::clone(&local))
+            .runs_many(fid("body"), &[terms[0].as_str()])
+            .await
+            .expect("sound");
+        assert!(!found(&sound).concat().is_empty());
+        assert_eq!(found(&looked_up), found(&sound));
+        promotions_settle(&cache).await;
+        let touched: Vec<ContentHash> = root
+            .slices_for_key(&fid("body").term_key(&terms[0]))
+            .map(|s| s.content_hash)
+            .collect();
+        for hash in &touched {
+            let (stored, _) = local.get(&slice_uri(hash)).await.expect("slice");
+            assert_eq!(
+                disk.get(hash).await.map(Bytes::from),
+                Some(stored),
+                "written back sound"
+            );
+        }
     }
 
     #[tokio::test]

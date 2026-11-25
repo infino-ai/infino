@@ -5035,8 +5035,8 @@ mod tests {
         // hold a rare word. No disk cache, the default.
         //  - a search for the rare word, and one for a row's own word, return
         //    exactly the rows that hold it;
-        //  - the term index is read only by range, and no read covers a whole
-        //    slice over the small-slice size.
+        //  - the first search reads every slice over the small-slice size only
+        //    by range: no whole GET, and no ranged read of all of it.
         // This test pins the ranged slice read under a real search, where the
         // index's runs, tiers and heads choose the superfiles it reads.
         let storage_dir = TempDir::new().expect("storage tempdir");
@@ -5092,6 +5092,9 @@ mod tests {
         let mut rare: Vec<String> = RARE_ROWS.iter().map(|&i| titles[i].clone()).collect();
         rare.sort();
         assert_eq!(search(RARE_WORD), rare);
+        // Taken before the second search, whose reuse of the slice reads it
+        // whole in the background.
+        let whole_reads = recording.gets();
         assert_eq!(search("row123"), vec![titles[123].clone()]);
 
         let reader = table.reader().expect("reader");
@@ -5118,6 +5121,11 @@ mod tests {
                 assert!(range.end - range.start < len, "{uri} read whole: {range:?}");
             }
         }
+        let whole: Vec<&String> = whole_reads
+            .iter()
+            .filter(|uri| large.contains_key(*uri))
+            .collect();
+        assert!(whole.is_empty(), "large slices read whole: {whole:?}");
     }
 
     #[test]
