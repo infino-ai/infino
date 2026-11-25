@@ -184,7 +184,7 @@ fn release_oldest(
         if !more(freed) {
             break;
         }
-        if let Some(reader) = caches[at].release_lazy_entry(&uri, caches[at].now_us()) {
+        if let Some(reader) = caches[at].release_lazy_entry(&uri) {
             released.push(reader);
             freed += bytes;
         }
@@ -1214,7 +1214,7 @@ mod tests {
         let uri = charged_entry(&store, 1);
         store.charge_heap(&uri, &cached_reader(&store, &uri), ENTRY_BYTES);
         assert_eq!(budget.charged(), 2 * ENTRY_BYTES);
-        store.release_lazy_entry(&uri, store.now_us());
+        store.release_lazy_entry(&uri);
         assert!(!store.is_cached(&uri));
         assert_eq!(budget.charged(), 0);
     }

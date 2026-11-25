@@ -126,7 +126,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -145,7 +145,7 @@ use tokio::{
 };
 use tracing::Instrument;
 
-use super::disk::{ArcMmapOwner, DiskCacheStore, Reservation};
+use super::disk::{ArcMmapOwner, DiskCacheStore, Reservation, unix_us};
 use crate::{
     runtime_bridge::shared_io_runtime,
     storage::{StorageError, stuck_after},
@@ -185,6 +185,16 @@ const FETCH_THROUGH_BLOCKS: u32 = 2;
 /// forward miss taken for a jump back: its window then also covers blocks behind
 /// it.
 const READ_ENDS: usize = 16;
+
+/// How far a read must be past the source's recorded last read before it is recorded again, in
+/// microseconds: eviction ranks files far coarser than this, and readers sharing a source then
+/// rarely write the same cache line.
+const LAST_READ_STEP_US: u64 = 1_000;
+
+/// How far a read must be past the last time a read moved the block file's mtime before it moves
+/// it again, in microseconds. The mtime is what a restart ranks the file by, and a file only read
+/// from cache is never written or released, so its reads move it; one syscall a minute at most.
+const MTIME_MARK_STEP_US: u64 = 60_000_000;
 
 /// Near the aligned region (see [`SourceLayout::aligned_region`]) a GET covers
 /// whole groups of this many bytes, aligned to file offset 0. Vector reads are
@@ -290,6 +300,12 @@ pub(crate) struct BlockCachedSource {
     /// past any of them.
     read_ends: [AtomicU64; READ_ENDS],
     next_read_end: AtomicUsize,
+    /// When a query last read through this source, in microseconds since the unix epoch, 0 before
+    /// any read.
+    last_read_us: AtomicU64,
+    /// When a read last moved the block file's mtime, in microseconds since the unix epoch; the
+    /// source's build time before any.
+    mtime_marked_us: AtomicU64,
     state: OnceLock<Option<BlockFile>>,
     /// Filled-block set. Guarded by a sync mutex; never held across await.
     filled: Mutex<RoaringBitmap>,
@@ -795,6 +811,9 @@ impl BlockCachedSource {
             },
             read_ends: array::from_fn(|_| AtomicU64::new(u64::MAX)),
             next_read_end: AtomicUsize::new(0),
+            last_read_us: AtomicU64::new(0),
+            // Built just now: a read moves the mtime once a minute has passed, not on the first read.
+            mtime_marked_us: AtomicU64::new(unix_us(SystemTime::now())),
             state: OnceLock::new(),
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
@@ -939,6 +958,53 @@ impl BlockCachedSource {
         Arc::clone(&self.filled_bytes)
     }
 
+    /// The block file this source opened or adopted, while its path still names it: `None` before
+    /// the first read, or once a newer generation replaced it. Never opens one.
+    pub(crate) fn named_file(&self) -> Option<&fs::File> {
+        self.created_block_file()
+            .filter(|block| self.path_names(block))
+            .map(|block| &block.file)
+    }
+
+    /// When a query last read through this source, `None` before any read.
+    pub(crate) fn last_read(&self) -> Option<SystemTime> {
+        match self.last_read_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(UNIX_EPOCH + Duration::from_micros(us)),
+        }
+    }
+
+    /// Move the block file's mtime to the read at `now_us` when a read last moved it at least
+    /// [`MTIME_MARK_STEP_US`] ago, so a file read only from cache until a stop or a crash still
+    /// ranks by its last use after the restart. Only the reader that wins the swap makes the call.
+    /// It runs on the reading thread: a metadata write with no data I/O, once a minute per file.
+    /// No path check, which would cost a stat per mark: moving a replaced file's mtime is harmless.
+    fn mark_read_in_mtime(&self, now_us: u64) {
+        let marked = self.mtime_marked_us.load(Ordering::Relaxed);
+        if now_us.abs_diff(marked) < MTIME_MARK_STEP_US {
+            return;
+        }
+        let Some(block) = self.created_block_file() else {
+            return;
+        };
+        if self
+            .mtime_marked_us
+            .compare_exchange(marked, now_us, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            // On failure the mtime stays at the last write or release.
+            let _ = block
+                .file
+                .set_modified(UNIX_EPOCH + Duration::from_micros(now_us));
+        }
+    }
+
+    /// As if a read last moved the block file's mtime more than [`MTIME_MARK_STEP_US`] ago.
+    #[cfg(test)]
+    pub(crate) fn forget_mtime_mark_for_test(&self) {
+        self.mtime_marked_us.store(0, Ordering::Relaxed);
+    }
+
     /// The sparse file, created on first use once the object size is known.
     fn block_file(&self) -> Option<&BlockFile> {
         let size = self.inner.size();
@@ -1079,12 +1145,6 @@ impl BlockCachedSource {
     /// naming a later generation's file.
     fn path_names(&self, bf: &BlockFile) -> bool {
         fs::metadata(&self.path).is_ok_and(|named| named.ino() == bf.ino)
-    }
-
-    /// Whether this source has a block file and its path still names it.
-    pub(crate) fn path_names_its_file(&self) -> bool {
-        self.created_block_file()
-            .is_some_and(|bf| self.path_names(bf))
     }
 
     /// Byte length of block `b` (the trailing block may be partial).
@@ -2322,6 +2382,12 @@ impl LazyByteSource for BlockCachedSource {
     fn note_read(&self, start: u64, len: u64) {
         if len > 0 {
             self.note_read_end(start.saturating_add(len));
+            let now = unix_us(SystemTime::now());
+            // A move either way counts, so reads still record after the wall clock steps back.
+            if now.abs_diff(self.last_read_us.load(Ordering::Relaxed)) >= LAST_READ_STEP_US {
+                self.last_read_us.store(now, Ordering::Relaxed);
+                self.mark_read_in_mtime(now);
+            }
         }
     }
 
@@ -4832,7 +4898,7 @@ mod tests {
         fs::remove_file(&path).expect("unlink blocks");
         fs::File::create(&path).expect("newer file");
 
-        store.retain_block_file(&uri, &older, 0);
+        store.retain_block_file(&uri, &older, None);
         drop(older);
         assert_eq!(
             store.stats().current_bytes,
@@ -4869,7 +4935,7 @@ mod tests {
         let _ = older.range(0, 100).await.expect("fill block 0");
         store.block_writes_settled().await;
         store.remove_block_entry_for_test(&uri);
-        store.retain_block_file(&uri, &older, 0);
+        store.retain_block_file(&uri, &older, None);
         drop(older);
         assert!(store.stats().current_bytes > 0, "the kept file is charged");
 
