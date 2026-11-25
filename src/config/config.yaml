@@ -299,10 +299,10 @@ vector:
   centroid_graph_concentration_ratio: 0.5
 
   # For ivf_router = auto: the scale floor (hidden-table doc count) below which
-  # auto picks stamped. On a very small table the selection is spread too thin
-  # across cells for the graph to pay off. A 0 value is rejected at load and
-  # reverts to this default.
-  centroid_graph_scale_floor_docs: 1000000
+  # auto picks stamped. The selected clusters coalesce into a cold-read win only
+  # at large N (measured win at 10M+, loss at 1M). Documented starting point; a 0
+  # value is rejected at load and reverts to this default.
+  centroid_graph_scale_floor_docs: 10000000
 
   # Ceiling on the fanout the router's recall calibration considers: the widest
   # number of global fine clusters the calibration selects + scores per query,

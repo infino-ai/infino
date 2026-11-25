@@ -538,8 +538,9 @@ const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_POOL_FLOOR: usize = 30_000;
 /// subset to concentrate on). A documented starting point, tuned per corpus.
 const DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO: f64 = 0.5;
 /// Default `ivf_router = auto` scale floor: `centroid_graph` only at or above
-/// 1M docs. A documented starting point.
-const DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS: u64 = 1_000_000;
+/// 10M docs, where the selected clusters coalesce into a cold-read win (the
+/// graph measured a win at 10M+, a loss at 1M). A documented starting point.
+const DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS: u64 = 10_000_000;
 const DEFAULT_CENTROID_GRAPH_MAX_FANOUT: usize = 4096;
 /// Default `ivf_router = auto` parity gap: how far below `hnsw_register_floor`
 /// the router-fanout acceptance bar may relax toward the router's OWN measured
@@ -935,9 +936,13 @@ pub struct VectorSettings {
     /// starting point, tunable; the final value comes from a real-corpus sweep.
     pub centroid_graph_concentration_ratio: f64,
     /// For `ivf_router = auto`: the scale floor (hidden-table doc count) below
-    /// which `auto` picks `stamped`. On a very small table the selection is
-    /// spread too thin across cells for the graph to pay off. Default 1M,
-    /// tunable. A `0` value is rejected at load and reverts to the default.
+    /// which `auto` picks `stamped`. The selected clusters coalesce into a
+    /// cold-read win only at large N — the centroid graph measured a win at 10M+
+    /// and a loss at 1M, where the selection is spread too thin across cells to
+    /// coalesce. Documented starting point (10M), tunable; final value from a
+    /// real-corpus sweep. A `0` value is rejected at load and reverts to the
+    /// default (a 0 floor would route below-scale tables to a graph that loses
+    /// there).
     pub centroid_graph_scale_floor_docs: u64,
     /// Ceiling on the fanout the router's recall calibration considers — the
     /// widest number of global fine clusters the calibration sweep selects and
@@ -2244,7 +2249,7 @@ mod tests {
     fn centroid_graph_auto_thresholds_default_and_override() {
         let cfg = Config::defaults().expect("defaults parse");
         assert_eq!(cfg.vector.centroid_graph_concentration_ratio, 0.5);
-        assert_eq!(cfg.vector.centroid_graph_scale_floor_docs, 1_000_000);
+        assert_eq!(cfg.vector.centroid_graph_scale_floor_docs, 10_000_000);
         assert_eq!(
             cfg.vector.ivf_router,
             IvfRouter::Auto,
