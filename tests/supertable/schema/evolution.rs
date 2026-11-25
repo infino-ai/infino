@@ -16,9 +16,13 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Analyzer, BoolMode, ColumnIndex, CompactionSettings, Connection, FieldId, FieldPatch,
+    Analyzer, BoolMode, ColumnIndex, CompactionSettings, Connection, FieldId, FieldPatch, FtsField,
     IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaError, SchemaPatch, TableSchema,
-    VectorFilter, connect, serde_json, test_helpers::distinct_unit_vectors,
+    VectorFilter, connect, serde_json,
+    test_helpers::{
+        build_title_batch, copy_dir_recursive, distinct_unit_vectors, old_format_fts_fixture,
+        open_old_format_fts_fixture,
+    },
 };
 use tempfile::TempDir;
 
@@ -1882,4 +1886,134 @@ fn a_text_match_on_a_text_column_added_later_answers_as_token_match_does() {
         physical.iter().all(|r| !r.contains("text_match")),
         "{plan:?}"
     );
+}
+
+/// The column's index as the table records it, for adding it again later.
+fn index_of(db: &Connection, column: &str) -> ColumnIndex {
+    db.schema(TABLE)
+        .expect("schema")
+        .fields()
+        .iter()
+        .find(|field| field.name == column)
+        .and_then(|field| field.index.clone())
+        .expect("indexed column")
+}
+
+/// Drop `column` and add it again, of `data_type`, under `index`.
+fn drop_and_add_again(db: &Connection, column: &str, data_type: DataType, index: ColumnIndex) {
+    db.apply_schema(
+        TABLE,
+        &SchemaPatch::new(vec![FieldPatch::named(column).dropped()]),
+        None,
+    )
+    .expect("drop");
+    db.apply_schema(
+        TABLE,
+        &SchemaPatch::new(vec![
+            FieldPatch::named(column)
+                .with_type(data_type)
+                .with_index(index),
+        ]),
+        None,
+    )
+    .expect("add again");
+}
+
+/// A word search on a column dropped and added again finds only rows
+/// written after.
+/// - Files written before the drop keep the dropped column's index under the
+///   same name; their rows hold no value for the new column.
+/// - `text_match`, `ILIKE` and the `token_match` table function all look for
+///   `pope`.
+///
+/// So only the row written after the drop comes back.
+#[test]
+fn a_word_search_on_a_column_added_again_skips_the_dropped_columns_index() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
+        .expect("create");
+    docs.append(&batch(vec![("title", titles(&["pope one"]))]), None)
+        .expect("append before the drop");
+    let index = index_of(&db, "title");
+    drop_and_add_again(&db, "title", DataType::LargeUtf8, index);
+    docs.append_rows(&[serde_json::json!({"title": "pope two"})], None)
+        .expect("append after");
+    for sql in [
+        format!("SELECT title FROM {TABLE} WHERE text_match(title, 'pope')"),
+        format!("SELECT title FROM {TABLE} WHERE title ILIKE '%pope%'"),
+        format!(
+            "SELECT title FROM {TABLE} WHERE _id IN \
+             (SELECT _id FROM token_match('{TABLE}', 'title', 'pope'))"
+        ),
+    ] {
+        assert_eq!(rows(&db, &sql), ["pope two"], "{sql}");
+    }
+}
+
+/// A phrase search on a column dropped and added again, both times with
+/// positions, finds only rows written after.
+/// - Files written before the drop keep the dropped column's positional
+///   index under the same name.
+/// - The `token_match` table function looks for the phrase `"pope leo"`.
+///
+/// So only the row written after the drop comes back.
+#[test]
+fn a_phrase_search_on_a_column_added_again_skips_the_dropped_columns_index() {
+    let db = connect("memory://").expect("connect");
+    let mut index = ColumnIndex::fts(Analyzer::Standard);
+    if let ColumnIndex::Fts { positions, .. } = &mut index {
+        *positions = true;
+    }
+    let docs = db
+        .create_table(
+            TABLE,
+            title_schema(),
+            IndexSpec::new().fts(FtsField::new("title").positions(true)),
+        )
+        .expect("create");
+    docs.append(&batch(vec![("title", titles(&["pope leo one"]))]), None)
+        .expect("append before the drop");
+    drop_and_add_again(&db, "title", DataType::LargeUtf8, index);
+    docs.append_rows(&[serde_json::json!({"title": "pope leo two"})], None)
+        .expect("append after");
+    let sql = format!(
+        "SELECT title FROM {TABLE} WHERE _id IN \
+         (SELECT _id FROM token_match('{TABLE}', 'title', '\"pope leo\"'))"
+    );
+    assert_eq!(rows(&db, &sql), ["pope leo two"], "{sql}");
+}
+
+/// A file written before field ids still answers `text_match` by the
+/// column's name.
+/// - The fixture's three files, written by an engine that recorded no field
+///   ids, index `title` with no id; every row holds `shared`.
+/// - One row from the current engine adds a file whose index carries the id.
+///
+/// So every row is counted: the old files fall back to the name.
+#[test]
+fn a_text_match_on_a_file_written_before_field_ids_finds_its_rows_by_name() {
+    let dir = TempDir::new().expect("tempdir");
+    copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+    let (_storage, st) = open_old_format_fts_fixture(dir.path(), |o| o);
+    let reader = st.reader().expect("reader");
+    let fixture_rows = reader
+        .token_match("title", "shared", BoolMode::Or)
+        .expect("token_match")
+        .len();
+    drop(reader);
+    let mut writer = st.writer().expect("writer");
+    writer
+        .append(&build_title_batch(&["shared fresh row"]))
+        .expect("append");
+    writer.commit().expect("commit");
+    drop(writer);
+    let batches = st
+        .reader()
+        .expect("reader")
+        .query_sql("SELECT title FROM supertable WHERE text_match(title, 'shared')")
+        .expect("sql");
+    let found: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert!(fixture_rows > 0, "the fixture holds `shared`");
+    assert_eq!(found, fixture_rows + 1);
 }

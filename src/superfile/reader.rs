@@ -72,7 +72,7 @@ use crate::{
     runtime_bridge::run_on_pool_unless_blocking,
     superfile::{
         BytesLazyByteSource, LazyByteSource, LazyByteSourceError, LazySubSource, ReadError,
-        error::FtsError,
+        error::{FtsError, VectorError},
         format::{self, footer, kv},
         fts::{
             bm25::Bm25Params,
@@ -1422,31 +1422,34 @@ impl SuperfileReader {
         self.n_docs
     }
 
-    /// FTS column names in declaration order, or empty.
-    /// The name this file knows the column `id` by, for a caller holding
-    /// the table's current name for it. A file written before a rename
-    /// carries the old label in its FTS and vector blobs, which key their
-    /// columns by name; the id is what identifies the column across both.
-    /// Falls back to `name` for a file written before ids, whose labels
-    /// were the table's at the time.
-    pub(crate) fn column_alias<'a>(&'a self, id: Option<FieldId>, name: &'a str) -> &'a str {
-        let Some(id) = id else {
-            return name;
-        };
-        let fts = self
+    /// The name this file's FTS blob knows the column `id` by, for a caller
+    /// holding the table's current `name`; see [`file_label`]. A column the
+    /// file does not hold is the `UnknownColumn` error of a missing name.
+    pub(crate) fn fts_column<'a>(
+        &'a self,
+        id: Option<FieldId>,
+        name: &'a str,
+    ) -> Result<&'a str, FtsError> {
+        let labels = self
             .fts()
             .into_iter()
             .flat_map(|fts| fts.fts_columns_config())
-            .find(|c| c.field_id == Some(id))
-            .map(|c| c.name.as_str());
-        fts.or_else(|| {
-            self.vec()
-                .into_iter()
-                .flat_map(|vec| vec.vector_columns_config())
-                .find(|c| c.field_id == Some(id))
-                .map(|c| c.name.as_str())
-        })
-        .unwrap_or(name)
+            .map(|c| (c.name.as_str(), c.field_id));
+        file_label(labels, id, name).ok_or_else(|| FtsError::UnknownColumn(name.to_owned()))
+    }
+
+    /// [`Self::fts_column`] for the vector blob.
+    pub(crate) fn vector_column<'a>(
+        &'a self,
+        id: Option<FieldId>,
+        name: &'a str,
+    ) -> Result<&'a str, VectorError> {
+        let labels = self
+            .vec()
+            .into_iter()
+            .flat_map(|vec| vec.vector_columns_config())
+            .map(|c| (c.name.as_str(), c.field_id));
+        file_label(labels, id, name).ok_or_else(|| VectorError::UnknownColumn(name.to_owned()))
     }
 
     pub fn fts_columns(&self) -> Vec<&str> {
@@ -4283,6 +4286,30 @@ impl fmt::Display for SuperfileSizeBreakdown {
     }
 }
 
+/// The label a file's blob gives the column `id` (`name` in the table now),
+/// or `None` when the file does not hold it.
+/// - The id finds the column under the old name of a rename.
+/// - A same-named column with another id was dropped before this one was
+///   added, so the file holds none of this one.
+/// - A file written before ids carries none, so `name` stands.
+fn file_label<'a>(
+    labels: impl Iterator<Item = (&'a str, Option<FieldId>)>,
+    id: Option<FieldId>,
+    name: &'a str,
+) -> Option<&'a str> {
+    let Some(id) = id else {
+        return Some(name);
+    };
+    let mut other_id = false;
+    for (label, field_id) in labels {
+        if field_id == Some(id) {
+            return Some(label);
+        }
+        other_id |= label == name && field_id.is_some();
+    }
+    (!other_id).then_some(name)
+}
+
 /// An FTS read error surfaced by the size report is a read error of the
 /// file it was read from; any other FTS error stays typed under it.
 fn fts_reader_error_to_read(e: FtsError) -> ReadError {
@@ -4329,6 +4356,25 @@ mod tests {
         },
         test_helpers::{capture_logs, decimal128_ids, default_vector_config},
     };
+
+    /// A file's label for a column follows its id, not its name.
+    /// - A rename keeps the id, so the old label is found.
+    /// - A same-named column with another id is a dropped one: absent.
+    /// - A file without ids, or a caller without one, keeps the name.
+    ///
+    /// So only the dropped column is hidden.
+    #[test]
+    fn a_file_label_follows_the_column_id() {
+        let (old, new) = (Some(FieldId(1)), Some(FieldId(2)));
+        let label = |labels: &[(&'static str, Option<FieldId>)], id| {
+            file_label(labels.iter().copied(), id, "title")
+        };
+        assert_eq!(label(&[("headline", new)], new), Some("headline"));
+        assert_eq!(label(&[("title", old)], new), None);
+        assert_eq!(label(&[("title", None)], new), Some("title"));
+        assert_eq!(label(&[("title", old)], None), Some("title"));
+        assert_eq!(label(&[], new), Some("title"));
+    }
 
     fn schema_with_text() -> Arc<Schema> {
         Arc::new(Schema::new(vec![

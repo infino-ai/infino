@@ -284,7 +284,7 @@ pub(crate) type TermMemos = HashMap<String, Arc<FetchedTermMemo>>;
 /// table `field` id. A superfile written before a rename keys its
 /// dictionary by the old name, so each superfile lookup maps the column
 /// to that superfile's own name through the id
-/// ([`SuperfileReader::column_alias`]).
+/// ([`SuperfileReader::fts_column`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CandidatePlan {
     /// Rows whose `column` contains every one of `tokens` (term-AND).
@@ -477,7 +477,7 @@ impl CandidatePlan {
                     let memo = memos.get(column).map(Arc::as_ref);
                     let (docs, work) = reader
                         .token_match_prefetched(
-                            reader.column_alias(*field, column),
+                            reader.fts_column(*field, column)?,
                             &refs,
                             BoolMode::And,
                             memo,
@@ -500,7 +500,7 @@ impl CandidatePlan {
                     let memo = memos.get(column).map(Arc::as_ref);
                     let (docs, work) = reader
                         .token_match_prefetched(
-                            reader.column_alias(*field, column),
+                            reader.fts_column(*field, column)?,
                             &refs,
                             BoolMode::Or,
                             memo,
@@ -1049,7 +1049,7 @@ async fn fold_dfs(
     }
     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
     let (dfs, work) = reader
-        .term_dfs_with_dict(reader.column_alias(field, column), &refs, dict)
+        .term_dfs_with_dict(reader.fts_column(field, column)?, &refs, dict)
         .await?;
     Ok((dfs.into_iter().fold(init, fold), work))
 }
@@ -1199,7 +1199,7 @@ async fn expand_like(
     let patterns: Vec<TermPattern<'_>> = tokens.iter().map(LikeToken::pattern).collect();
     let (expansions, work) = reader
         .expand_terms(
-            reader.column_alias(field, column),
+            reader.fts_column(field, column)?,
             &patterns,
             fold,
             LIKE_MAX_TERMS,

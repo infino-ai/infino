@@ -1262,19 +1262,24 @@ impl SupertableProvider {
             let mut rows = RoaringBitmap::new();
             let mut every_leaf_read = true;
             for leaf in leaves {
-                let file_column = prepared
+                let read = match prepared
                     .reader
-                    .column_alias(self.manifest.field_id(&leaf.column), &leaf.column);
-                let read = prepared
-                    .reader
-                    .term_rows(
-                        file_column,
-                        self.whole_term_analyzer(&leaf.column),
-                        &[leaf.needle.as_str()],
-                        memos.get(&leaf.column).map(Arc::as_ref),
-                        &dict,
-                    )
-                    .await;
+                    .fts_column(self.manifest.field_id(&leaf.column), &leaf.column)
+                {
+                    Ok(file_column) => {
+                        prepared
+                            .reader
+                            .term_rows(
+                                file_column,
+                                self.whole_term_analyzer(&leaf.column),
+                                &[leaf.needle.as_str()],
+                                memos.get(&leaf.column).map(Arc::as_ref),
+                                &dict,
+                            )
+                            .await
+                    }
+                    Err(e) => Err(e.into()),
+                };
                 match read {
                     Ok((mut leaf_rows, leaf_work)) => {
                         work.merge(leaf_work);
@@ -1320,34 +1325,39 @@ impl SupertableProvider {
             // the column's old name.
             let file_column = prepared
                 .reader
-                .column_alias(self.manifest.field_id(column), column);
-            let read = if whole {
-                prepared
-                    .reader
-                    .term_rows(
-                        file_column,
-                        self.whole_term_analyzer(column),
-                        &needles,
-                        memos.get(column).map(Arc::as_ref),
-                        &dict,
-                    )
-                    .await
-            } else {
-                // The `ILIKE` walk reads its own copy; the shared one is not held through it.
-                dict.give_back();
-                prepared
-                    .reader
-                    .contains_rows(file_column, &needles, Some(pool), Some(budget))
-                    .await
+                .fts_column(self.manifest.field_id(column), column);
+            let held = file_column.is_ok();
+            let read = match file_column {
+                Err(e) => Err(e.into()),
+                Ok(file_column) if whole => {
+                    prepared
+                        .reader
+                        .term_rows(
+                            file_column,
+                            self.whole_term_analyzer(column),
+                            &needles,
+                            memos.get(column).map(Arc::as_ref),
+                            &dict,
+                        )
+                        .await
+                }
+                Ok(file_column) => {
+                    // The `ILIKE` walk reads its own copy; the shared one is not held through it.
+                    dict.give_back();
+                    prepared
+                        .reader
+                        .contains_rows(file_column, &needles, Some(pool), Some(budget))
+                        .await
+                }
             };
             let (rows, column_work) = match read {
                 Ok(read) => read,
-                // A whole-term column this superfile holds no postings of
-                // the column's analyzer for (it was written before the
-                // column's index, or under another analyzer): every live
-                // row is doubtful, so each is checked against its text
-                // below.
-                Err(e) if whole && holds_no_postings(&e) => (
+                // A column this superfile does not hold, or a whole-term
+                // column it holds no postings of the column's analyzer for
+                // (it was written before the column's index, or under
+                // another analyzer): every live row is doubtful, so each is
+                // checked against its text below.
+                Err(e) if (whole || !held) && holds_no_postings(&e) => (
                     vec![every_live_row_doubtful(prepared, tombstones); needles.len()],
                     MatchWork::default(),
                 ),
@@ -1380,7 +1390,8 @@ impl SupertableProvider {
             }
             let file_column = prepared
                 .reader
-                .column_alias(self.manifest.field_id(&text.column), &text.column);
+                .fts_column(self.manifest.field_id(&text.column), &text.column)
+                .map_err(QueryError::from)?;
             let words: Vec<&str> = text.query.words.iter().map(String::as_str).collect();
             let read = prepared
                 .reader
