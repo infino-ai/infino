@@ -659,12 +659,10 @@ impl FtsReader {
         Ok((out, work))
     }
 
-    /// Whether `column` was indexed by `analyzer`, as an error when not: an
-    /// exact answer from the postings agrees with a check of the text only
-    /// under the analyzer the text is checked with.
     fn ensure_analyzer(&self, column: &str, analyzer: &'static str) -> Result<(), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         let indexed = self.columns[column_id as usize].tokenizer.name();
+        // Postings match the text only under the analyzer that indexed it.
         if indexed != analyzer {
             return Err(FtsError::ExactNeedsAnalyzer {
                 column: column.to_owned(),
@@ -675,11 +673,10 @@ impl FtsReader {
         Ok(())
     }
 
-    /// The rows of `column` whose tokens under `analyzer` hold `words` and
-    /// `phrases` under `mode`, from the phrase walk: every row proven. A
-    /// column indexed without positions is [`FtsError::PositionsUnavailable`].
-    /// The walk reads the dictionary itself, not through a shared
-    /// `QueryDict`, where the term index's memo does not locate a term.
+    /// The rows of `column` that hold `words` and `phrases` under `mode`, read
+    /// from the positions. A column without positions is
+    /// [`FtsError::PositionsUnavailable`]. Where the term index has not located a
+    /// term, this reads its own copy of the dictionary.
     pub(crate) async fn text_rows(
         &self,
         column: &str,

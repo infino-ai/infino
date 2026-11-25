@@ -1636,12 +1636,11 @@ pub(crate) struct ExactContains {
     pub(crate) whole: bool,
 }
 
-/// A `text_match` whose query holds a quoted phrase: its rows are those
-/// whose tokens hold the query's words and phrases under `mode`, a phrase
-/// read from the positions (see the provider's `exact_rows`).
+/// A `text_match` whose query holds a quoted phrase. Its rows come from the
+/// positions, or, on a column without them, from [`Self::superset`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExactText {
-    /// The FTS column, indexed by `standard`.
+    /// The full-text column, indexed by `standard`.
     pub(crate) column: String,
     /// The query's words and phrases.
     pub(crate) query: TextQuery,
@@ -1689,7 +1688,6 @@ pub(crate) fn exact_contains(
     })
 }
 
-/// The leaf of the rows holding `needle` as one whole token of `column`.
 fn whole_token_leaf(column: &str, needle: String) -> ExactFilter {
     ExactFilter::Contains(ExactContains {
         column: column.to_owned(),
@@ -1699,10 +1697,8 @@ fn whole_token_leaf(column: &str, needle: String) -> ExactFilter {
 }
 
 impl ExactText {
-    /// The rows that may hold this query, from the postings alone: its words
-    /// and each phrase's terms under the mode, every phrase read as the
-    /// `AND` of its terms. Exact when the query has no phrase; a superset
-    /// otherwise, for a scan that checks the phrase on the rows it reads.
+    /// The rows that may hold this query, from the postings alone: each phrase
+    /// counts as all of its words. The scan checks the phrase on these rows.
     pub(crate) fn superset(&self) -> ExactFilter {
         let word = |needle: &String| whole_token_leaf(&self.column, needle.clone());
         let words = self.query.words.iter().map(word);
@@ -1722,9 +1718,8 @@ impl ExactText {
 }
 
 impl ExactFilter {
-    /// This tree with each [`ExactText`] leaf on a column without positions
-    /// replaced by its [`ExactText::superset`], and whether the tree is
-    /// still exact (no leaf was replaced).
+    /// This tree with each phrase leaf on a column without positions replaced by
+    /// its [`ExactText::superset`], and whether the tree is still exact.
     pub(crate) fn read_without_positions(
         self,
         has_positions: &dyn Fn(&str) -> bool,
@@ -1744,7 +1739,6 @@ impl ExactFilter {
     }
 }
 
-/// [`ExactFilter::read_without_positions`] of each of `children`.
 fn read_children(
     children: Vec<ExactFilter>,
     has_positions: &dyn Fn(&str) -> bool,
@@ -1905,7 +1899,6 @@ impl ExactFilter {
         out
     }
 
-    /// Call `f` on each leaf of the tree, in order.
     fn for_each_leaf<'a>(&'a self, f: &mut dyn FnMut(&'a ExactFilter)) {
         match self {
             ExactFilter::And(children) | ExactFilter::Or(children) => {

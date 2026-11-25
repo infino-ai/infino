@@ -1055,13 +1055,11 @@ impl SupertableProvider {
         (!common).then_some(exact)
     }
 
-    /// [`Self::exact_filter`] with each quoted `text_match` on a column
-    /// indexed without positions read as the rows holding its words (see
-    /// [`ExactFilter::read_without_positions`]), and whether the result is
-    /// still exact. When it is not, the scan bounds its rows by it and
-    /// DataFusion checks the phrase on the rows the scan reads, which costs
-    /// about a scan of the text; checking each candidate row by its id costs
-    /// several times that when the words are common.
+    /// [`Self::exact_filter`], and whether the scan answers it exactly. A quoted
+    /// `text_match` on a column without positions is not exact: the scan narrows
+    /// the rows by its words and DataFusion checks the phrase on the rows read.
+    /// That costs about a scan of the text, a few times less than checking each
+    /// row by id when the words are common.
     fn exact_conjunct(
         &self,
         filter: &Expr,
@@ -1072,7 +1070,6 @@ impl SupertableProvider {
         Some(exact.read_without_positions(&|column| positional.contains(column)))
     }
 
-    /// The full-text columns indexed with positions.
     fn positional_columns(&self) -> HashSet<String> {
         self.manifest
             .fts_configs()
@@ -1176,10 +1173,8 @@ impl SupertableProvider {
             .map_or(STANDARD_TOKENIZER, |tokenizer| tokenizer.name())
     }
 
-    /// Whether this provider answers or bounds any of `filters` from the
-    /// index ([`Self::exact_filter`]): a scan carrying it returns fewer rows
-    /// than the manifest's statistics describe. DataFusion keeps no `Filter`
-    /// node for it unless it only bounds the rows ([`Self::exact_conjunct`]).
+    /// Whether the index answers or narrows any of `filters`: a scan carrying it
+    /// returns fewer rows than the manifest's statistics describe.
     pub(crate) fn has_exact_filter(&self, filters: &[Expr]) -> bool {
         let fts_cols = self.fts_cols_set();
         filters
@@ -1371,9 +1366,8 @@ impl SupertableProvider {
                     .zip(rows),
             );
         }
-        // Each distinct phrase leaf's rows, proven from the positions. The
-        // phrase walk reads its own copy of the dictionary, so the shared one
-        // is not held through it.
+        // Phrase rows come from the positions. The walk reads its own dictionary,
+        // so give the shared one back first.
         dict.give_back();
         let mut text_rows: Vec<(&ExactText, ContainsRows)> = Vec::new();
         for text in check.filter.texts() {
@@ -1400,13 +1394,12 @@ impl SupertableProvider {
                     work.merge(text_work);
                     rows
                 }
-                // A file indexed without positions: the rows holding the
-                // words, checked against their text.
+                // A file without positions: check the rows holding the words against their
+                // text.
                 Err(e) if lacks_positions(&e) => {
                     let terms = text.query.tokens();
                     let terms: Vec<&str> = terms.iter().map(String::as_str).collect();
-                    // Its own dictionary read, shared by the terms: the
-                    // scan's was given back above.
+                    // One dictionary read for all the terms; the shared one was given back.
                     let dict =
                         QueryDict::with_budget(&self.manifest.options.connection_memory_budget);
                     let (rows, term_work) = prepared
@@ -1447,8 +1440,7 @@ impl SupertableProvider {
                         doubtful: superset.proven | superset.doubtful,
                     }
                 }
-                // As for a word: no postings here, so every live row is
-                // checked against its text.
+                // No postings here: check every live row against its text, as for a word.
                 Err(e) if holds_no_postings(&e) => every_live_row_doubtful(prepared, tombstones),
                 Err(e) => return Err(QueryError::from(e).into()),
             };
@@ -2616,9 +2608,6 @@ fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
         && max.distance(min).map(|d| d as u64) == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
 }
 
-/// Every live row of `prepared`'s superfile, doubtful: what a leaf reads
-/// where the file holds no postings for its column, so the scan checks each
-/// row against its text.
 fn every_live_row_doubtful(
     prepared: &PreparedScanFile,
     tombstones: &RoaringBitmap,
@@ -2638,7 +2627,6 @@ fn every_live_row_doubtful(
     }
 }
 
-/// Whether `e` says a superfile's column was indexed without positions.
 fn lacks_positions(e: &ReadError) -> bool {
     matches!(e, ReadError::Fts(f) if matches!(f.as_ref(), FtsError::PositionsUnavailable { .. }))
 }
@@ -3114,9 +3102,8 @@ impl TableProvider for SupertableProvider {
         let mut exact_filters: Vec<Expr> = Vec::new();
         let mut exact_conjuncts: Vec<ExactFilter> = Vec::new();
         let mut bounded_filters: Vec<Expr> = Vec::new();
-        // A conjunct that only bounds the rows (a phrase on a column without
-        // positions) is checked again above the scan, so the scan cannot stop
-        // at the LIMIT.
+        // DataFusion checks a conjunct the scan only narrows again above the scan,
+        // so the scan must not stop at the LIMIT.
         let mut every_exact = true;
         let positional = self.positional_columns();
         let text: Vec<Option<(ExactFilter, bool)>> = filters

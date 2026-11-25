@@ -33,22 +33,19 @@
 //! key, and its postings are the rows (see `candidate::ExactFilter`). The
 //! scan then decodes only those rows, intersects them with whatever else
 //! the `WHERE` bounds, and stops at the `LIMIT`. A phrase is read from the
-//! column's token positions. Where the column was indexed without them, the
-//! rows holding the phrase's tokens are checked against their text instead,
-//! which costs about a scan of that text over the rows the rest of the
-//! `WHERE` keeps.
+//! column's token positions. Without positions, the rows holding its words
+//! are checked against their text, which costs about a scan of that text.
 //!
 //! ## What it means
 //!
 //! `text_match(column, query, mode)` is true when the value of `column`,
 //! split by the `standard` analyzer, holds every (`'and'`) or any (`'or'`,
 //! the default, as `token_match`'s) of the words and phrases of `query`. A
-//! phrase is a pair of double quotes around two or more tokens, and a value
-//! holds it where its tokens stand in that order, next to each other:
-//! `'"pope leo"'` holds for `Pope Leo XIV` and not for `leo the pope`. Each
-//! other token of `query` is a word; an unpaired quote, and `+` or `-`, are
-//! separators, as in the text. A query with no token matches nothing, and a
-//! NULL value is NULL, so `WHERE` drops it.
+//! phrase is two or more tokens in double quotes, and a value holds it when
+//! those tokens stand next to each other, in order: `'"pope leo"'` holds for
+//! `Pope Leo XIV`, not for `leo the pope`. Outside quotes, `+`, `-` and an
+//! unpaired quote are separators, as in the text. A query with no token
+//! matches nothing, and a NULL value is NULL, so `WHERE` drops it.
 //!
 //! Row by row, the function tokenizes each value with `standard`. The scan
 //! uses the postings instead only where they give the same answer: a column
@@ -111,17 +108,16 @@ pub(crate) struct TextQuery {
     pub(crate) words: Vec<String>,
     /// The distinct quoted runs of two or more tokens.
     pub(crate) phrases: Vec<Phrase<String>>,
-    /// `words`, for telling a repeat apart in constant time.
+    /// `words` as a set, to skip repeats.
     seen: HashSet<String>,
 }
 
 impl TextQuery {
     /// `query` split by `standard`. Each pair of double quotes, paired left to
-    /// right, holds a phrase, or a word when it holds one token, and empty
-    /// quotes hold nothing. Everything outside the pairs is split as the text
-    /// is, so an unpaired quote, `+` and `-` are what they are in the text
-    /// (separators, or part of a word where `standard` keeps them, as in
-    /// `צה"ל`), and a query without a pair is exactly its words.
+    /// right, holds a phrase, or a word if it holds one token. Everything else is
+    /// split as the text is, so a query without a pair gives exactly its words.
+    /// For example, `pope "leo xiv" -rome` gives the words `pope` and `rome` and
+    /// the phrase `leo xiv`.
     pub(crate) fn parse(query: &str) -> Self {
         let tokenizer = StandardTokenizer::new();
         let mut out = Self::default();
@@ -155,12 +151,10 @@ impl TextQuery {
         out
     }
 
-    /// Add `text`'s tokens as words, each once.
     fn add_words(&mut self, tokenizer: &StandardTokenizer, text: &str) {
         tokenizer.tokenize_each_inline(text, |token| self.add_word(token));
     }
 
-    /// Add `token` as a word, once.
     fn add_word(&mut self, token: &str) {
         if !self.seen.contains(token) {
             self.seen.insert(token.to_owned());
@@ -168,14 +162,12 @@ impl TextQuery {
         }
     }
 
-    /// Whether the query holds no token.
     fn is_empty(&self) -> bool {
         self.words.is_empty() && self.phrases.is_empty()
     }
 
-    /// Every distinct token the query names, its words' and its phrases': a
-    /// row the query holds holds every one of them
-    /// under `'and'`, and one of them under `'or'`.
+    /// Every distinct token, words and phrase terms: a matching row holds all of
+    /// them under `'and'`, and at least one under `'or'`.
     pub(crate) fn tokens(&self) -> Vec<String> {
         let mut seen = self.seen.clone();
         let mut out = self.words.clone();
@@ -275,8 +267,8 @@ fn literal_arg<'a>(value: &'a ColumnarValue, what: &str) -> DfResult<Option<&'a 
     }
 }
 
-/// A value's tokens and their positions, kept in one buffer that is reused
-/// from value to value, so checking a phrase allocates nothing per token.
+/// A value's tokens and positions, in one buffer reused across values, so a
+/// phrase check allocates nothing per token.
 #[derive(Default)]
 struct Positioned {
     /// The tokens, one after another.
@@ -286,7 +278,6 @@ struct Positioned {
 }
 
 impl Positioned {
-    /// Hold `value`'s tokens under `tokenizer`, in place of the last value's.
     fn fill(&mut self, tokenizer: &StandardTokenizer, value: &str) {
         self.text.clear();
         self.spans.clear();
@@ -297,14 +288,12 @@ impl Positioned {
         });
     }
 
-    /// Each token with its position, in order.
     fn tokens(&self) -> impl Iterator<Item = (u64, &str)> {
         self.spans
             .iter()
             .map(|&(position, start, end)| (position, &self.text[start..end]))
     }
 
-    /// The token at `position`, if any.
     fn at(&self, position: u64) -> Option<&str> {
         let i = self
             .spans
@@ -315,8 +304,8 @@ impl Positioned {
     }
 }
 
-/// A query compiled for checking values: the query and every token it names
-/// ([`TextQuery::tokens`]), which the substring check reads.
+/// A query ready to check values, with every token it names for the substring
+/// check.
 struct Matcher<'q> {
     query: &'q TextQuery,
     tokens: Vec<String>,
@@ -332,9 +321,8 @@ impl<'q> Matcher<'q> {
         }
     }
 
-    /// Whether `value` holds the query under the mode: every word and phrase
-    /// for `'and'`, any for `'or'`. A phrase holds where its terms stand at
-    /// its offsets from one position.
+    /// Whether `value` holds the query: every word and phrase under `'and'`, any
+    /// under `'or'`.
     fn holds(
         &self,
         tokenizer: &StandardTokenizer,
@@ -390,8 +378,8 @@ impl<'q> Matcher<'q> {
         }
     }
 
-    /// [`Self::holds`] for a query of words alone, in one pass that stops as
-    /// soon as the answer is known.
+    /// [`Self::holds`] for words only, in one pass that stops once the answer is
+    /// known.
     fn holds_words(&self, tokenizer: &StandardTokenizer, value: &str) -> bool {
         let words = &self.query.words;
         let mut found = vec![false; words.len()];

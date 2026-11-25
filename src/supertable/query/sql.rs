@@ -3121,8 +3121,7 @@ mod tests {
         committed_table(options_id_cat_title_with(stemmer), &exact_ilike_titles())
     }
 
-    /// `titles` committed under `options` over [`EXACT_FIXTURE_COMMITS`]
-    /// superfiles, categories alternating `x` / `y`, and the oracle over the
+    /// `titles` over [`EXACT_FIXTURE_COMMITS`] superfiles, and the oracle over the
     /// same rows.
     fn committed_table(
         options: SupertableOptions,
@@ -3431,8 +3430,8 @@ mod tests {
         assert!(plan.contains("text_match"), "{plan}");
     }
 
-    /// Titles that hold `pope leo` as a phrase, its words reversed, apart, or
-    /// joined by punctuation, and a repeated word.
+    /// Titles with `pope leo` as a phrase, reversed, apart, across punctuation,
+    /// and with a repeated word.
     const PHRASE_TITLES: &[&str] = &[
         "Pope Leo XIV",
         "leo the pope",
@@ -3443,9 +3442,9 @@ mod tests {
         "rome",
     ];
 
-    /// `text_match` filters with quoted phrases: alone, under each mode, beside
-    /// words, a repeated word, an unpaired quote, signs, empty and one-token
-    /// quotes, a phrase no row holds, and trees with other conjuncts.
+    /// Quoted `text_match` filters: each mode, beside words, a repeated word, an
+    /// unpaired quote, signs, empty and one-token quotes, a phrase no row holds,
+    /// and trees with other conjuncts.
     const PHRASE_FILTERS: &[&str] = &[
         "text_match(title, '\"pope leo\"')",
         "text_match(title, '\"leo pope\"', 'and')",
@@ -3463,8 +3462,8 @@ mod tests {
         "NOT text_match(title, '\"pope leo\"')",
     ];
 
-    /// [`PHRASE_TITLES`] among filler rows over [`EXACT_FIXTURE_COMMITS`]
-    /// superfiles, `positions` or not, and the oracle over the same rows.
+    /// [`PHRASE_TITLES`] among filler rows, with or without positions, and the
+    /// oracle.
     fn phrase_table(stemmer: Stemmer, positions: bool) -> (Supertable, SessionContext) {
         let options = SupertableOptions::new(
             schema_id_cat_title(),
@@ -3484,10 +3483,10 @@ mod tests {
 
     #[test]
     fn a_quoted_text_match_returns_the_rows_of_its_phrase() {
-        // With positions the scan reads the phrase from them; without, it
-        // checks the rows holding its words against their text; under a
-        // stemmer DataFusion calls the function row by row. The oracle calls
-        // it row by row on every row, so every path must return its rows.
+        // Every path must return the row-by-row oracle's rows:
+        // - with positions, the scan walks the phrase;
+        // - without, it checks the rows holding the words;
+        // - under a stemmer, DataFusion calls the function on each row.
         let rt = Runtime::new().expect("runtime");
         for (stemmer, positions) in [
             (Stemmer::None, true),
@@ -3544,8 +3543,8 @@ mod tests {
 
     #[test]
     fn a_quoted_text_match_is_answered_by_the_scan_only_with_positions() {
-        // With positions the scan answers the phrase in full; without, it
-        // bounds the rows by the words and DataFusion checks the phrase.
+        // With positions the scan answers the phrase; without, DataFusion checks it
+        // above the scan.
         for positions in [true, false] {
             let (st, _) = phrase_table(Stemmer::None, positions);
             let plan = explain_physical(

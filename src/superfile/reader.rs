@@ -3073,8 +3073,7 @@ impl SuperfileReader {
             .await?)
     }
 
-    /// The rows of `column` that hold `words` and `phrases` under `mode`.
-    /// Delegates to [`FtsReader::text_rows`].
+    /// See [`FtsReader::text_rows`].
     pub(crate) async fn text_rows(
         &self,
         column: &str,
