@@ -22,6 +22,7 @@ Inputs (env):
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 
 # Report keys are "anchor|subtitle|label|header"; split on this into 4 fields.
@@ -132,7 +133,11 @@ GATE_ABS_NS = 5_000_000.0
 # warm p90 at about 45 ms or about 75 ms on the same commit: 1 to 4 of its
 # 30 reps run 75 to 115 ms, and p90 is the 4th slowest. It failed the gate
 # on a main push benchmarking main against main. Its p90 still reports as
-# an informational mover. Remove the entry once that tail is fixed.
+# an informational mover. Remove the entry once both that tail and the
+# whole-run shift are fixed: a slow run moves its median too, from 42.5 to
+# 56.5 ms (https://github.com/infino-ai/infino/issues/1512). The summary
+# fails when a report that ran has no row matching an entry, so a renamed
+# anchor or label on the Rust side cannot quietly send the row back to p90.
 P50_GATED_ROWS = {
     (
         "supertable_sql",
@@ -155,6 +160,8 @@ class Diff:
     # False with a baseline present means no report emitted the gate metric,
     # so nothing could have blocked — a dead gate, not a clean run.
     gate_metric_seen: bool = False
+    # `P50_GATED_ROWS` entries whose report ran but emitted no matching row.
+    unseen_gated_rows: list = field(default_factory=list)
 
 
 def is_text_only(header):
@@ -288,17 +295,20 @@ def diff(reports, baseline_dir, current_dir, threshold, gate_header):
     had_baseline = False
     cost_present = False
     gate_metric_seen = False
+    ran, seen_rows = set(), set()
     for report in reports:
         base = load(os.path.join(baseline_dir, f"{report}.json"))
         cur = load(os.path.join(current_dir, f"{report}.json"))
         if not cur:
             continue
+        ran.add(report)
         subsystem, area = SUBSYSTEM.get(report, (report, ""))
         for key, new in cur.items():
             parts = key.split("|")
             if len(parts) != KEY_PARTS:
                 continue
             anchor, _subtitle, label, header = parts
+            seen_rows.add((report, anchor, label))
             if is_text_only(header):
                 continue
             if is_cost(header):
@@ -350,6 +360,9 @@ def diff(reports, baseline_dir, current_dir, threshold, gate_header):
         had_baseline=had_baseline,
         cost_present=cost_present,
         gate_metric_seen=gate_metric_seen,
+        unseen_gated_rows=sorted(
+            row for row in P50_GATED_ROWS if row[0] in ran and row not in seen_rows
+        ),
     )
 
 
@@ -379,6 +392,14 @@ def main():
     info_file = os.environ.get("INFO_FILE", DEFAULT_INFO_FILE)
     failures = [ln.strip() for ln in os.environ.get("ERRORS", "").splitlines() if ln.strip()]
     ab = diff(reports, baseline_dir, current_dir, threshold, gate_header)
+    # A failed run may stop before the row; only a run that reported no failure must have it.
+    if ab.unseen_gated_rows and not failures:
+        for report, anchor, row_label in ab.unseen_gated_rows:
+            print(
+                f"::error::P50_GATED_ROWS entry ({report}, {anchor}, {row_label}) matched no row; "
+                "rename it to match the bench, or remove it"
+            )
+        sys.exit(1)
     blocking, informational = ab.blocking, ab.informational
     regressions, improvements = ab.regressions, ab.improvements
 
