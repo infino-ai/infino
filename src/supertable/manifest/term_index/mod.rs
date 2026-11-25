@@ -499,9 +499,11 @@ enum IndexRead {
 }
 
 /// A lookup's place in a shared first read of a block index. A read that is
-/// cancelled passes to the next waiter. On drop, finished or cancelled, it
-/// takes the read out of `index_reads` if it is still there, so a later
-/// lookup reads afresh rather than finding a failed or abandoned read.
+/// cancelled passes to the next waiter. On drop it takes the read out of
+/// `index_reads` once the read has ended, or when it was the read's last
+/// lookup, so a later lookup reads afresh rather than finding a failed or
+/// abandoned read; a lookup that gives up while others wait leaves the read
+/// to them and to newcomers.
 struct IndexReading {
     tier_chunks: TierChunkCache,
     hash: ContentHash,
@@ -533,11 +535,14 @@ impl Drop for IndexReading {
             .tier_chunks
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if chunks
+        let ours = chunks
             .index_reads
             .get(&self.hash)
-            .is_some_and(|read| Arc::ptr_eq(read, &self.read))
-        {
+            .is_some_and(|read| Arc::ptr_eq(read, &self.read));
+        // Lookups join under this lock, so the count is stable: the map's and
+        // this one's mean nobody else waits.
+        let last = Arc::strong_count(&self.read) == 2;
+        if ours && (self.read.initialized() || last) {
             chunks.index_reads.remove(&self.hash);
         }
     }
@@ -4388,7 +4393,10 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use futures::{future::join_all, poll};
+    use futures::{
+        future::{join, join_all},
+        poll,
+    };
     use object_store::MultipartUpload;
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
@@ -10820,6 +10828,22 @@ mod tests {
     /// first slice read.
     const RACE_POLLS: usize = 32;
 
+    /// The fewest lookups holding any one of `hashes`' shared index reads in
+    /// `index`, so a racing test checks they all joined before it goes on.
+    fn fewest_joined(index: &TermIndex, hashes: &HashSet<ContentHash>) -> usize {
+        let chunks = index.tier_chunks.lock().expect("tier chunk cache lock");
+        hashes
+            .iter()
+            .map(|hash| {
+                chunks
+                    .index_reads
+                    .get(hash)
+                    .map_or(0, |read| Arc::strong_count(read) - 1)
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
     #[tokio::test]
     async fn lookups_racing_for_a_cold_slice_share_one_read_of_its_block_index() {
         // Sixteen lookups of one term at once, nothing resident, slice reads
@@ -10835,11 +10859,11 @@ mod tests {
         slow.hold_reads_of(SLICE_URI_FRAGMENT);
         let index = ranged_index(&root, Arc::clone(&slow) as Arc<dyn StorageProvider>);
         let asked = [terms[0].as_str()];
-        let touched = root
+        let hashes: HashSet<ContentHash> = root
             .slices_for_key(&fid("body").term_key(&terms[0]))
             .map(|s| s.content_hash)
-            .collect::<HashSet<_>>()
-            .len();
+            .collect();
+        let touched = hashes.len();
         let mut lookups = pin!(join_all(
             (0..LOOKUPS).map(|_| index.runs_many(fid("body"), &asked))
         ));
@@ -10847,6 +10871,10 @@ mod tests {
             assert!(poll!(lookups.as_mut()).is_pending(), "reads are held");
             task::yield_now().await;
         }
+        assert!(
+            fewest_joined(&index, &hashes) >= LOOKUPS,
+            "every lookup waits on the shared reads"
+        );
         assert_eq!(
             slow.reads_of(SLICE_URI_FRAGMENT),
             touched,
@@ -10898,11 +10926,11 @@ mod tests {
         slow.hold_reads_of(SLICE_URI_FRAGMENT);
         let index = ranged_index(&root, Arc::clone(&slow) as Arc<dyn StorageProvider>);
         let asked = [terms[0].as_str()];
-        let touched = root
+        let hashes: HashSet<ContentHash> = root
             .slices_for_key(&fid("body").term_key(&terms[0]))
             .map(|s| s.content_hash)
-            .collect::<HashSet<_>>()
-            .len();
+            .collect();
+        let touched = hashes.len();
         let mut lookups = pin!(join_all(
             (0..LOOKUPS).map(|_| index.runs_many(fid("body"), &asked))
         ));
@@ -10910,6 +10938,10 @@ mod tests {
             assert!(poll!(lookups.as_mut()).is_pending(), "reads are held");
             task::yield_now().await;
         }
+        assert!(
+            fewest_joined(&index, &hashes) >= LOOKUPS,
+            "every lookup waits on the shared reads"
+        );
         slow.release_reads();
         let runs = timeout(BUDGET_DEADLOCK_TIMEOUT, lookups)
             .await
@@ -10928,6 +10960,61 @@ mod tests {
             .await
             .expect("whole");
         for run in runs {
+            assert_eq!(found(&run.expect("lookup")), found(&whole));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lookup_giving_up_on_a_shared_index_read_leaves_it_to_the_others() {
+        // Two lookups of one term share the held first read of each slice's
+        // block index; the second gives up, then a third lookup starts.
+        //  - the third joins the same reads: still one block index read per
+        //    slice;
+        //  - once released, the first and third answer as whole reads do.
+        // This test pins that a lookup giving up does not orphan the read the
+        // others wait on.
+        let (local, root, terms, _store) = two_layer_checked_index().await;
+        let slow = SlowStorage::wrap(Arc::clone(&local), Duration::ZERO);
+        slow.hold_reads_of(SLICE_URI_FRAGMENT);
+        let index = ranged_index(&root, Arc::clone(&slow) as Arc<dyn StorageProvider>);
+        let asked = [terms[0].as_str()];
+        let hashes: HashSet<ContentHash> = root
+            .slices_for_key(&fid("body").term_key(&terms[0]))
+            .map(|s| s.content_hash)
+            .collect();
+        let mut first = pin!(index.runs_many(fid("body"), &asked));
+        let mut second = Box::pin(index.runs_many(fid("body"), &asked));
+        for _ in 0..RACE_POLLS {
+            assert!(poll!(first.as_mut()).is_pending(), "reads are held");
+            assert!(poll!(second.as_mut()).is_pending(), "reads are held");
+            task::yield_now().await;
+        }
+        assert!(
+            fewest_joined(&index, &hashes) >= 2,
+            "both wait on the reads"
+        );
+        drop(second);
+        let mut third = pin!(index.runs_many(fid("body"), &asked));
+        for _ in 0..RACE_POLLS {
+            assert!(poll!(first.as_mut()).is_pending(), "reads are held");
+            assert!(poll!(third.as_mut()).is_pending(), "reads are held");
+            task::yield_now().await;
+        }
+        assert_eq!(
+            slow.reads_of(SLICE_URI_FRAGMENT),
+            hashes.len(),
+            "one block index read per slice"
+        );
+        slow.release_reads();
+        let (first, third) = timeout(BUDGET_DEADLOCK_TIMEOUT, join(first, third))
+            .await
+            .expect("the lookups finish");
+        let whole = TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None)
+            .with_small_slice_bytes(u64::MAX)
+            .runs_many(fid("body"), &asked)
+            .await
+            .expect("whole");
+        for run in [first, third] {
             assert_eq!(found(&run.expect("lookup")), found(&whole));
         }
     }
