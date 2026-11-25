@@ -135,7 +135,6 @@ use crate::{
         manifest::{SuperfileEntry, SuperfileUri},
         query::{
             fts::{IndexedSuperfile, PlanLocations, memos_from_plan_locations},
-            provider::holds_no_postings,
             prune::PruneLeaf,
             text_match::{TextMatchMode, TextQuery, text_match_call},
         },
@@ -286,6 +285,9 @@ pub(crate) type TermMemos = HashMap<String, Arc<FetchedTermMemo>>;
 /// dictionary by the old name, so each superfile lookup maps the column
 /// to that superfile's own name through the id
 /// ([`SuperfileReader::fts_label`]).
+///
+/// There is no `Not`: a leaf gives no rows for a file that holds none of its
+/// column, which is right only while nothing negates a leaf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CandidatePlan {
     /// Rows whose `column` contains every one of `tokens` (term-AND).
@@ -474,7 +476,7 @@ impl CandidatePlan {
                     field,
                     tokens,
                 } => {
-                    // A file holding a dropped column of this name has no row.
+                    // A file that holds none of the column has no row.
                     let Some(file_column) = reader.fts_label(*field, column) else {
                         return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
                     };
@@ -495,7 +497,7 @@ impl CandidatePlan {
                     if terms.is_empty() {
                         return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
                     }
-                    // A file holding a dropped column of this name has no row.
+                    // A file that holds none of the column has no row.
                     let Some(file_column) = reader.fts_label(*field, column) else {
                         return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
                     };
@@ -756,36 +758,19 @@ impl CandidatePlan {
             locations,
             superfile,
         };
-        // A file whose index cannot answer the plan (it has no full-text
-        // index, or none for a column) gets no bound: the scan reads it and
-        // the filter checks its rows, as the plan is only a superset.
-        let unbounded = || Resolved {
-            rows: None,
-            work: MatchWork::default(),
-        };
-        let (estimate, mut work) = match self
+        let (estimate, mut work) = self
             .estimate(&reader, pool.map(|(pool, _)| pool), Some(located), &dict)
-            .await
-        {
-            Ok(estimated) => estimated,
-            Err(e) if holds_no_postings(&e) => return Ok(unbounded()),
-            Err(e) => return Err(e),
-        };
+            .await?;
         if !gate.pays(estimate) {
             return Ok(Resolved { rows: None, work });
         }
         let memos = memos_from_plan_locations(&reader, locations, superfile).await;
-        let matched = match pool {
+        let (rows, matched) = match pool {
             Some((pool, slots)) => {
                 self.evaluate_on_pool(reader, superfile, pool, slots, memos, dict)
-                    .await
+                    .await?
             }
-            None => self.evaluate(&reader, None, &memos, &dict).await,
-        };
-        let (rows, matched) = match matched {
-            Ok(matched) => matched,
-            Err(e) if holds_no_postings(&e) => return Ok(unbounded()),
-            Err(e) => return Err(e),
+            None => self.evaluate(&reader, None, &memos, &dict).await?,
         };
         work.merge(matched);
         Ok(Resolved { rows, work })
@@ -1061,7 +1046,7 @@ async fn fold_dfs(
     if let Some(folded) = indexed {
         return Ok((folded, MatchWork::default()));
     }
-    // A file holding a dropped column of this name holds none of the terms.
+    // A file that holds none of the column holds none of the terms.
     let Some(file_column) = reader.fts_label(field, column) else {
         return Ok((
             terms.iter().fold(init, |acc, _| fold(acc, 0)),
@@ -1214,7 +1199,7 @@ async fn expand_like(
     pool: Option<&ThreadPool>,
     dict: &QueryDict,
 ) -> Result<(CandidatePlan, MatchWork), ReadError> {
-    // A file holding a dropped column of this name has no row: no term.
+    // A file that holds none of the column has no row: no term.
     let Some(file_column) = reader.fts_label(field, column) else {
         let none = CandidatePlan::TermsAny {
             column: column.to_owned(),
@@ -1894,7 +1879,8 @@ fn exact_keyword_equality(
 ///
 /// Leaves combine row by row ([`Self::rows`]). A NULL holds no term, so
 /// every leaf reads it as false, which matches SQL only while there is no
-/// `NOT` above it, so `NOT` is never exact.
+/// `NOT` above it, so `NOT` is never exact. For the same reason a leaf gives
+/// no rows for a file that holds none of its column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExactFilter {
     Contains(ExactContains),

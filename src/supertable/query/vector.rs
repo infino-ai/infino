@@ -144,9 +144,8 @@ use crate::{
             fine_graph_follow, fine_graph_publish,
             fine_graph_store::{GraphHead, KeyedGraph},
             fts::{memo_from_locations, memos_from_plan_locations},
-            provider::{holds_no_postings, prune_leaves_for_filters},
+            provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
-            skip::file_lacks_column,
             superfile_reader::OpenTierCounts,
             widening::next_want,
         },
@@ -7378,12 +7377,10 @@ impl SupertableReader {
             let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
             async move {
-                // A file written without the column (before it was added,
-                // or while it was dropped) has no row of it.
-                if filter_field.is_some_and(|id| file_lacks_column(&entry, id)) {
+                // A file that holds none of the column has no row of it.
+                let Some(file_column) = r.fts_label(filter_field, &filter_col_arc) else {
                     return Ok(RoaringBitmap::new());
-                }
-                let file_column = r.fts_column(filter_field, &filter_col_arc)?;
+                };
                 let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                 let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                 let (docs, work) = r
@@ -8394,25 +8391,15 @@ impl SupertableReader {
                 let memos = memos_from_plan_locations(&r, &locations, entry.superfile_id).await;
                 // A `LIKE` leaf's expansion and the match share one dictionary read while the
                 // budget has room.
-                let evaluated = plan
+                let (bitmap, work) = plan
                     .evaluate(
                         r.as_ref(),
                         Some(&reader_pool),
                         &memos,
                         &QueryDict::with_budget(&budget),
                     )
-                    .await;
-                let (bitmap, work) = match evaluated {
-                    Ok(evaluated) => evaluated,
-                    // A file whose index cannot answer the plan keeps every
-                    // row; the `WHERE` checks them, as the plan is a superset.
-                    Err(e) if holds_no_postings(&e) => {
-                        let mut all = RoaringBitmap::new();
-                        all.insert_range(0..r.n_docs() as u32);
-                        return Ok(all);
-                    }
-                    Err(e) => return Err(QueryError::from(e)),
-                };
+                    .await
+                    .map_err(QueryError::from)?;
                 // The SQL predicate's posting walks, summed across the
                 // plan tree — the pushdown leg of the vector TVF.
                 work.add_to(op_stats.as_deref());

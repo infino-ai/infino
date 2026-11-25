@@ -1423,20 +1423,26 @@ impl SuperfileReader {
     }
 
     /// The name this file's FTS blob knows the column `id` by, for a caller
-    /// holding the table's current `name`, or `None` when the blob holds a
-    /// dropped column of that name, so none of the file's rows can match.
+    /// holding the table's current `name`, or `None` when the file holds none
+    /// of the column, so none of its rows can match. The file's stored
+    /// columns count too, so one stored but not indexed keeps its label.
     /// See [`file_label`].
     pub(crate) fn fts_label<'a>(&'a self, id: Option<FieldId>, name: &'a str) -> Option<&'a str> {
-        let labels = self
+        let indexed = self
             .fts()
             .into_iter()
             .flat_map(|fts| fts.fts_columns_config())
             .map(|c| (c.name.as_str(), c.field_id));
-        file_label(labels, id, name)
+        let stored = self
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (f.name().as_str(), field_id_of(f)));
+        file_label(indexed.chain(stored), id, name)
     }
 
     /// [`Self::fts_label`] for a caller that only reads files the manifest
-    /// says hold the column, where a dropped column of that name is an error.
+    /// says hold the column, where a file holding none of it is an error.
     pub(crate) fn fts_column<'a>(
         &'a self,
         id: Option<FieldId>,
@@ -4305,12 +4311,13 @@ impl fmt::Display for SuperfileSizeBreakdown {
     }
 }
 
-/// The label a file's blob gives the column `id` (`name` in the table now).
+/// The label a file's blob gives the column `id` (`name` in the table now),
+/// or `None` when the file holds none of it.
 /// - A label with the id is the column, under its old name after a rename.
-/// - A label `name` with another id is another column, dropped or renamed
-///   away: `None`, as the file holds none of this one.
-/// - Otherwise `name`: a file written before ids, or one without the column,
-///   whose reads then fail as for a missing name.
+/// - Labels that carry ids, none of them `id`, mean the file was written
+///   before the column was added, while it was dropped, or holds a dropped
+///   column of the same name: `None`.
+/// - Labels without ids (a file written before ids) keep `name`.
 fn file_label<'a>(
     labels: impl Iterator<Item = (&'a str, Option<FieldId>)>,
     id: Option<FieldId>,
@@ -4319,14 +4326,14 @@ fn file_label<'a>(
     let Some(id) = id else {
         return Some(name);
     };
-    let mut other_id = false;
+    let mut records_ids = false;
     for (label, field_id) in labels {
         if field_id == Some(id) {
             return Some(label);
         }
-        other_id |= label == name && field_id.is_some();
+        records_ids |= field_id.is_some();
     }
-    (!other_id).then_some(name)
+    (!records_ids).then_some(name)
 }
 
 /// An FTS read error surfaced by the size report is a read error of the
@@ -4378,11 +4385,12 @@ mod tests {
 
     /// A file's label for a column follows its id, not its name.
     /// - A rename keeps the id, so the old label is found.
-    /// - A same-named column with another id is a dropped one: absent.
-    /// - A file without ids, one without the column, or a caller without an
-    ///   id keeps the name.
+    /// - Labels with ids but not this one: the file holds none of it, even
+    ///   under a same-named dropped column.
+    /// - Labels without ids, no labels, or a caller without an id keep the
+    ///   name.
     ///
-    /// So only the dropped column is hidden.
+    /// So only a file that records ids can say it lacks the column.
     #[test]
     fn a_file_label_follows_the_column_id() {
         let (old, new) = (Some(FieldId(1)), Some(FieldId(2)));
@@ -4391,6 +4399,7 @@ mod tests {
         };
         assert_eq!(label(&[("headline", new)], new), Some("headline"));
         assert_eq!(label(&[("title", old)], new), None);
+        assert_eq!(label(&[("body", old)], new), None);
         assert_eq!(label(&[("title", None)], new), Some("title"));
         assert_eq!(label(&[("title", old)], None), Some("title"));
         assert_eq!(label(&[], new), Some("title"));

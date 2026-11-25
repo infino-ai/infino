@@ -1217,7 +1217,9 @@ impl SupertableProvider {
     /// without positions; the leaves combine through the conjuncts' `AND` /
     /// `OR` tree ([`ExactFilter::rows`]), and the rows that leaves doubtful
     /// are checked against their stored text, tombstoned ones left out
-    /// first since the scan skips them anyway.
+    /// first since the scan skips them anyway. A file holding none of a
+    /// leaf's column gives it no rows; one with no postings for it holds
+    /// every live row doubtful.
     ///
     /// A `bound` of at most `gate` rows — the bounded path's own selection
     /// limit — skips the dictionary: its rows are checked against their
@@ -1262,7 +1264,7 @@ impl SupertableProvider {
             let mut rows = RoaringBitmap::new();
             let mut every_leaf_read = true;
             for leaf in leaves {
-                // A file holding a dropped column of this name has no row.
+                // A file that holds none of the column has no row.
                 let Some(file_column) = prepared
                     .reader
                     .fts_label(self.manifest.field_id(&leaf.column), &leaf.column)
@@ -1325,7 +1327,7 @@ impl SupertableProvider {
                 .reader
                 .fts_label(self.manifest.field_id(column), column);
             let read = match file_column {
-                // A file holding a dropped column of this name has no row.
+                // A file that holds none of the column has no row.
                 None => Ok((
                     vec![ContainsRows::default(); needles.len()],
                     MatchWork::default(),
@@ -1353,11 +1355,12 @@ impl SupertableProvider {
             };
             let (rows, column_work) = match read {
                 Ok(read) => read,
-                // No postings to answer from: the file has no index for the
-                // column (written before it, or while the column was
-                // dropped) or one under another analyzer. Every live row is
-                // doubtful and is checked against its text below.
-                Err(e) if holds_no_postings(&e) => (
+                // A whole-term column this superfile holds no postings of
+                // the column's analyzer for (it was written before the
+                // column's index, or under another analyzer): every live
+                // row is doubtful, so each is checked against its text
+                // below.
+                Err(e) if whole && holds_no_postings(&e) => (
                     vec![every_live_row_doubtful(prepared, tombstones); needles.len()],
                     MatchWork::default(),
                 ),
@@ -1388,7 +1391,7 @@ impl SupertableProvider {
             if text_rows.iter().any(|(seen, _)| *seen == text) {
                 continue;
             }
-            // A file holding a dropped column of this name has no row.
+            // A file that holds none of the column has no row.
             let Some(file_column) = prepared
                 .reader
                 .fts_label(self.manifest.field_id(&text.column), &text.column)
@@ -1415,8 +1418,8 @@ impl SupertableProvider {
                     rows
                 }
                 // A file without positions under a column that has them (one
-                // written before the column was dropped and added again):
-                // check the rows holding the words against their text.
+                // written before field ids, which reads the old index by
+                // name): check the rows holding the words against their text.
                 Err(e) if lacks_positions(&e) => {
                     let terms = text.query.tokens();
                     let terms: Vec<&str> = terms.iter().map(String::as_str).collect();
@@ -3384,26 +3387,17 @@ impl TableProvider for SupertableProvider {
                                     .unwrap_or(0);
                                 full_walk_pays(terms, bytes)
                             };
-                            let expanded = candidate_plan
+                            let (plan, expand_work) = candidate_plan
                                 .expand(
                                     prepared.reader.as_ref(),
                                     &full_walk_pays,
                                     Some(reader_pool),
                                     &dict,
                                 )
-                                .await;
-                            match expanded {
-                                Ok((plan, expand_work)) => {
-                                    predicate_work.merge(expand_work);
-                                    Arc::new(plan)
-                                }
-                                // A file whose index cannot expand the plan
-                                // gets no bound; the filter checks its rows.
-                                Err(e) if holds_no_postings(&e) => {
-                                    Arc::new(CandidatePlan::Unbounded)
-                                }
-                                Err(e) => return Err(QueryError::from(e).into()),
-                            }
+                                .await
+                                .map_err(QueryError::from)?;
+                            predicate_work.merge(expand_work);
+                            Arc::new(plan)
                         } else {
                             Arc::clone(candidate_plan)
                         };

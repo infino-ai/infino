@@ -1740,8 +1740,7 @@ fn a_quoted_text_match_on_a_text_column_added_later_matches_the_phrase() {
 /// - Their rows hold no value for the new column, so none of them match.
 /// - Files written after hold positions, and only the phrase's rows match.
 ///
-/// So the old index is read, its rows are checked against their text, and
-/// none of them comes back.
+/// So none of the old rows comes back.
 #[test]
 fn a_quoted_text_match_on_a_column_added_again_with_positions_matches_the_phrase() {
     let db = connect("memory://").expect("connect");
@@ -1799,9 +1798,9 @@ fn a_quoted_text_match_on_a_column_added_again_with_positions_matches_the_phrase
 
 /// A text column added after the table was created is not among the FTS
 /// columns the table was created with, yet `text_match` on it is answered
-/// from its postings, and a superfile written before the column existed,
-/// which holds no postings for it, has its rows checked against their
-/// (null) text. Every answer is `token_match`'s.
+/// from its postings, and a superfile written before the column existed
+/// holds none of it, so none of its rows match. Every answer is
+/// `token_match`'s.
 #[test]
 fn a_text_match_on_a_text_column_added_later_answers_as_token_match_does() {
     let db = connect("memory://").expect("connect");
@@ -1979,10 +1978,49 @@ fn a_search_on_a_column_added_again_finds_only_rows_written_after() {
              WHERE title LIKE 'pope%'"
         );
         assert_eq!(rows(&db, &sql), ["pope two"], "{uri}: {sql}");
+        let sql = format!("SELECT title FROM {TABLE} WHERE text_match(title, 'pope') LIMIT 5");
+        assert_eq!(rows(&db, &sql), ["pope two"], "{uri}: {sql}");
         // `body` keeps every file, so `title`'s bound meets each of them.
         let sql =
             format!("SELECT n FROM {TABLE} WHERE title = 'pope two' OR body = 'x' ORDER BY n");
         assert_eq!(rows(&db, &sql), ["1", "2", "3"], "{uri}: {sql}");
+        // A negated search answers as on a table that never dropped `title`,
+        // whose first two rows hold a null title.
+        let control = db
+            .create_table(
+                "control",
+                Arc::new(Schema::new(vec![
+                    Field::new("title", DataType::LargeUtf8, true),
+                    Field::new("body", DataType::LargeUtf8, false),
+                    Field::new("n", DataType::Int64, true),
+                ])),
+                IndexSpec::new()
+                    .fts(FtsField::new("title").positions(true))
+                    .fts("body"),
+            )
+            .expect("create control");
+        control
+            .append_rows(
+                &[
+                    serde_json::json!({"body": "x", "n": 1}),
+                    serde_json::json!({"body": "x", "n": 2}),
+                    serde_json::json!({"title": "pope two", "body": "y", "n": 3}),
+                ],
+                None,
+            )
+            .expect("append control");
+        for filter in [
+            "NOT text_match(title, 'pope')",
+            "title NOT LIKE '%pope%'",
+            "NOT (title ILIKE '%pope%' AND body = 'x')",
+        ] {
+            let sql = |table: &str| format!("SELECT n FROM {table} WHERE {filter} ORDER BY n");
+            assert_eq!(
+                rows(&db, &sql(TABLE)),
+                rows(&db, &sql("control")),
+                "{uri}: {filter}"
+            );
+        }
     }
 }
 
@@ -1990,7 +2028,8 @@ fn a_search_on_a_column_added_again_finds_only_rows_written_after() {
 /// finds only rows written after.
 /// - A file written before the drop keeps the dropped column's index under
 ///   the same name; one written while it was dropped has no `title`.
-/// - The search asks for every row whose `title` holds `pope`.
+/// - The search asks, through `VectorFilter` and through SQL's
+///   `vector_search ... WHERE`, for every row whose `title` holds `pope`.
 ///
 /// So only the rows written after come back.
 #[test]
@@ -2059,6 +2098,13 @@ fn a_vector_filter_on_a_column_added_again_finds_only_rows_written_after() {
     found.sort();
     let expected: Vec<String> = (0..ROWS).map(|r| format!("pope after {r}")).collect();
     assert_eq!(found, expected);
+    let query = vec!["1"; DIM].join(",");
+    let sql = format!(
+        "SELECT title FROM vector_search('{TABLE}', 'emb', '{query}', {}) \
+         WHERE title LIKE 'pope%' ORDER BY title",
+        3 * ROWS
+    );
+    assert_eq!(rows(&db, &sql), expected, "{sql}");
 }
 
 /// A file written before field ids still answers `text_match` by the
