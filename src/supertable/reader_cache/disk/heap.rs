@@ -670,7 +670,7 @@ mod tests {
             mpsc::{Receiver, Sender, channel},
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use bytes::Bytes;
@@ -1158,10 +1158,11 @@ mod tests {
         budget.set_short_of_memory(true);
         budget.release_over_budget();
         assert!(!store.is_cached(&idle), "the file keeping the page goes");
-        assert!(
-            budget.charged() <= ENTRY_BYTES,
-            "the page's bytes come back"
-        );
+        let deadline = Instant::now() + FREE_DEADLINE;
+        while budget.charged() != 0 && Instant::now() < deadline {
+            sleep(CLOCK_STEP).await;
+        }
+        assert_eq!(budget.charged(), 0, "the page's bytes come back");
     }
 
     #[test]

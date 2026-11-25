@@ -1422,7 +1422,16 @@ impl FtsReader {
         reads: &[Range<usize>],
     ) -> Result<Vec<RowId>, FtsError> {
         let page_of = |id: &FtsDocId| id.get() as usize * DOC_MAP_ENTRY_BYTES / DOC_MAP_PAGE_BYTES;
-        let wanted: HashSet<usize> = ids.iter().map(page_of).collect();
+        // Sized by the pages the reads cover, not by the ids: many ids share a page, and
+        // `collect` would reserve one slot per id.
+        let covered = reads
+            .iter()
+            .map(|read| read.end.div_ceil(DOC_MAP_PAGE_BYTES) - read.start / DOC_MAP_PAGE_BYTES)
+            .sum();
+        let mut wanted = HashSet::with_capacity(covered);
+        for id in ids {
+            wanted.insert(page_of(id));
+        }
         let pages: HashMap<usize, Bytes> =
             try_join_all(reads.iter().map(|read| self.read_pages(read, &wanted)))
                 .await?
@@ -5044,6 +5053,31 @@ mod tests {
         // This test pins that a full budget keeps no page and charges nothing.
         let (blob, json, order, _) = dense_translation();
         let budget = roomy(Some(0));
+        let r = open_charged(blob, &json, budget).await;
+        let hits = sparse_hits();
+        for _ in 0..2 {
+            assert_eq!(
+                r.hits_to_rows_async(hits.clone()).await.expect("translate"),
+                rows_of(&order, &hits)
+            );
+        }
+        assert_eq!(
+            r.doc_map_reads(),
+            2 * SPARSE_READS,
+            "every page read each time"
+        );
+        assert_eq!(budget.charged(), 0, "nothing kept");
+        assert_eq!(r.kept_pages.page_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn short_of_memory_a_sparse_translation_keeps_no_page_and_reads_again() {
+        // Setup: two hits in two pages; a budget with no limit, in a process short of memory.
+        //  - Each translation reads both pages and keeps nothing, so a repeat reads them again.
+        // This test pins that memory pressure alone refuses page keeps the budget has room for.
+        let (blob, json, order, _) = dense_translation();
+        let budget = roomy(None);
+        budget.set_short_of_memory(true);
         let r = open_charged(blob, &json, budget).await;
         let hits = sparse_hits();
         for _ in 0..2 {
