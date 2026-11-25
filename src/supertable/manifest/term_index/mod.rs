@@ -10592,10 +10592,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_lookup_waiting_on_a_dropped_disk_read_reads_the_slice_itself() {
-        // Two lookups of one term, its slices in the local disk cache: the first is dropped while
-        // it reads them, the second waiting on that read.
-        //  - the second reads the slices itself and answers as whole-slice reads do.
-        // This test pins that a cancelled read never leaves a lookup waiting on it.
+        // A lookup of one term, its slices in the local disk cache, each slice already being read
+        // from disk by another lookup; then those reads are dropped unfinished.
+        //  - the lookup waits on the reads, then reads the slices itself and answers as
+        //    whole-slice reads do.
+        // This test pins that a cancelled read never leaves a lookup waiting on it. The reads in
+        // flight are made by hand: a real one can land within its first poll.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let dir = TempDir::new().expect("cache dir");
         let disk = MetadataDiskCache::new(dir.path().to_path_buf(), DISK_CACHE_BYTES, None)
@@ -10604,21 +10606,39 @@ mod tests {
         let cache = new_tier_chunk_cache();
         let index = disk_index(&root, Arc::clone(&local), &disk, &cache);
         let asked = [terms[0].as_str()];
-        let mut first = Box::pin(index.runs_many(fid("body"), &asked));
+        let reads: Vec<DiskRead> = root
+            .slices_for_key(&fid("body").term_key(&terms[0]))
+            .map(|slice| {
+                let done = Arc::new(Notify::new());
+                let hash = slice.content_hash;
+                let mut chunks = cache.lock().expect("tier chunk cache lock");
+                chunks.disk_reads.insert(hash, Arc::clone(&done));
+                let tier_chunks = Arc::clone(&cache);
+                DiskRead {
+                    tier_chunks,
+                    hash,
+                    done,
+                }
+            })
+            .collect();
+        let hits = disk.stats().n_hits;
+        let mut lookup = pin!(index.runs_many(fid("body"), &asked));
         assert!(
-            poll!(first.as_mut()).is_pending(),
-            "the first lookup reads from disk"
+            poll!(lookup.as_mut()).is_pending(),
+            "the lookup waits on the reads in flight"
         );
-        let mut second = pin!(index.runs_many(fid("body"), &asked));
-        assert!(
-            poll!(second.as_mut()).is_pending(),
-            "the second waits on that read"
-        );
-        drop(first);
-        let runs = timeout(Duration::from_secs(10), second)
+        assert_eq!(disk.stats().n_hits, hits, "nothing read while it waits");
+        let touched = reads.len() as u64;
+        drop(reads);
+        let runs = timeout(Duration::from_secs(10), lookup)
             .await
-            .expect("the second lookup finishes")
+            .expect("the lookup finishes")
             .expect("lookup");
+        assert_eq!(
+            disk.stats().n_hits - hits,
+            touched,
+            "it reads each slice itself"
+        );
         let whole = TermIndex::new(root.clone(), String::new(), local, None)
             .with_small_slice_bytes(u64::MAX)
             .runs_many(fid("body"), &asked)
