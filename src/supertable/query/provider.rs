@@ -1387,6 +1387,7 @@ impl SupertableProvider {
                     &text.query.phrases,
                     text.mode,
                     memos.get(&text.column).map(Arc::as_ref),
+                    Some(pool),
                 )
                 .await;
             let rows = match read {
@@ -1394,8 +1395,9 @@ impl SupertableProvider {
                     work.merge(text_work);
                     rows
                 }
-                // A file without positions: check the rows holding the words against their
-                // text.
+                // A file without positions under a column that has them (one
+                // written before the column was dropped and added again):
+                // check the rows holding the words against their text.
                 Err(e) if lacks_positions(&e) => {
                     let terms = text.query.tokens();
                     let terms: Vec<&str> = terms.iter().map(String::as_str).collect();

@@ -3082,12 +3082,13 @@ impl SuperfileReader {
         phrases: &[Phrase<String>],
         mode: BoolMode,
         prefetched: Option<&FetchedTermMemo>,
+        pool: Option<&ThreadPool>,
     ) -> Result<(ContainsRows, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .text_rows(column, analyzer, words, phrases, mode, prefetched)
+            .text_rows(column, analyzer, words, phrases, mode, prefetched, pool)
             .await?)
     }
 
@@ -3154,7 +3155,7 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .atoms_match_ids_prefetched(column, terms, phrases, mode, prefetched)
+            .atoms_match_ids_prefetched(column, terms, phrases, mode, prefetched, None)
             .await?)
     }
 

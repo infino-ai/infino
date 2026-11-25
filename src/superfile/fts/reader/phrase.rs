@@ -964,11 +964,13 @@ mod tests {
 
     use std::{
         slice,
-        sync::{Arc, OnceLock},
+        sync::{Arc, OnceLock, mpsc},
+        time::Duration,
     };
 
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use roaring::RoaringBitmap;
+    use tokio::time::timeout;
 
     use super::{super::test_util::*, *};
     use crate::{
@@ -976,7 +978,8 @@ mod tests {
             fts::{
                 builder::FtsBuilder,
                 reader::{
-                    BoolMode, FtsReader, OpenOptions, QueryIdf, core::ClauseLists,
+                    BoolMode, FtsReader, OpenOptions, QueryIdf,
+                    core::{ClauseLists, on_pool_or_here},
                     cursor::CursorUse,
                 },
                 tokenize::Phrase,
@@ -1231,7 +1234,15 @@ mod tests {
         let phrases = phrase(&["the", "mid", "rare"]);
         let build = || async {
             let (mut atoms, _) = r
-                .build_atom_cursors(0, &[], &phrases, QueryIdf::ThisFile, None, CursorUse::Score)
+                .build_atom_cursors(
+                    0,
+                    &[],
+                    &phrases,
+                    QueryIdf::ThisFile,
+                    None,
+                    CursorUse::Score,
+                    None,
+                )
                 .await
                 .expect("atoms");
             match atoms.remove(0).expect("phrase present") {
@@ -1566,6 +1577,7 @@ mod tests {
                 QueryIdf::ThisFile,
                 None,
                 purpose,
+                None,
             )
             .await
             .expect("build atoms");
@@ -1590,8 +1602,64 @@ mod tests {
         Bytes::from(b.finish().expect("finish"))
     }
 
+    /// How long the pool test waits on a match while the pool is held.
+    const POOL_HELD_FOR: Duration = Duration::from_millis(300);
+
     fn open_positional(docs: impl Iterator<Item = String>) -> FtsReader {
         FtsReader::open(positional_blob(docs), POSITIONAL_JSON).expect("open")
+    }
+
+    /// A phrase match given the reader pool runs there, and finds the rows it
+    /// finds here.
+    /// - 200 docs: a quarter hold `pope leo`, a quarter `leo the pope`.
+    /// - With the pool's one thread held, the match cannot finish.
+    /// - Released, it finds the same rows as a match without a pool.
+    #[tokio::test]
+    async fn a_phrase_match_on_the_pool_finds_the_rows_it_finds_here() {
+        let r = open_positional((0..200).map(|i| match i % 4 {
+            0 => "pope leo xiv".to_owned(),
+            1 => "leo the pope".to_owned(),
+            _ => format!("filler {i}"),
+        }));
+        let phrases = [Phrase::adjacent(vec!["pope".to_owned(), "leo".to_owned()])];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool");
+        let (here, _) = r
+            .atoms_match_ids_prefetched("title", &[], &phrases, BoolMode::And, None, None)
+            .await
+            .expect("match here");
+        let (on_pool, _) = r
+            .atoms_match_ids_prefetched("title", &[], &phrases, BoolMode::And, None, Some(&pool))
+            .await
+            .expect("match on the pool");
+        assert_eq!(here.len(), 50);
+        assert_eq!(here, on_pool);
+        let (release, held) = mpsc::channel::<()>();
+        pool.spawn(move || {
+            let _ = held.recv();
+        });
+        let blocked = timeout(
+            POOL_HELD_FOR,
+            r.atoms_match_ids_prefetched("title", &[], &phrases, BoolMode::And, None, Some(&pool)),
+        )
+        .await;
+        assert!(blocked.is_err(), "the match waits for the pool");
+        release.send(()).expect("release the pool");
+        let thread = || rayon::current_thread_index();
+        assert!(
+            on_pool_or_here(Some(&pool), "probe", thread)
+                .await
+                .expect("pool")
+                .is_some()
+        );
+        assert!(
+            on_pool_or_here(None, "probe", thread)
+                .await
+                .expect("here")
+                .is_none()
+        );
     }
 
     /// Phrases whose matching occurrence lies deep in a common member's run,
@@ -1904,7 +1972,7 @@ mod tests {
                 .set(lazy.dict_range.clone())
                 .expect("refused once");
             let (ids, from_memo) = lazy
-                .atoms_match_ids_prefetched("title", &[], one, BoolMode::And, Some(&memo))
+                .atoms_match_ids_prefetched("title", &[], one, BoolMode::And, Some(&memo), None)
                 .await
                 .expect("memo match ids");
             // The memo spares the one dictionary read the plan counts.

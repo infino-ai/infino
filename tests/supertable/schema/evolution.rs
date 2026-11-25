@@ -1726,6 +1726,67 @@ fn a_quoted_text_match_on_a_text_column_added_later_matches_the_phrase() {
     }
 }
 
+/// A quoted `text_match` on a text column dropped and added again with
+/// positions.
+/// - Files written before the drop keep the old index, without positions, under
+///   the same name.
+/// - Their rows hold no value for the new column, so none of them match.
+/// - Files written after hold positions, and only the phrase's rows match.
+#[test]
+fn a_quoted_text_match_on_a_column_added_again_with_positions_matches_the_phrase() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
+        .expect("create");
+    docs.append(
+        &batch(vec![("title", titles(&["pope leo one", "leo pope two"]))]),
+        None,
+    )
+    .expect("append before the drop");
+    db.apply_schema(
+        TABLE,
+        &SchemaPatch::new(vec![FieldPatch::named("title").dropped()]),
+        None,
+    )
+    .expect("drop title");
+    let mut index = ColumnIndex::fts(Analyzer::Standard);
+    if let ColumnIndex::Fts { positions, .. } = &mut index {
+        *positions = true;
+    }
+    db.apply_schema(
+        TABLE,
+        &SchemaPatch::new(vec![
+            FieldPatch::named("title")
+                .with_type(DataType::LargeUtf8)
+                .with_index(index),
+        ]),
+        None,
+    )
+    .expect("add title again, with positions");
+    docs.append_rows(
+        &[
+            serde_json::json!({"title": "Pope Leo three"}),
+            serde_json::json!({"title": "leo the pope four"}),
+        ],
+        None,
+    )
+    .expect("append after");
+    for (query, mode, want) in [
+        ("\"pope leo\"", "and", &["Pope Leo three"][..]),
+        ("\"leo pope\"", "or", &[][..]),
+        (
+            "\"pope leo\" four",
+            "or",
+            &["Pope Leo three", "leo the pope four"][..],
+        ),
+    ] {
+        let sql = format!(
+            "SELECT title FROM {TABLE} WHERE text_match(title, '{query}', '{mode}') ORDER BY title"
+        );
+        assert_eq!(rows(&db, &sql), want, "{sql}");
+    }
+}
+
 /// A text column added after the table was created is not among the FTS
 /// columns the table was created with, yet `text_match` on it is answered
 /// from its postings, and a superfile written before the column existed,

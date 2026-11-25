@@ -379,18 +379,7 @@ pub trait Tokenizer: Send + Sync + std::fmt::Debug + 'static {
                 None => i,
             };
             self.parse_unquoted_segment(&query[seg_start..unquoted_end], &mut parsed);
-            let mut phrase: Phrase<Cow<'q, str>> = Phrase::default();
-            // Offsets are relative to the first *surviving* term. A
-            // leading token the analysis chain removed is unobservable
-            // — there is nothing before it to space it from — and
-            // normalizing here is what lets the verifier subtract an
-            // offset from a position without underflowing near the
-            // start of a document.
-            let mut first_position: Option<u64> = None;
-            self.tokenize_each_query_positioned(&query[i + 1..close], &mut |t, position| {
-                let first = *first_position.get_or_insert(position);
-                phrase.push(t, position.saturating_sub(first));
-            });
+            let mut phrase = quoted_phrase(self, &query[i + 1..close]);
             match (phrase.len(), sigil) {
                 // Empty quotes contribute nothing.
                 (0, _) => {}
@@ -430,6 +419,23 @@ pub trait Tokenizer: Send + Sync + std::fmt::Debug + 'static {
     }
 }
 
+/// The phrase a quoted run `text` holds under `tokenizer`, its offsets
+/// counted from its first kept token. A leading token the analysis chain
+/// drops is unobservable, and starting at 0 lets the verifier subtract an
+/// offset from a position without underflowing near the start of a document.
+pub(crate) fn quoted_phrase<'q, T: Tokenizer + ?Sized>(
+    tokenizer: &T,
+    text: &'q str,
+) -> Phrase<Cow<'q, str>> {
+    let mut phrase = Phrase::default();
+    let mut first_position: Option<u64> = None;
+    tokenizer.tokenize_each_query_positioned(text, &mut |t, position| {
+        let first = *first_position.get_or_insert(position);
+        phrase.push(t, position.saturating_sub(first));
+    });
+    phrase
+}
+
 /// Tokenize several `texts` into one sorted, de-duplicated term list.
 /// For building a single term set from many values (e.g. an `IN` list)
 /// where a word shared across values must be probed only once. `None`
@@ -467,7 +473,7 @@ pub(crate) fn unique_tokens<'a>(
 /// underflowing near the start of a document.
 ///
 /// Without a chain every offset is its term's index.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Phrase<T> {
     /// The phrase's terms, in query order.
     pub terms: Vec<T>,

@@ -54,7 +54,7 @@
 //! the scan leaves the predicate to DataFusion, which calls the function on
 //! each row.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, LargeStringArray, StringArray, StringViewArray,
@@ -71,7 +71,7 @@ use datafusion::{
     },
 };
 
-use crate::superfile::fts::tokenize::{Phrase, StandardTokenizer, Tokenizer};
+use crate::superfile::fts::tokenize::{Phrase, StandardTokenizer, Tokenizer, quoted_phrase};
 
 /// SQL name of the token-match predicate.
 pub(crate) const TEXT_MATCH_UDF: &str = "text_match";
@@ -110,6 +110,8 @@ pub(crate) struct TextQuery {
     pub(crate) phrases: Vec<Phrase<String>>,
     /// `words` as a set, to skip repeats.
     seen: HashSet<String>,
+    /// `phrases` as a set, to skip repeats.
+    seen_phrases: HashSet<Phrase<String>>,
 }
 
 impl TextQuery {
@@ -127,23 +129,14 @@ impl TextQuery {
                 break;
             };
             out.add_words(&tokenizer, &rest[..open]);
-            let mut phrase = Phrase::default();
-            let mut first = None;
-            tokenizer.tokenize_each_query_positioned(
-                &rest[open + 1..open + 1 + len],
-                &mut |token, position| {
-                    let first = *first.get_or_insert(position);
-                    phrase.terms.push(token.into_owned());
-                    phrase
-                        .offsets
-                        .push(u32::try_from(position.saturating_sub(first)).unwrap_or(u32::MAX));
-                },
-            );
+            let phrase = quoted_phrase(&tokenizer, &rest[open + 1..open + 1 + len]);
             match phrase.terms.as_slice() {
                 [] => {}
                 [word] => out.add_word(word),
-                _ if out.phrases.contains(&phrase) => {}
-                _ => out.phrases.push(phrase),
+                _ => out.add_phrase(Phrase {
+                    terms: phrase.terms.into_iter().map(Cow::into_owned).collect(),
+                    offsets: phrase.offsets,
+                }),
             }
             rest = &rest[open + len + 2..];
         }
@@ -153,6 +146,12 @@ impl TextQuery {
 
     fn add_words(&mut self, tokenizer: &StandardTokenizer, text: &str) {
         tokenizer.tokenize_each_inline(text, |token| self.add_word(token));
+    }
+
+    fn add_phrase(&mut self, phrase: Phrase<String>) {
+        if self.seen_phrases.insert(phrase.clone()) {
+            self.phrases.push(phrase);
+        }
     }
 
     fn add_word(&mut self, token: &str) {
@@ -507,7 +506,31 @@ impl ScalarUDFImpl for TextMatchFunc {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    /// Distinct phrases in the smaller query of the parse-time test.
+    const FEW_PHRASES: usize = 4_000;
+
+    /// How many times more phrases the larger query holds.
+    const PHRASE_GROWTH: u32 = 4;
+
+    /// The most the parse time may grow by: linear growth is about
+    /// [`PHRASE_GROWTH`], a pairwise dedupe about its square.
+    const MAX_PARSE_TIME_GROWTH: u32 = 8;
+
+    /// How long parsing `n` distinct ten-word phrases takes.
+    fn parse_time(n: usize) -> Duration {
+        let query: String = (0..n)
+            .map(|i| format!("\"a b c d e f g h i w{i}\" "))
+            .collect();
+        let start = Instant::now();
+        let parsed = TextQuery::parse(&query);
+        let elapsed = start.elapsed();
+        assert_eq!(parsed.phrases.len(), n);
+        elapsed
+    }
 
     fn eval(values: &[Option<&str>], query: &str, mode: TextMatchMode) -> Vec<Option<bool>> {
         match_strings(
@@ -686,6 +709,28 @@ mod tests {
             ),
             vec![Some(true)]
         );
+    }
+
+    #[test]
+    fn parse_time_grows_linearly_with_the_phrases() {
+        let few = parse_time(FEW_PHRASES);
+        let many = parse_time(FEW_PHRASES * PHRASE_GROWTH as usize);
+        assert!(many < few * MAX_PARSE_TIME_GROWTH, "{few:?} then {many:?}");
+    }
+
+    #[test]
+    fn quoted_runs_read_as_the_search_parser_reads_them() {
+        let query = "\"Pope Leo\" x \"the  end\" \"a-b, c\"";
+        let search: Vec<Phrase<String>> = StandardTokenizer::new()
+            .parse(query)
+            .positive_phrases
+            .into_iter()
+            .map(|p| Phrase {
+                terms: p.terms.into_iter().map(Cow::into_owned).collect(),
+                offsets: p.offsets,
+            })
+            .collect();
+        assert_eq!(TextQuery::parse(query).phrases, search);
     }
 
     #[test]

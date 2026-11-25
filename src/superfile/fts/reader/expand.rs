@@ -685,10 +685,11 @@ impl FtsReader {
         phrases: &[Phrase<String>],
         mode: BoolMode,
         prefetched: Option<&FetchedTermMemo>,
+        pool: Option<&ThreadPool>,
     ) -> Result<(ContainsRows, MatchWork), FtsError> {
         self.ensure_analyzer(column, analyzer)?;
         let (rows, work) = self
-            .atoms_match_ids_prefetched(column, words, phrases, mode, prefetched)
+            .atoms_match_ids_prefetched(column, words, phrases, mode, prefetched, pool)
             .await?;
         let rows = ContainsRows {
             proven: row_bitmap(&rows),

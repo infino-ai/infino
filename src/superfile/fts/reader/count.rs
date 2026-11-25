@@ -9,6 +9,7 @@
 use std::{cmp::Reverse, collections::BinaryHeap, str::from_utf8};
 
 use bytes::Bytes;
+use rayon::ThreadPool;
 
 #[cfg(any(test, feature = "test-helpers"))]
 use super::cursor::TermMeta;
@@ -97,7 +98,7 @@ impl FtsReader {
     /// part of its cursor); `Or` walks their union. The shared spine
     /// of the phrase-aware `token_match` / `count` entries.
     pub(super) fn walk_atoms_match(
-        &self,
+        n_docs: u32,
         mut atoms: Vec<AnyCursor>,
         mode: BoolMode,
         mut filter: Option<AtomExcludeFilter>,
@@ -108,7 +109,7 @@ impl FtsReader {
             .map(AnyCursor::df_bound)
             .fold(0u64, u64::saturating_add);
         let sparse_union = matches!(mode, BoolMode::Or)
-            && or_walk_prefers_heap(atoms.len(), atom_postings, u64::from(self.n_docs));
+            && or_walk_prefers_heap(atoms.len(), atom_postings, u64::from(n_docs));
         match mode {
             BoolMode::Or if sparse_union => {
                 // A sparse union over many atoms: a heap keyed by current
@@ -245,12 +246,15 @@ impl FtsReader {
         phrases: &[Phrase<String>],
         mode: BoolMode,
     ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
-        self.atoms_match_ids_prefetched(column, terms, phrases, mode, None)
+        self.atoms_match_ids_prefetched(column, terms, phrases, mode, None, None)
             .await
     }
 
     /// [`Self::atoms_match_ids`] with a memo of located postings: a term or
-    /// phrase member the memo holds is not looked up in the dictionary.
+    /// phrase member the memo holds is not looked up in the dictionary. With
+    /// a `pool`, the phrase cursors' first seek and the walk run on it, while
+    /// the reads stay on this task. Without one they run here, for callers
+    /// that poll this future to completion in one go.
     pub(crate) async fn atoms_match_ids_prefetched(
         &self,
         column: &str,
@@ -258,6 +262,7 @@ impl FtsReader {
         phrases: &[Phrase<String>],
         mode: BoolMode,
         prefetched: Option<&FetchedTermMemo>,
+        pool: Option<&ThreadPool>,
     ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: built to match, so no global idf and no norms; the
@@ -270,6 +275,7 @@ impl FtsReader {
                 QueryIdf::ThisFile,
                 prefetched,
                 CursorUse::Match,
+                pool,
             )
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
@@ -281,11 +287,15 @@ impl FtsReader {
         if missing_and_atom || atoms.is_empty() {
             return Ok((Vec::new(), work));
         }
-        let (walk, walk_ns) = timed_section(|| {
-            let mut out = Vec::new();
-            self.walk_atoms_match(atoms, mode, None, |d| out.push(FtsDocId::new(d)))
-                .map(|()| out)
-        });
+        let n_docs = self.n_docs;
+        let (walk, walk_ns) = on_pool_or_here(pool, "phrase walk", move || {
+            timed_section(|| {
+                let mut out = Vec::new();
+                Self::walk_atoms_match(n_docs, atoms, mode, None, |d| out.push(FtsDocId::new(d)))
+                    .map(|()| out)
+            })
+        })
+        .await?;
         work.kernel_cpu_ns = walk_ns;
         let docs = walk?;
         Ok((self.ids_to_rows_async(docs).await?, work))
@@ -371,6 +381,7 @@ impl FtsReader {
                 QueryIdf::ThisFile,
                 prefetched,
                 CursorUse::Match,
+                None,
             )
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
@@ -395,6 +406,7 @@ impl FtsReader {
                     QueryIdf::ThisFile,
                     prefetched,
                     CursorUse::Match,
+                    None,
                 )
                 .await?;
             let neg_atoms: Vec<AnyCursor> = neg_built.into_iter().flatten().collect();
@@ -412,8 +424,7 @@ impl FtsReader {
         }
         let (walk, walk_ns) = timed_section(|| {
             let mut n = 0u64;
-            self.walk_atoms_match(atoms, mode, filter, |_| n += 1)
-                .map(|()| n)
+            Self::walk_atoms_match(self.n_docs, atoms, mode, filter, |_| n += 1).map(|()| n)
         });
         work.kernel_cpu_ns = walk_ns;
         Ok((walk?, work))

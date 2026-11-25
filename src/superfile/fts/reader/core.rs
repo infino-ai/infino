@@ -50,7 +50,7 @@ use super::{
 };
 use crate::{
     memory::{ConnectionMemoryBudget, Reclaim, Reservation},
-    runtime_bridge::run_on_pool_unless_blocking,
+    runtime_bridge::{run_on_pool_unless_blocking, run_on_pool_while_awaited},
     superfile::{
         ReadError,
         error::FtsError,
@@ -2247,6 +2247,7 @@ impl FtsReader {
         idf: QueryIdf<'_>,
         prefetched: Option<&FetchedTermMemo>,
         purpose: CursorUse,
+        pool: Option<&ThreadPool>,
     ) -> Result<(Vec<Option<AnyCursor>>, u64), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         // A scored walk needs the norms before any cursor is built; an
@@ -2356,13 +2357,14 @@ impl FtsReader {
             for (member, group) in inline_groups {
                 positions[member] = group;
             }
-            out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
-                cursors,
-                positions,
-                positional,
-                member_at,
-                phrase.offsets().to_vec(),
-            )?)));
+            // Building the cursor seeks its first verified match, which can
+            // decode many position runs.
+            let offsets = phrase.offsets().to_vec();
+            let cursor = on_pool_or_here(pool, "phrase cursor", move || {
+                PhraseCursor::new(cursors, positions, positional, member_at, offsets)
+            })
+            .await??;
+            out.push(Some(AnyCursor::Phrase(cursor)));
         }
         Ok((out, dict_ranges))
     }
@@ -3645,6 +3647,26 @@ fn check_version(version: u32) -> Result<(), FtsError> {
         v => Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
             "fts section version {v}"
         )))),
+    }
+}
+
+/// `f` on `pool` behind a oneshot when given, else on this thread. A job the
+/// caller stopped waiting for before it started is skipped, as only the
+/// caller needs its result.
+pub(super) async fn on_pool_or_here<R, F>(
+    pool: Option<&ThreadPool>,
+    what: &'static str,
+    f: F,
+) -> Result<R, FtsError>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    match pool {
+        Some(pool) => run_on_pool_while_awaited(pool, what, f)
+            .await
+            .map_err(|_| FtsError::TaskDropped(what)),
+        None => Ok(f()),
     }
 }
 
