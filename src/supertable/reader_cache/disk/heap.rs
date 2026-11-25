@@ -347,6 +347,26 @@ impl HeapBudget {
         self.charged.load(Ordering::Acquire)
     }
 
+    /// Reserve `bytes` a reader may keep to save a later read, such as a page of a doc-id map:
+    /// `None` while the process is short of memory or the budget has no room for them. Never makes
+    /// room, so keeping something optional drops nothing else.
+    pub(crate) fn try_reserve_page(&'static self, bytes: u64) -> Option<HeapReservation> {
+        if self.short_of_memory() {
+            return None;
+        }
+        let budget = self.budget().unwrap_or(u64::MAX);
+        self.charged
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                charged.checked_add(bytes).filter(|&total| total <= budget)
+            })
+            .ok()?;
+        Some(HeapReservation {
+            budget: self,
+            bytes: AtomicU64::new(bytes),
+            map: false,
+        })
+    }
+
     /// Count `bytes` of decoded metadata until the reservation drops. Drops no file now: the next
     /// [`Self::release_over_budget`] does, once queries let go of their files.
     pub(crate) fn reserve(&'static self, bytes: u64) -> HeapReservation {
@@ -532,11 +552,16 @@ impl HeapBudget {
     /// The unheld files counted here, oldest first, with the bytes held and unheld.
     fn scan(&self, caches: &[Arc<DiskCacheStore>]) -> Scan {
         let oldest = oldest_unheld(caches, |entry| {
-            entry
+            let metadata = entry
                 .heap
                 .get()
                 .filter(|heap| heap.counts_against(self))
-                .map_or(0, HeapReservation::bytes)
+                .map_or(0, HeapReservation::bytes);
+            metadata
+                + entry
+                    .reader
+                    .fts()
+                    .map_or(0, |fts| fts.kept_page_bytes(self))
         });
         let unheld = oldest.iter().map(|&(_, _, _, bytes)| bytes).sum();
         // Held file metadata: what is charged, less doc-id maps and the unheld files found here.
@@ -725,11 +750,12 @@ mod tests {
         uri
     }
 
-    /// A file whose text index keeps a doc-id map, opened lazily and charged to `budget`, its map
-    /// kept by one translation of every document.
-    async fn reader_keeping_a_map(
+    /// A file of `superfile`, opened lazily and charged to `budget`, after one translation of the
+    /// documents `ids` picks from its count: every one keeps the doc-id map, one keeps its page.
+    async fn reader_translating(
         superfile: &Bytes,
         budget: &'static HeapBudget,
+        ids: impl FnOnce(u32) -> Vec<FtsDocId>,
     ) -> SuperfileReader {
         let source: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(superfile.clone()));
         let reader = SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
@@ -737,11 +763,29 @@ mod tests {
             .expect("open lazily")
             .with_fts_heap_budget(budget);
         let fts = reader.fts().expect("a text index");
-        let ids = (0..fts.n_docs()).map(FtsDocId::new).collect();
-        fts.ids_to_rows_async(ids)
+        fts.ids_to_rows_async(ids(fts.n_docs()))
             .await
-            .expect("translate every document");
+            .expect("translate");
         reader
+    }
+
+    /// A file whose text index keeps a doc-id map, its map kept by a translation of every document.
+    async fn reader_keeping_a_map(
+        superfile: &Bytes,
+        budget: &'static HeapBudget,
+    ) -> SuperfileReader {
+        reader_translating(superfile, budget, |n_docs| {
+            (0..n_docs).map(FtsDocId::new).collect()
+        })
+        .await
+    }
+
+    /// A file whose text index keeps the doc-id map page of its first document only.
+    async fn reader_keeping_a_page(
+        superfile: &Bytes,
+        budget: &'static HeapBudget,
+    ) -> SuperfileReader {
+        reader_translating(superfile, budget, |_| vec![FtsDocId::new(0)]).await
     }
 
     /// Bytes of the doc-id map a reader of `superfile` keeps, measured on a budget of its own.
@@ -761,8 +805,17 @@ mod tests {
         superfile: &Bytes,
         last_access_us: u64,
     ) -> SuperfileUri {
-        let uri = SuperfileUri::new_v4();
         let reader = reader_keeping_a_map(superfile, store.heap_budget()).await;
+        cache_lazy_entry(store, reader, last_access_us)
+    }
+
+    /// Cache `reader` as a lazy entry for a new file, last used at `last_access_us`.
+    fn cache_lazy_entry(
+        store: &Arc<DiskCacheStore>,
+        reader: SuperfileReader,
+        last_access_us: u64,
+    ) -> SuperfileUri {
+        let uri = SuperfileUri::new_v4();
         let residency = Residency::Paged {
             block_source: dummy_block_source(store, uri),
         };
@@ -1073,6 +1126,42 @@ mod tests {
         assert_eq!(budget.charged(), ENTRY_BYTES);
         drop(kept);
         assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_file_keeping_only_map_pages_goes_on_the_pass_like_other_cached_bytes() {
+        // Setup: a budget of one doc-id map page, kept by an idle file for a sparse translation,
+        // then a newer file's metadata pushing the budget over, in a process short of memory.
+        //  - The pass counts the page as the idle file's, lets that file go, and the page's
+        //    bytes come back.
+        // This test pins that kept pages are cached bytes the pass can free, never bytes it
+        // takes for running statements' and cannot free.
+        let superfile = Bytes::from(reordered_test_superfile());
+        let probe = HeapBudget::with_budget(None);
+        probe.set_short_of_memory(false);
+        let page = {
+            let _reader = reader_keeping_a_page(&superfile, probe).await;
+            probe.charged()
+        };
+        assert!(page > 0, "a sparse translation keeps its page");
+        let (_dir, store) = store_with_budget(Some(page));
+        let budget = store.heap_budget();
+        budget.set_short_of_memory(false);
+        let reader = reader_keeping_a_page(&superfile, budget).await;
+        let idle = cache_lazy_entry(&store, reader, 1);
+        charged_entry(&store, 2);
+        assert_eq!(
+            budget.charged(),
+            page + ENTRY_BYTES,
+            "over budget by the metadata"
+        );
+        budget.set_short_of_memory(true);
+        budget.release_over_budget();
+        assert!(!store.is_cached(&idle), "the file keeping the page goes");
+        assert!(
+            budget.charged() <= ENTRY_BYTES,
+            "the page's bytes come back"
+        );
     }
 
     #[test]
