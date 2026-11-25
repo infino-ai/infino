@@ -2016,6 +2016,20 @@ mod tests {
         (table, storage_dir, cache_dir)
     }
 
+    /// Deletes the rows [`MAPPED_DELETED`] names.
+    fn delete_mapped(st: &Supertable) {
+        for n in MAPPED_DELETED {
+            st.delete(col("body").eq(lit(mapped_body(n))))
+                .expect("delete");
+        }
+    }
+
+    /// Asserts every superfile's set in `scope` is in blob ids.
+    fn assert_in_blob_ids(scope: &RankScope) {
+        let sets = scope.allow.as_ref().expect("a bounded scope");
+        assert!(sets.values().all(|set| matches!(set, Admitted::BlobIds(_))));
+    }
+
     /// The reader of the table's one superfile, the same one its queries use.
     async fn the_superfile_reader(st: &Supertable) -> Arc<SuperfileReader> {
         let reader = st.reader().expect("reader");
@@ -2192,10 +2206,7 @@ mod tests {
         // This test pins that the search ranks exactly the live rows the
         // `WHERE` keeps.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
-        for n in MAPPED_DELETED {
-            st.delete(col("body").eq(lit(mapped_body(n))))
-                .expect("delete");
-        }
+        delete_mapped(&st);
         let reader = st.reader().expect("reader");
         assert_eq!(
             bodies_of(&reader, &shared_search(MAPPED_EVERY_HIT, "tag = 'red'")),
@@ -2222,8 +2233,7 @@ mod tests {
                     .await
                     .expect("scope"),
             );
-            let sets = in_blob_ids.allow.as_ref().expect("a bounded scope");
-            assert!(sets.values().all(|set| matches!(set, Admitted::BlobIds(_))));
+            assert_in_blob_ids(&in_blob_ids);
             for k in [1, MAPPED_FEW_HITS, red - 1, red, red + 1] {
                 let mut hits = Vec::new();
                 for scope in [&in_blob_ids, &in_rows] {
@@ -2245,8 +2255,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_blob_id_scope_meeting_new_deletes_ranks_only_live_rows() {
         // A reordered superfile's scope under `tag = 'red'` built in blob ids, then three rows
-        // deleted, then a search on the new snapshot under that scope.
-        // - The search turns the blob ids into rows and takes the deleted rows out.
+        // deleted, then searches on the new snapshot under that scope, with `k` small, at the
+        // live red count and past it.
+        // - The search turns the blob ids into rows and takes the deleted rows out before it
+        //   ranks, so it still fills `k`.
         // - It ranks the same hits as a scope built after the deletes, which is in rows.
         // This test pins that a delete seen after the scope was built is never ranked.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
@@ -2256,31 +2268,27 @@ mod tests {
         let scope = before
             .block_on(before.rank_scope(&filters, &plan))
             .expect("scope");
-        let sets = scope.allow.as_ref().expect("a bounded scope");
-        assert!(sets.values().all(|set| matches!(set, Admitted::BlobIds(_))));
-        for n in MAPPED_DELETED {
-            st.delete(col("body").eq(lit(mapped_body(n))))
-                .expect("delete");
-        }
+        assert_in_blob_ids(&scope);
+        delete_mapped(&st);
         let after = st.reader().expect("reader");
         let fresh = after
             .block_on(after.rank_scope(&filters, &plan))
             .expect("scope");
-        let mut hits = Vec::new();
-        for scope in [&scope, &fresh] {
-            let search = after.bm25_search_scoped_async(
-                "body",
-                "shared",
-                MAPPED_EVERY_HIT,
-                Bm25SearchOptions::new(),
-                Some(scope),
-            );
-            hits.push(after.block_on(search).expect("search"));
+        let live = bodies_kept(|n| mapped_tag(n) == "red" && !MAPPED_DELETED.contains(&n)).len();
+        for k in [MAPPED_FEW_HITS, live, MAPPED_EVERY_HIT] {
+            let mut hits = Vec::new();
+            for scope in [&scope, &fresh] {
+                let search = after.bm25_search_scoped_async(
+                    "body",
+                    "shared",
+                    k,
+                    Bm25SearchOptions::new(),
+                    Some(scope),
+                );
+                hits.push(after.block_on(search).expect("search"));
+            }
+            assert_eq!(hits[0].len(), k.min(live), "k = {k}: live red rows only");
+            assert_eq!(hits[0], hits[1], "k = {k}");
         }
-        let want = (0..MAPPED_ROWS)
-            .filter(|n| mapped_tag(*n) == "red" && !MAPPED_DELETED.contains(n))
-            .count();
-        assert_eq!(hits[0].len(), want, "every live red row, no deleted one");
-        assert_eq!(hits[0], hits[1]);
     }
 }
