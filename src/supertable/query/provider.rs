@@ -3571,8 +3571,7 @@ impl TableProvider for SupertableProvider {
         // lazily-opened readers (a cache-state-dependent priced counter).
         //
         // The factory also sends byte reads through read-ahead. The meter
-        // hands it the scan's final filter when the scan runs, and
-        // `ReadAheadOff` turns it off under a LIMIT that can stop the scan.
+        // hands it the scan's final filter when the scan runs.
         let read_ahead = Arc::new(ScanReadAhead::new(
             Arc::clone(&self.scan_store),
             Arc::clone(&self.manifest.options.connection_memory_budget),

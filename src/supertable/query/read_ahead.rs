@@ -29,8 +29,11 @@
 //!   that read took most of each column (see [`MIN_CHUNK_READ_PERCENT`]).
 //! - It stops for good when the scan reads out of order, keeping only the
 //!   batch the scan is in. At most two batches are wasted.
-//! - It never starts under a `LIMIT` or a top-k (see [`ReadAheadOff`]), or
-//!   while every read finds its bytes already local.
+//! - It never starts while every read finds its bytes already local.
+//! - Under a `LIMIT` or a top-k it runs as in any scan. It fetches only row
+//!   groups the scan planned, after the scan's own pruning, and a top-k's
+//!   filter prunes a file's row groups when the file is planned. So a scan
+//!   that stops early wastes at most the batches in flight when it stops.
 //!
 //! # How it downloads
 //!
@@ -46,8 +49,11 @@
 //! connection's memory budget: at most half of it ([`BUDGET_SHARE_PERCENT`]),
 //! 16 MiB per reader (one file in one partition) and 256 MiB per scan. A batch
 //! is charged what the cache downloads for it, which can be more than the
-//! scan's bytes. It also reserves room in the disk cache's write queue first,
-//! so the cache keeps what it downloads.
+//! scan's bytes. It also reserves room in the disk cache's write queue, so
+//! the cache keeps what it downloads. When the queue has none, a disk slower
+//! than the network say, the batch downloads anyway and the cache serves it
+//! without keeping it: waiting for room would leave the scan one GET at a
+//! time, which is what read-ahead is for.
 //!
 //! When anything else on the connection needs memory the budget can't give, a
 //! join's build side say, read-ahead gives back everything it holds and stays
@@ -58,8 +64,6 @@
 //!
 //! Read-ahead's downloads are not counted as page reads, and the scan's reads
 //! are counted as usual, so `sql_page_bytes` is the same with or without it.
-//!
-//! [`ReadAheadOff`]: crate::supertable::query::read_ahead_rule::ReadAheadOff
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -167,10 +171,8 @@ pub(crate) struct ScanReadAhead {
     predicate: OnceLock<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExprAdapterFactory>)>,
     /// The table's schema, which the filter is written against.
     schema: SchemaRef,
-    /// Turned off by [`ReadAheadOff`] when a `LIMIT` or top-k can stop the
-    /// scan early.
-    ///
-    /// [`ReadAheadOff`]: crate::supertable::query::read_ahead_rule::ReadAheadOff
+    /// Turned off when the budget takes read-ahead's memory back (see
+    /// [`Reclaim`]).
     enabled: AtomicBool,
     /// Bytes all readers of this scan hold, capped at
     /// [`READ_AHEAD_SCAN_MAX_BYTES`].
@@ -193,10 +195,7 @@ impl fmt::Debug for ScanReadAhead {
 }
 
 impl ScanReadAhead {
-    /// Read-ahead for a scan over `schema`, on until [`ReadAheadOff`] turns it
-    /// off.
-    ///
-    /// [`ReadAheadOff`]: crate::supertable::query::read_ahead_rule::ReadAheadOff
+    /// Read-ahead for a scan over `schema`, on until [`Self::disable`].
     pub(crate) fn new(
         store: Arc<SuperfileObjectStore>,
         budget: Arc<ConnectionMemoryBudget>,
@@ -930,8 +929,9 @@ impl ReadAhead {
     ///   that one itself.
     /// - It skips row groups whose columns are already local.
     /// - It drops row groups from the end until the batch fits the reader's
-    ///   cap, and starts nothing if the budget or the cache's write queue
-    ///   has no room.
+    ///   cap, and starts nothing if the budget has no room. With no room in
+    ///   the cache's write queue it still downloads, and the cache does not
+    ///   keep the batch.
     /// - It does nothing while a batch is still downloading.
     fn start_ahead(&mut self, row_group: usize, columns: &[usize]) {
         if !self.scan.is_enabled() || self.batches.iter().any(Batch::is_running) {
@@ -998,12 +998,11 @@ impl ReadAhead {
             row_groups.pop();
         };
         // Reserve room in the cache's write queue for what the cache will
-        // download (not just the spans), so it keeps the batch's downloads.
-        // The room is held until the download ends.
+        // download (not just the spans), so it keeps the batch's downloads,
+        // held until the download ends. With none, the batch still downloads
+        // and is served but not kept.
         let downloads = blocks.map_or(charge as u64, |blocks| download_bytes(&clusters, blocks));
-        let Some(room) = self.scan.store.cache_room_ahead(location, downloads) else {
-            return;
-        };
+        let room = self.scan.store.cache_room_ahead(location, downloads);
         // Charged what the cache downloads, not just the spans: a read of a
         // whole download is served as a slice of it, which keeps it all alive.
         let Some(hold) = self.scan.reserve(charge.max(downloads as usize)) else {
@@ -1666,11 +1665,20 @@ mod tests {
             physical_plan::parquet::ParquetAccessPlan,
         },
         execution::context::ExecutionProps,
-        logical_expr::{Expr, col, lit, utils::conjunction},
+        logical_expr::{Expr, Operator, col, lit, utils::conjunction},
         object_store::path::Path as ObjPath,
         physical_expr::{
-            PhysicalExpr, create_physical_expr,
-            expressions::{Column, DynamicFilterPhysicalExpr},
+            LexOrdering, PhysicalExpr, PhysicalSortExpr, create_physical_expr,
+            expressions::{BinaryExpr, Column, DynamicFilterPhysicalExpr},
+        },
+        physical_plan::{
+            ExecutionPlan,
+            aggregates::{AggregateExec, AggregateMode, LimitOptions, PhysicalGroupBy},
+            empty::EmptyExec,
+            expressions::lit as plit,
+            filter::FilterExec,
+            limit::GlobalLimitExec,
+            sorts::sort::SortExec,
         },
     };
     use object_store::OBJECT_STORE_COALESCE_DEFAULT;
@@ -1684,15 +1692,16 @@ mod tests {
     use tokio::{spawn, task::yield_now, time::timeout};
 
     use crate::{
-        memory::{ConnectionMemoryBudget, Reclaim},
+        memory::{ConnectionMemoryBudget, Reclaim, budgeted_session_context},
         runtime_metrics::op_stats::with_op_stats,
         superfile::{CacheBlocks, lazy_source::LazyByteSource},
         supertable::query::{
             df_object_store::SuperfileObjectStore,
+            exec::metered_exec::MeteredExec,
             read_ahead::{
                 Batch, Held, MAX_READ_THROUGH_SPAN_BYTES, PAGE_READ_THROUGH_BYTES,
-                READ_AHEAD_BATCHES_IN_FLIGHT, ReadAhead, ScanReadAhead, Span, chunk_range, cut,
-                download_bytes, fetch_spans,
+                READ_AHEAD_BATCHES_IN_FLIGHT, READ_AHEAD_MIN_ROW_GROUPS, ReadAhead, ScanReadAhead,
+                Span, chunk_range, cut, download_bytes, fetch_spans,
                 fixture::{
                     GROUPS, ROWS_PER_GROUP, Superfile, block_cached, schema, small_file, wide_file,
                 },
@@ -1703,6 +1712,8 @@ mod tests {
 
     /// Columns `a` and `c`: the scan reads both, leaving `b` unread between them.
     const PROJECTED: [usize; 2] = [0, 2];
+    /// The `LIMIT` the plan-shape tests use.
+    const LIMIT: usize = 10;
     /// The cache block size the span tests assume.
     const BLOCK: u64 = 64 * 1024;
     /// The fewest bytes one of the cache's downloads covers, in those tests.
@@ -2563,22 +2574,151 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_is_fetched_ahead_while_the_cache_cannot_keep_it() {
+    async fn a_full_write_queue_still_fetches_ahead_and_serves_the_batch() {
+        // The cache's write queue has no room for what a batch downloads.
+        //  - read-ahead still fetches the next batch;
+        //  - the scan reads it from memory, not from the store again.
+        // This test pins that a cache disk slower than the network does not
+        // turn a cold scan back into one GET at a time.
         let (superfile, store, path, meta) = setup(false);
         let budget = ConnectionMemoryBudget::measured();
         superfile.keeps.store(false, Ordering::Relaxed);
         let mut reader = plain_reader(&store, &budget, &path, &meta);
         read_row_groups(&mut reader, &meta, &[0, 1]).await;
         settle(&reader).await;
+        let reads = superfile.reads();
         assert!(
-            !touched(&superfile.reads(), &meta, 2),
-            "no batch while it cannot"
+            touched(&reads, &meta, 2) && touched(&reads, &meta, 3),
+            "fetched ahead"
         );
-        // Room again: the next row group reached in order looks ahead.
-        superfile.keeps.store(true, Ordering::Relaxed);
-        read_row_groups(&mut reader, &meta, &[2]).await;
+        superfile.clear();
+        let got = reader
+            .get_byte_ranges(chunks(&meta, 2))
+            .await
+            .expect("rg 2");
+        assert_eq!(got, superfile.slices(&chunks(&meta, 2)));
+        assert!(!touched(&superfile.reads(), &meta, 2), "served from memory");
+    }
+
+    #[test]
+    fn session_rules_leave_read_ahead_on_under_a_limit_or_top_k() {
+        // Plans that can stop the scan early: a LIMIT above a filter, a
+        // top-k, and a DISTINCT ... LIMIT.
+        //  - after every physical rule the SQL session runs, read-ahead is
+        //    still on for the scan.
+        // This test pins that a scan which may stop early still reads ahead;
+        // what it can waste is bounded by the batches in flight (see
+        // `a_top_k_that_stops_early_wastes_at_most_the_batch_in_flight`).
+        let ctx =
+            budgeted_session_context(&ConnectionMemoryBudget::measured(), None).expect("session");
+        let state = ctx.state();
+        let a = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let order =
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::clone(&a))]).expect("order");
+        let filtered = |scan: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
+            let a_gt = Arc::new(BinaryExpr::new(Arc::clone(&a), Operator::Gt, plit(5i64)));
+            Arc::new(FilterExec::try_new(a_gt, scan).expect("filter"))
+        };
+        let shapes: [(
+            &str,
+            Box<dyn Fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>>,
+        ); 3] = [
+            (
+                "limit above a filter",
+                Box::new(|scan| Arc::new(GlobalLimitExec::new(filtered(scan), 0, Some(LIMIT)))),
+            ),
+            (
+                "top-k",
+                Box::new(|scan| {
+                    Arc::new(SortExec::new(order.clone(), filtered(scan)).with_fetch(Some(LIMIT)))
+                }),
+            ),
+            (
+                "distinct limit",
+                Box::new(|scan| {
+                    Arc::new(
+                        AggregateExec::try_new(
+                            AggregateMode::Single,
+                            PhysicalGroupBy::new_single(vec![(Arc::clone(&a), "a".to_string())]),
+                            vec![],
+                            vec![],
+                            scan,
+                            schema(),
+                        )
+                        .expect("aggregate")
+                        .with_limit_options(Some(LimitOptions::new(LIMIT))),
+                    )
+                }),
+            ),
+        ];
+        for (shape, wrap) in shapes {
+            let store = Arc::new(SuperfileObjectStore::new());
+            let scan = Arc::new(ScanReadAhead::new(
+                store,
+                ConnectionMemoryBudget::measured(),
+                schema(),
+            ));
+            let meter: Arc<dyn ExecutionPlan> = Arc::new(
+                MeteredExec::new(Arc::new(EmptyExec::new(schema())), None)
+                    .with_read_ahead(Arc::clone(&scan)),
+            );
+            let mut plan = wrap(meter);
+            for rule in state.physical_optimizers() {
+                plan = rule.optimize(plan, state.config_options()).expect("rule");
+            }
+            assert!(scan.is_enabled(), "{shape}: read-ahead stays on");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_top_k_that_stops_early_wastes_at_most_the_batch_in_flight() {
+        // A top-k reads row groups 0 and 1 of a file, read-ahead starts on 2
+        // and 3, then the top-k's filter rules out every later row: the scan
+        // stops and drops the reader.
+        //  - nothing past the batch in flight was fetched;
+        //  - the batch's memory is given back;
+        //  - a file planned after the filter tightened prunes its row groups
+        //    and fetches nothing ahead.
+        // This test pins the bound on what read-ahead can waste under a
+        // `LIMIT` or top-k: the batches in flight when the scan stops.
+        let (superfile, store, path, meta) = setup(false);
+        let budget = ConnectionMemoryBudget::measured();
+        let scan = Arc::new(
+            ScanReadAhead::new(Arc::clone(&store), Arc::clone(&budget), schema())
+                .with_reader_cap(two_row_groups_cap()),
+        );
+        let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let top_k = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&a)],
+            predicate(&lit(true), schema()),
+        ));
+        scan.set_predicate(Arc::clone(&top_k) as Arc<dyn PhysicalExpr>, None);
+        let read = [0, 1];
+        let mut reader = reader_of(&scan, &path, &meta);
+        read_row_groups(&mut reader, &meta, &read).await;
+        let kept = (read.len() * ROWS_PER_GROUP) as i64;
+        top_k
+            .update(predicate(&col("a").lt(lit(kept)), schema()))
+            .expect("update");
         settle(&reader).await;
-        assert!(touched(&superfile.reads(), &meta, 3));
+        drop(reader);
+        let reads = superfile.reads();
+        let past_batch = read.len() + READ_AHEAD_MIN_ROW_GROUPS;
+        assert!(
+            (past_batch..GROUPS).all(|rg| !touched(&reads, &meta, rg)),
+            "nothing past the batch in flight"
+        );
+        assert_eq!(budget.used(), 0, "the unread batch is given back");
+        superfile.clear();
+        let mut late = reader_of(&scan, &path, &meta);
+        read_row_groups(&mut late, &meta, &read).await;
+        settle(&late).await;
+        assert!(
+            !touched(&superfile.reads(), &meta, read.len()),
+            "the filter prunes the next row group"
+        );
+        drop(late);
+        assert_eq!(budget.used(), 0);
     }
 
     #[tokio::test]
