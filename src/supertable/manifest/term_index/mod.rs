@@ -10869,6 +10869,13 @@ mod tests {
             touched * (1 + LOOKUPS * WARM_RANGED_READS),
             "then a block and a run read per lookup"
         );
+        let left = index
+            .tier_chunks
+            .lock()
+            .expect("tier chunk cache lock")
+            .index_reads
+            .len();
+        assert_eq!(left, 0, "no read left in the map");
     }
 
     #[tokio::test]
@@ -10908,6 +10915,13 @@ mod tests {
             .await
             .expect("the lookups finish");
         assert_eq!(faults.fired(), touched, "one failed index read per slice");
+        let left = index
+            .tier_chunks
+            .lock()
+            .expect("tier chunk cache lock")
+            .index_reads
+            .len();
+        assert_eq!(left, 0, "no failed read left for later lookups to find");
         let whole = TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None)
             .with_small_slice_bytes(u64::MAX)
             .runs_many(fid("body"), &asked)
