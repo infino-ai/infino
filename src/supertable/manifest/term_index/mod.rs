@@ -152,18 +152,20 @@ const REASSOCIATION_ULPS_PER_TERM: f32 = 2.0;
 /// count bound, not a byte budget.
 const RESIDENT_RUNS: usize = 4096;
 
-/// Whole slices one batched lookup reads at once, from local disk or the
-/// object store. Each is hashed on a blocking thread and held until its
-/// terms are decoded.
+/// Whole slices over [`SMALL_SLICE_BYTES`] one batched lookup reads at once,
+/// from local disk or the object store. Each is hashed on a blocking thread
+/// and held until its terms are decoded. A small slice is one short request,
+/// so it waits for a request turn instead.
 const WHOLE_SLICES_AT_ONCE: usize = 8;
 
-/// Room per whole slice beyond the target size: a build cuts a slice by its
-/// runs and dictionary alone, so its header, block index and checks take it
-/// a little over.
+/// Room per whole slice beyond the target size. A build cuts a slice by its
+/// runs, dictionary and block index, so the header and the checks take it a
+/// little over. A slice of one run longer than the target is bigger still,
+/// and its read takes the whole budget.
 const SLICE_OVERSHOOT_BYTES: usize = SLICE_TARGET_BYTES / 8;
 
-/// Slice bytes one batched lookup holds at once: a piece from its read until
-/// it lands, a whole slice until its terms are decoded.
+/// Slice bytes one batched lookup holds at once: a ranged read until it is
+/// decoded, a whole slice until its terms are decoded.
 const SLICE_FETCH_BUDGET_BYTES: u32 =
     (WHOLE_SLICES_AT_ONCE * (SLICE_TARGET_BYTES + SLICE_OVERSHOOT_BYTES)) as u32;
 
@@ -560,8 +562,9 @@ fn runs_in(
 
 /// Limits on what one batched lookup has in flight: slice bytes, ranged
 /// requests and whole slice reads. A read takes its bytes first and its turn
-/// second, and while holding a turn waits only on its own read, so the
-/// limits cannot deadlock.
+/// second. A read holding a turn waits only on its own read, or on another
+/// lookup's whole read of the same slice from local disk, which already
+/// holds every permit it needs. So the limits cannot deadlock.
 struct FetchBudget {
     bytes: Semaphore,
     most_bytes: u32,
@@ -596,7 +599,8 @@ impl FetchBudget {
             .expect("a lookup's budget is never closed")
     }
 
-    /// A turn to read one whole slice, from local disk or the object store.
+    /// A turn to read one whole slice over [`SMALL_SLICE_BYTES`], from local
+    /// disk or the object store.
     async fn whole(&self) -> SemaphorePermit<'_> {
         self.wholes
             .acquire()
@@ -2969,10 +2973,11 @@ pub(crate) struct TermIndex {
     indexed: HashMap<Uuid, i128>,
     storage: Arc<dyn StorageProvider>,
     disk_cache: Option<Arc<MetadataDiskCache>>,
-    /// Fetched tier chunks — directory and bodies — by `(tier object, chunk
-    /// offset)`, under the same byte budget as the slices. A chunk is the
-    /// unit so a merge's reads cost the set a lookup per region, not per
-    /// block.
+    /// What this index keeps resident, shared with the indexes of the roots
+    /// before and after it: slices (whole or as block indexes), tier chunks
+    /// by `(tier object, chunk offset)`, and decoded head levels, each under
+    /// a budget of [`RESIDENT_SLICE_BUDGET_BYTES`]. A tier chunk is the unit
+    /// so a merge's reads cost a lookup per region, not per block.
     tier_chunks: TierChunkCache,
     /// Decoded runs by key; see [`RESIDENT_RUNS`]. A std mutex: nothing
     /// awaits while it is held.

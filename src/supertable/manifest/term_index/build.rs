@@ -2387,10 +2387,11 @@ pub(crate) fn build(
 /// ordinals continue from `base`'s superfile count. Onto an empty root this
 /// is a full build: one layer, ordinals from zero.
 ///
-/// Optimize skips the rebuild when the current index already has a full
-/// build's shape, so a change to what this writes reaches an existing
-/// table only as folds rewrite its layers. Older roots and slices still
-/// load, and are read as their layout allows.
+/// A change to what this writes reaches an existing table's next commit at
+/// once, in the layer the commit adds; its older layers change only as
+/// folds rewrite them, since optimize skips the rebuild when the index
+/// already has a full build's shape. Older roots and slices still load,
+/// and are read as their layout allows.
 #[cfg_attr(
     feature = "detailed-tracing",
     tracing::instrument(skip_all, fields(inputs = contributions.len()))
