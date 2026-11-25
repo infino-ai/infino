@@ -35,7 +35,8 @@
 //! the `WHERE` bounds, and stops at the `LIMIT`. A phrase is answered
 //! exactly from the column's token positions. Without positions, the scan
 //! returns the rows holding its words and DataFusion checks the phrase on
-//! them, which costs about a scan of that text.
+//! them, which costs about a scan of that text. A file written before the
+//! column had positions has its rows checked by the scan instead.
 //!
 //! ## What it means
 //!

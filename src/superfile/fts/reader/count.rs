@@ -253,8 +253,8 @@ impl FtsReader {
     /// [`Self::atoms_match_ids`] with a memo of located postings: a term or
     /// phrase member the memo holds is not looked up in the dictionary. With
     /// a `pool`, the phrase cursors' first seek and the walk run on it, while
-    /// the reads stay on this task. Without one they run here, for callers
-    /// that block on this future.
+    /// the reads stay on this task. Without one they run on the task that
+    /// polls this future.
     pub(crate) async fn atoms_match_ids_prefetched(
         &self,
         column: &str,

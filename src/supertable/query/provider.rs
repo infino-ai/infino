@@ -1213,7 +1213,8 @@ impl SupertableProvider {
     /// them). A word leaf's rows come from the dictionary
     /// ([`SuperfileReader::contains_rows`]), each column walked once for
     /// all its needles, and a phrase leaf's from the positions
-    /// ([`SuperfileReader::text_rows`]); the leaves combine through the conjuncts' `AND` /
+    /// ([`SuperfileReader::text_rows`]), or held doubtful in a file written
+    /// without positions; the leaves combine through the conjuncts' `AND` /
     /// `OR` tree ([`ExactFilter::rows`]), and the rows that leaves doubtful
     /// are checked against their stored text, tombstoned ones left out
     /// first since the scan skips them anyway.
