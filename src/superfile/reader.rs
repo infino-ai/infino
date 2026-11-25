@@ -2962,8 +2962,8 @@ impl SuperfileReader {
             .await?)
     }
 
-    /// [`Self::token_match_prefetched`] left in blob ids, ascending, reading no doc-id map.
-    /// Delegates to [`FtsReader::token_match_prefetched_in_blob_ids`].
+    /// [`Self::token_match_prefetched`] in blob ids, ascending, without reading the doc-id map.
+    /// See [`FtsReader::token_match_prefetched_in_blob_ids`].
     pub(crate) async fn token_match_prefetched_in_blob_ids(
         &self,
         column: &str,
@@ -2980,8 +2980,8 @@ impl SuperfileReader {
             .await?)
     }
 
-    /// `set` in rows: as it is, or a blob-id set translated through this superfile's doc-id map,
-    /// which a blob that keeps its documents in row order does not read.
+    /// `set` as rows. A blob-id set goes through this superfile's doc-id map; a blob stored in
+    /// row order has no map to read.
     pub(crate) async fn admitted_rows(
         &self,
         set: &Admitted,

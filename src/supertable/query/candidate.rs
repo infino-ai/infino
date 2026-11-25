@@ -172,14 +172,14 @@ const MIN_FILES_PER_POOL_JOB: usize = 2;
 // silent way for a future `..Default::default()` to drop the row bound.
 // Construct one through `empty()` or `SupertableReader::candidate_scope`.
 //
-// Each superfile's set is its rows (`S` is a row bitmap), what every caller takes; a ranked text
-// search also takes a [`RankScope`], whose sets may be blob ids.
+// By default `S` is a row bitmap, which every caller can use. A ranked
+// text search uses a [`RankScope`], whose sets may be blob ids.
 #[derive(Debug, Clone)]
 pub(crate) struct CandidateScope<S = Arc<RoaringBitmap>> {
     /// Superfiles a match may live in, in manifest order.
     pub(crate) superfiles: Vec<Arc<SuperfileEntry>>,
-    /// Each superfile's candidate set (rows, or blob ids in a [`RankScope`]): a superset of the
-    /// rows satisfying the predicate, keyed by the superfile's URI; a superfile
+    /// Candidate sets per superfile URI (rows, or blob ids in a
+    /// [`RankScope`]): a superset of the matching documents; a superfile
     /// absent from the map has no candidate row. `None` when the plan is
     /// [`Unbounded`](CandidatePlan::Unbounded): the index bounds no row,
     /// every row of every superfile above is a candidate, and the caller
@@ -187,9 +187,8 @@ pub(crate) struct CandidateScope<S = Arc<RoaringBitmap>> {
     pub(crate) allow: Option<HashMap<SuperfileUri, S>>,
 }
 
-/// A [`CandidateScope`] for a ranked text search: a superfile's set is in blob ids when its own
-/// full-text index bounds the `WHERE` alone, so the search checks it with no doc-id map, and in
-/// rows otherwise.
+/// A [`CandidateScope`] for a ranked text search. A superfile's set is in blob ids when its own
+/// text index bounds the `WHERE` alone, so the search needs no doc-id map; otherwise it is rows.
 pub(crate) type RankScope = CandidateScope<Admitted>;
 
 impl From<CandidateScope> for RankScope {
@@ -495,8 +494,8 @@ impl CandidatePlan {
         self.evaluate_in(SetSpace::Rows, reader, pool, memos, dict)
     }
 
-    /// [`Self::evaluate`] with the sets built in `space`. In blob ids a range leaf bounds nothing
-    /// (a range index names rows), so a caller asks for them only for a plan without one.
+    /// [`Self::evaluate`] with the sets built in `space`. Ask for blob ids only when the plan has
+    /// no range leaf: a range index gives rows, so it cannot bound blob ids.
     pub(crate) fn evaluate_in<'a>(
         &'a self,
         space: SetSpace,
@@ -568,8 +567,7 @@ impl CandidatePlan {
                         let rows = reader.range_rows(*field, data_type, *lo, *hi, pool).await?;
                         Ok((rows, MatchWork::default()))
                     }
-                    // A range index names rows, so it bounds nothing in blob ids: a caller asks
-                    // for blob ids only for a plan without a range leaf.
+                    // Callers never ask for blob ids on a plan with a range leaf.
                     SetSpace::BlobIds => {
                         debug_assert!(false, "a range leaf evaluated in blob ids");
                         Ok((None, MatchWork::default()))
@@ -615,18 +613,18 @@ impl CandidatePlan {
     }
 }
 
-/// The numbering [`CandidatePlan::evaluate_in`] builds a superfile's set in.
+/// Which ids [`CandidatePlan::evaluate_in`] builds a superfile's set in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SetSpace {
-    /// Parquet rows, which anything outside the full-text index can use.
+    /// Parquet rows, usable by any caller.
     Rows,
-    /// The superfile's full-text blob ids, which only its own index's kernels can check, but
-    /// which need no doc-id map.
+    /// Blob ids, the superfile's own text-index document numbers. Only its own search kernels
+    /// can check them, but they need no doc-id map.
     BlobIds,
 }
 
-/// One term leaf's matches in `space`: `column` is the superfile's name for it and the memo
-/// serving its terms.
+/// One term leaf's matches in `space`. `column` is the superfile's name for the column, paired
+/// with the memo that serves its terms.
 async fn term_match(
     space: SetSpace,
     reader: &SuperfileReader,
@@ -1192,7 +1190,7 @@ impl CandidatePlan {
         }
     }
 
-    /// Whether any leaf is a [`Range`](Self::Range), which only rows can hold.
+    /// Whether any leaf is a [`Range`](Self::Range), which can only be evaluated in rows.
     pub(crate) fn has_range(&self) -> bool {
         match self {
             CandidatePlan::Range { .. } => true,

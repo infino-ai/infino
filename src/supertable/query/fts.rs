@@ -2073,8 +2073,8 @@ impl SupertableReader {
             // This superfile's admitted rows under a bounded scope. `kept`
             // holds only superfiles the scope admits, so the lookup
             // succeeds; an absent entry would mean no row and is treated
-            // as exactly that rather than as "every row". Empty, it admits
-            // nothing in either space; as blob ids it reads no doc-id map.
+            // as exactly that rather than as "every row". An empty blob-id
+            // set admits nothing and reads no doc-id map.
             let allow: Option<Admitted> = per_row_scope.as_ref().map(|sets| {
                 sets.get(&uri)
                     .cloned()
@@ -2311,8 +2311,8 @@ impl SupertableReader {
                                     "superfile {suid} row count exceeds a local id"
                                 ))
                             })?;
-                            // Deletes name rows, so a blob-id set goes to rows here, through
-                            // the map.
+                            // Deletes are rows, so a blob-id set is turned into rows here,
+                            // through the doc-id map.
                             let mut live = match &allow {
                                 Some(set) => Arc::unwrap_or_clone(r.admitted_rows(set).await?),
                                 None => {
@@ -2510,8 +2510,8 @@ impl SupertableReader {
                             ));
                         };
                         // The check and its rounds work in rows. A checked search's scope is
-                        // the rows its terms match, so this translates nothing; the rounds' row
-                        // gate reads the whole doc-id map, as it always has.
+                        // already the rows its terms match, so nothing is turned into rows
+                        // here; the rounds' row gate still reads the whole doc-id map.
                         let mut admitted = r.admitted_rows(&set).await?;
                         // The unit's best `want` admitted rows, checked where
                         // not checked before. Rows that fail leave the
@@ -3816,7 +3816,7 @@ impl SupertableReader {
     /// bounds one (already free of tombstones) and has the superfile's
     /// tombstones taken out when it does not. The result is bounded, its
     /// sets free of tombstones, and holds only superfiles with a row left.
-    /// A blob-id set goes to rows through its superfile's doc-id map.
+    /// A blob-id set is turned into rows through its superfile's doc-id map.
     pub(crate) async fn match_scope(
         &self,
         column: &str,

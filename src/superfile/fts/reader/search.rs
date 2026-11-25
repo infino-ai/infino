@@ -662,8 +662,8 @@ impl FtsReader {
         (distinct, qtf)
     }
 
-    /// `allow` as a filter checks it. A row set reads the doc-id map now, so a filter that checks
-    /// rows always holds the real one; a blob-id set needs no map.
+    /// `allow` as a filter's gate. A row set reads the doc-id map here, so a row gate always holds
+    /// the real map; a blob-id set needs none.
     async fn allow_gate(&self, allow: Option<Admitted>) -> Result<Option<AllowGate>, FtsError> {
         Ok(match allow {
             None => None,

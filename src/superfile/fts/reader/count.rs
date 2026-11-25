@@ -481,7 +481,7 @@ impl FtsReader {
         Ok((self.ids_to_rows_async(docs).await?, work))
     }
 
-    /// [`Self::token_match_prefetched`] left in blob ids, ascending: no doc-id map is read.
+    /// [`Self::token_match_prefetched`] in blob ids, ascending, without reading the doc-id map.
     pub(crate) async fn token_match_prefetched_in_blob_ids(
         &self,
         column: &str,
@@ -517,7 +517,7 @@ impl FtsReader {
             .flatten()
             .collect();
         // The cursors are built; a dictionary `dict` did not keep is not held through the walk and
-        // a caller's row-map read after it.
+        // a caller's doc-id map read after it.
         drop(dict_bytes);
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.

@@ -69,13 +69,12 @@ pub(crate) fn row_bitmap(rows: &[RowId]) -> RoaringBitmap {
     bitmap_of(|| rows.iter().map(|row| row.get()))
 }
 
-/// `ids` as a bitmap of their positions, as [`row_bitmap`] does for rows. A match walks postings
-/// in blob order, so they come ascending.
+/// [`row_bitmap`] for blob ids. A match walks postings in blob order, so `ids` come ascending.
 pub(crate) fn blob_id_bitmap(ids: &[FtsDocId]) -> RoaringBitmap {
     bitmap_of(|| ids.iter().map(|id| id.get()))
 }
 
-/// The positions `positions` yields, appended while they ascend and inserted one by one if not.
+/// A bitmap of what `positions` yields: built in one pass when ascending, else one by one.
 fn bitmap_of<I: Iterator<Item = u32>>(positions: impl Fn() -> I) -> RoaringBitmap {
     RoaringBitmap::from_sorted_iter(positions()).unwrap_or_else(|_| positions().collect())
 }
@@ -288,15 +287,14 @@ impl RowSet {
     }
 }
 
-/// The blob documents a caller admits: a SQL `WHERE` every bound of which came from one
-/// superfile's own full-text index, resolved there and left in blob ids. A kernel checks the doc it
-/// walks against it directly, so the blob's [`DocMap`] is never read for it; [`RowSet`] is the
-/// same gate in rows, for a bound from anywhere else.
+/// The blob ids a pushed-down SQL `WHERE` admits, when one superfile's own text index bounds it
+/// alone. A kernel checks the blob id it walks directly, so the blob's [`DocMap`] is never read.
+/// [`RowSet`] is the same gate in rows.
 #[derive(Clone, Debug)]
 pub(crate) struct BlobIdSet(Arc<RoaringBitmap>);
 
 impl BlobIdSet {
-    /// The set of the blob ids in `bitmap`, which is already in blob space.
+    /// Wraps `bitmap`, which must already hold blob ids, not rows.
     #[inline]
     pub fn new(bitmap: Arc<RoaringBitmap>) -> Self {
         Self(bitmap)
@@ -309,13 +307,13 @@ impl BlobIdSet {
     }
 }
 
-/// What a pushed-down SQL `WHERE` admits in one superfile, in the space it was resolved in.
+/// What a pushed-down SQL `WHERE` admits in one superfile, as rows or as blob ids.
 #[derive(Clone, Debug)]
 pub(crate) enum Admitted {
-    /// Rows, which a kernel checks a blob id against through the blob's [`DocMap`].
+    /// Rows. A kernel turns each blob id into its row through the blob's [`DocMap`] to check it.
     Rows(Arc<RoaringBitmap>),
-    /// Blob ids, from a `WHERE` the superfile's own full-text index bounds alone: a kernel checks
-    /// them as it walks, and reads no map for them.
+    /// Blob ids, when the superfile's own text index bounds the `WHERE` alone. A kernel checks
+    /// them directly and reads no map.
     BlobIds(Arc<RoaringBitmap>),
 }
 

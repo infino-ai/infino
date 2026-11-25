@@ -430,11 +430,10 @@ impl ExecutionPlan for Bm25Exec {
         let fut = async move {
             // What the pushed-down `WHERE` admits: the superfiles the
             // manifest keeps and, under an index-bounded predicate, the
-            // documents in each, in blob ids where the file's own text
-            // index bounds it, so the search reads no doc-id map for them.
-            // Prefix search has no scoped kernel (its term set is only known
-            // per superfile), so it fills its `k` under the exact predicate
-            // alone.
+            // documents in each (in blob ids where the file's own text index
+            // bounds it alone, so no doc-id map is read). Prefix search has no
+            // scoped kernel (its term set is only known per superfile), so it
+            // fills its `k` under the exact predicate alone.
             let scope = match &query {
                 Bm25Query::Terms { .. } if !filters.is_empty() => {
                     let plan = candidate_plan_for_filters(reader.manifest(), &filters);
@@ -1904,9 +1903,8 @@ mod tests {
 
     // ---- A WHERE on text columns over a reordered superfile ------------
 
-    /// Commits the mapped fixture writes. Their merge, past the size below
-    /// which a merge keeps arrival order, stores its documents in an order
-    /// of its own and so carries a doc-id map.
+    /// Commits the mapped fixture writes: enough that their merge reorders the
+    /// documents (a smaller merge keeps arrival order) and so has a doc-id map.
     const MAPPED_COMMITS: usize = 60;
     /// Rows in each of [`MAPPED_COMMITS`].
     const MAPPED_PER_COMMIT: usize = 80;
@@ -1914,27 +1912,28 @@ mod tests {
     const MAPPED_ROWS: usize = MAPPED_COMMITS * MAPPED_PER_COMMIT;
     /// Values the `tag` column cycles through, row by row.
     const MAPPED_TAGS: [&str; 3] = ["red", "blue", "green"];
-    /// Compaction target for the mapped fixture, in MiB: past every commit
-    /// together, so the merge makes one file of them.
+    /// Compaction target for the mapped fixture, in MiB: larger than all the
+    /// commits together, so they merge into one file.
     const MAPPED_TARGET_MB: u64 = 64;
-    /// A search width past every row, so a search returns each match.
+    /// A `k` above the row count, so a search returns every match.
     const MAPPED_EVERY_HIT: usize = 2 * MAPPED_ROWS;
-    /// A search width well below the matches, so the kernel's heap prunes.
+    /// A `k` well below the match count, so the kernel's heap prunes.
     const MAPPED_FEW_HITS: usize = 10;
     /// Queries the concurrency test runs at once on one reader.
     const MAPPED_CONCURRENT: usize = 8;
-    /// Rows the deletes test deletes: two `tag = 'red'` keeps and one it does not.
+    /// Rows the deletes test removes: two that `tag = 'red'` keeps, one it does not.
     const MAPPED_DELETED: [usize; 3] = [3, 2223, 1000];
-    /// Commits of the checked fixture: past the fill's smallest ceiling, so a widening that keeps
-    /// fewer than `k` rows ends short.
+    /// Commits of the checked fixture: past the fill's smallest ceiling, so a
+    /// widening that keeps fewer than `k` rows stops short.
     const CHECKED_COMMITS: usize = OVER_FETCH_MIN_CEILING / MAPPED_PER_COMMIT + 1;
-    /// The one row [`checked_where`] keeps: `red`, and the only body holding its `uq` word.
+    /// The one row [`checked_where`] keeps.
     const CHECKED_ROW: usize = 6;
-    /// Moduli giving each mapped body two words shared by many rows, so most terms match many
-    /// documents.
+    /// Moduli that give each body two words shared with many other rows, so
+    /// most terms match many documents.
     const MAPPED_SHARED_WORDS: [usize; 2] = [37, 53];
 
-    /// A `WHERE` only row [`CHECKED_ROW`] passes: `red` and the one body holding its `uq` word.
+    /// A `WHERE` only row [`CHECKED_ROW`] passes: it is `red` and the only body
+    /// holding its `uq` word.
     fn checked_where() -> String {
         format!("tag = 'red' AND body LIKE '%uq{CHECKED_ROW} %'")
     }
@@ -1957,9 +1956,9 @@ mod tests {
         ]))
     }
 
-    /// A table of `commits` commits merged into one superfile whose blob reorders its documents,
-    /// with `body` and `tag` indexed, reopened cold behind a lazily filled disk cache: a query
-    /// reads the doc-id map only if it needs it.
+    /// `commits` commits with `body` and `tag` text-indexed, merged into one
+    /// superfile that reorders its documents. Reopened cold behind a lazily
+    /// filled disk cache, so a query reads the doc-id map only if it needs it.
     fn mapped_body_tag_table(commits: usize) -> (Supertable, TempDir, TempDir) {
         let storage_dir = TempDir::new().expect("storage tempdir");
         let storage: Arc<dyn StorageProvider> =
@@ -2017,7 +2016,7 @@ mod tests {
         (table, storage_dir, cache_dir)
     }
 
-    /// The table's one superfile reader, as its queries share it.
+    /// The reader of the table's one superfile, the same one its queries use.
     async fn the_superfile_reader(st: &Supertable) -> Arc<SuperfileReader> {
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
@@ -2059,7 +2058,7 @@ mod tests {
         out
     }
 
-    /// A `bm25_search` for `shared`, which every row holds, `k` wide, under `filter`.
+    /// SQL for a top-`k` `bm25_search` of `shared` (in every row) under `filter`.
     fn shared_search(k: usize, filter: &str) -> String {
         format!("SELECT body FROM bm25_search('body', 'shared', {k}) WHERE {filter}")
     }
@@ -2082,12 +2081,14 @@ mod tests {
         ]
     }
 
-    /// A ranked search under a `WHERE` the text indexes bound checks it
-    /// without the doc-id map of a superfile that reorders its documents,
-    /// which on a large file is hundreds of megabytes: a few top hits read
-    /// only the map pages they fall in, and the map is not kept.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_text_where_on_a_reordered_file_keeps_no_doc_id_map() {
+        // A reordered superfile, top hits for `shared` under `tag = 'red'`.
+        // - The text index bounds the `WHERE`, so the set is in blob ids.
+        // - The kernel checks blob ids directly, with no doc-id map.
+        // - Only the few top hits become rows, reading just their map pages.
+        // This test pins that the whole doc-id map (hundreds of MB on a large
+        // file) is never loaded.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
         let file = the_superfile_reader(&st).await;
         let fts = file.fts().expect("fts");
@@ -2106,12 +2107,13 @@ mod tests {
         );
     }
 
-    /// A ranked search under a `WHERE` the text indexes bound ranks exactly
-    /// the rows it keeps on a superfile that reorders its documents, for
-    /// `OR`, `NOT`, an `AND` across two columns, a `WHERE` keeping no row
-    /// and one keeping every row.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_text_where_on_a_reordered_file_ranks_exactly_its_rows() {
+        // A reordered superfile, searched under each `WHERE` of `mapped_wheres`:
+        // `OR`, `NOT`, an `AND` across two columns, none kept and all kept.
+        // - With `k` above the row count, the hits are exactly the kept rows.
+        // - With a small `k`, every hit is a kept row.
+        // This test pins that checking in blob ids keeps the same rows as rows.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
         let reader = st.reader().expect("reader");
         for (filter, keep) in mapped_wheres() {
@@ -2130,12 +2132,14 @@ mod tests {
         }
     }
 
-    /// A `WHERE` keeping fewer rows than `k`, on a table past the fill's smallest ceiling, ends
-    /// its widening short: the search ranks again within the rows its terms match, checking the
-    /// predicate on them in rows, through the doc-id map of a superfile that reorders its
-    /// documents. The answer is exactly the row the `WHERE` keeps.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_checked_search_on_a_reordered_file_returns_exactly_its_rows() {
+        // A reordered superfile past the fill's smallest ceiling, under a
+        // `WHERE` that keeps one row, fewer than `k`.
+        // - The widening stops short at the ceiling.
+        // - The search ranks again within the rows its terms match, checking
+        //   the predicate on them in rows, through the doc-id map.
+        // This test pins that the answer is exactly the one row the `WHERE` keeps.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(CHECKED_COMMITS);
         let file = the_superfile_reader(&st).await;
         assert!(
@@ -2149,10 +2153,11 @@ mod tests {
         );
     }
 
-    /// Queries at once on one reader, half under a `WHERE` and half not,
-    /// share the superfile's map pages; each still ranks exactly its rows.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_searches_with_and_without_a_where_each_rank_their_rows() {
+        // Queries at once on one reader, half under `tag = 'red'` and half not.
+        // - All of them share the superfile's doc-id map pages.
+        // This test pins that each query still ranks exactly its own rows.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
         let reader = Arc::new(st.reader().expect("reader"));
         let red = bodies_kept(|n| mapped_tag(n) == "red");
@@ -2179,11 +2184,12 @@ mod tests {
         }
     }
 
-    /// A superfile with deleted rows takes the `WHERE` in rows, since a
-    /// delete names rows: the search still ranks exactly the live rows the
-    /// `WHERE` keeps.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_text_where_on_a_reordered_file_with_deletes_ranks_its_live_rows() {
+        // A reordered superfile with three deleted rows, under `tag = 'red'`.
+        // - Deletes are rows, so this superfile's set is in rows, not blob ids.
+        // This test pins that the search ranks exactly the live rows the
+        // `WHERE` keeps.
         let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
         for n in MAPPED_DELETED {
             st.delete(col("body").eq(lit(mapped_body(n))))

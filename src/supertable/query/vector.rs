@@ -8381,12 +8381,12 @@ impl SupertableReader {
         .await
     }
 
-    /// [`Self::candidate_scope`] for a ranked text search. When every bound of `plan` comes from
-    /// full-text indexes, a superfile whose blob stores its documents in an order of its own and
-    /// that has no deleted row gets its set in blob ids, which the search checks without reading
-    /// the blob's doc-id map; on a large superfile that map is hundreds of megabytes. Every other
-    /// superfile, and every one under a plan with a range leaf, gets its rows: deletes and range
-    /// indexes name rows.
+    /// [`Self::candidate_scope`] for a ranked text search, where a superfile's set may be in blob
+    /// ids, which the search checks without reading the doc-id map (hundreds of megabytes on a
+    /// large superfile). A set is in blob ids when all of these hold, and in rows otherwise:
+    /// - `plan` has no range leaf, since a range index gives rows.
+    /// - The blob reorders its documents; a blob in row order needs no map anyway.
+    /// - The superfile has no deleted row, since deletes are rows.
     pub(crate) async fn rank_scope(
         &self,
         filters: &[Expr],
@@ -8403,9 +8403,7 @@ impl SupertableReader {
         Ok(RankScope { superfiles, allow })
     }
 
-    /// [`Self::candidate_bitmaps_from_plan`] with a superfile's set in blob ids where
-    /// [`Self::rank_scope`] keeps it so: `plan` has no range leaf, the blob reorders its documents
-    /// and none of its rows is deleted.
+    /// [`Self::candidate_bitmaps_from_plan`], with sets in blob ids as [`Self::rank_scope`] says.
     async fn admitted_from_plan(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
@@ -8432,7 +8430,7 @@ impl SupertableReader {
         .await
     }
 
-    /// What evaluating `plan` over `superfiles` shares across them.
+    /// The state every superfile's evaluation of `plan` shares.
     async fn plan_evaluation(
         &self,
         plan: &CandidatePlan,
@@ -8473,8 +8471,8 @@ impl SupertableReader {
         .await
     }
 
-    /// Fan out over `superfiles` and keep each one's set as `set_of` builds it, told the
-    /// superfile's deleted rows (`None` when it has none); a `None` set is empty and is dropped.
+    /// Fan out over `superfiles` and build each one's set with `set_of`, which is given the
+    /// superfile's deleted rows (`None` if none). A `None` set means empty and is dropped.
     async fn fanout_candidate_sets<T, F, Fut>(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
@@ -8815,8 +8813,7 @@ impl SupertableReader {
     }
 }
 
-/// One bounded [`CandidatePlan`] evaluated superfile by superfile, with what every superfile's
-/// evaluation shares.
+/// A bounded [`CandidatePlan`], plus what its evaluation shares across superfiles.
 struct PlanEvaluation {
     plan: CandidatePlan,
     /// Whether the plan may bound nothing in a superfile (see

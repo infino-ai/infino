@@ -5,8 +5,8 @@
 //! phrase-aware sibling [`AtomExcludeFilter`]. Both skip-probe their
 //! negated cursors against a monotonically increasing candidate doc, so
 //! a common negated list is never fully decoded — and both can carry an
-//! **allow-set**, the documents a SQL `WHERE` pushed into the search admits
-//! at all, checked before any negated list is consulted. `pub(super)` within
+//! **allow-set**, the documents a pushed-down SQL `WHERE` admits, checked
+//! before any negated list is read. `pub(super)` within
 //! `reader/` (ExcludeFilter stays pub(crate) — PreparedClauses carries it).
 
 use super::{
@@ -19,20 +19,16 @@ use crate::superfile::{
     id_space::{BlobIdSet, DocMap, FtsDocId, RowSet},
 };
 
-/// A pushed-down `WHERE`'s set as both gates check it, in the space it was resolved in.
+/// A pushed-down `WHERE`'s set, in rows or in blob ids, as both gates check it.
 pub(super) enum AllowGate {
-    /// Rows, built outside from a predicate over rows. The kernel walks blob ids, so each is
-    /// translated through `doc_map`, this blob's doc-id map, before the set is consulted: without
-    /// it a scoped search on a reordered blob tests a row set with a blob id and matches almost
-    /// nothing.
+    /// Rows. The kernel walks blob ids, so each one is turned into its row through `doc_map`, this
+    /// blob's doc-id map, before the check; on a reordered blob a blob id is not its row.
     Rows { rows: RowSet, doc_map: DocMap },
-    /// Blob ids, from a `WHERE` this blob's own index bounds alone: checked as they are, with no
-    /// map.
+    /// Blob ids, when this blob's own text index bounds the `WHERE` alone: checked directly.
     BlobIds(BlobIdSet),
 }
 
-/// Whether the pushed-down set admits the blob id `doc`: the single place both gates ask it.
-/// `None` admits everything.
+/// Whether the pushed-down set admits blob id `doc`; both gates ask here. `None` admits everything.
 #[inline]
 fn allows(allow: &Option<AllowGate>, doc: u32) -> bool {
     match allow {
@@ -107,10 +103,9 @@ impl AtomExcludeFilter {
 /// parameter threaded through each walk.
 pub(crate) struct ExcludeFilter {
     pub(super) cursors: Vec<TermCursor>,
-    /// The documents the caller admits at all: a SQL `WHERE`'s candidate
-    /// set, resolved for this superfile. `None` admits every doc the negated
-    /// lists do not exclude. Checked first: a doc outside the set never costs
-    /// a negated-list probe.
+    /// The documents a pushed-down SQL `WHERE` admits in this superfile.
+    /// `None` admits every doc the negated lists do not exclude. Checked
+    /// first, so a doc outside the set never costs a negated-list probe.
     pub(super) allow: Option<AllowGate>,
     /// Last doc-id passed to `admits`; guards the monotonic call order.
     pub(super) last_doc: u32,

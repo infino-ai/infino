@@ -200,14 +200,12 @@ pub(crate) struct ClauseLists<'a> {
     /// kth into it as their heaps fill. `None` on single-superfile
     /// entry points, where there is no fan-out to share with.
     pub live_floor: Option<&'a LiveFloor>,
-    /// The documents this search may rank at all: a SQL `WHERE` pushed
-    /// into the search and resolved against the index, as rows or, when
-    /// this superfile's own index bounds it alone, as blob ids. Every
-    /// kernel admits a doc into its heap only if the set holds it, so the
-    /// top-k fills from allowed rows instead of being a post-filtered
-    /// global top-k that underflows. `None` ranks every matching row.
-    /// Owned, not borrowed: the prepared clauses carry it into a `'static`
-    /// kernel.
+    /// The documents this search may rank, from a SQL `WHERE` pushed into it:
+    /// in rows, or in blob ids when this superfile's own text index bounds the
+    /// `WHERE` alone. A kernel adds a doc to its heap only if the set holds it,
+    /// so the top-k fills from allowed docs instead of coming up short like a
+    /// post-filtered top-k. `None` ranks every match. Owned, so the prepared
+    /// clauses can carry it into a `'static` kernel.
     pub allow: Option<Admitted>,
     /// Score every match in one pass and count them, instead of pruning
     /// to the top-k. Set by the exact-count entry points, which pair it
