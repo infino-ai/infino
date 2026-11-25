@@ -298,8 +298,8 @@ pub(crate) struct BlockCachedSource {
     /// When a query last read through this source, in microseconds since the unix epoch, 0 before
     /// any read.
     last_read_us: AtomicU64,
-    /// When a read last moved the block file's mtime, in microseconds since the unix epoch, 0
-    /// before any.
+    /// When a read last moved the block file's mtime, in microseconds since the unix epoch; the
+    /// source's build time before any.
     mtime_marked_us: AtomicU64,
     state: OnceLock<Option<BlockFile>>,
     /// Filled-block set. Guarded by a sync mutex; never held across await.
@@ -807,7 +807,8 @@ impl BlockCachedSource {
             read_ends: array::from_fn(|_| AtomicU64::new(u64::MAX)),
             next_read_end: AtomicUsize::new(0),
             last_read_us: AtomicU64::new(0),
-            mtime_marked_us: AtomicU64::new(0),
+            // Built just now: a read moves the mtime once a minute has passed, not on the first read.
+            mtime_marked_us: AtomicU64::new(unix_us(SystemTime::now())),
             state: OnceLock::new(),
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
@@ -971,6 +972,8 @@ impl BlockCachedSource {
     /// Move the block file's mtime to the read at `now_us` when a read last moved it at least
     /// [`MTIME_MARK_STEP_US`] ago, so a file read only from cache until a stop or a crash still
     /// ranks by its last use after the restart. Only the reader that wins the swap makes the call.
+    /// It runs on the reading thread: a metadata write with no data I/O, once a minute per file.
+    /// No path check, which would cost a stat per mark: moving a replaced file's mtime is harmless.
     fn mark_read_in_mtime(&self, now_us: u64) {
         let marked = self.mtime_marked_us.load(Ordering::Relaxed);
         if now_us.abs_diff(marked) < MTIME_MARK_STEP_US {

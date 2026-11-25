@@ -457,7 +457,8 @@ impl DiskCacheStore {
     /// gives its bytes back when it drops. A released source may wait on the freeing thread with
     /// the file open, so if the record is evicted meanwhile, its disk space comes back only then.
     /// `last_used` is when a query last opened or read the file, `None` if no admitted reader had
-    /// it. The record takes the later of that and the last block write; the mtime moves up to it.
+    /// it. The record takes the later of that and the file's mtime (its last block write or read mark);
+    /// the mtime moves up to it.
     pub(crate) fn retain_block_file(
         &self,
         uri: &SuperfileUri,
@@ -476,7 +477,7 @@ impl DiskCacheStore {
         if let Some(time) = last_used
             && last_used != written
         {
-            // On failure the mtime stays at the last write; only a restart reads it.
+            // On failure the mtime stays where it was; only a restart reads it.
             let _ = file.set_modified(time);
         }
         // From here the record counts the bytes and the source no longer writes the index, so both
