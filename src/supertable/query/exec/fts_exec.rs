@@ -1982,9 +1982,10 @@ mod tests {
         ]))
     }
 
-    /// `commits` commits with `body` and `tag` text-indexed and `n`, the row number, range-indexed,
-    /// merged into one superfile that reorders its documents. Reopened cold behind a lazily filled
-    /// disk cache, so a query reads the doc-id map only if it needs it.
+    /// `commits` commits with `body` (with token positions, for phrases) and `tag` text-indexed
+    /// and `n`, the row number, range-indexed, merged into one superfile that reorders its
+    /// documents. Reopened cold behind a lazily filled disk cache, so a query reads the doc-id map
+    /// only if it needs it.
     fn mapped_body_tag_table(commits: usize) -> (Supertable, TempDir, TempDir) {
         let storage_dir = TempDir::new().expect("storage tempdir");
         let storage: Arc<dyn StorageProvider> =
@@ -1998,7 +1999,10 @@ mod tests {
             );
             SupertableOptions::new(
                 body_tag_schema(),
-                vec![FtsConfig::new("body"), FtsConfig::new("tag")],
+                vec![
+                    FtsConfig::new("body").positions(true),
+                    FtsConfig::new("tag"),
+                ],
                 vec![],
             )
             .expect("valid options")
