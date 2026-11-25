@@ -5755,11 +5755,7 @@ mod tests {
 
     /// Rows `sql` returns on `conn`.
     fn rows_on(conn: &Connection, sql: &str) -> usize {
-        conn.query_sql(sql)
-            .expect(sql)
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum()
+        n_rows(&conn.query_sql(sql).expect(sql))
     }
 
     /// A cold plain search opens its table without statistics and downloads none; a filtered

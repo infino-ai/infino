@@ -1201,6 +1201,22 @@ fn term_cap(head: &Head, slot: &Slot, weights: &Weights, len: u8) -> f32 {
     by_key.min(weights.contribution(head.term, tf, len) * BOUND_SLACK)
 }
 
+/// Unseen bounds by slot shape: slots of one layer built at one average read
+/// the same heads at the same norms.
+type ShapeBounds<'a> = HashMap<(&'a [Option<usize>], *const [f32; LEN_BUCKETS]), f32>;
+
+/// `unseen_bound` for `slot`, computed once per shape.
+fn cached_unseen_bound<'a>(
+    by_shape: &mut ShapeBounds<'a>,
+    slot: &'a Slot,
+    heads: &[Head],
+    weights: &Weights,
+) -> f32 {
+    *by_shape
+        .entry((&slot.heads, Arc::as_ptr(&slot.key_norm)))
+        .or_insert_with(|| unseen_bound(slot, heads, weights))
+}
+
 /// Per slot, `(lb, ub)`: the best lower bound among its candidates
 /// carrying every required term, and a bound on any of its documents;
 /// `NEG_INFINITY` for a slot that holds no match.
@@ -1211,15 +1227,11 @@ fn slot_bounds(
     weights: &Weights,
     lb_slack: f32,
 ) -> Vec<(f32, f32)> {
-    // Slots of one layer built at one average read the same heads at the
-    // same norms: their unseen bound is computed once per such shape.
-    let mut by_shape: HashMap<(&[Option<usize>], *const [f32; LEN_BUCKETS]), f32> = HashMap::new();
+    let mut by_shape = ShapeBounds::new();
     let mut out: Vec<(f32, f32)> = slots
         .iter()
         .map(|slot| {
-            let unseen = *by_shape
-                .entry((&slot.heads, Arc::as_ptr(&slot.key_norm)))
-                .or_insert_with(|| unseen_bound(slot, heads, weights));
+            let unseen = cached_unseen_bound(&mut by_shape, slot, heads, weights);
             (f32::NEG_INFINITY, unseen)
         })
         .collect();
@@ -1566,18 +1578,14 @@ fn resolve(
     // A slot is answered whole when every head lists it whole, or when its
     // unseen documents bound strictly under the threshold and probes have
     // filled in every candidate's terms.
-    // Slots of one shape share their unseen bound, as in `slot_bounds`.
-    let mut by_shape: HashMap<(&[Option<usize>], *const [f32; LEN_BUCKETS]), f32> = HashMap::new();
+    let mut by_shape = ShapeBounds::new();
     let mut whole: Vec<bool> = slots
         .iter()
         .map(|slot| {
             slot.deny.is_none()
                 && slot.heads.iter().flatten().next().is_some()
                 && (slot.heads.iter().flatten().all(|&h| heads[h].whole())
-                    || *by_shape
-                        .entry((&slot.heads, Arc::as_ptr(&slot.key_norm)))
-                        .or_insert_with(|| unseen_bound(slot, heads, weights))
-                        < theta)
+                    || cached_unseen_bound(&mut by_shape, slot, heads, weights) < theta)
         })
         .collect();
     for (&(s, _), c) in candidates {

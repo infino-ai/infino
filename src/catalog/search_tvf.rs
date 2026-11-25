@@ -60,6 +60,17 @@ use crate::{
     },
 };
 
+/// The search TVFs [`register_search_tvfs`] registers, by name.
+pub(crate) const SEARCH_FUNCTIONS: [&str; 7] = [
+    BM25_SEARCH_UDTF,
+    BM25_FIELDS_UDTF,
+    BM25_PREFIX_UDTF,
+    VECTOR_SEARCH_UDTF,
+    TOKEN_MATCH_UDTF,
+    EXACT_MATCH_UDTF,
+    HYBRID_SEARCH_UDTF,
+];
+
 /// Why the table a search names could not be opened, as a DataFusion error that
 /// keeps its cause: a name that resolves to nothing is the caller's mistake (a
 /// plan error); a storage or credential failure while opening it is not, and
@@ -302,17 +313,6 @@ enum IndexedColumns {
     /// `hybrid_search`.
     Both,
 }
-
-/// The search TVFs [`register_search_tvfs`] registers, by name.
-pub(crate) const SEARCH_FUNCTIONS: [&str; 7] = [
-    BM25_SEARCH_UDTF,
-    BM25_FIELDS_UDTF,
-    BM25_PREFIX_UDTF,
-    VECTOR_SEARCH_UDTF,
-    TOKEN_MATCH_UDTF,
-    EXACT_MATCH_UDTF,
-    HYBRID_SEARCH_UDTF,
-];
 
 /// Register the catalog search TVFs (table-name-first form) on `ctx`,
 /// resolving tables through `conn` and counting each into `reads`. Tables
