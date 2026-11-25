@@ -295,6 +295,7 @@ mod tests {
                 QueryIdf::ThisFile,
                 None,
                 CursorUse::Match,
+                None,
             )
             .await
             .expect("build atoms");
@@ -451,6 +452,7 @@ mod tests {
                 QueryIdf::ThisFile,
                 None,
                 CursorUse::Match,
+                None,
             )
             .await
             .expect("build atoms");
@@ -482,6 +484,7 @@ mod tests {
                 QueryIdf::ThisFile,
                 None,
                 CursorUse::Match,
+                None,
             )
             .await
             .expect("build atoms");

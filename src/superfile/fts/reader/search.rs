@@ -738,6 +738,7 @@ impl FtsReader {
                     lists.idf,
                     lists.prefetched,
                     CursorUse::Score,
+                    None,
                 )
                 .await?;
             if must_atoms.iter().any(Option::is_none) {
@@ -762,6 +763,7 @@ impl FtsReader {
                     lists.idf,
                     lists.prefetched,
                     CursorUse::Score,
+                    None,
                 )
                 .await?;
             let should_atoms: Vec<AnyCursor> = should_built.into_iter().flatten().collect();
@@ -775,6 +777,7 @@ impl FtsReader {
                     QueryIdf::ThisFile,
                     None,
                     CursorUse::Match,
+                    None,
                 )
                 .await?;
             let negative_atoms: Vec<AnyCursor> = negative_built.into_iter().flatten().collect();

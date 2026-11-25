@@ -1478,7 +1478,9 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             manifest::{ManifestSnapshot, list::VALUE_TABLES_BUDGET_BYTES},
-            query::{candidate::LIKE_MAX_TERMS, sql::build_sql_schemas},
+            query::{
+                candidate::LIKE_MAX_TERMS, sql::build_sql_schemas, text_match::register_text_match,
+            },
         },
     };
 
@@ -3116,8 +3118,16 @@ mod tests {
     /// `title` stemmed by `stemmer`, categories alternating `x` / `y`, and a
     /// DataFusion oracle over the same rows.
     fn exact_ilike_table(stemmer: Stemmer) -> (Supertable, SessionContext) {
-        let titles = exact_ilike_titles();
-        let st = Supertable::create(options_id_cat_title_with(stemmer)).expect("create");
+        committed_table(options_id_cat_title_with(stemmer), &exact_ilike_titles())
+    }
+
+    /// `titles` over [`EXACT_FIXTURE_COMMITS`] superfiles, and the oracle over the
+    /// same rows.
+    fn committed_table(
+        options: SupertableOptions,
+        titles: &[String],
+    ) -> (Supertable, SessionContext) {
+        let st = Supertable::create(options).expect("create");
         let mut batches = Vec::new();
         let mut offset = 0;
         for chunk in titles.chunks(titles.len().div_ceil(EXACT_FIXTURE_COMMITS)) {
@@ -3291,7 +3301,7 @@ mod tests {
         for stemmer in [Stemmer::None, Stemmer::English] {
             let name = &format!("{stemmer:?}");
             let (st, oracle) = exact_ilike_table(stemmer);
-            crate::supertable::query::text_match::register_text_match(&oracle);
+            register_text_match(&oracle);
             for filter in TEXT_MATCH_FILTERS {
                 for sql in [
                     format!("SELECT title FROM supertable WHERE {filter}"),
@@ -3420,6 +3430,132 @@ mod tests {
         assert!(plan.contains("text_match"), "{plan}");
     }
 
+    /// Titles with `pope leo` as a phrase, reversed, apart, across punctuation,
+    /// and with a repeated word.
+    const PHRASE_TITLES: &[&str] = &[
+        "Pope Leo XIV",
+        "leo the pope",
+        "pope and leo",
+        "POPE-LEO in rome",
+        "the leo leo pope",
+        "pope leo pope leo",
+        "rome",
+    ];
+
+    /// Quoted `text_match` filters: each mode, beside words, a repeated word, an
+    /// unpaired quote, signs, empty and one-token quotes, a phrase no row holds,
+    /// and trees with other conjuncts.
+    const PHRASE_FILTERS: &[&str] = &[
+        "text_match(title, '\"pope leo\"')",
+        "text_match(title, '\"leo pope\"', 'and')",
+        "text_match(title, '\"pope leo\" rome', 'and')",
+        "text_match(title, '\"pope leo\" rome', 'or')",
+        "text_match(title, '\"pope leo\" \"leo pope\"', 'or')",
+        "text_match(title, '\"leo leo pope\"')",
+        "text_match(title, '\"pope leo')",
+        "text_match(title, '+\"pope leo\" -rome', 'and')",
+        "text_match(title, '\"\" \"rome\"')",
+        "text_match(title, '\"rome pope\"')",
+        "text_match(title, '\"pope leo\"') AND category = 'y'",
+        "text_match(title, '\"pope leo\"') AND title >= 'p'",
+        "text_match(title, '\"pope leo\"') OR text_match(title, 'rome')",
+        "NOT text_match(title, '\"pope leo\"')",
+    ];
+
+    /// [`PHRASE_TITLES`] among filler rows, with or without positions, and the
+    /// oracle.
+    fn phrase_table(stemmer: Stemmer, positions: bool) -> (Supertable, SessionContext) {
+        let options = SupertableOptions::new(
+            schema_id_cat_title(),
+            vec![
+                FtsConfig::new("title")
+                    .stemmer(stemmer)
+                    .positions(positions),
+            ],
+            vec![],
+        )
+        .expect("valid options")
+        .with_writer_pool(one_superfile_per_commit_pool());
+        let (st, oracle) = committed_table(options, &with_walk_filler(PHRASE_TITLES));
+        register_text_match(&oracle);
+        (st, oracle)
+    }
+
+    #[test]
+    fn a_quoted_text_match_returns_the_rows_of_its_phrase() {
+        // Every path must return the row-by-row oracle's rows:
+        // - with positions, the scan walks the phrase;
+        // - without, it checks the rows holding the words;
+        // - under a stemmer, DataFusion calls the function on each row.
+        // So no path changes which rows a quoted query returns.
+        let rt = Runtime::new().expect("runtime");
+        for (stemmer, positions) in [
+            (Stemmer::None, true),
+            (Stemmer::None, false),
+            (Stemmer::English, true),
+        ] {
+            let name = &format!("{stemmer:?}, positions {positions}");
+            let (st, oracle) = phrase_table(stemmer, positions);
+            for filter in PHRASE_FILTERS {
+                for sql in [
+                    format!("SELECT title FROM supertable WHERE {filter}"),
+                    format!("SELECT COUNT(*) FROM supertable WHERE {filter}"),
+                    format!(
+                        "SELECT category, COUNT(*) FROM supertable WHERE {filter} GROUP BY category"
+                    ),
+                    format!(
+                        "SELECT COUNT(*) FROM \
+                         (SELECT title FROM supertable WHERE {filter} LIMIT 1)"
+                    ),
+                ] {
+                    assert_same_rows(&rt, &oracle, &st, &sql, name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_quoted_text_match_holds_the_rows_token_match_returns() {
+        let (st, _) = phrase_table(Stemmer::None, true);
+        let reader = st.reader().expect("reader");
+        for (query, mode) in [
+            ("\"pope leo\"", "and"),
+            ("\"leo pope\"", "or"),
+            ("\"pope leo\" rome", "or"),
+            ("\"leo leo pope\"", "and"),
+        ] {
+            let predicate = rendered_rows(
+                &reader
+                    .query_sql(&format!(
+                        "SELECT _id FROM supertable WHERE text_match(title, '{query}', '{mode}') ORDER BY _id"
+                    ))
+                    .expect("text_match"),
+            );
+            let function = rendered_rows(
+                &reader
+                    .query_sql(&format!(
+                        "SELECT _id FROM token_match('title', '{query}', '{mode}') ORDER BY _id"
+                    ))
+                    .expect("token_match"),
+            );
+            assert_eq!(predicate, function, "{query} ({mode})");
+        }
+    }
+
+    #[test]
+    fn a_quoted_text_match_is_answered_by_the_scan_only_with_positions() {
+        // With positions the scan answers the phrase; without, DataFusion checks it
+        // above the scan.
+        for positions in [true, false] {
+            let (st, _) = phrase_table(Stemmer::None, positions);
+            let plan = explain_physical(
+                &st,
+                "SELECT title FROM supertable WHERE text_match(title, '\"pope leo\"')",
+            );
+            assert_eq!(plan.contains("text_match"), !positions, "{plan}");
+        }
+    }
+
     /// `AND` / `OR` trees over the exact-`ILIKE` fixture's one column: exact
     /// when every leaf is, verified when any leaf is not or a `NOT` sits
     /// above them. The doubtful needles (`%xi%`, `%taxi%`) ride along so a
@@ -3535,7 +3671,7 @@ mod tests {
         w.append(&batch).expect("append");
         w.commit().expect("commit");
         let oracle = memtable_oracle(schema_title_body(), vec![batch]);
-        crate::supertable::query::text_match::register_text_match(&oracle);
+        register_text_match(&oracle);
         for tree in [
             "text_match(title, 'bbc') OR text_match(body, 'bbc')",
             "text_match(title, 'bbc news', 'and') OR text_match(body, 'evening news', 'and')",

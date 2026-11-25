@@ -2673,9 +2673,10 @@ fn peel_not_null_filter<'a>(input: &'a LogicalPlan, column: &str) -> Option<&'a 
 /// residual scan (which is never rewritten again), and the scan carries no
 /// filter the provider answers exactly.
 ///
-/// An exact filter leaves no `Filter` node above the scan — DataFusion
-/// hands it to the scan alone — so the scan looks unfiltered while its rows
-/// are only the filter's. Every rewrite here answers from statistics that
+/// A filter the index answers or narrows makes the scan return fewer rows
+/// than its statistics describe, and an exact one leaves no `Filter` node
+/// above the scan, so the scan looks unfiltered while its rows are only the
+/// filter's. Every rewrite here answers from statistics that
 /// describe whole segments, so each would count rows the filter excludes;
 /// refusing the provider leaves the plan to the scan, which is exact. A
 /// counting provider (this rule's own range count) is refused for the same
