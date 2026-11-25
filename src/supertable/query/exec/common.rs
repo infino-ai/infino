@@ -2097,9 +2097,10 @@ impl AsyncFileReader for ByteSourceAsyncReader {
             return async move { Ok(bytes) }.boxed();
         }
         // `range_async` resolves mmap/block-resident ranges synchronously
-        // (zero-copy, no I/O) via `try_get_range_sync`, and only `await`s a
-        // real fetch on a cold miss — the same fast path the FTS reader's
-        // posting fetches ride.
+        // via `try_get_range_sync` (a slice of a mapping, or a small block
+        // file range read with one `pread` on this thread), and only
+        // `await`s a real fetch on a cold miss — the same fast path the FTS
+        // reader's posting fetches ride.
         let source = self.source.clone();
         let range = range.start as usize..range.end as usize;
         async move {
