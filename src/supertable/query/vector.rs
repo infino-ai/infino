@@ -3324,9 +3324,9 @@ async fn collect_hnsw_plane(
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
-        // A file written before a rename labels its vector blob with the name
-        // the column had then; the id is what finds the column in either file.
-        let file_column = reader.column_alias(manifest.field_id(column), column);
+        let Some(file_column) = reader.vector_label(manifest.field_id(column), column) else {
+            continue;
+        };
         let Some(rows) = vr
             .materialized_index_rows_excluding_async(
                 file_column,
@@ -3390,8 +3390,11 @@ async fn count_hnsw_rows(manifest: &ManifestSnapshot, column: &str) -> Result<us
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
-        // The file's own label for the column; see the fan-out sites.
-        if !vr.has_index_column(reader.column_alias(manifest.field_id(column), column)) {
+        // The file's label for the column (see `vector_label`).
+        if !reader
+            .vector_label(manifest.field_id(column), column)
+            .is_some_and(|file_column| vr.has_index_column(file_column))
+        {
             continue;
         }
         let sup = superseded.get(&entry.superfile_id);
@@ -3728,9 +3731,9 @@ async fn gather_sq16_rows(
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
-        // A file written before a rename labels its vector blob with the name
-        // the column had then; the id is what finds the column in either file.
-        let file_column = reader.column_alias(manifest.field_id(column), column);
+        let Some(file_column) = reader.vector_label(manifest.field_id(column), column) else {
+            continue;
+        };
         let Some(rows) = vr
             .materialized_index_rows_excluding_async(
                 file_column,
@@ -4373,9 +4376,9 @@ pub(crate) async fn assemble_hnsw_incremental(
         )
         .await?;
         let Some(vr) = reader.vec() else { continue };
-        // A file written before a rename labels its vector blob with the name
-        // the column had then; the id is what finds the column in either file.
-        let file_column = reader.column_alias(manifest.field_id(column), column);
+        let Some(file_column) = reader.vector_label(manifest.field_id(column), column) else {
+            continue;
+        };
         let Some(rows) = vr
             .materialized_index_rows_excluding_async(
                 file_column,
@@ -5362,10 +5365,11 @@ impl SupertableReader {
             let Some(vr) = readers[si].as_ref().vec() else {
                 continue;
             };
-            let file_column = readers[si]
-                .as_ref()
-                .column_alias(column_field_id, column)
-                .to_owned();
+            let Some(file_column) = readers[si].as_ref().vector_label(column_field_id, column)
+            else {
+                continue;
+            };
+            let file_column = file_column.to_owned();
             let pool = Arc::clone(&scan_pool);
             let budget = Arc::clone(&scan_budget);
             scan_futs.push(async move {
@@ -5464,7 +5468,7 @@ impl SupertableReader {
             for (si, selected) in by_seg {
                 let entry = &superfiles[si];
                 let reader = readers[si].as_ref();
-                let file_column = reader.column_alias(column_field_id, column);
+                let file_column = reader.vector_column(column_field_id, column)?;
                 let (hits, rerank_ns) = reader
                     .vector_rerank_selected(
                         file_column,
@@ -6918,7 +6922,7 @@ impl SupertableReader {
                     // A file written before a rename labels its vector
                     // blob with the name the column had then; the id is what
                     // finds the column in either file.
-                    let column = reader.column_alias(column_field_id, &column).to_owned();
+                    let column = reader.vector_column(column_field_id, &column)?.to_owned();
                     // Unfiltered user path on row-addressable locals: resolve the
                     // bitmap once (warm after the orchestrator's prefetch) and
                     // push it down. Filtered search leaves it `None` — its
@@ -7205,7 +7209,7 @@ impl SupertableReader {
                         // A file written before a rename labels its vector
                         // blob with the name the column had then; the id is what
                         // finds the column in either file.
-                        let column = reader.column_alias(column_field_id, &column).to_owned();
+                        let column = reader.vector_column(column_field_id, &column)?.to_owned();
                         // Hidden-path invariants: no tombstone sidecars (the
                         // manifest's deletes apply after the stable-id
                         // remap upstream), replica slack mirrors phase A.
@@ -7373,11 +7377,15 @@ impl SupertableReader {
             let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
             async move {
+                // A file that holds none of the column has no row of it.
+                let Some(file_column) = r.fts_label(filter_field, &filter_col_arc) else {
+                    return Ok(RoaringBitmap::new());
+                };
                 let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                 let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                 let (docs, work) = r
                     .token_match_prefetched(
-                        r.column_alias(filter_field, &filter_col_arc),
+                        file_column,
                         &refs,
                         mode,
                         memo.as_deref(),

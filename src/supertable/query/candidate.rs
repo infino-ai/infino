@@ -284,7 +284,10 @@ pub(crate) type TermMemos = HashMap<String, Arc<FetchedTermMemo>>;
 /// table `field` id. A superfile written before a rename keys its
 /// dictionary by the old name, so each superfile lookup maps the column
 /// to that superfile's own name through the id
-/// ([`SuperfileReader::column_alias`]).
+/// ([`SuperfileReader::fts_label`]).
+///
+/// There is no `Not`: a leaf gives no rows for a file that holds none of its
+/// column, which is right only while nothing negates a leaf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CandidatePlan {
     /// Rows whose `column` contains every one of `tokens` (term-AND).
@@ -473,16 +476,14 @@ impl CandidatePlan {
                     field,
                     tokens,
                 } => {
+                    // A file that holds none of the column has no row.
+                    let Some(file_column) = reader.fts_label(*field, column) else {
+                        return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
+                    };
                     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
                     let memo = memos.get(column).map(Arc::as_ref);
                     let (docs, work) = reader
-                        .token_match_prefetched(
-                            reader.column_alias(*field, column),
-                            &refs,
-                            BoolMode::And,
-                            memo,
-                            dict,
-                        )
+                        .token_match_prefetched(file_column, &refs, BoolMode::And, memo, dict)
                         .await?;
                     Ok((Some(row_bitmap(&docs)), work))
                 }
@@ -496,16 +497,14 @@ impl CandidatePlan {
                     if terms.is_empty() {
                         return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
                     }
+                    // A file that holds none of the column has no row.
+                    let Some(file_column) = reader.fts_label(*field, column) else {
+                        return Ok((Some(RoaringBitmap::new()), MatchWork::default()));
+                    };
                     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
                     let memo = memos.get(column).map(Arc::as_ref);
                     let (docs, work) = reader
-                        .token_match_prefetched(
-                            reader.column_alias(*field, column),
-                            &refs,
-                            BoolMode::Or,
-                            memo,
-                            dict,
-                        )
+                        .token_match_prefetched(file_column, &refs, BoolMode::Or, memo, dict)
                         .await?;
                     Ok((Some(row_bitmap(&docs)), work))
                 }
@@ -1047,10 +1046,15 @@ async fn fold_dfs(
     if let Some(folded) = indexed {
         return Ok((folded, MatchWork::default()));
     }
+    // A file that holds none of the column holds none of the terms.
+    let Some(file_column) = reader.fts_label(field, column) else {
+        return Ok((
+            terms.iter().fold(init, |acc, _| fold(acc, 0)),
+            MatchWork::default(),
+        ));
+    };
     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-    let (dfs, work) = reader
-        .term_dfs_with_dict(reader.column_alias(field, column), &refs, dict)
-        .await?;
+    let (dfs, work) = reader.term_dfs_with_dict(file_column, &refs, dict).await?;
     Ok((dfs.into_iter().fold(init, fold), work))
 }
 
@@ -1195,11 +1199,20 @@ async fn expand_like(
     pool: Option<&ThreadPool>,
     dict: &QueryDict,
 ) -> Result<(CandidatePlan, MatchWork), ReadError> {
+    // A file that holds none of the column has no row: no term.
+    let Some(file_column) = reader.fts_label(field, column) else {
+        let none = CandidatePlan::TermsAny {
+            column: column.to_owned(),
+            field,
+            terms: Vec::new(),
+        };
+        return Ok((none, MatchWork::default()));
+    };
     // One dictionary pass widens every token of the leaf.
     let patterns: Vec<TermPattern<'_>> = tokens.iter().map(LikeToken::pattern).collect();
     let (expansions, work) = reader
         .expand_terms(
-            reader.column_alias(field, column),
+            file_column,
             &patterns,
             fold,
             LIKE_MAX_TERMS,
@@ -1866,7 +1879,8 @@ fn exact_keyword_equality(
 ///
 /// Leaves combine row by row ([`Self::rows`]). A NULL holds no term, so
 /// every leaf reads it as false, which matches SQL only while there is no
-/// `NOT` above it, so `NOT` is never exact.
+/// `NOT` above it, so `NOT` is never exact. For the same reason a leaf gives
+/// no rows for a file that holds none of its column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExactFilter {
     Contains(ExactContains),

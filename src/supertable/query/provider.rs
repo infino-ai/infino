@@ -1217,7 +1217,9 @@ impl SupertableProvider {
     /// without positions; the leaves combine through the conjuncts' `AND` /
     /// `OR` tree ([`ExactFilter::rows`]), and the rows that leaves doubtful
     /// are checked against their stored text, tombstoned ones left out
-    /// first since the scan skips them anyway.
+    /// first since the scan skips them anyway. A file holding none of a
+    /// leaf's column gives it no rows; one with no postings for it holds
+    /// every live row doubtful.
     ///
     /// A `bound` of at most `gate` rows — the bounded path's own selection
     /// limit — skips the dictionary: its rows are checked against their
@@ -1262,9 +1264,13 @@ impl SupertableProvider {
             let mut rows = RoaringBitmap::new();
             let mut every_leaf_read = true;
             for leaf in leaves {
-                let file_column = prepared
+                // A file that holds none of the column has no row.
+                let Some(file_column) = prepared
                     .reader
-                    .column_alias(self.manifest.field_id(&leaf.column), &leaf.column);
+                    .fts_label(self.manifest.field_id(&leaf.column), &leaf.column)
+                else {
+                    continue;
+                };
                 let read = prepared
                     .reader
                     .term_rows(
@@ -1316,29 +1322,36 @@ impl SupertableProvider {
         let mut leaf_rows: HashMap<(&str, &str, bool), ContainsRows> = HashMap::new();
         for ((ilike, column), needles) in by_column {
             let whole = !ilike;
-            // A superfile written before a rename keys its dictionary by
-            // the column's old name.
+            // The file's label for the column, its old name after a rename.
             let file_column = prepared
                 .reader
-                .column_alias(self.manifest.field_id(column), column);
-            let read = if whole {
-                prepared
-                    .reader
-                    .term_rows(
-                        file_column,
-                        self.whole_term_analyzer(column),
-                        &needles,
-                        memos.get(column).map(Arc::as_ref),
-                        &dict,
-                    )
-                    .await
-            } else {
-                // The `ILIKE` walk reads its own copy; the shared one is not held through it.
-                dict.give_back();
-                prepared
-                    .reader
-                    .contains_rows(file_column, &needles, Some(pool), Some(budget))
-                    .await
+                .fts_label(self.manifest.field_id(column), column);
+            let read = match file_column {
+                // A file that holds none of the column has no row.
+                None => Ok((
+                    vec![ContainsRows::default(); needles.len()],
+                    MatchWork::default(),
+                )),
+                Some(file_column) if whole => {
+                    prepared
+                        .reader
+                        .term_rows(
+                            file_column,
+                            self.whole_term_analyzer(column),
+                            &needles,
+                            memos.get(column).map(Arc::as_ref),
+                            &dict,
+                        )
+                        .await
+                }
+                Some(file_column) => {
+                    // The `ILIKE` walk reads its own copy; the shared one is not held through it.
+                    dict.give_back();
+                    prepared
+                        .reader
+                        .contains_rows(file_column, &needles, Some(pool), Some(budget))
+                        .await
+                }
             };
             let (rows, column_work) = match read {
                 Ok(read) => read,
@@ -1378,9 +1391,14 @@ impl SupertableProvider {
             if text_rows.iter().any(|(seen, _)| *seen == text) {
                 continue;
             }
-            let file_column = prepared
+            // A file that holds none of the column has no row.
+            let Some(file_column) = prepared
                 .reader
-                .column_alias(self.manifest.field_id(&text.column), &text.column);
+                .fts_label(self.manifest.field_id(&text.column), &text.column)
+            else {
+                text_rows.push((text, ContainsRows::default()));
+                continue;
+            };
             let words: Vec<&str> = text.query.words.iter().map(String::as_str).collect();
             let read = prepared
                 .reader
@@ -1400,8 +1418,8 @@ impl SupertableProvider {
                     rows
                 }
                 // A file without positions under a column that has them (one
-                // written before the column was dropped and added again):
-                // check the rows holding the words against their text.
+                // written before field ids, which reads the old index by
+                // name): check the rows holding the words against their text.
                 Err(e) if lacks_positions(&e) => {
                     let terms = text.query.tokens();
                     let terms: Vec<&str> = terms.iter().map(String::as_str).collect();

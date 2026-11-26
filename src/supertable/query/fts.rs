@@ -378,22 +378,20 @@ impl MatchKernel {
         &self,
         r: &SuperfileReader,
         suid: Uuid,
-    ) -> (String, Option<Arc<FetchedTermMemo>>, Vec<&str>) {
+    ) -> Result<(String, Option<Arc<FetchedTermMemo>>, Vec<&str>), QueryError> {
         // A file written before a rename labels the column as it was then,
         // and its dictionary is keyed by that label; the id is what finds
         // the column in either file.
-        let column = r
-            .column_alias(self.column_field_id, &self.column)
-            .to_owned();
+        let column = r.fts_column(self.column_field_id, &self.column)?.to_owned();
         let memo = memo_from_locations(r, &self.locations, suid).await;
         let refs: Vec<&str> = self.terms.iter().map(String::as_str).collect();
-        (column, memo, refs)
+        Ok((column, memo, refs))
     }
 
     /// The rows of superfile `suid`, read through `r`, that the match
     /// keeps: the positive walk minus any row a negated atom reaches.
     async fn docs(&self, r: &Arc<SuperfileReader>, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
-        let (column, memo, refs) = self.file_inputs(r, suid).await;
+        let (column, memo, refs) = self.file_inputs(r, suid).await?;
         let neg_refs: Vec<&str> = self.negatives.iter().map(String::as_str).collect();
         let dict = walk_dict(
             self.phrase_involved,
@@ -474,7 +472,7 @@ impl MatchKernel {
 
     /// The cursors every slice of superfile `suid` walks, built once.
     async fn cursor_set(&self, r: &SuperfileReader, suid: Uuid) -> Result<OrCursorSet, QueryError> {
-        let (column, memo, refs) = self.file_inputs(r, suid).await;
+        let (column, memo, refs) = self.file_inputs(r, suid).await?;
         let (set, work) = r.match_cursor_set(&column, &refs, memo.as_deref()).await?;
         work.add_to(self.op_stats.as_deref());
         Ok(set)
@@ -2085,7 +2083,7 @@ impl SupertableReader {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+                let column_arc = r.fts_column(column_field_id, &column_arc)?.to_owned();
                 let scoring = table_scoring(&column_arc, bm25_params, avgdl);
 
                 // This superfile's open-wave fetches (global stats): the
@@ -3081,7 +3079,7 @@ impl SupertableReader {
                     // A file written before a rename labels the column as it was
                     // then, and its dictionary is keyed by that label; the id is
                     // what finds the column in either file.
-                    let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+                    let column_arc = r.fts_column(column_field_id, &column_arc)?.to_owned();
 
                     let refs: Vec<&str> = terms_arc.iter().map(String::as_str).collect();
                     if full {
@@ -3251,7 +3249,7 @@ impl SupertableReader {
                         .ok_or_else(|| QueryError::Internal("superfile has no FTS index".into()))?;
                     // A file written before a rename labels the column as it
                     // was then; the id finds it in either file.
-                    let column = r.column_alias(column_field_id, &column_arc);
+                    let column = r.fts_column(column_field_id, &column_arc)?;
                     Ok(fts
                         .terms_with_prefix(column, &prefix_arc, Some(&pool))
                         .await?)
@@ -3351,7 +3349,7 @@ impl SupertableReader {
                     let fts = r
                         .fts()
                         .ok_or_else(|| QueryError::Internal("superfile has no FTS index".into()))?;
-                    let column = r.column_alias(field, &column_arc);
+                    let column = r.fts_column(field, &column_arc)?;
                     let terms = fts.terms_with_prefix(column, b"", Some(&pool)).await?;
                     if refused.load(AtomicOrdering::Relaxed) {
                         return Ok(None);
@@ -4074,7 +4072,7 @@ impl SupertableReader {
                     // A file written before a rename labels the column as it was
                     // then, and its dictionary is keyed by that label; the id is
                     // what finds the column in either file.
-                    let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+                    let column_arc = r.fts_column(column_field_id, &column_arc)?.to_owned();
 
                     let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                     // Tombstone bitmap for this superfile (None = no deletes).
@@ -4308,7 +4306,7 @@ impl SupertableReader {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
+                let column_arc = r.fts_column(column_field_id, &column_arc)?.to_owned();
 
                 let mut candidates: Vec<u32> = if tokens_arc.is_empty() {
                     (0..r.n_docs() as u32).collect()

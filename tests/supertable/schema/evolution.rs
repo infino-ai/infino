@@ -16,9 +16,13 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Analyzer, BoolMode, ColumnIndex, CompactionSettings, Connection, FieldId, FieldPatch,
+    Analyzer, BoolMode, ColumnIndex, CompactionSettings, Connection, FieldId, FieldPatch, FtsField,
     IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaError, SchemaPatch, TableSchema,
-    VectorFilter, connect, serde_json, test_helpers::distinct_unit_vectors,
+    VectorFilter, connect, serde_json,
+    test_helpers::{
+        build_title_batch, copy_dir_recursive, distinct_unit_vectors, old_format_fts_fixture,
+        open_old_format_fts_fixture,
+    },
 };
 use tempfile::TempDir;
 
@@ -1736,8 +1740,7 @@ fn a_quoted_text_match_on_a_text_column_added_later_matches_the_phrase() {
 /// - Their rows hold no value for the new column, so none of them match.
 /// - Files written after hold positions, and only the phrase's rows match.
 ///
-/// So the old index is read, its rows are checked against their text, and
-/// none of them comes back.
+/// So none of the old rows comes back.
 #[test]
 fn a_quoted_text_match_on_a_column_added_again_with_positions_matches_the_phrase() {
     let db = connect("memory://").expect("connect");
@@ -1795,9 +1798,9 @@ fn a_quoted_text_match_on_a_column_added_again_with_positions_matches_the_phrase
 
 /// A text column added after the table was created is not among the FTS
 /// columns the table was created with, yet `text_match` on it is answered
-/// from its postings, and a superfile written before the column existed,
-/// which holds no postings for it, has its rows checked against their
-/// (null) text. Every answer is `token_match`'s.
+/// from its postings, and a superfile written before the column existed
+/// holds none of it, so none of its rows match. Every answer is
+/// `token_match`'s.
 #[test]
 fn a_text_match_on_a_text_column_added_later_answers_as_token_match_does() {
     let db = connect("memory://").expect("connect");
@@ -1882,4 +1885,258 @@ fn a_text_match_on_a_text_column_added_later_answers_as_token_match_does() {
         physical.iter().all(|r| !r.contains("text_match")),
         "{plan:?}"
     );
+}
+
+/// Drop the text `column`, returning the index it had, to add it again with.
+fn drop_column(db: &Connection, column: &str) -> ColumnIndex {
+    let index = db
+        .schema(TABLE)
+        .expect("schema")
+        .fields()
+        .iter()
+        .find(|field| field.name == column)
+        .and_then(|field| field.index.clone())
+        .expect("indexed column");
+    db.apply_schema(
+        TABLE,
+        &SchemaPatch::new(vec![FieldPatch::named(column).dropped()]),
+        None,
+    )
+    .expect("drop");
+    index
+}
+
+/// Add the text `column` again, under `index`.
+fn add_text_column(db: &Connection, column: &str, index: ColumnIndex) {
+    db.apply_schema(
+        TABLE,
+        &SchemaPatch::new(vec![
+            FieldPatch::named(column)
+                .with_type(DataType::LargeUtf8)
+                .with_index(index),
+        ]),
+        None,
+    )
+    .expect("add again");
+}
+
+/// A search on a column dropped and added again finds only rows written
+/// after, in every shape SQL asks it, in memory and on disk.
+/// - A file written before the drop keeps the dropped column's positional
+///   index under the same name; one written while it was dropped has no
+///   `title` at all. Both index `body`.
+/// - Neither file's rows hold a value for the new column.
+///
+/// So only the row written after matches `title`, and no shape fails.
+#[test]
+fn a_search_on_a_column_added_again_finds_only_rows_written_after() {
+    let dir = TempDir::new().expect("tempdir");
+    for uri in ["memory://", dir.path().to_str().expect("utf8 path")] {
+        let db = connect(uri).expect("connect");
+        // Not `score`, which the search table functions also return.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("body", DataType::LargeUtf8, false),
+            Field::new("n", DataType::Int64, true),
+        ]));
+        let docs = db
+            .create_table(
+                TABLE,
+                schema,
+                IndexSpec::new()
+                    .fts(FtsField::new("title").positions(true))
+                    .fts("body"),
+            )
+            .expect("create");
+        let append = |row: serde_json::Value| {
+            docs.append_rows(&[row], None).expect("append");
+        };
+        append(serde_json::json!({"title": "pope one", "body": "x", "n": 1}));
+        let index = drop_column(&db, "title");
+        append(serde_json::json!({"body": "x", "n": 2}));
+        add_text_column(&db, "title", index);
+        append(serde_json::json!({"title": "pope two", "body": "y", "n": 3}));
+        let token_match = |query: &str| {
+            format!("_id IN (SELECT _id FROM token_match('{TABLE}', 'title', '{query}'))")
+        };
+        for filter in [
+            "text_match(title, 'pope')".to_owned(),
+            "text_match(title, '\"pope two\"')".to_owned(),
+            "title ILIKE '%pope%'".to_owned(),
+            "title LIKE '%pope%'".to_owned(),
+            "title LIKE 'pope%'".to_owned(),
+            "title = 'pope two'".to_owned(),
+            "title IN ('pope one', 'pope two')".to_owned(),
+            token_match("pope"),
+            token_match("\"pope two\""),
+        ] {
+            let sql = format!("SELECT title FROM {TABLE} WHERE {filter}");
+            assert_eq!(rows(&db, &sql), ["pope two"], "{uri}: {sql}");
+        }
+        let sql = format!(
+            "SELECT title FROM bm25_search('{TABLE}', 'title', 'pope', 10) \
+             WHERE title LIKE 'pope%'"
+        );
+        assert_eq!(rows(&db, &sql), ["pope two"], "{uri}: {sql}");
+        let sql = format!("SELECT title FROM {TABLE} WHERE text_match(title, 'pope') LIMIT 5");
+        assert_eq!(rows(&db, &sql), ["pope two"], "{uri}: {sql}");
+        // `body` keeps every file, so `title`'s bound meets each of them.
+        let sql =
+            format!("SELECT n FROM {TABLE} WHERE title = 'pope two' OR body = 'x' ORDER BY n");
+        assert_eq!(rows(&db, &sql), ["1", "2", "3"], "{uri}: {sql}");
+        // A negated search answers as on a table that never dropped `title`,
+        // whose first two rows hold a null title.
+        let control = db
+            .create_table(
+                "control",
+                Arc::new(Schema::new(vec![
+                    Field::new("title", DataType::LargeUtf8, true),
+                    Field::new("body", DataType::LargeUtf8, false),
+                    Field::new("n", DataType::Int64, true),
+                ])),
+                IndexSpec::new()
+                    .fts(FtsField::new("title").positions(true))
+                    .fts("body"),
+            )
+            .expect("create control");
+        control
+            .append_rows(
+                &[
+                    serde_json::json!({"body": "x", "n": 1}),
+                    serde_json::json!({"body": "x", "n": 2}),
+                    serde_json::json!({"title": "pope two", "body": "y", "n": 3}),
+                ],
+                None,
+            )
+            .expect("append control");
+        for filter in [
+            "NOT text_match(title, 'pope')",
+            "title NOT LIKE '%pope%'",
+            "NOT (title ILIKE '%pope%' AND body = 'x')",
+        ] {
+            let sql = |table: &str| format!("SELECT n FROM {table} WHERE {filter} ORDER BY n");
+            assert_eq!(
+                rows(&db, &sql(TABLE)),
+                rows(&db, &sql("control")),
+                "{uri}: {filter}"
+            );
+        }
+    }
+}
+
+/// A vector search filtered by text on a column dropped and added again
+/// finds only rows written after.
+/// - A file written before the drop keeps the dropped column's index under
+///   the same name; one written while it was dropped has no `title`.
+/// - The search asks, through `VectorFilter` and through SQL's
+///   `vector_search ... WHERE`, for every row whose `title` holds `pope`.
+///
+/// So only the rows written after come back.
+#[test]
+fn a_vector_filter_on_a_column_added_again_finds_only_rows_written_after() {
+    /// The narrowest vector dimension supported by the index.
+    const DIM: usize = 16;
+    /// Rows in each append.
+    const ROWS: usize = 4;
+    let db = connect("memory://").expect("connect");
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let docs = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, false),
+                Field::new(
+                    "emb",
+                    DataType::FixedSizeList(Arc::clone(&item), DIM as i32),
+                    false,
+                ),
+            ])),
+            IndexSpec::new()
+                .fts("title")
+                .vector("emb", DIM, Metric::L2Sq),
+        )
+        .expect("create");
+    let append = |label: &str, seed: u64, with_title: bool| {
+        let vectors = FixedSizeListArray::try_new(
+            Arc::clone(&item),
+            DIM as i32,
+            Arc::new(Float32Array::from(distinct_unit_vectors(ROWS, DIM, seed))),
+            None,
+        )
+        .expect("vectors");
+        let names: Vec<String> = (0..ROWS).map(|r| format!("pope {label} {r}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut columns: Vec<(&str, ArrayRef)> = vec![("emb", Arc::new(vectors))];
+        if with_title {
+            columns.push(("title", titles(&names)));
+        }
+        docs.append(&batch(columns), None).expect("append");
+    };
+    append("before", 1, true);
+    let index = drop_column(&db, "title");
+    append("dropped", 2, false);
+    add_text_column(&db, "title", index);
+    append("after", 3, true);
+    let filter = VectorFilter {
+        column: "title",
+        query: "pope",
+        mode: BoolMode::Or,
+    };
+    let hits = docs
+        .vector_search("emb", &[1.0; DIM], 3 * ROWS, Some(filter), Some(&["title"]))
+        .expect("search");
+    let mut found: Vec<String> = Vec::new();
+    for batch in &hits {
+        let title = batch
+            .column_by_name("title")
+            .expect("title")
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("titles");
+        found.extend((0..title.len()).map(|i| title.value(i).to_owned()));
+    }
+    found.sort();
+    let expected: Vec<String> = (0..ROWS).map(|r| format!("pope after {r}")).collect();
+    assert_eq!(found, expected);
+    let query = vec!["1"; DIM].join(",");
+    let sql = format!(
+        "SELECT title FROM vector_search('{TABLE}', 'emb', '{query}', {}) \
+         WHERE title LIKE 'pope%' ORDER BY title",
+        3 * ROWS
+    );
+    assert_eq!(rows(&db, &sql), expected, "{sql}");
+}
+
+/// A file written before field ids still answers `text_match` by the
+/// column's name.
+/// - The fixture's three files, written by an engine that recorded no field
+///   ids, index `title` with no id; every row holds `shared`.
+/// - One row from the current engine adds a file whose index carries the id.
+///
+/// So every row is counted: the old files fall back to the name.
+#[test]
+fn a_text_match_on_a_file_written_before_field_ids_finds_its_rows_by_name() {
+    let dir = TempDir::new().expect("tempdir");
+    copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+    let (_storage, st) = open_old_format_fts_fixture(dir.path(), |o| o);
+    let reader = st.reader().expect("reader");
+    let fixture_rows = reader
+        .token_match("title", "shared", BoolMode::Or)
+        .expect("token_match")
+        .len();
+    drop(reader);
+    let mut writer = st.writer().expect("writer");
+    writer
+        .append(&build_title_batch(&["shared fresh row"]))
+        .expect("append");
+    writer.commit().expect("commit");
+    drop(writer);
+    let batches = st
+        .reader()
+        .expect("reader")
+        .query_sql("SELECT title FROM supertable WHERE text_match(title, 'shared')")
+        .expect("sql");
+    let found: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert!(fixture_rows > 0, "the fixture holds `shared`");
+    assert_eq!(found, fixture_rows + 1);
 }
