@@ -11168,15 +11168,17 @@ mod tests {
             "fixture sanity: candidates from both packed cells, got {cells:?}"
         );
 
-        // Scope to one cell's flat at a time; only that cell may score.
-        for (flat, cell_idx) in [(0u32, 0usize), (2u32, 1usize)] {
+        // Scope to one cell's flats at a time; only that cell may score. Each
+        // cell holds identical rows, so which of its two clusters keeps them is
+        // up to the clustering: scope both.
+        for (flats, cell_idx) in [([0u32, 1], 0usize), ([2u32, 3], 1usize)] {
             let scoped = r
                 .search_clusters_scan_async(
                     "embedding",
                     &q,
                     5,
                     &fetch,
-                    Some(&[flat]),
+                    Some(&flats),
                     8,
                     8,
                     false,
@@ -11189,12 +11191,12 @@ mod tests {
                 .expect("scoped scan");
             assert!(
                 !scoped.candidates.is_empty(),
-                "flat {flat} resolves to a non-empty cluster; scoping it must score rows"
+                "flats {flats:?} hold cell {cell_idx}'s rows; scoping them must score rows"
             );
             for c in &scoped.candidates {
                 assert_eq!(
                     c.cell_idx, cell_idx,
-                    "flat {flat} belongs to cell {cell_idx}; a candidate scored from cell {} \
+                    "flats {flats:?} belong to cell {cell_idx}; a candidate scored from cell {} \
                      means the flat-to-cell mapping drifted from the fetch keying",
                     c.cell_idx
                 );
