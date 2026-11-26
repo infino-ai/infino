@@ -48,5 +48,7 @@ pub use error::{BuildError, FtsError, ReadError, VectorError};
 pub use lazy_source::{
     BytesLazyByteSource, CacheBlocks, CacheRoom, LazyByteSource, LazyByteSourceError,
 };
-pub(crate) use lazy_source::{LazySubSource, PrefetchedSource, held_buffer_bytes};
+pub(crate) use lazy_source::{
+    LazySubSource, PrefetchedSource, held_buffer_bytes, held_table_bytes,
+};
 pub use reader::{OpenOptions, SuperfileReader, VectorSearchOptions};

@@ -20,8 +20,9 @@ use datafusion::prelude::Expr;
 use serde_json::Value;
 
 use crate::{
-    Bm25FieldsOptions, Bm25SearchOptions, BoolMode, FieldClause, GcError, GcReport, InfinoError,
-    MutationStats, OptimizeError, OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
+    Bm25FieldsOptions, Bm25SearchOptions, BoolMode, FieldClause, GcError, GcReport,
+    IdempotencyToken, InfinoError, MutationStats, OptimizeError, OptimizeOptions, ReindexError,
+    ReindexOptions, TokenStatus, VectorFilter,
     catalog::ensure_expr_within_connective_cap,
     superfile::VectorSearchOptions,
     supertable::{
@@ -40,12 +41,39 @@ use crate::{
 /// the stable API (which is the inherent methods on [`Supertable`]).
 pub(crate) trait Table: Send + Sync {
     fn schema(&self) -> SchemaRef;
-    fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError>;
-    fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError>;
+    fn append(
+        &self,
+        batch: &RecordBatch,
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError>;
+    fn append_named(
+        &self,
+        batch: &RecordBatch,
+        source_name: &str,
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError>;
     fn stage(&self, batch: &RecordBatch) -> Result<StagedAppend, InfinoError>;
-    fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError>;
-    fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError>;
-    fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError>;
+    fn commit_staged(
+        &self,
+        staged: &[StagedAppend],
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError>;
+    fn append_rows(
+        &self,
+        rows: &[Value],
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError>;
+    fn append_rows_named(
+        &self,
+        rows: &[Value],
+        source_name: &str,
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError>;
+    fn idempotency_token_status(
+        &self,
+        token: IdempotencyToken<'_>,
+        since_ms: u64,
+    ) -> Result<TokenStatus, InfinoError>;
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError>;
     fn update_rows(&self, predicate: Expr, rows: &[Value]) -> Result<MutationStats, InfinoError>;
     fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError>;
@@ -141,23 +169,52 @@ impl Table for SupertableHandle {
     fn schema(&self) -> SchemaRef {
         SupertableHandle::schema(self)
     }
-    fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
-        SupertableHandle::append(self, batch)
+    fn append(
+        &self,
+        batch: &RecordBatch,
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        SupertableHandle::append_idempotent(self, batch, None, idempotency_token)
     }
-    fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
-        SupertableHandle::append_named(self, batch, source_name)
+    fn append_named(
+        &self,
+        batch: &RecordBatch,
+        source_name: &str,
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        SupertableHandle::append_idempotent(self, batch, Some(source_name), idempotency_token)
     }
     fn stage(&self, batch: &RecordBatch) -> Result<StagedAppend, InfinoError> {
         SupertableHandle::stage(self, batch)
     }
-    fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
-        SupertableHandle::commit_staged(self, staged)
+    fn commit_staged(
+        &self,
+        staged: &[StagedAppend],
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        SupertableHandle::commit_staged_idempotent(self, staged, idempotency_token)
     }
-    fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
-        SupertableHandle::append_rows(self, rows)
+    fn append_rows(
+        &self,
+        rows: &[Value],
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        SupertableHandle::append_rows_idempotent(self, rows, None, idempotency_token)
     }
-    fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
-        SupertableHandle::append_rows_named(self, rows, source_name)
+    fn append_rows_named(
+        &self,
+        rows: &[Value],
+        source_name: &str,
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        SupertableHandle::append_rows_idempotent(self, rows, Some(source_name), idempotency_token)
+    }
+    fn idempotency_token_status(
+        &self,
+        token: IdempotencyToken<'_>,
+        since_ms: u64,
+    ) -> Result<TokenStatus, InfinoError> {
+        SupertableHandle::idempotency_token_status(self, token, since_ms)
     }
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError> {
         SupertableHandle::update(self, predicate, batch)
@@ -331,8 +388,60 @@ impl Supertable {
     }
 
     /// Append a batch of rows.
-    pub fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
-        self.inner.append(batch)
+    ///
+    /// With an `idempotency_token`, the commit records the token with the
+    /// rows, and a call whose token the table already records publishes
+    /// nothing and returns `Ok`: a caller that retries after an error, or
+    /// resumes after a crash, with the same token applies the rows once.
+    /// [`Self::idempotency_token_status`] tells a resuming caller whether
+    /// a token committed. A batch with no rows records none.
+    ///
+    /// A token names one exact write. A call reusing a held token with a
+    /// different number of rows is refused with
+    /// [`InfinoError::AlreadyExists`] and commits nothing.
+    ///
+    /// A table keeps a token for its retention: the token retention of the
+    /// latest commit that recorded one, seven days by default. It also
+    /// keeps at most the newest 10,000 key tokens, so under heavy keyed
+    /// traffic the cap, not the retention, bounds how long a key is kept: at
+    /// 100 keyed appends a second a key lasts about 100 seconds. A writer
+    /// that commits often should use a sequence token, which keeps one entry
+    /// per writer.
+    ///
+    /// Readers of a table that has recorded a token must be at least this
+    /// engine version: the manifest list carrying tokens is written at a
+    /// format version an older reader refuses, until every token has expired
+    /// and a later commit has rewritten the list. With `None` the table is
+    /// written exactly as without tokens.
+    ///
+    /// Refused with a token, as [`InfinoError::Unsupported`], for a hosted
+    /// table and for a table with no storage (`memory://`).
+    pub fn append(
+        &self,
+        batch: &RecordBatch,
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        self.inner.append(batch, idempotency_token)
+    }
+
+    /// Whether the write carrying `token` committed, as the table records
+    /// it now.
+    ///
+    /// [`TokenStatus::Committed`] means it did; for a sequence token, that
+    /// the scope's latest committed number is at or past the one asked
+    /// about. [`TokenStatus::Absent`] means the table holds no record of it
+    /// and has dropped no token as recent as `since_ms` (milliseconds since
+    /// the Unix epoch), or holds the scope at an earlier number.
+    /// [`TokenStatus::Expired`] means retention dropped tokens at least as
+    /// recent as `since_ms`, so whether it committed is unknown: pass the
+    /// time the write was first attempted as `since_ms`, so that an expired
+    /// token is never read as absent.
+    pub fn idempotency_token_status(
+        &self,
+        token: IdempotencyToken<'_>,
+        since_ms: u64,
+    ) -> Result<TokenStatus, InfinoError> {
+        self.inner.idempotency_token_status(token, since_ms)
     }
 
     /// Build and write a batch's superfiles without adding them to the
@@ -375,8 +484,15 @@ impl Supertable {
     /// another open of this one, had its superfiles collected, or was
     /// staged before the table's schema moved - and those rows need staging
     /// again.
-    pub fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
-        self.inner.commit_staged(staged)
+    ///
+    /// An `idempotency_token` is recorded with the commit as
+    /// [`Self::append`] records one.
+    pub fn commit_staged(
+        &self,
+        staged: &[StagedAppend],
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        self.inner.commit_staged(staged, idempotency_token)
     }
 
     /// Append a batch of rows, naming the source they came from.
@@ -398,8 +514,17 @@ impl Supertable {
     /// orphans.
     ///
     /// Hosted tables do not accept a source name yet and return an error.
-    pub fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
-        self.inner.append_named(batch, source_name)
+    ///
+    /// An `idempotency_token` is recorded with the commit as
+    /// [`Self::append`] records one.
+    pub fn append_named(
+        &self,
+        batch: &RecordBatch,
+        source_name: &str,
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        self.inner
+            .append_named(batch, source_name, idempotency_token)
     }
 
     /// Append rows given as JSON documents. Each document is flattened to
@@ -409,14 +534,27 @@ impl Supertable {
     /// same error an Arrow batch would get. Numbers are never parsed from
     /// strings or truncated: an integral literal fits an integer or a
     /// `Float64` column, a literal with a fraction fits only a float column.
-    pub fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
-        self.inner.append_rows(rows)
+    ///
+    /// An `idempotency_token` is recorded with the commit as
+    /// [`Self::append`] records one.
+    pub fn append_rows(
+        &self,
+        rows: &[Value],
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        self.inner.append_rows(rows, idempotency_token)
     }
 
     /// [`Self::append_rows`], naming the source the rows came from as
     /// [`Self::append_named`] does.
-    pub fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
-        self.inner.append_rows_named(rows, source_name)
+    pub fn append_rows_named(
+        &self,
+        rows: &[Value],
+        source_name: &str,
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        self.inner
+            .append_rows_named(rows, source_name, idempotency_token)
     }
 
     /// Update rows matching `predicate` with values from `batch`.
@@ -530,7 +668,7 @@ impl Supertable {
     /// # let schema = Arc::new(Schema::new(vec![Field::new("size", DataType::Int64, false)]));
     /// # let logs = db.create_table("logs", schema.clone(), IndexSpec::new().range("size"))?;
     /// # logs.append(&RecordBatch::try_new(
-    /// #     schema, vec![Arc::new(Int64Array::from(vec![30, 10, 20]))])?)?;
+    /// #     schema, vec![Arc::new(Int64Array::from(vec![30, 10, 20]))])?, None)?;
     /// let largest = logs.sorted_search("size", true, 2, Some(&["size"]))?;
     /// let sizes = largest[0].column(0).as_any().downcast_ref::<Int64Array>().expect("size");
     /// assert_eq!(sizes.values(), &[30, 20]);
@@ -574,7 +712,7 @@ impl Supertable {
     /// # let schema = Arc::new(Schema::new(vec![Field::new("price", DataType::Float64, false)]));
     /// let orders = db.create_table("orders", schema.clone(), IndexSpec::new().range("price"))?;
     /// # let prices = Float64Array::from(vec![5.0, 50.0, 500.0, 5000.0]);
-    /// # orders.append(&RecordBatch::try_new(schema, vec![Arc::new(prices)])?)?;
+    /// # orders.append(&RecordBatch::try_new(schema, vec![Arc::new(prices)])?, None)?;
     /// let counts = orders.count_where(&[
     ///     lit(true),
     ///     col("price").lt(lit(100.0)),

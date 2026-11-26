@@ -64,6 +64,8 @@
 //! object-store-native engine never issues. For cold queries
 //! this is the difference between seconds and milliseconds.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::{
     borrow::Cow,
     cmp::Ordering,
@@ -127,7 +129,7 @@ use crate::{
             CellVectorSummary, ManifestSnapshot, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION,
             RABITQ_ADMIT_CELL_SHORTLIST_MIN, RabitqAdmitQuery, SuperfileEntry, SuperfileUri,
             VectorSummary,
-            list::{CellRoutingParams, PartitionStrategy},
+            list::{CellRoutingParams, PartitionStrategy, RoutingRef},
         },
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
@@ -139,18 +141,20 @@ use crate::{
                 SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source,
             },
             fine_graph_cache::{self, FineNodeKey, GraphRole},
-            fine_graph_follow,
-            fine_graph_store::GraphHead,
+            fine_graph_follow, fine_graph_publish,
+            fine_graph_store::{GraphHead, KeyedGraph},
             fts::{memo_from_locations, memos_from_plan_locations},
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
             superfile_reader::OpenTierCounts,
+            widening::next_want,
         },
         reader_cache::ReadIntent,
         schema::FieldId,
         slow_vector_state::{
             CentroidSection, ResidentIndexKind, ResidentVectorIndex, WalkPlaneRequest,
             fetch_centroid_section, fetch_resident_index_blob, hydrate_resident_index,
+            write_resident_index_blob,
         },
         tombstones::SidecarCache,
     },
@@ -173,9 +177,6 @@ const LAW_WIDTH_WITHIN_DEFAULT: usize = 1;
 /// headroom still only 0.9865. 4x holds the bar while keeping the total
 /// survivor budget well below the undivided width sweep.
 const WIDTH_BUDGET_OVERSAMPLE: usize = 4;
-
-/// Candidate growth when a deleted row occupies a current top-k slot.
-const DELETE_REFILL_GROWTH_FACTOR: usize = 2;
 
 /// A filtered search on the hidden index reads the cells that hold matching
 /// rows, instead of the cells near the query, when those cells hold at most
@@ -204,6 +205,13 @@ const CHECK_HITS_SLACK: f64 = 1.5;
 /// the vectors, keeping few rows near the query, and more rounds would only
 /// add cost.
 const CHECK_HITS_GIVE_UP_FACTOR: f64 = 4.0;
+
+#[cfg(test)]
+thread_local! {
+    /// The hits each delete-refill round asked for, in order. A sync search drives its future on
+    /// the caller's thread, so a test reads back exactly its own searches' refill sizes.
+    static REFILL_REQUESTS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Rounds of checking before the filter's rows are mapped instead.
 const CHECK_HITS_MAX_ROUNDS: usize = 3;
@@ -1932,23 +1940,21 @@ async fn centroid_router_from_stored(
     Some(router)
 }
 
-/// Build the centroid-router section bytes for the settled generation: open
-/// readers over `entries`, build the router for `column`/`dim` from the freshly
-/// published centroid `section`, and serialize it. `None` when membership is
-/// empty or a step fails (the settle then stamps no ref). The per-`k` fanout is
-/// derived and stamped by the compaction recalibration on its single
-/// ground-truth scan and carried forward by the settle, so it is not measured
-/// here. The caller has already resolved `column`/`dim` via
-/// [`select_eager_router_column`], so this does not re-gate. Called from the
-/// drain/compaction settle so the graph is published once per generation,
-/// `mmap`-loaded identically on every node and after a restart.
-pub(crate) async fn compose_centroid_router_section(
+/// Build the centroid router for the settled generation and store it,
+/// returning the ref the manifest stamps. With `centroid_graph_as_steps` the
+/// graph is stored as a base plus steps; otherwise, or when that cannot be
+/// written, as one section. `None` when membership is empty or a step fails
+/// (the settle then stamps no ref). The caller has already resolved
+/// `column`/`dim` via [`select_eager_router_column`].
+pub(crate) async fn publish_centroid_router_section(
+    storage: &dyn StorageProvider,
     manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
     section: &crate::supertable::slow_vector_state::CentroidSection,
     column: &str,
     dim: usize,
-) -> Option<Vec<u8>> {
+    as_steps: bool,
+) -> Option<RoutingRef> {
     if entries.is_empty() {
         return None;
     }
@@ -1965,6 +1971,7 @@ pub(crate) async fn compose_centroid_router_section(
     // the parallel build's non-determinism does not reach placement (which loads
     // these fixed bytes). Parallel keeps the one-time publish cheap.
     let column_id = manifest.field_id(column)?;
+    let superfile_ids = || entries.iter().map(|entry| &entry.superfile_id);
     let router = match build_centroid_router(
         entries,
         &readers,
@@ -1982,7 +1989,28 @@ pub(crate) async fn compose_centroid_router_section(
             return None;
         }
     };
-    Some(encode_centroid_router_section(&router, entries, dim))
+    if as_steps {
+        let keys = router
+            .node_map
+            .iter()
+            .map(|&node| (node != HOLE_NODE).then(|| (entries[node.0].superfile_id, None, node.1)))
+            .collect();
+        let graph = KeyedGraph::shared(keys, Arc::clone(&router.graph));
+        let written =
+            fine_graph_publish::write(storage, GraphRole::Router, column_id, dim as u32, graph)
+                .await;
+        if written.is_some() {
+            return written;
+        }
+        fine_graph_cache::forget(GraphRole::Router, column_id, superfile_ids());
+    }
+    write_resident_index_blob(
+        storage,
+        encode_centroid_router_section(&router, entries, dim),
+    )
+    .await
+    .map_err(|error| warn!(%error, "centroid-router publish: section write failed"))
+    .ok()
 }
 
 /// Build the in-memory centroid router from superfiles' OWN resident fine
@@ -7359,11 +7387,7 @@ impl SupertableReader {
                     .map_err(QueryError::from)?;
                 // The predicate-resolution leg of filtered vector search
                 // is FTS work like any other; flush it per superfile.
-                if let Some(stats) = &op_stats {
-                    stats.add_fts_postings_bytes(work.postings_bytes);
-                    stats.add_planned_read_ranges(work.planned_ranges);
-                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                }
+                work.add_to(op_stats.as_deref());
                 Ok(row_bitmap(&docs))
             }
         })
@@ -8370,11 +8394,7 @@ impl SupertableReader {
                     .map_err(QueryError::from)?;
                 // The SQL predicate's posting walks, summed across the
                 // plan tree — the pushdown leg of the vector TVF.
-                if let Some(stats) = &op_stats {
-                    stats.add_fts_postings_bytes(work.postings_bytes);
-                    stats.add_planned_read_ranges(work.planned_ranges);
-                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                }
+                work.add_to(op_stats.as_deref());
                 match bitmap {
                     Some(bitmap) => Ok(bitmap),
                     None if unbounded_is_legitimate => {
@@ -8564,18 +8584,13 @@ impl SupertableReader {
                 return Ok(combined);
             }
 
-            let next = requested
-                .saturating_mul(DELETE_REFILL_GROWTH_FACTOR)
-                .min(refill_cap);
-            if next == requested {
-                combined.retain(|hit| {
-                    hit.stable_id
-                        .is_some_and(|id| deleted.binary_search(&id).is_err())
-                });
-                combined.truncate(k);
-                return Ok(combined);
-            }
-            requested = next;
+            // Each refill reruns the fan-out over every superfile, so size it
+            // from how many of the last round's hits were live: a top-k
+            // buried under deletes refills in a round or two. It always
+            // grows, so the loop reaches the cap.
+            requested = next_want(k, requested, live, refill_cap);
+            #[cfg(test)]
+            REFILL_REQUESTS.with_borrow_mut(|requests| requests.push(requested));
             let hidden_retry = async {
                 if hidden_entries.is_empty() {
                     Ok(Vec::new())
@@ -9089,7 +9104,7 @@ impl Supertable {
     /// # let vecs = db.create_table("vecs", schema.clone(), IndexSpec::new().vector("emb", 16, Metric::Cosine))?;
     /// # let mut data = vec![0.0f32; 16]; data[0] = 1.0;
     /// # let col = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vec![Some(data.iter().copied().map(Some).collect::<Vec<_>>())], 16);
-    /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?)?;
+    /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?, None)?;
     /// # let mut query = vec![0.0f32; 16]; query[0] = 1.0;
     /// // Bare call → `_id` + `score`, no scalar decode:
     /// let hits = vecs.vector_search("emb", &query, 10, None, None)?;
@@ -9155,7 +9170,8 @@ mod tests {
     use std::{
         borrow::Cow,
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-        fs,
+        fs, mem,
+        ops::Range,
         path::Path,
         sync::{
             Arc, Mutex as StdMutex,
@@ -9166,10 +9182,11 @@ mod tests {
     use arrow::array::Array;
     use async_trait::async_trait;
     use bytes::Bytes;
+    use datafusion::prelude::{col, lit};
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use roaring::RoaringBitmap;
 
-    use super::{IndexOutcome, fine_graph_follow};
+    use super::{IndexOutcome, fine_graph_follow, publish_centroid_router_section};
     use crate::{
         superfile::{
             fts::reader::Bm25SearchOptions,
@@ -9182,7 +9199,7 @@ mod tests {
                 fine_graph_store::{GraphBase, GraphHead, GraphStep, KeyedGraph},
             },
             schema::FieldId,
-            slow_vector_state::{CentroidSection, storage_path},
+            slow_vector_state::{CentroidSection, fetch_resident_index_blob, storage_path},
         },
         test_helpers::fid,
     };
@@ -9206,9 +9223,9 @@ mod tests {
 
     use super::{
         CellLayout, CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN,
-        ReadIntent, SCORE_COLUMN, ScanCandidate, VectorFilter, VectorSearchOptions,
-        admit_extension_round, admit_shortlist_window, allowed_cells, apply_width_pin,
-        assemble_flat_sections, assemble_hnsw_sections, build_centroid_router,
+        REFILL_REQUESTS, ReadIntent, SCORE_COLUMN, ScanCandidate, VectorFilter,
+        VectorSearchOptions, admit_extension_round, admit_shortlist_window, allowed_cells,
+        apply_width_pin, assemble_flat_sections, assemble_hnsw_sections, build_centroid_router,
         calibrated_query_for, cell_layout, cell_passes, cell_row_ranges,
         cells_ranked_by_fine_score, centroid_router_from_stored, centroid_router_walk,
         decode_centroid_router_section, dispatch, encode_centroid_router_section, filtered_k,
@@ -12444,8 +12461,7 @@ mod tests {
                     ss,
                 )
                 .expect("router build")
-                .node_map
-                .len()
+                .live_nodes
             };
 
             let full = node_count(None);
@@ -12491,6 +12507,7 @@ mod tests {
         section: Arc<CentroidSection>,
         emb: FieldId,
         centroids: HashMap<FineNodeKey, Vec<f32>>,
+        manifest: Arc<ManifestSnapshot>,
     }
 
     impl StoredGraphFixture {
@@ -12527,7 +12544,28 @@ mod tests {
                 section,
                 emb,
                 centroids,
+                manifest: Arc::clone(hr.manifest()),
             }
+        }
+
+        /// Store this drain's router as the settle does and return what was
+        /// stored.
+        async fn publish(&self, storage: &dyn StorageProvider, as_steps: bool) -> Bytes {
+            let reference = publish_centroid_router_section(
+                storage,
+                &self.manifest,
+                &self.entries,
+                self.section.as_ref(),
+                "emb",
+                STORED_GRAPH_DIM,
+                as_steps,
+            )
+            .await
+            .expect("publish");
+            fetch_resident_index_blob(storage, &reference)
+                .await
+                .expect("fetch")
+                .0
         }
 
         fn scorer(&self, nodes: &[Option<FineNodeKey>]) -> Fp32Scorer {
@@ -12591,11 +12629,91 @@ mod tests {
             .collect()
     }
 
+    /// Commit `commits` batches to the stored-graph test table, then drain.
+    fn stored_graph_commits(st: &Supertable, from: u64, commits: u64) {
+        let schema = schema_with_vector(STORED_GRAPH_DIM);
+        for c in from..from + commits {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(
+                c * STORED_GRAPH_ROWS_PER_COMMIT as u64,
+                STORED_GRAPH_ROWS_PER_COMMIT,
+                STORED_GRAPH_DIM,
+                schema.clone(),
+            ))
+            .expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+    }
+
+    /// With the switch on, each drain's router is stored as a base or a step
+    /// and a reader loads it as the writer's router.
+    #[test]
+    fn a_router_graph_written_as_steps_loads_as_built() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(
+            options_one_superfile_per_commit(STORED_GRAPH_DIM).with_storage(Arc::clone(&storage)),
+        )
+        .expect("create");
+
+        block_on_mt(async {
+            let built = |fixture: &StoredGraphFixture| {
+                let router = build_centroid_router(
+                    &fixture.entries,
+                    &fixture.readers,
+                    "emb",
+                    fixture.emb,
+                    fixture.section.as_ref(),
+                    STORED_GRAPH_DIM,
+                    Metric::Cosine,
+                    true,
+                    None,
+                )
+                .expect("build");
+                fixture.picks(&router)
+            };
+
+            stored_graph_commits(&st, 0, STORED_GRAPH_FIRST_COMMITS);
+            let first = StoredGraphFixture::of(&st).await;
+            let first_bytes = first.publish(storage.as_ref(), true).await;
+            let first_head = GraphHead::from_bytes(&first_bytes).expect("a head");
+            assert!(first_head.steps.is_empty());
+            let first_router = first
+                .load(storage.as_ref(), &first_bytes, None)
+                .await
+                .expect("the base loads");
+            assert_eq!(first.picks(&first_router), built(&first));
+
+            stored_graph_commits(&st, STORED_GRAPH_FIRST_COMMITS, STORED_GRAPH_NEXT_COMMITS);
+            let second = StoredGraphFixture::of(&st).await;
+            let second_bytes = second.publish(storage.as_ref(), true).await;
+            let second_head = GraphHead::from_bytes(&second_bytes).expect("a head");
+            // A step on the first base, unless another test pushed this
+            // table's graph out of the build cache: then a new base.
+            assert!(second_head.steps.len() <= 1);
+            let second_router = second
+                .load(
+                    storage.as_ref(),
+                    &second_bytes,
+                    first_router.stored.as_ref(),
+                )
+                .await
+                .expect("the second loads");
+            assert_eq!(second.picks(&second_router), built(&second));
+
+            // With the switch off the router is stored whole.
+            let whole = second.publish(storage.as_ref(), false).await;
+            assert!(GraphHead::from_bytes(&whole).is_none());
+            assert!(second.load(storage.as_ref(), &whole, None).await.is_some());
+        });
+    }
+
     /// A graph stored as a base plus a step loads as the writer's graph.
     #[test]
     fn a_stored_router_graph_loads_from_its_base_and_steps() {
         let dim = STORED_GRAPH_DIM;
-        let schema = schema_with_vector(dim);
         let dir = tempfile::TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
@@ -12603,20 +12721,7 @@ mod tests {
             options_one_superfile_per_commit(dim).with_storage(Arc::clone(&storage)),
         )
         .expect("create");
-        let commit = |from: u64, commits: u64| {
-            for c in from..from + commits {
-                let mut w = st.writer().expect("writer");
-                w.append(&build_vector_batch(
-                    c * STORED_GRAPH_ROWS_PER_COMMIT as u64,
-                    STORED_GRAPH_ROWS_PER_COMMIT,
-                    dim,
-                    schema.clone(),
-                ))
-                .expect("append");
-                w.commit().expect("commit");
-            }
-            st.drain_vectors_to_cells_sync().expect("drain");
-        };
+        let commit = |from: u64, commits: u64| stored_graph_commits(&st, from, commits);
 
         block_on_mt(async {
             let publish = |bytes: Vec<u8>| async {
@@ -12635,7 +12740,7 @@ mod tests {
                 first_keys.iter().copied().map(Some).collect();
             let first_scorer = first.scorer(&first_nodes);
             let first_graph = Hnsw::build_serial(&first_scorer, HnswParams::default());
-            let base = GraphBase::new(first_keys.clone(), first_graph.clone()).expect("base");
+            let base = GraphBase::new(first_nodes.clone(), first_graph.clone()).expect("base");
             let (base_hash, base_len) = publish(base.to_bytes()).await;
             let first_head = GraphHead::of_base(
                 GraphRole::Router,
@@ -15783,6 +15888,109 @@ mod tests {
             hits_before.len() - 1,
             "the deleted doc must drop out of the results"
         );
+    }
+
+    /// Rows in the delete-refill fixture: one superfile, drained to the hidden
+    /// index, every row one-hot so the query's nearest rows are known.
+    const REFILL_ROWS: usize = 64;
+
+    /// The `k` the delete-refill test asks for.
+    const REFILL_K: usize = 10;
+
+    /// Rows the delete-refill test deletes first: enough that most of the
+    /// first round's hits are deleted and the search has to refill, while
+    /// more than [`REFILL_K`] rows stay live.
+    const REFILL_FIRST_DELETES: usize = 40;
+
+    /// Live rows left after the second delete, fewer than [`REFILL_K`], so
+    /// the refill runs to its cap of `k` plus the deleted count.
+    const REFILL_LAST_LIVE: usize = 4;
+
+    /// When deleted rows crowd a vector search's top `k`, the search refills
+    /// with more hits until `k` live rows stand or it has asked for `k` plus
+    /// every deleted row. Sized from the live rate, a refill reaches that cap
+    /// in one round here, and must still end: with enough live rows it returns
+    /// `k` of them, and with too few it returns every live row.
+    #[test]
+    fn a_refill_past_deletes_returns_k_live_rows_or_every_live_row() {
+        let dim = 16;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(options_one_superfile_per_commit(dim).with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, REFILL_ROWS, dim, schema))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w); // release the writer so the deletes can take one
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let search = |k: usize| {
+            st.reader()
+                .expect("reader")
+                .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
+                .expect("search")
+        };
+        let ids = |hits: &[SuperfileHit]| -> HashSet<i128> {
+            hits.iter()
+                .map(|hit| hit.stable_id.expect("stable _id"))
+                .collect()
+        };
+        assert_eq!(search(REFILL_ROWS).len(), REFILL_ROWS, "every row found");
+        let delete_rows = |rows: Range<usize>| {
+            let titles = rows.map(|i| lit(format!("doc {i}"))).collect();
+            st.delete(col("title").in_list(titles, false))
+                .expect("delete")
+        };
+
+        let stats = delete_rows(0..REFILL_FIRST_DELETES);
+        assert_eq!(stats.n_tombstoned(), REFILL_FIRST_DELETES);
+        let every_live = search(REFILL_ROWS);
+        let live = ids(&every_live);
+        assert_eq!(live.len(), REFILL_ROWS - REFILL_FIRST_DELETES);
+        REFILL_REQUESTS.with_borrow_mut(mem::take);
+        let top_k = search(REFILL_K);
+        // Sized from the live rate, one refill asks for the cap of `k` plus every
+        // deleted row; doubling from `k` takes two (20, then 40).
+        assert_eq!(
+            REFILL_REQUESTS.with_borrow_mut(mem::take),
+            [REFILL_K + REFILL_FIRST_DELETES],
+            "the refill was not sized from the live rate"
+        );
+        assert_eq!(top_k.len(), REFILL_K, "k live rows exist, so k come back");
+        assert!(
+            ids(&top_k).is_subset(&live),
+            "a deleted row came back from the refill"
+        );
+        // One live row is the query's exact match; the others tie far away.
+        let nearest_live = every_live[0].stable_id.expect("stable _id");
+        assert!(
+            ids(&top_k).contains(&nearest_live),
+            "the refill missed the nearest live row"
+        );
+
+        let stats = delete_rows(REFILL_FIRST_DELETES..REFILL_ROWS - REFILL_LAST_LIVE);
+        assert_eq!(
+            stats.n_tombstoned(),
+            REFILL_ROWS - REFILL_LAST_LIVE - REFILL_FIRST_DELETES
+        );
+        REFILL_REQUESTS.with_borrow_mut(mem::take);
+        let top_k = search(REFILL_K);
+        assert_eq!(
+            REFILL_REQUESTS.with_borrow_mut(mem::take),
+            [REFILL_K + REFILL_ROWS - REFILL_LAST_LIVE],
+            "the refill was not sized from the live rate"
+        );
+        assert_eq!(
+            top_k.len(),
+            REFILL_LAST_LIVE,
+            "fewer than k live rows, so every one comes back"
+        );
+        assert_eq!(ids(&top_k), ids(&search(REFILL_ROWS)));
     }
 
     /// Commit writes user superfiles in the cell-packed (MultiCellIvf) layout,

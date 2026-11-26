@@ -90,7 +90,7 @@ fn seeded_table(dir: &TempDir) -> Connection {
             IndexSpec::new().fts("body").fts("resource_indexed"),
         )
         .expect("create_table");
-    logs.append(&batch).expect("append");
+    logs.append(&batch, None).expect("append");
     db
 }
 

@@ -23,7 +23,7 @@ use object_store::{
 
 use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, child_prefix_names, counting,
-    io_counters, logical_list_key, options::apply, retry,
+    etag_meta, io_counters, logical_list_key, options::apply, retry,
 };
 use crate::{runtime_metrics::io::UsageMeter, utils::trace::record};
 
@@ -222,33 +222,27 @@ impl StorageProvider for AzureStorageProvider {
             .await
             .map_err(|e| translate(uri, e))?;
         self.meter.record_head();
-        Ok(ObjectMeta {
-            size: meta.size as u64,
-            etag: meta.e_tag,
-            last_modified: meta.last_modified.into(),
-        })
+        Ok(etag_meta(meta))
     }
 
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(uri = uri, len = tracing::field::Empty))
+        tracing::instrument(
+            skip_all,
+            fields(uri = uri, len = tracing::field::Empty, hedged = tracing::field::Empty)
+        )
     )]
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
         let tl = io_counters::timeline_start();
         // etag and bytes are atomically paired in the same response, so
         // no follow-up HEAD is needed.
-        let out = retry::complete_get(uri, || async {
+        let out = retry::read_body(uri, retry::Hedging::reads(&self.meter), || async {
             let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
-            let meta = ObjectMeta {
-                size: result.meta.size as u64,
-                etag: result.meta.e_tag.clone(),
-                last_modified: result.meta.last_modified.into(),
-            };
-            let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
-            Ok((bytes, meta))
+            Ok(retry::Response::new(result, move |e| translate(uri, e)))
         })
-        .await;
+        .await
+        .map(|(bytes, meta)| (bytes, etag_meta(meta)));
         if let Ok((b, _)) = &out {
             self.meter.record_get(uri, None, b.len() as u64);
             record("len", b.len() as u64);
@@ -259,7 +253,10 @@ impl StorageProvider for AzureStorageProvider {
 
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(uri = uri, len = tracing::field::Empty))
+        tracing::instrument(
+            skip_all,
+            fields(uri = uri, len = tracing::field::Empty, hedged = tracing::field::Empty)
+        )
     )]
     async fn get_if_none_match(
         &self,
@@ -270,25 +267,21 @@ impl StorageProvider for AzureStorageProvider {
         // Native `If-None-Match`: an unchanged blob comes back as a
         // bodyless 304 instead of a full read. Both arms are still a
         // billable GET (0 body bytes on 304).
-        let out = retry::with_reissue(|| async {
+        let out = retry::read_whole(uri, retry::Hedging::reads(&self.meter), || async {
             let options = GetOptions {
                 if_none_match: Some(etag.to_string()),
                 ..GetOptions::default()
             };
-            let result = match self.store.get_opts(&path, options).await {
-                Ok(result) => result,
-                Err(ObjError::NotModified { .. }) => return Ok(None),
-                Err(e) => return Err(translate(uri, e)),
-            };
-            let meta = ObjectMeta {
-                size: result.meta.size as u64,
-                etag: result.meta.e_tag.clone(),
-                last_modified: result.meta.last_modified.into(),
-            };
-            let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
-            Ok(Some((bytes, meta)))
+            match self.store.get_opts(&path, options).await {
+                Ok(result) => Ok(Some(retry::Response::new(result, move |e| {
+                    translate(uri, e)
+                }))),
+                Err(ObjError::NotModified { .. }) => Ok(None),
+                Err(e) => Err(translate(uri, e)),
+            }
         })
-        .await;
+        .await
+        .map(|read| read.map(|(bytes, meta)| (bytes, etag_meta(meta))));
         match &out {
             Ok(Some((b, _))) => {
                 self.meter.record_get(uri, None, b.len() as u64);
@@ -305,18 +298,23 @@ impl StorageProvider for AzureStorageProvider {
 
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(uri = uri, len = range.end - range.start))
+        tracing::instrument(
+            skip_all,
+            fields(uri = uri, len = range.end - range.start, hedged = tracing::field::Empty)
+        )
     )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
         let requested = (range.start, range.end);
         let off = range.start;
         let tl = io_counters::timeline_start();
-        let out = retry::complete_range(uri, range, |r| async {
-            self.store
-                .get_range(&path, r)
+        let out = retry::read_range(uri, range, retry::Hedging::reads(&self.meter), |r| async {
+            let result = self
+                .store
+                .get_opts(&path, GetOptions::new().with_range(Some(r)))
                 .await
-                .map_err(|e| translate(uri, e))
+                .map_err(|e| translate(uri, e))?;
+            Ok(retry::Response::new(result, move |e| translate(uri, e)))
         })
         .await;
         if let Ok(b) = &out {
@@ -490,14 +488,7 @@ impl StorageProvider for AzureStorageProvider {
         let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
             let location = meta.location.to_string();
-            out.push((
-                logical_list_key(&self.prefix, &location),
-                ObjectMeta {
-                    size: meta.size,
-                    etag: meta.e_tag,
-                    last_modified: meta.last_modified.into(),
-                },
-            ));
+            out.push((logical_list_key(&self.prefix, &location), etag_meta(meta)));
         }
         Ok(out)
     }
@@ -534,6 +525,14 @@ mod tests {
     //! exercised end-to-end against Azurite in the gated
     //! `supertable_smoke_via_azure_wire_protocol` integration test.
     use super::*;
+    use crate::storage::stalling_endpoint::{
+        Endpoint, Read, Stall, assert_stalled_read_recovers, stalling_endpoint,
+    };
+
+    /// The account and container the stalled-read tests read from (the stalling endpoint serves
+    /// any path).
+    const STALL_ACCOUNT: &str = "acct";
+    const STALL_CONTAINER: &str = "container";
 
     // ---- translate -----------------------------------------------------
 
@@ -772,5 +771,62 @@ mod tests {
             .object_store_handle("data/seg-1")
             .expect("handle for valid uri");
         assert_eq!(path.to_string(), "tbl/data/seg-1");
+    }
+
+    // ---- stalled reads, through the real client ---------------------------
+
+    /// An Azure provider whose store is `endpoint`, its usage counted on `meter`.
+    fn stalling_provider(endpoint: &Endpoint, meter: &Arc<UsageMeter>) -> AzureStorageProvider {
+        let store = MicrosoftAzureBuilder::new()
+            .with_account(STALL_ACCOUNT)
+            .with_container_name(STALL_CONTAINER)
+            .with_endpoint(endpoint.url.clone())
+            .with_skip_signature(true)
+            .with_client_options(tuned_client_options().with_allow_http(true))
+            .with_retry(retry::config())
+            .build()
+            .expect("store");
+        AzureStorageProvider::from_object_store(STALL_CONTAINER, store)
+            .with_usage_meter(Arc::clone(meter))
+    }
+
+    /// Through the real Azure client: a range GET whose headers never arrive gets a second request
+    /// after its delay, so the read returns in seconds instead of waiting out the 60 s request
+    /// timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_range_get_with_stalled_headers_is_answered_by_its_hedge() {
+        let endpoint = stalling_endpoint(Stall::BeforeHeaders);
+        let meter = UsageMeter::new();
+        let provider = stalling_provider(&endpoint, &meter);
+        assert_stalled_read_recovers(
+            &provider,
+            &meter,
+            &endpoint,
+            Stall::BeforeHeaders,
+            Read::Range,
+        )
+        .await;
+    }
+
+    /// Through the real Azure client: a range GET whose body stops partway is dropped after its
+    /// idle timeout and only its missing bytes are asked for again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_range_get_with_a_stalled_body_asks_again_for_its_missing_bytes() {
+        let endpoint = stalling_endpoint(Stall::MidBody);
+        let meter = UsageMeter::new();
+        let provider = stalling_provider(&endpoint, &meter);
+        assert_stalled_read_recovers(&provider, &meter, &endpoint, Stall::MidBody, Read::Range)
+            .await;
+    }
+
+    /// Through the real Azure client: a whole-object GET whose body stops partway is dropped after
+    /// its idle timeout and sent again whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_get_with_a_stalled_body_is_sent_again() {
+        let endpoint = stalling_endpoint(Stall::MidBody);
+        let meter = UsageMeter::new();
+        let provider = stalling_provider(&endpoint, &meter);
+        assert_stalled_read_recovers(&provider, &meter, &endpoint, Stall::MidBody, Read::Whole)
+            .await;
     }
 }

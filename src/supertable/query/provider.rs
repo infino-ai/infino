@@ -130,8 +130,9 @@ use crate::{
         query::{
             SuperfileHit,
             candidate::{
-                CandidatePlan, ExactFilter, PoolFile, Resolved, SelectionGate, TermMemos,
-                exact_filter, exact_range, like_prune_leaves, single_range,
+                CandidatePlan, ExactContains, ExactFilter, ExactText, PoolFile, Resolved,
+                SelectionGate, TermMemos, exact_filter, exact_range, like_prune_leaves,
+                single_range,
             },
             covered_agg::{LiveTermCounts, is_keyword_column, not_null_column},
             deleted_stats::DeletedStatsCache,
@@ -999,9 +1000,9 @@ impl SupertableProvider {
             .collect()
     }
 
-    /// `filter` as a conjunct this provider answers exactly from the term
-    /// dictionary (see [`ExactFilter`]), or `None` for one the index only
-    /// bounds and DataFusion verifies. The one classification
+    /// `filter` as a conjunct the index answers or narrows (see
+    /// [`ExactFilter`]; [`Self::exact_conjunct`] says which), or `None` for
+    /// one the index only bounds and DataFusion verifies. The one classification
     /// [`supports_filters_pushdown`](TableProvider::supports_filters_pushdown),
     /// [`scan`](TableProvider::scan) and the covered-aggregate rewrite
     /// share, so what DataFusion is told is exact is what the scan answers
@@ -1052,6 +1053,32 @@ impl SupertableProvider {
         }
         let common = rows.saturating_mul(POSTINGS_MAX_ROW_SHARE) > out_of && out_of > 0;
         (!common).then_some(exact)
+    }
+
+    /// [`Self::exact_filter`], and whether the scan answers it exactly. A quoted
+    /// `text_match` on a column without positions is not exact: the scan narrows
+    /// the rows by its words and DataFusion checks the phrase on the rows read.
+    fn exact_conjunct(
+        &self,
+        filter: &Expr,
+        fts_cols: &HashSet<&str>,
+    ) -> Option<(ExactFilter, bool)> {
+        let exact = self.exact_filter(filter, fts_cols)?;
+        // Only a phrase needs the columns' positions; other queries skip reading them.
+        if exact.texts().is_empty() {
+            return Some((exact, true));
+        }
+        let positional = self.positional_columns();
+        Some(exact.read_without_positions(&|column| positional.contains(column)))
+    }
+
+    fn positional_columns(&self) -> HashSet<String> {
+        self.manifest
+            .fts_configs()
+            .into_iter()
+            .filter(|config| config.positions)
+            .map(|config| config.column)
+            .collect()
     }
 
     /// Read from the term index how many rows hold each `keyword` value an
@@ -1148,10 +1175,8 @@ impl SupertableProvider {
             .map_or(STANDARD_TOKENIZER, |tokenizer| tokenizer.name())
     }
 
-    /// Whether this provider answers any of `filters` exactly
-    /// ([`Self::exact_filter`]): DataFusion then keeps no `Filter` node for
-    /// it, and a scan carrying it returns fewer rows than the manifest's
-    /// statistics describe.
+    /// Whether the index answers or narrows any of `filters`: a scan carrying it
+    /// returns fewer rows than the manifest's statistics describe.
     pub(crate) fn has_exact_filter(&self, filters: &[Expr]) -> bool {
         let fts_cols = self.fts_cols_set();
         filters
@@ -1161,7 +1186,7 @@ impl SupertableProvider {
 
     /// Each of `filters` as an exact interval on a range-indexed column
     /// ([`exact_range`]), or `None`. Only beside a conjunct the dictionary
-    /// answers exactly (`with_text`): the scan then intersects the range
+    /// answers or narrows (`with_text`): the scan then intersects the range
     /// index's rows with the dictionary's, and with every conjunct exact
     /// DataFusion hands the scan its `LIMIT`. Alone, a range stays a bound
     /// that a `FilterExec` verifies, which the covered-aggregate rewrite and
@@ -1185,9 +1210,11 @@ impl SupertableProvider {
 
     /// The rows of one superfile its exact conjuncts hold for, within
     /// `bound` (the other conjuncts' candidate rows, when the index bounded
-    /// them). Every leaf's rows come from the dictionary
+    /// them). A word leaf's rows come from the dictionary
     /// ([`SuperfileReader::contains_rows`]), each column walked once for
-    /// all its needles; the leaves combine through the conjuncts' `AND` /
+    /// all its needles, and a phrase leaf's from the positions
+    /// ([`SuperfileReader::text_rows`]), or held doubtful in a file written
+    /// without positions; the leaves combine through the conjuncts' `AND` /
     /// `OR` tree ([`ExactFilter::rows`]), and the rows that leaves doubtful
     /// are checked against their stored text, tombstoned ones left out
     /// first since the scan skips them anyway.
@@ -1320,22 +1347,10 @@ impl SupertableProvider {
                 // column's index, or under another analyzer): every live
                 // row is doubtful, so each is checked against its text
                 // below.
-                Err(e) if whole && holds_no_postings(&e) => {
-                    let total: u64 = prepared
-                        .shape
-                        .row_counts
-                        .iter()
-                        .map(|&n| u64::from(n))
-                        .sum();
-                    let mut every = RoaringBitmap::new();
-                    every.insert_range(0..u32::try_from(total).unwrap_or(u32::MAX));
-                    every -= tombstones;
-                    let doubtful = ContainsRows {
-                        proven: RoaringBitmap::new(),
-                        doubtful: every,
-                    };
-                    (vec![doubtful; needles.len()], MatchWork::default())
-                }
+                Err(e) if whole && holds_no_postings(&e) => (
+                    vec![every_live_row_doubtful(prepared, tombstones); needles.len()],
+                    MatchWork::default(),
+                ),
                 Err(e) => return Err(QueryError::from(e).into()),
             };
             // One result per needle, or the zip below would pair needles
@@ -1355,9 +1370,91 @@ impl SupertableProvider {
                     .zip(rows),
             );
         }
+        // Phrase rows come from the positions. The walk reads its own dictionary,
+        // so give the shared one back first.
+        dict.give_back();
+        let mut text_rows: Vec<(&ExactText, ContainsRows)> = Vec::new();
+        for text in check.filter.texts() {
+            if text_rows.iter().any(|(seen, _)| *seen == text) {
+                continue;
+            }
+            let file_column = prepared
+                .reader
+                .column_alias(self.manifest.field_id(&text.column), &text.column);
+            let words: Vec<&str> = text.query.words.iter().map(String::as_str).collect();
+            let read = prepared
+                .reader
+                .text_rows(
+                    file_column,
+                    self.whole_term_analyzer(&text.column),
+                    &words,
+                    &text.query.phrases,
+                    text.mode,
+                    memos.get(&text.column).map(Arc::as_ref),
+                    Some(pool),
+                )
+                .await;
+            let rows = match read {
+                Ok((rows, text_work)) => {
+                    work.merge(text_work);
+                    rows
+                }
+                // A file without positions under a column that has them (one
+                // written before the column was dropped and added again):
+                // check the rows holding the words against their text.
+                Err(e) if lacks_positions(&e) => {
+                    let terms = text.query.tokens();
+                    let terms: Vec<&str> = terms.iter().map(String::as_str).collect();
+                    // One dictionary read for all the terms; the shared one was given back.
+                    let dict =
+                        QueryDict::with_budget(&self.manifest.options.connection_memory_budget);
+                    let (rows, term_work) = prepared
+                        .reader
+                        .term_rows(
+                            file_column,
+                            self.whole_term_analyzer(&text.column),
+                            &terms,
+                            memos.get(&text.column).map(Arc::as_ref),
+                            &dict,
+                        )
+                        .await
+                        .map_err(QueryError::from)?;
+                    // One result per term, or the lookup below would pair a
+                    // term with another term's rows.
+                    if rows.len() != terms.len() {
+                        return Err(DataFusionError::Internal(format!(
+                            "phrase rows of column {:?}: {} results for {} terms",
+                            text.column,
+                            rows.len(),
+                            terms.len()
+                        )));
+                    }
+                    work.merge(term_work);
+                    let superset = text.superset().rows(
+                        &|leaf| {
+                            terms
+                                .iter()
+                                .zip(&rows)
+                                .find(|(term, _)| **term == leaf.needle)
+                                .map(|(_, rows)| rows.clone())
+                                .unwrap_or_default()
+                        },
+                        &|_| ContainsRows::default(),
+                    );
+                    ContainsRows {
+                        proven: RoaringBitmap::new(),
+                        doubtful: superset.proven | superset.doubtful,
+                    }
+                }
+                // No postings here: check every live row against its text, as for a word.
+                Err(e) if holds_no_postings(&e) => every_live_row_doubtful(prepared, tombstones),
+                Err(e) => return Err(QueryError::from(e).into()),
+            };
+            text_rows.push((text, rows));
+        }
         drop(dict);
         // Every leaf the tree reads has its rows; checked up front so the
-        // lookup below cannot miss.
+        // lookups below cannot miss.
         if let Some(leaf) = check.filter.leaves().into_iter().find(|leaf| {
             !leaf_rows.contains_key(&(leaf.column.as_str(), leaf.needle.as_str(), leaf.whole))
         }) {
@@ -1366,12 +1463,32 @@ impl SupertableProvider {
                 leaf.column, leaf.needle
             )));
         }
-        let mut rows = check.filter.rows(&|leaf| {
-            leaf_rows
-                .get(&(leaf.column.as_str(), leaf.needle.as_str(), leaf.whole))
-                .cloned()
-                .unwrap_or_default()
-        });
+        if let Some(text) = check
+            .filter
+            .texts()
+            .into_iter()
+            .find(|text| !text_rows.iter().any(|(seen, _)| seen == text))
+        {
+            return Err(DataFusionError::Internal(format!(
+                "exact rows of column {:?}: no result for a phrase",
+                text.column
+            )));
+        }
+        let mut rows = check.filter.rows(
+            &|leaf| {
+                leaf_rows
+                    .get(&(leaf.column.as_str(), leaf.needle.as_str(), leaf.whole))
+                    .cloned()
+                    .unwrap_or_default()
+            },
+            &|text| {
+                text_rows
+                    .iter()
+                    .find(|(seen, _)| *seen == text)
+                    .map(|(_, rows)| rows.clone())
+                    .unwrap_or_default()
+            },
+        );
         // The range conjuncts, from the range index: its rows are exactly
         // the interval's. A superfile without the index has its rows
         // checked against their values instead, with the rest below.
@@ -2508,6 +2625,29 @@ fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
         && max.distance(min).map(|d| d as u64) == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
 }
 
+fn every_live_row_doubtful(
+    prepared: &PreparedScanFile,
+    tombstones: &RoaringBitmap,
+) -> ContainsRows {
+    let total: u64 = prepared
+        .shape
+        .row_counts
+        .iter()
+        .map(|&n| u64::from(n))
+        .sum();
+    let mut every = RoaringBitmap::new();
+    every.insert_range(0..u32::try_from(total).unwrap_or(u32::MAX));
+    every -= tombstones;
+    ContainsRows {
+        proven: RoaringBitmap::new(),
+        doubtful: every,
+    }
+}
+
+fn lacks_positions(e: &ReadError) -> bool {
+    matches!(e, ReadError::Fts(f) if matches!(f.as_ref(), FtsError::PositionsUnavailable { .. }))
+}
+
 /// Whether `e` says a superfile has no `standard` postings for a column:
 /// no FTS section at all, no index on the column, or one under another
 /// analyzer.
@@ -2522,7 +2662,7 @@ pub(crate) fn holds_no_postings(e: &ReadError) -> bool {
     }
 }
 
-/// A scan's exact conjuncts ([`SupertableProvider::exact_filter`]),
+/// A scan's conjuncts the index answers or narrows ([`SupertableProvider::exact_filter`]),
 /// compiled once per scan together with the check their doubtful rows get.
 struct ExactCheck {
     /// The conjunction as the dictionary answers it: an `AND` of the
@@ -2592,7 +2732,7 @@ impl ExactCheck {
 
     /// The whole-term leaves of a conjunction that is one `OR` of them (or
     /// a single one), in order; `None` for any other shape.
-    fn whole_or_leaves(&self) -> Option<Vec<&crate::supertable::query::candidate::ExactContains>> {
+    fn whole_or_leaves(&self) -> Option<Vec<&ExactContains>> {
         let ExactFilter::And(conjuncts) = &self.filter else {
             return None;
         };
@@ -2608,7 +2748,7 @@ impl ExactCheck {
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>()?,
-            ExactFilter::And(_) => return None,
+            ExactFilter::And(_) | ExactFilter::Text(_) => return None,
         };
         leaves.iter().all(|leaf| leaf.whole).then_some(leaves)
     }
@@ -2624,6 +2764,20 @@ impl ExactCheck {
                 }
                 Some(_) => {}
                 None => out.push((leaf.column.clone(), vec![leaf.needle.clone()])),
+            }
+        }
+        for text in self.filter.texts() {
+            let at = match out.iter().position(|(column, _)| *column == text.column) {
+                Some(at) => at,
+                None => {
+                    out.push((text.column.clone(), Vec::new()));
+                    out.len() - 1
+                }
+            };
+            for token in text.query.tokens() {
+                if !out[at].1.contains(token) {
+                    out[at].1.push(token.clone());
+                }
             }
         }
         out
@@ -2762,18 +2916,23 @@ impl TableProvider for SupertableProvider {
             return Ok(vec![TableProviderFilterPushDown::Exact; filters.len()]);
         }
         let fts_cols = self.fts_cols_set();
-        let text: Vec<bool> = filters
+        let text: Vec<Option<bool>> = filters
             .iter()
-            .map(|filter| self.exact_filter(filter, &fts_cols).is_some())
+            .map(|filter| {
+                self.exact_conjunct(filter, &fts_cols)
+                    .map(|(_, exact)| exact)
+            })
             .collect();
-        let ranges = self.exact_ranges(filters.iter().copied(), text.contains(&true));
+        let ranges = self.exact_ranges(filters.iter().copied(), text.iter().any(Option::is_some));
         Ok(text
             .iter()
             .zip(ranges)
-            .map(|(&text, range)| match text || range.is_some() {
-                true => TableProviderFilterPushDown::Exact,
-                false => TableProviderFilterPushDown::Inexact,
-            })
+            .map(
+                |(&text, range)| match text == Some(true) || (text.is_none() && range.is_some()) {
+                    true => TableProviderFilterPushDown::Exact,
+                    false => TableProviderFilterPushDown::Inexact,
+                },
+            )
             .collect())
     }
 
@@ -2959,15 +3118,19 @@ impl TableProvider for SupertableProvider {
         let mut exact_filters: Vec<Expr> = Vec::new();
         let mut exact_conjuncts: Vec<ExactFilter> = Vec::new();
         let mut bounded_filters: Vec<Expr> = Vec::new();
-        let text: Vec<Option<ExactFilter>> = filters
+        // A conjunct the scan only narrows is checked again above it, so the scan
+        // must not stop at the LIMIT.
+        let mut every_exact = true;
+        let text: Vec<Option<(ExactFilter, bool)>> = filters
             .iter()
-            .map(|filter| self.exact_filter(filter, &fts_cols))
+            .map(|filter| self.exact_conjunct(filter, &fts_cols))
             .collect();
         let ranges = self.exact_ranges(filters.iter(), text.iter().any(Option::is_some));
         let mut exact_ranges = Vec::new();
         for ((filter, text), range) in filters.iter().zip(text).zip(ranges) {
             match (text, range) {
-                (Some(exact), _) => {
+                (Some((exact, is_exact)), _) => {
+                    every_exact &= is_exact;
                     exact_filters.push(filter.clone());
                     exact_conjuncts.push(exact);
                 }
@@ -2987,7 +3150,9 @@ impl TableProvider for SupertableProvider {
         // that many, and a wide column is decoded for those rows alone
         // rather than for every row the conjuncts keep.
         let exact_limit = match (exact_check, limit) {
-            (Some(_), Some(limit)) if bounded_filters.is_empty() => Some(limit as u64),
+            (Some(_), Some(limit)) if bounded_filters.is_empty() && every_exact => {
+                Some(limit as u64)
+            }
             _ => None,
         };
         let batch_size = state.config().batch_size();
@@ -3308,12 +3473,9 @@ impl TableProvider for SupertableProvider {
         // walks, flushed through the same collector that meters this
         // scan's pages — once the fan-out is in, so the tallies land in
         // manifest order whatever order the superfiles finished in.
-        if let Some(stats) = self.scan_store.op_stats() {
-            for seg in &superfiles {
-                stats.add_fts_postings_bytes(seg.predicate_work.postings_bytes);
-                stats.add_planned_read_ranges(seg.predicate_work.planned_ranges);
-                stats.add_kernel_cpu_ns(seg.predicate_work.kernel_cpu_ns);
-            }
+        let stats = self.scan_store.op_stats();
+        for seg in &superfiles {
+            seg.predicate_work.add_to(stats.as_deref());
         }
 
         // The store DataFusion resolves the scan's URL to. Byte reads go

@@ -116,7 +116,7 @@ fn optimize_once(rows: &RecordBatch, dim: usize) -> Duration {
                 .vector("emb", dim, Metric::Cosine),
         )
         .expect("create");
-    table.append(rows).expect("append");
+    table.append(rows, None).expect("append");
     let started = Instant::now();
     table
         .optimize(&OptimizeOptions::default())

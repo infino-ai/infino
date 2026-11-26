@@ -1867,7 +1867,7 @@ mod tests {
                     ],
                 )
                 .expect("batch");
-                t.append(&batch).expect("append");
+                t.append(&batch, None).expect("append");
             }
             (dir, db)
         }

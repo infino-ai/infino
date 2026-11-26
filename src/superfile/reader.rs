@@ -83,7 +83,7 @@ use crate::{
             },
             tokenize::{Phrase, Tokenizer},
         },
-        held_buffer_bytes,
+        held_buffer_bytes, held_table_bytes,
         id_space::{FtsDocId, RowId},
         ids::{self, PackedIds},
         load_watch::{LoadListener, LoadWatch},
@@ -1199,11 +1199,15 @@ impl SuperfileReader {
     /// A lazy reader also counts the buffers its sources keep: the open
     /// batch (the file's tail, which carries the footer, and the vector and
     /// FTS open ranges), and the headers and directories the vector and FTS
-    /// readers read as they opened. A byte several of them share counts once.
+    /// readers read as they opened, and the tables that find those ranges. A
+    /// byte or table several of them share counts once.
+    ///
+    /// The vector reader counts its columns' structures too: a multi-cell
+    /// blob opens one column per cell, so they grow with the file.
     ///
     /// Not counted: the vector columns' transposed codes, which hold their
     /// own reservations against the connection's budget, and the fixed size
-    /// of the reader's own structures.
+    /// of this reader's own struct.
     pub(crate) fn held_bytes(&self) -> usize {
         let footer = self.footer.load();
         let parquet = footer.parquet();
@@ -1218,21 +1222,25 @@ impl SuperfileReader {
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .map_or(0, |(_, view)| view.view_held_bytes());
-        let mut buffers = Vec::new();
+        let (mut buffers, mut tables) = (Vec::new(), Vec::new());
         if let Some(source) = &self.source {
             source.held_buffers(&mut buffers);
+            source.held_tables(&mut tables);
         }
         if let Some(fts) = &self.fts {
             fts.held_buffers(&mut buffers);
+            fts.held_tables(&mut tables);
         }
         if let Some(vec) = &self.vec {
             vec.held_buffers(&mut buffers);
+            vec.held_tables(&mut tables);
         }
         parquet.memory_size()
             + schema_heap_bytes(&self.schema)
             + scan
             + scored
             + held_buffer_bytes(&mut buffers)
+            + held_table_bytes(&mut tables)
             + self.fts.as_ref().map_or(0, FtsReader::held_bytes)
             + self.vec.as_ref().map_or(0, VectorReader::held_bytes)
             + self
@@ -3065,6 +3073,25 @@ impl SuperfileReader {
             .await?)
     }
 
+    /// See [`FtsReader::text_rows`].
+    pub(crate) async fn text_rows(
+        &self,
+        column: &str,
+        analyzer: &'static str,
+        words: &[&str],
+        phrases: &[Phrase<String>],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+        pool: Option<&ThreadPool>,
+    ) -> Result<(ContainsRows, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .text_rows(column, analyzer, words, phrases, mode, prefetched, pool)
+            .await?)
+    }
+
     /// Unranked token-match **count**: the number of `local_doc_id`s
     /// [`token_match`](Self::token_match) would return under `mode`,
     /// without materializing the id `Vec`. Delegates to
@@ -3128,7 +3155,7 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .atoms_match_ids_prefetched(column, terms, phrases, mode, prefetched)
+            .atoms_match_ids_prefetched(column, terms, phrases, mode, prefetched, None)
             .await?)
     }
 
@@ -5362,9 +5389,22 @@ mod tests {
             held_buffer_bytes(&mut buffers)
         };
         assert!(fts_overlay > 0, "the FTS open keeps what it read");
+        // The tail overlay's own table of installed ranges counts too.
+        let tables = |reader: &SuperfileReader| {
+            let mut tables = Vec::new();
+            reader
+                .source
+                .as_ref()
+                .expect("lazy")
+                .held_tables(&mut tables);
+            reader.fts.as_ref().expect("fts").held_tables(&mut tables);
+            held_table_bytes(&mut tables)
+        };
+        let tail_table = tables(&tailed) - tables(&bare);
+        assert!(tail_table > 0, "the tail overlay keeps a table");
         assert_eq!(
             tailed.held_bytes(),
-            bare.held_bytes() - fts_overlay + tail_len as usize,
+            bare.held_bytes() - fts_overlay + tail_len as usize + tail_table,
             "the tail counts, and the FTS overlay's slices of it do not again"
         );
     }
@@ -5430,8 +5470,16 @@ mod tests {
             .expect("lazy")
             .held_buffers(&mut buffers);
         reader.fts.as_ref().expect("fts").held_buffers(&mut buffers);
+        let mut tables = Vec::new();
+        reader
+            .source
+            .as_ref()
+            .expect("lazy")
+            .held_tables(&mut tables);
+        reader.fts.as_ref().expect("fts").held_tables(&mut tables);
         let without_schema = reader.parquet_metadata().memory_size()
             + held_buffer_bytes(&mut buffers)
+            + held_table_bytes(&mut tables)
             + reader.fts.as_ref().map_or(0, FtsReader::held_bytes);
         assert_eq!(
             reader.held_bytes(),

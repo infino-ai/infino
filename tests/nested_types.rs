@@ -107,9 +107,9 @@ fn seeded_table(dir: &TempDir) -> Connection {
     let docs = db
         .create_table(TABLE, schema.clone(), IndexSpec::new().fts("title"))
         .expect("create_table");
-    docs.append(&batch_from_json(schema.clone(), FIRST_ROWS))
+    docs.append(&batch_from_json(schema.clone(), FIRST_ROWS), None)
         .expect("append 1");
-    docs.append(&batch_from_json(schema, SECOND_ROWS))
+    docs.append(&batch_from_json(schema, SECOND_ROWS), None)
         .expect("append 2");
     db
 }
@@ -163,9 +163,9 @@ fn struct_column_round_trips_through_append_and_sql() {
         "the fixture must carry a null struct before it is appended"
     );
 
-    docs.append(&first)
+    docs.append(&first, None)
         .expect("append batch with a struct column");
-    docs.append(&batch_from_json(schema.clone(), SECOND_ROWS))
+    docs.append(&batch_from_json(schema.clone(), SECOND_ROWS), None)
         .expect("append second batch");
 
     // The declared schema comes back with the struct intact, not flattened or
@@ -226,9 +226,9 @@ fn list_of_structs_and_timestamp_round_trip() {
         .create_table(TABLE, schema.clone(), IndexSpec::new().fts("title"))
         .expect("create_table accepts a list-of-structs and a timestamp");
 
-    docs.append(&batch_from_json(schema.clone(), FIRST_ROWS))
+    docs.append(&batch_from_json(schema.clone(), FIRST_ROWS), None)
         .expect("append batch with a list of structs");
-    docs.append(&batch_from_json(schema, SECOND_ROWS))
+    docs.append(&batch_from_json(schema, SECOND_ROWS), None)
         .expect("append second batch");
 
     let described = docs.schema();

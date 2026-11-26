@@ -71,8 +71,9 @@ use crate::{
         query::{
             SuperfileHit,
             candidate::{CandidatePlan, CandidateScope},
-            exec::common::{OVER_FETCH_GROWTH, resolve_hits_named},
+            exec::common::resolve_hits_named,
             fts::select_top_k_stable,
+            widening::OVER_FETCH_GROWTH,
         },
         reader_cache::disk::ForegroundQueryGuard,
     },

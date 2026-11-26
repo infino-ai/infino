@@ -21,10 +21,6 @@
 //! grown large beside the base ([`GraphHead::fold_due`]) the writer builds a
 //! fresh base, which also clears the holes removed nodes leave.
 
-// Nothing writes or reads the stored form yet: the writer that publishes a
-// step with each generation is its first caller.
-#![allow(dead_code)]
-
 use std::{fmt, sync::Arc};
 
 use uuid::Uuid;
@@ -86,9 +82,10 @@ pub(crate) enum GraphStoreError {
     /// A step names a different number of keys than nodes it appends, or a
     /// base a different number than its graph has nodes.
     KeyCount,
-    /// A base holds a hole. Only a fresh build is written as a base.
-    HoleInBase,
+    /// A base names a centroid for a hole, or none for a live node.
+    KeyForHole,
     /// The graph put together is not the one the head describes.
+    #[cfg(test)]
     HeadMismatch,
 }
 
@@ -113,20 +110,24 @@ pub(crate) struct KeyedGraph {
 
 impl KeyedGraph {
     pub(crate) fn new(keys: Vec<Option<FineNodeKey>>, graph: Hnsw) -> Self {
+        Self::shared(keys, Arc::new(graph))
+    }
+
+    pub(crate) fn shared(keys: Vec<Option<FineNodeKey>>, graph: Arc<Hnsw>) -> Self {
         let node_digest = graph.node_digest();
         Self {
             keys,
-            graph: Arc::new(graph),
+            graph,
             node_digest,
         }
     }
 }
 
-/// A full copy of a graph: what a reader with nothing starts from. It holds
-/// no holes, since it is written from a fresh build.
+/// A full copy of a graph: what a reader with nothing starts from.
 #[derive(Clone)]
 pub(crate) struct GraphBase {
-    keys: Vec<FineNodeKey>,
+    /// `None` for a hole.
+    keys: Vec<Option<FineNodeKey>>,
     graph: Hnsw,
 }
 
@@ -149,12 +150,19 @@ impl fmt::Debug for GraphBase {
 
 impl GraphBase {
     /// The base of `graph`, whose node `i` stands for `keys[i]`.
-    pub(crate) fn new(keys: Vec<FineNodeKey>, graph: Hnsw) -> Result<Self, GraphStoreError> {
+    pub(crate) fn new(
+        keys: Vec<Option<FineNodeKey>>,
+        graph: Hnsw,
+    ) -> Result<Self, GraphStoreError> {
         if keys.len() != graph.len() {
             return Err(GraphStoreError::KeyCount);
         }
-        if graph.live_len() != graph.len() {
-            return Err(GraphStoreError::HoleInBase);
+        if keys
+            .iter()
+            .enumerate()
+            .any(|(node, key)| key.is_none() != graph.is_hole(node as u32))
+        {
+            return Err(GraphStoreError::KeyForHole);
         }
         Ok(Self { keys, graph })
     }
@@ -167,30 +175,29 @@ impl GraphBase {
         out.extend_from_slice(BASE_MAGIC);
         out.extend_from_slice(&(self.keys.len() as u64).to_le_bytes());
         for key in &self.keys {
-            put_key(&mut out, Some(key));
+            put_key(&mut out, key.as_ref());
         }
         out.extend_from_slice(&graph);
         out
     }
 
     /// Decode [`to_bytes`](Self::to_bytes). `None` on a bad magic, a
-    /// truncation, a hole among the keys, or a graph that does not decode or
-    /// does not match the keys.
+    /// truncation, or a graph that does not decode or does not match the
+    /// keys.
     pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut c = Cursor::new(bytes);
         if c.take(BASE_MAGIC.len())? != BASE_MAGIC {
             return None;
         }
-        let keys = take_keys(&mut c)?
-            .into_iter()
-            .collect::<Option<Vec<FineNodeKey>>>()?;
-        let graph = Hnsw::from_bytes(c.take(c.remaining())?)?;
+        let keys = take_keys(&mut c)?;
+        let holes = (0..keys.len() as u32).filter(|&node| keys[node as usize].is_none());
+        let graph = Hnsw::from_bytes(c.take(c.remaining())?)?.with_holes(holes)?;
         Self::new(keys, graph).ok()
     }
 
     /// The graph a reader holds once it has this base and no step.
     pub(crate) fn into_graph(self) -> KeyedGraph {
-        KeyedGraph::new(self.keys.into_iter().map(Some).collect(), self.graph)
+        KeyedGraph::new(self.keys, self.graph)
     }
 }
 
@@ -296,6 +303,14 @@ pub(crate) struct GraphHead {
 }
 
 impl GraphHead {
+    /// How many leading bytes [`is_head`](Self::is_head) needs.
+    pub(crate) const MAGIC_BYTES: usize = HEAD_MAGIC.len();
+
+    /// Whether an object starting with `prefix` is a head.
+    pub(crate) fn is_head(prefix: &[u8]) -> bool {
+        prefix.starts_with(HEAD_MAGIC)
+    }
+
     /// The head of a graph that is its base `base`, stored as `bytes` bytes
     /// under `hash`, with no step yet.
     pub(crate) fn of_base(
@@ -356,6 +371,7 @@ impl GraphHead {
 
     /// Put the current generation together from the decoded `base` and
     /// `steps`, which must be this head's, in its order.
+    #[cfg(test)]
     pub(crate) fn replay(
         &self,
         base: GraphBase,
@@ -577,11 +593,8 @@ mod tests {
     fn a_reader_with_only_the_stored_objects_matches_the_writer() {
         let vectors = unit_vectors(START_NODES + GENERATIONS * CHURN, 0x51A7);
         let mut writer = built(&vectors, START_NODES);
-        let base = GraphBase::new(
-            writer.keys.iter().flatten().copied().collect(),
-            Hnsw::clone(&writer.graph),
-        )
-        .expect("a fresh build has no holes");
+        let base = GraphBase::new(writer.keys.clone(), Hnsw::clone(&writer.graph))
+            .expect("a fresh build has no holes");
         let base_bytes = base.to_bytes();
         let mut head = GraphHead::of_base(
             GraphRole::Router,
@@ -626,11 +639,7 @@ mod tests {
     fn a_step_is_small_beside_its_base() {
         let vectors = unit_vectors(START_NODES + CHURN, 0xB16);
         let writer = built(&vectors, START_NODES);
-        let base = GraphBase::new(
-            writer.keys.iter().flatten().copied().collect(),
-            Hnsw::clone(&writer.graph),
-        )
-        .expect("base");
+        let base = GraphBase::new(writer.keys.clone(), Hnsw::clone(&writer.graph)).expect("base");
         let after = next_generation(&writer, &vectors, 0);
         let step = GraphStep::between(&writer, &after).expect("step");
         assert!(step.to_bytes().len() * 2 < base.to_bytes().len());
@@ -646,11 +655,7 @@ mod tests {
         let third = next_generation(&second, &vectors, 1);
         let to_second = GraphStep::between(&first, &second).expect("step");
         let to_third = GraphStep::between(&second, &third).expect("step");
-        let base = GraphBase::new(
-            first.keys.iter().flatten().copied().collect(),
-            Hnsw::clone(&first.graph),
-        )
-        .expect("base");
+        let base = GraphBase::new(first.keys.clone(), Hnsw::clone(&first.graph)).expect("base");
         let hash = ContentHash::of(b"x");
         let head = GraphHead::of_base(GraphRole::Placement, FieldId(1), DIM as u32, hash, 1, &base)
             .with_step(hash, 1, &to_second);
@@ -668,20 +673,24 @@ mod tests {
         assert!(head.replay(base, std::slice::from_ref(&to_second)).is_ok());
     }
 
-    /// A base is a fresh build: a graph with a hole, or with the wrong number
-    /// of keys, is not one.
+    /// A base keeps its holes, and its keys must match them.
     #[test]
-    fn a_base_holds_no_holes() {
+    fn a_base_keeps_its_holes() {
         let vectors = unit_vectors(START_NODES + CHURN, 0xBA5E);
         let fresh = built(&vectors, START_NODES);
         let holed = next_generation(&fresh, &vectors, 0);
-        let keys: Vec<FineNodeKey> = (0..holed.graph.len()).map(key).collect();
+        let base = GraphBase::new(holed.keys.clone(), Hnsw::clone(&holed.graph)).expect("base");
+        let decoded = GraphBase::from_bytes(&base.to_bytes()).expect("decode");
+        assert_eq!(decoded.into_graph().keys, holed.keys);
+
+        let all_keys: Vec<Option<FineNodeKey>> =
+            (0..holed.graph.len()).map(|i| Some(key(i))).collect();
         assert_eq!(
-            GraphBase::new(keys, Hnsw::clone(&holed.graph)).expect_err("holes"),
-            GraphStoreError::HoleInBase
+            GraphBase::new(all_keys, Hnsw::clone(&holed.graph)).expect_err("key for a hole"),
+            GraphStoreError::KeyForHole
         );
         assert_eq!(
-            GraphBase::new(vec![key(0)], Hnsw::clone(&fresh.graph)).expect_err("one key"),
+            GraphBase::new(vec![Some(key(0))], Hnsw::clone(&fresh.graph)).expect_err("one key"),
             GraphStoreError::KeyCount
         );
     }
@@ -693,11 +702,7 @@ mod tests {
         const BASE_BYTES: u64 = 1_000;
         let vectors = unit_vectors(START_NODES + 4 * CHURN, 0xF01D);
         let first = built(&vectors, START_NODES);
-        let base = GraphBase::new(
-            first.keys.iter().flatten().copied().collect(),
-            Hnsw::clone(&first.graph),
-        )
-        .expect("base");
+        let base = GraphBase::new(first.keys.clone(), Hnsw::clone(&first.graph)).expect("base");
         let hash = ContentHash::of(b"x");
         let head = GraphHead::of_base(
             GraphRole::Router,
@@ -735,11 +740,7 @@ mod tests {
         let vectors = unit_vectors(START_NODES + CHURN, 0xDEAD);
         let first = built(&vectors, START_NODES);
         let second = next_generation(&first, &vectors, 0);
-        let base = GraphBase::new(
-            first.keys.iter().flatten().copied().collect(),
-            Hnsw::clone(&first.graph),
-        )
-        .expect("base");
+        let base = GraphBase::new(first.keys.clone(), Hnsw::clone(&first.graph)).expect("base");
         let step = GraphStep::between(&first, &second).expect("step");
         let hash = ContentHash::of(b"x");
         let head = GraphHead::of_base(GraphRole::Router, FieldId(1), DIM as u32, hash, 1, &base)

@@ -219,6 +219,7 @@ fn a_scan_the_index_narrows_in_some_superfiles_reads_kept_decoded_columns() {
                 ],
             )
             .expect("batch"),
+            None,
         )
         .expect("append");
     }

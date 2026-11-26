@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.11.36"
+version = "0.12.0"
 dependencies = [
  "apache-avro",
  "arc-swap",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "infino-node"
-version = "0.11.32"
+version = "0.12.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2866,6 +2866,12 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "potential_utf"

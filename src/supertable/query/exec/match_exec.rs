@@ -684,7 +684,7 @@ mod tests {
 
     use arrow::util::display::array_value_to_string;
     use arrow_array::{
-        Array, Date32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+        Array, Date32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
         TimestampNanosecondArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -716,7 +716,7 @@ mod tests {
             query::{
                 exec::common::{output_schema_with_score, test_support::sql_row_count},
                 fts::ROW_FILTER_MIN_HITS,
-                match_order::{MatchOrder, ORDERED_WINDOW},
+                match_order::{MAX_OVERLAPPING_FETCH, MatchOrder, ORDERED_WINDOW},
             },
         },
     };
@@ -1102,7 +1102,7 @@ mod tests {
             .create_table(METERED_TABLE, Arc::clone(schema), spec)
             .expect("create");
         for batch in commits {
-            table.append(batch).expect("append");
+            table.append(batch, None).expect("append");
         }
         conn
     }
@@ -1519,7 +1519,7 @@ mod tests {
             IndexSpec::new().fts("title").fts("tag"),
         )
         .expect("create")
-        .append(&batch)
+        .append(&batch, None)
         .expect("append");
         conn.open_table(METERED_TABLE)
             .expect("open")
@@ -1678,28 +1678,41 @@ mod tests {
         )
         .expect("batch");
         let table = conn.open_table(METERED_TABLE).expect("open");
-        table.append(&later).expect("append with the column");
+        table.append(&later, None).expect("append with the column");
         for sql in match_path_sqls("rust") {
             let filtered = format!("{sql} WHERE body = 'v' OR tag = 'y'");
             assert_eq!(metered_rows(&conn, &filtered).0, 2, "{filtered}");
         }
     }
     /// A `WHERE` on a range-indexed column retyped after its superfile was
-    /// written still finds the row it keeps, on every match path.
+    /// written still finds the row it keeps, on every match path. Only row
+    /// 0 holds the kept value. A float narrowed to `Float32` rounds
+    /// `1.00000001` to `1.0`, a key the file's range index never wrote.
     #[test]
     fn sql_where_on_a_retyped_range_column_keeps_its_rows() {
-        let cases: [(Arc<dyn Array>, DataType, &str, &str); 2] = [
+        /// `first` in row 0, `rest` in each of the other rows.
+        fn pick<T: Copy>(first: T, rest: T) -> impl Iterator<Item = T> {
+            (0..NARROWED_REPEAT).map(move |i| if i == 0 { first } else { rest })
+        }
+        let n = NARROWED_REPEAT;
+        let cases: [(Arc<dyn Array>, DataType, &str, &str); 3] = [
             (
-                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(Int64Array::from_iter_values(pick(1_i64, 2))),
                 DataType::Float64,
                 "1.0",
                 "7.0",
             ),
             (
-                Arc::new(Date32Array::from(vec![1, 2])),
+                Arc::new(Date32Array::from_iter_values(pick(1, 2))),
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 "TIMESTAMP '1970-01-02 00:00:00'",
                 "TIMESTAMP '1970-01-08 00:00:00'",
+            ),
+            (
+                Arc::new(Float64Array::from_iter_values(pick(1.000_000_01_f64, 2.0))),
+                DataType::Float32,
+                "CAST(1 AS REAL)",
+                "CAST(7 AS REAL)",
             ),
         ];
         for (values, new_type, kept, absent) in cases {
@@ -1707,7 +1720,7 @@ mod tests {
                 Field::new("title", DataType::LargeUtf8, false),
                 Field::new("bucket", values.data_type().clone(), false),
             ]));
-            let batch = titled_batch(&schema, &["rust", "rust one"], values);
+            let batch = titled_batch(&schema, &vec!["rust"; n], values);
             let conn = metered_table(
                 &schema,
                 IndexSpec::new().fts("title").range("bucket"),
@@ -2379,7 +2392,10 @@ mod tests {
         for day in DAYS_AFTER_RETYPE {
             let at = TimestampNanosecondArray::from(vec![day * NANOS_PER_DAY; 2]);
             table
-                .append(&titled_batch(&retyped, &["Zyzzyva", "page"], Arc::new(at)))
+                .append(
+                    &titled_batch(&retyped, &["Zyzzyva", "page"], Arc::new(at)),
+                    None,
+                )
                 .expect("append");
         }
         let got = walked(&conn, "zyzzyva", "", "day DESC", "LIMIT 1", "day");
@@ -2580,6 +2596,223 @@ mod tests {
         assert!(
             walks_by_hour(&hourly_conn()),
             "superfiles of one hour each walk"
+        );
+    }
+
+    /// Rows per superfile of the overlapping-walk tests.
+    const OVERLAPPING_ROWS: i64 = 200;
+    /// Hours the overlapping-walk tests spread their rows over, the same in
+    /// every superfile.
+    const OVERLAPPING_HOURS: i64 = 500;
+    /// The `LIMIT` of the overlapping-walk tests.
+    const OVERLAPPING_FETCH: usize = 3;
+
+    /// The hour of `row` in superfile `file`: distinct within a superfile,
+    /// overlapping across them.
+    fn spread_hour(file: i64, row: i64) -> i64 {
+        (row * 7 + file * 13) % OVERLAPPING_HOURS
+    }
+
+    /// `conn` with [`OVERLAPPING_FILES`] superfiles of [`OVERLAPPING_ROWS`]
+    /// rows matching "Zyzzyva", row `row` of superfile `file` at
+    /// `hour(file, row)`.
+    fn overlapping_conn(conn: Connection, hour: impl Fn(i64, i64) -> Option<i64>) -> Connection {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("hour", DataType::Int64, true),
+        ]));
+        let commits: Vec<RecordBatch> = (0..OVERLAPPING_FILES)
+            .map(|file| {
+                let rows = 0..OVERLAPPING_ROWS;
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(LargeStringArray::from_iter_values(
+                            rows.clone().map(|_| "Zyzzyva"),
+                        )),
+                        Arc::new(Int64Array::from_iter(rows.map(|row| hour(file, row)))),
+                    ],
+                )
+                .expect("batch")
+            })
+            .collect();
+        metered_table_in(conn, &schema, IndexSpec::new().fts("title"), &commits)
+    }
+
+    /// Every [`spread_hour`], best first.
+    fn spread_hours_desc() -> Vec<i64> {
+        let mut every: Vec<i64> = (0..OVERLAPPING_FILES)
+            .flat_map(|file| (0..OVERLAPPING_ROWS).map(move |row| spread_hour(file, row)))
+            .collect();
+        every.sort_unstable_by(|a, b| b.cmp(a));
+        every
+    }
+
+    /// The order `ORDER BY hour DESC LIMIT fetch` builds over the metered
+    /// table, if any.
+    fn hour_order(conn: &Connection, fetch: usize) -> Option<MatchOrder> {
+        let reader = conn
+            .open_table(METERED_TABLE)
+            .expect("table")
+            .local_handle()
+            .reader()
+            .expect("reader");
+        let output_schema = output_schema_with_score(&reader.manifest().scalar_schema());
+        MatchOrder::new(&reader, "hour", true, fetch, &[], &output_schema).expect("order")
+    }
+
+    /// Rows deleted before the match are not in its hits, so a deleted row
+    /// holding the best key never raises the floor: the rows after it still
+    /// place.
+    #[test]
+    fn an_overlapping_walk_leaves_out_a_deleted_top_row() {
+        // A delete needs storage.
+        let dir = TempDir::new().expect("tempdir");
+        let conn = overlapping_conn(
+            connect(dir.path().to_str().expect("utf8 path")).expect("connect"),
+            |file, row| Some(spread_hour(file, row)),
+        );
+        let every = spread_hours_desc();
+        let top = every[0];
+        conn.open_table(METERED_TABLE)
+            .expect("table")
+            .delete(col("hour").eq(lit(top)))
+            .expect("delete");
+        let live: Vec<i64> = every.into_iter().filter(|&h| h != top).collect();
+        assert_eq!(
+            walked(&conn, "zyzzyva", "", "hour DESC", "LIMIT 3", "hour"),
+            hour_text(&live[..OVERLAPPING_FETCH])
+        );
+    }
+
+    /// Rows with no key are never dropped: under `DESC` nulls sort first, so
+    /// they are the answer; under `ASC` they sort last and the best keys are.
+    #[test]
+    fn an_overlapping_walk_keeps_rows_with_no_key() {
+        // Every tenth row of each superfile has no hour.
+        let conn = overlapping_conn(connect("memory://").expect("connect"), |file, row| {
+            (row % 10 != 0).then(|| spread_hour(file, row))
+        });
+        assert_eq!(
+            walked(&conn, "zyzzyva", "", "hour DESC", "LIMIT 3", "hour"),
+            vec![String::new(); OVERLAPPING_FETCH],
+            "nulls first under DESC"
+        );
+        let mut keyed: Vec<i64> = (0..OVERLAPPING_FILES)
+            .flat_map(|file| {
+                (0..OVERLAPPING_ROWS)
+                    .filter(|row| row % 10 != 0)
+                    .map(move |row| spread_hour(file, row))
+            })
+            .collect();
+        keyed.sort_unstable();
+        assert_eq!(
+            walked(&conn, "zyzzyva", "", "hour ASC", "LIMIT 3", "hour"),
+            hour_text(&keyed[..OVERLAPPING_FETCH])
+        );
+    }
+
+    /// With few distinct keys the best one is held by many rows in every
+    /// superfile. Each superfile hands up at most `LIMIT` of them, and a
+    /// `LIMIT` ending inside a group of ties, or past it, still gets the
+    /// full sort's keys.
+    #[test]
+    fn an_overlapping_walk_keeps_enough_ties_at_the_floor() {
+        const KEYS: i64 = 5;
+        let conn = overlapping_conn(connect("memory://").expect("connect"), |_, row| {
+            Some(row % KEYS)
+        });
+        let mut every: Vec<i64> = (0..OVERLAPPING_FILES)
+            .flat_map(|_| (0..OVERLAPPING_ROWS).map(|row| row % KEYS))
+            .collect();
+        every.sort_unstable_by(|a, b| b.cmp(a));
+        let top_ties = every.iter().filter(|&&h| h == KEYS - 1).count();
+        for limit in [OVERLAPPING_FETCH, top_ties + 7] {
+            assert_eq!(
+                walked(
+                    &conn,
+                    "zyzzyva",
+                    "",
+                    "hour DESC",
+                    &format!("LIMIT {limit}"),
+                    "hour"
+                ),
+                hour_text(&every[..limit]),
+                "LIMIT {limit}"
+            );
+        }
+    }
+
+    /// A walk over overlapping ranges hands up at most `LIMIT` rows per
+    /// superfile, whether its keys are distinct or all the same.
+    #[test]
+    fn an_overlapping_walk_hands_up_at_most_fetch_rows_a_superfile() {
+        let distinct = |file, row| Some(spread_hour(file, row));
+        let tied = |_, _| Some(1);
+        for (name, conn) in [
+            (
+                "distinct",
+                overlapping_conn(connect("memory://").expect("connect"), distinct),
+            ),
+            (
+                "tied",
+                overlapping_conn(connect("memory://").expect("connect"), tied),
+            ),
+        ] {
+            let order = hour_order(&conn, OVERLAPPING_FETCH).expect("an order");
+            let reader = conn
+                .open_table(METERED_TABLE)
+                .expect("table")
+                .local_handle()
+                .reader()
+                .expect("reader");
+            let hits = Runtime::new()
+                .expect("runtime")
+                .block_on(reader.token_match_hits_async(
+                    "title",
+                    "zyzzyva",
+                    BoolMode::Or,
+                    false,
+                    &[],
+                    Some(&Arc::new(order)),
+                ))
+                .expect("hits");
+            assert!(
+                hits.len() >= OVERLAPPING_FETCH,
+                "{name}: {} rows",
+                hits.len()
+            );
+            assert!(
+                hits.len() <= OVERLAPPING_FETCH * OVERLAPPING_FILES as usize,
+                "{name}: {} of {} rows handed up",
+                hits.len(),
+                OVERLAPPING_FILES * OVERLAPPING_ROWS
+            );
+        }
+    }
+
+    /// Above [`MAX_OVERLAPPING_FETCH`] a walk that cannot stop early is not
+    /// built, and the match runs as it would without one; one that can stop
+    /// early is still built.
+    #[test]
+    fn an_overlapping_walk_past_the_cap_is_not_built() {
+        let conn = overlapping_conn(connect("memory://").expect("connect"), |file, row| {
+            Some(spread_hour(file, row))
+        });
+        assert!(hour_order(&conn, MAX_OVERLAPPING_FETCH).is_some());
+        assert!(hour_order(&conn, MAX_OVERLAPPING_FETCH + 1).is_none());
+        assert!(hour_order(&hourly_conn(), MAX_OVERLAPPING_FETCH + 1).is_some());
+        let limit = MAX_OVERLAPPING_FETCH + 1;
+        assert_eq!(
+            walked(
+                &conn,
+                "zyzzyva",
+                "",
+                "hour DESC",
+                &format!("LIMIT {limit}"),
+                "hour"
+            ),
+            hour_text(&spread_hours_desc()[..limit.min(spread_hours_desc().len())])
         );
     }
 

@@ -20,8 +20,8 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use datafusion::prelude::{col, lit};
 use infino::{
     Analyzer, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions, FieldPatch, FtsField,
-    IndexSpec, InfinoError, Metric, OptimizeError, OptimizeOptions, SchemaPatch, Stemmer,
-    Stopwords, VectorFilter, VectorSearchOptions,
+    IdempotencyToken, IndexSpec, InfinoError, Metric, OptimizeError, OptimizeOptions, SchemaPatch,
+    Stemmer, Stopwords, VectorFilter, VectorSearchOptions,
 };
 use serde_json::json;
 use wiremock::{
@@ -210,7 +210,9 @@ async fn append_streams_arrow_body_with_table_query() {
 
     with_connection(server.uri(), |db| {
         let table = db.open_table("posts").expect("open_table");
-        table.append(&id_batch(vec![1, 2, 3])).expect("append");
+        table
+            .append(&id_batch(vec![1, 2, 3]), None)
+            .expect("append");
     })
     .await;
 }
@@ -728,6 +730,48 @@ async fn delete_unparses_predicate_and_returns_stats() {
 }
 
 #[tokio::test]
+async fn an_idempotency_token_is_refused_before_any_request() {
+    // The hosted append records no token yet. A retry that looked protected
+    // would apply the rows twice, so a token is refused, and nothing is sent.
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+    let errors = with_connection(server.uri(), |db| {
+        let table = db.open_table("posts").expect("open");
+        let keyed = table
+            .append(&id_batch(vec![1]), Some(IdempotencyToken::Key("order-1")))
+            .expect_err("a keyed append is refused");
+        let rows = table
+            .append_rows(
+                &[json!({ "id": 1 })],
+                Some(IdempotencyToken::Sequence {
+                    scope: "loader",
+                    seq: 1,
+                }),
+            )
+            .expect_err("a sequenced append is refused");
+        let status = table
+            .idempotency_token_status(IdempotencyToken::Key("order-1"), 0)
+            .expect_err("status is refused");
+        [keyed, rows, status]
+    })
+    .await;
+    for err in errors {
+        assert!(matches!(err, InfinoError::Unsupported(_)), "{err:?}");
+    }
+    let appends = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled")
+        .into_iter()
+        .filter(|r| r.url.path() != "/v1/schema/mydb")
+        .count();
+    assert_eq!(
+        appends, 0,
+        "nothing but the schema read reached the service"
+    );
+}
+
+#[tokio::test]
 async fn optimize_is_client_unsupported_without_a_request() {
     let server = MockServer::start().await;
     mount_schema(&server).await;
@@ -1076,7 +1120,7 @@ async fn remote_client_matches_the_published_api_spec() {
         let _ = db.schema("posts");
         let _ = db.apply_schema("posts", &body_patch(), Some(1));
         if let Ok(table) = db.open_table("posts") {
-            let _ = table.append(&id_batch(vec![1]));
+            let _ = table.append(&id_batch(vec![1]), None);
             let _ = table.update(col("id").gt(lit(0_i32)), &id_batch(vec![1]));
             let _ = table.delete(col("id").lt(lit(0_i32)));
             let _ = table.bm25_search("id", "x", 1, Bm25SearchOptions::new(), Some(&["_id"]));

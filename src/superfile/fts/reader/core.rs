@@ -50,7 +50,7 @@ use super::{
 };
 use crate::{
     memory::{ConnectionMemoryBudget, Reclaim, Reservation},
-    runtime_bridge::run_on_pool_unless_blocking,
+    runtime_bridge::{run_on_pool_unless_blocking, run_on_pool_while_awaited},
     superfile::{
         ReadError,
         error::FtsError,
@@ -91,6 +91,10 @@ pub(crate) const QUERY_DICT_SHARE_PERCENT: usize = READ_AHEAD_SHARE_PERCENT / 2;
 const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
 /// Maximum total gap bytes tolerated in one coalesced postings request.
 const TERM_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
+
+/// The most doc-id map pages a reader keeps (1 MiB): room for the top hits of a few searches,
+/// small next to the whole map, which only a dense read keeps.
+pub(super) const DOC_MAP_KEPT_PAGES_MAX: usize = if cfg!(test) { 4 } else { 16 };
 
 /// What a query scores a superfile at in place of what its columns
 /// declare. The default changes nothing.
@@ -715,16 +719,19 @@ pub struct FtsReader {
     /// that can't keep it reads only the pages it needs. Shared by every view cloned from this
     /// reader.
     pub(super) doc_map: Arc<OnceCell<DocMap>>,
+    /// Doc-id map pages a ranked search's top hits fell in, kept so a later search whose pages are
+    /// all kept reads nothing. Empty once the whole map is kept. Shared by every view cloned from this reader.
+    pub(super) kept_pages: Arc<KeptPages>,
     /// Where the map's body lies, with its CRC right after it; `None` on a
     /// blob in row order.
     pub(super) doc_map_region: Option<Range<usize>>,
     /// Whether a read after open checks its CRC, as the open's reads did.
     pub(super) verify_crc: bool,
-    /// Told when a read loads the doc-id map, a column's norms or a block
-    /// table. Shared with `block_tables` and with every view cloned from
-    /// this reader.
-    loads: LoadWatch,
-    /// The heap budget a kept doc-id map is charged to: the process one, or a test's own.
+    /// Told when a read loads the doc-id map or its pages, a column's norms or a block table.
+    /// Shared with `block_tables` and with every view cloned from this reader.
+    pub(super) loads: LoadWatch,
+    /// The heap budget a kept doc-id map or its kept pages are reserved against: the process one,
+    /// or a test's own.
     pub(super) heap_budget: &'static HeapBudget,
     /// Page reads of the map from the source, shared with this reader's views.
     #[cfg(test)]
@@ -869,12 +876,18 @@ impl FtsReader {
         self.source.held_buffers(out);
     }
 
-    /// Heap bytes reads have loaded into this reader since it opened: the
-    /// doc-id map, each column's norms and long terms' block tables.
+    /// Push the lookup tables this reader's source keeps (see
+    /// [`LazyByteSource::held_tables`]).
+    pub(crate) fn held_tables(&self, out: &mut Vec<(usize, usize)>) {
+        self.source.held_tables(out);
+    }
+
+    /// Heap bytes reads have loaded into this reader since it opened: the doc-id map or its kept
+    /// pages, each column's norms and long terms' block tables.
     pub(crate) fn held_bytes(&self) -> usize {
         let doc_map = match self.doc_map.get() {
             Some(DocMap::Permuted(map)) => map.len(),
-            _ => 0,
+            _ => self.kept_pages.held_bytes(),
         };
         doc_map
             + self.block_tables.held_bytes()
@@ -1442,6 +1455,7 @@ impl FtsReader {
             columns,
             column_id_by_name,
             doc_map,
+            kept_pages: Arc::default(),
             doc_map_region,
             verify_crc: opts.verify_crc,
             loads,
@@ -1472,8 +1486,15 @@ impl FtsReader {
                 self.read_whole_doc_map(reservation).await
             })
             .await?;
-        self.loads.loaded();
+        self.map_kept();
         Ok(map)
+    }
+
+    /// The whole map is kept now: drop its kept pages, and have whoever weighs this reader by what
+    /// it holds weigh it again.
+    fn map_kept(&self) {
+        self.kept_pages.close();
+        self.loads.loaded();
     }
 
     /// The whole doc-id map, read and kept only if the process has memory to spare and kept maps
@@ -1497,8 +1518,7 @@ impl FtsReader {
             .await;
         match kept {
             Ok(map) => {
-                // Whoever weighs this reader by what it holds weighs it again with the map.
-                self.loads.loaded();
+                self.map_kept();
                 Ok(Some(map))
             }
             Err(None) => Ok(None),
@@ -1566,6 +1586,7 @@ impl FtsReader {
         // A concurrent first read may have set it meanwhile; both are the
         // same map.
         let _ = self.doc_map.set(map.clone());
+        self.map_kept();
         Ok(map)
     }
 
@@ -1624,6 +1645,16 @@ impl FtsReader {
                 region.len() as u64
             }
             _ => 0,
+        }
+    }
+
+    /// Bytes of doc-id map pages this reader keeps, reserved against `budget`. For a file in the
+    /// disk cache, [`HeapBudget::release_over_budget`] frees them by letting go of the file, like
+    /// other cached bytes; any other reader's pages go when it keeps the whole map or drops.
+    pub(crate) fn kept_page_bytes(&self, budget: &HeapBudget) -> u64 {
+        match ptr::eq(self.heap_budget, budget) {
+            true => self.kept_pages.held_bytes() as u64,
+            false => 0,
         }
     }
 
@@ -2241,6 +2272,7 @@ impl FtsReader {
         idf: QueryIdf<'_>,
         prefetched: Option<&FetchedTermMemo>,
         purpose: CursorUse,
+        pool: Option<&ThreadPool>,
     ) -> Result<(Vec<Option<AnyCursor>>, u64), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         // A scored walk needs the norms before any cursor is built; an
@@ -2350,13 +2382,14 @@ impl FtsReader {
             for (member, group) in inline_groups {
                 positions[member] = group;
             }
-            out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
-                cursors,
-                positions,
-                positional,
-                member_at,
-                phrase.offsets().to_vec(),
-            )?)));
+            // Building the cursor seeks its first verified match, which can
+            // decode many position runs, so it runs on the pool.
+            let offsets = phrase.offsets().to_vec();
+            let cursor = on_pool_or_here(pool, "phrase cursor", move || {
+                PhraseCursor::new(cursors, positions, positional, member_at, offsets)
+            })
+            .await??;
+            out.push(Some(AnyCursor::Phrase(cursor)));
         }
         Ok((out, dict_ranges))
     }
@@ -2925,13 +2958,85 @@ fn default_heap_budget() -> &'static HeapBudget {
     })
 }
 
-/// A lazy reader's map, holding `reservation` until the last copy drops. A copy, because a lazy
-/// source may hand back a window onto a bigger fetch, and keeping the window keeps all of it.
+/// A lazy reader's map, holding `reservation` until the last copy drops.
 fn kept_copy(body: &Bytes, reservation: HeapReservation) -> DocMap {
-    DocMap::permuted(Bytes::from_owner(KeptMap {
+    DocMap::permuted(kept_bytes(body, reservation))
+}
+
+/// A copy of `body` holding `reservation` until the last copy drops. It copies because a lazy
+/// source may hand back a window onto a bigger fetch, and keeping the window keeps all of it.
+fn kept_bytes(body: &[u8], reservation: HeapReservation) -> Bytes {
+    Bytes::from_owner(KeptMap {
         body: body.to_vec(),
         _reservation: reservation,
-    }))
+    })
+}
+
+/// Doc-id map pages a reader keeps while it does not keep the whole map, each a copy holding its
+/// own heap reservation. Once the whole map is kept, the pages drop and none is kept again.
+#[derive(Debug, Default)]
+pub(super) struct KeptPages(Mutex<PageCache>);
+
+/// [`KeptPages`]' pages by page number, and whether the whole map is kept, after which none is.
+#[derive(Debug, Default)]
+struct PageCache {
+    pages: HashMap<usize, Bytes>,
+    closed: bool,
+}
+
+impl KeptPages {
+    /// The kept bytes of `pages`, in order, or `None` if any of them is not kept.
+    pub(super) fn all(&self, pages: &[usize]) -> Option<Vec<Bytes>> {
+        let kept = self.lock();
+        pages
+            .iter()
+            .map(|page| kept.pages.get(page).cloned())
+            .collect()
+    }
+
+    /// Keeps a copy of each of `pages` not kept yet, reserving its bytes against `budget`. Stops
+    /// when the budget has no room, [`DOC_MAP_KEPT_PAGES_MAX`] pages are kept, or the whole map
+    /// is. Returns whether it kept any.
+    pub(super) fn keep_all(&self, pages: &[(usize, Bytes)], budget: &'static HeapBudget) -> bool {
+        let mut kept = self.lock();
+        let mut kept_any = false;
+        for (page, bytes) in pages {
+            if kept.closed || kept.pages.len() >= DOC_MAP_KEPT_PAGES_MAX {
+                break;
+            }
+            if kept.pages.contains_key(page) {
+                continue;
+            }
+            let Some(reservation) = budget.try_reserve_page(bytes.len() as u64) else {
+                break;
+            };
+            kept.pages.insert(*page, kept_bytes(bytes, reservation));
+            kept_any = true;
+        }
+        kept_any
+    }
+
+    /// Bytes of the pages kept.
+    fn held_bytes(&self) -> usize {
+        self.lock().pages.values().map(Bytes::len).sum()
+    }
+
+    /// The whole map is kept: drops every page, giving back its reservation, and keeps none after.
+    fn close(&self) {
+        let mut kept = self.lock();
+        kept.pages.clear();
+        kept.closed = true;
+    }
+
+    /// Pages kept, for the tests.
+    #[cfg(test)]
+    pub(super) fn page_count(&self) -> usize {
+        self.lock().pages.len()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PageCache> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// A kept doc-id map's bytes and their heap reservation, given back when it drops.
@@ -3639,6 +3744,25 @@ fn check_version(version: u32) -> Result<(), FtsError> {
         v => Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
             "fts section version {v}"
         )))),
+    }
+}
+
+/// Runs `f` on `pool` when given, else here. If the caller stops waiting
+/// before `f` starts, `f` is skipped.
+pub(super) async fn on_pool_or_here<R, F>(
+    pool: Option<&ThreadPool>,
+    what: &'static str,
+    f: F,
+) -> Result<R, FtsError>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    match pool {
+        Some(pool) => run_on_pool_while_awaited(pool, what, f)
+            .await
+            .map_err(|_| FtsError::TaskDropped(what)),
+        None => Ok(f()),
     }
 }
 

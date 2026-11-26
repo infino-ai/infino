@@ -648,7 +648,7 @@ mod tests {
         .expect("things");
         db.create_table(THINGS, schema, IndexSpec::new())
             .expect("create things")
-            .append(&batch)
+            .append(&batch, None)
             .expect("append things");
         let rows = db
             .query_sql("SELECT _id FROM things ORDER BY _id")
@@ -701,7 +701,7 @@ mod tests {
         let table = graph
             .create_table(EDGES, schema, IndexSpec::new())
             .expect("create edges");
-        table.append(&batch).expect("append edges");
+        table.append(&batch, None).expect("append edges");
         table
             .optimize(
                 &OptimizeOptions::compact(CompactionSettings::default()).with_adjacency(

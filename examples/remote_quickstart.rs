@@ -55,7 +55,7 @@ mod remote_example {
                 ])),
             ],
         )?;
-        posts.append(&batch)?;
+        posts.append(&batch, None)?;
         println!("appended {} rows", batch.num_rows());
 
         let hits = posts.bm25_search(

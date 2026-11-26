@@ -107,7 +107,7 @@ fn pages_over_kept_columns_return_each_row_once() {
     for c in 0..COMMITS {
         let seq = Int64Array::from((c * ROWS..(c + 1) * ROWS).collect::<Vec<_>>());
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(seq)]).expect("batch");
-        t.append(&batch).expect("append");
+        t.append(&batch, None).expect("append");
     }
 
     for (select, kept) in [

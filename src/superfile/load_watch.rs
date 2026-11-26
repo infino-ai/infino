@@ -16,6 +16,8 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use crate::superfile::lazy_source::ARC_COUNTS_BYTES;
+
 /// What a [`LoadWatch`] calls on each load.
 pub(crate) type LoadListener = Arc<dyn Fn() + Send + Sync>;
 
@@ -29,6 +31,10 @@ impl LoadWatch {
     pub(crate) fn watch(&self, listener: &LoadListener) {
         let _ = self.0.set(Arc::clone(listener));
     }
+
+    /// Heap bytes of the listener slot: one allocation, shared by every clone. A vector column
+    /// counts its own, one per cell of a multi-cell blob.
+    pub(crate) const SLOT_BYTES: usize = ARC_COUNTS_BYTES + size_of::<OnceLock<LoadListener>>();
 
     /// Report a load. Called with none of the reader's own locks held,
     /// since the listener weighs the reader, which takes them.

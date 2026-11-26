@@ -185,7 +185,7 @@ impl DiskCacheStore {
             .map(|e| *e.key())
             .collect();
         for uri in idle {
-            self.release_lazy_entry(&uri, now_us);
+            self.release_lazy_entry(&uri);
         }
     }
 
@@ -221,22 +221,17 @@ impl DiskCacheStore {
             return Vec::new();
         };
         unheld.sort_unstable();
-        let now_us = self.now_us();
         unheld
             .into_iter()
             .take(over)
-            .filter_map(|(_, uri)| self.release_lazy_entry(&uri, now_us))
+            .filter_map(|(_, uri)| self.release_lazy_entry(&uri))
             .collect()
     }
 
     /// Remove `uri`'s entry if it is still a lazy one only the cache holds,
     /// releasing its budget and keeping its block file. Returns its reader, for
     /// the caller to free where it chooses.
-    pub(super) fn release_lazy_entry(
-        &self,
-        uri: &SuperfileUri,
-        now_us: u64,
-    ) -> Option<Arc<SuperfileReader>> {
+    pub(super) fn release_lazy_entry(&self, uri: &SuperfileUri) -> Option<Arc<SuperfileReader>> {
         // Re-check under the shard guard: a query may have taken a
         // reference since the snapshot, in which case dropping the
         // entry would free nothing and cost that query a re-open.
@@ -246,7 +241,9 @@ impl DiskCacheStore {
         {
             self.release_entry_accounting(&removed);
             if let Some(source) = removed.block_source() {
-                self.retain_block_file(uri, source, now_us);
+                let opened = self.store_time(removed.last_access_us.load(Ordering::Acquire));
+                let last_used = source.last_read().map_or(opened, |read| read.max(opened));
+                self.retain_block_file(uri, source, Some(last_used));
             }
             return Some(Arc::clone(&removed.reader));
         }
@@ -1103,6 +1100,8 @@ mod tests {
     };
 
     use bytes::Bytes;
+    use tempfile::TempDir;
+    use tokio::time::sleep;
     use tracing::{
         Event, Subscriber,
         callsite::rebuild_interest_cache,
@@ -1116,6 +1115,7 @@ mod tests {
         supertable::{
             manifest::{SuperfileUri, disk_cache::MetadataDiskCache, part::ContentHash},
             reader_cache::{
+                DiskCacheConfig,
                 block_source::CACHE_BLOCK_BYTES,
                 config::ColdFetchMode,
                 disk::{budget::*, created_at_us, file_mtime_us, test_support::*, unix_us},
@@ -1280,6 +1280,11 @@ mod tests {
             );
         }
     }
+    /// How long before this run a block file the previous run left was last written.
+    const LAST_RUN_AGE: Duration = Duration::from_secs(60 * 60);
+    /// A wait between steps, so their order shows in file mtimes, not only on the store clock. The
+    /// tests need a filesystem that keeps mtimes finer than this (ext4, xfs and APFS keep ns).
+    const STEP: Duration = Duration::from_millis(20);
 
     #[tokio::test]
     async fn downloads_ahead_of_reads_get_half_the_unwritten_runs_cap() {
@@ -1429,16 +1434,180 @@ mod tests {
         store.block_writes_settled().await;
     }
 
+    /// Three `.blocks` files, least recently used first: one left by the previous run, and two
+    /// this run wrote in one order, used in the other and released in write order.
+    async fn three_block_files_by_last_use() -> (TempDir, Arc<DiskCacheStore>, [SuperfileUri; 3]) {
+        let (dir, before_restart) = test_store_with(|_| {});
+        let last_run = SuperfileUri::new_v4();
+        seed_valid_block_file(&before_restart, &last_run, CACHE_BLOCK_BYTES, &[0]);
+        fs::File::options()
+            .write(true)
+            .open(before_restart.blocks_path(&last_run))
+            .expect("open blocks")
+            .set_modified(SystemTime::now() - LAST_RUN_AGE)
+            .expect("set mtime");
+        let store = reopen_store(&before_restart, lazy_streaming);
+
+        let written_first = SuperfileUri::new_v4();
+        let written_last = SuperfileUri::new_v4();
+        for uri in [written_first, written_last] {
+            put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+            open_and_fill_a_block(&store, &uri).await;
+            sleep(STEP).await;
+        }
+        // Read again from its filled block: used last, with nothing written.
+        open_and_fill_a_block(&store, &written_first).await;
+        sleep(STEP).await;
+        for uri in [written_first, written_last] {
+            drop(store.release_lazy_entry(&uri));
+            sleep(STEP).await;
+        }
+        store.assert_budget_consistent();
+        (dir, store, [last_run, written_last, written_first])
+    }
+
+    fn lazy_streaming(cfg: &mut DiskCacheConfig) {
+        cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        cfg.promotion_defer_timeout = Duration::MAX;
+    }
+
+    /// Evicts one block file at a time, checking each goes in the order of `by_last_use`.
+    fn assert_evicted_in_order(store: &DiskCacheStore, by_last_use: &[SuperfileUri]) {
+        for (at, uri) in by_last_use.iter().enumerate() {
+            assert!(store.evict_block_files(1, None) > 0, "one file evicted");
+            assert!(
+                !store.blocks_path(uri).exists(),
+                "the least recently used goes first"
+            );
+            assert!(
+                by_last_use[at + 1..]
+                    .iter()
+                    .all(|uri| store.blocks_path(uri).exists()),
+                "the rest stay"
+            );
+            store.assert_budget_consistent();
+        }
+    }
+
+    /// Block files go least recently used first, the previous run's beside this run's, and a
+    /// released file ranks by its last use, not its last write or its release.
+    #[tokio::test]
+    async fn block_files_are_evicted_in_order_of_last_use_across_a_restart() {
+        let (_dir, store, by_last_use) = three_block_files_by_last_use().await;
+        assert_evicted_in_order(&store, &by_last_use);
+    }
+
+    /// A release puts the file's last use in its mtime, so after a restart the order is the same.
+    #[tokio::test]
+    async fn a_restart_keeps_the_last_use_a_release_recorded() {
+        let (_dir, store, by_last_use) = three_block_files_by_last_use().await;
+        let restarted = reopen_store(&store, lazy_streaming);
+        assert_evicted_in_order(&restarted, &by_last_use);
+    }
+
+    /// A released file whose blocks were written after its last open and read (a download ahead of
+    /// the reader) ranks by that write.
+    #[tokio::test]
+    async fn a_released_file_written_after_its_last_open_ranks_by_the_write() {
+        let (_dir, store) = test_store_with(lazy_streaming);
+        let (scanned, opened_between) = (SuperfileUri::new_v4(), SuperfileUri::new_v4());
+        put_superfile(&store, &scanned, multi_block_superfile_bytes()).await;
+        put_superfile(&store, &opened_between, tiny_superfile_bytes()).await;
+
+        let scan = open_lazily(&store, &scanned).await;
+        sleep(STEP).await;
+        open_and_fill_a_block(&store, &opened_between).await;
+        sleep(STEP).await;
+        // A download ahead fills a block nothing has touched, after the other file's open; it is not
+        // a read, so only the write can rank the file.
+        scan.range_ahead(0, 1).await.expect("block download");
+        store.block_writes_settled().await;
+        drop(scan);
+        for uri in [scanned, opened_between] {
+            drop(store.release_lazy_entry(&uri));
+        }
+
+        assert_evicted_in_order(&store, &[opened_between, scanned]);
+    }
+
+    /// A released file read from its cached blocks after another file's open ranks by that read,
+    /// though the read writes nothing.
+    #[tokio::test]
+    async fn a_released_file_read_after_another_files_open_ranks_by_the_read() {
+        let (_dir, store) = test_store_with(lazy_streaming);
+        let (scanned, opened_between) = (SuperfileUri::new_v4(), SuperfileUri::new_v4());
+        put_superfile(&store, &scanned, multi_block_superfile_bytes()).await;
+        put_superfile(&store, &opened_between, tiny_superfile_bytes()).await;
+
+        let scan = open_lazily(&store, &scanned).await;
+        scan.range(0, 1).await.expect("block read");
+        store.block_writes_settled().await;
+        sleep(STEP).await;
+        open_and_fill_a_block(&store, &opened_between).await;
+        sleep(STEP).await;
+        // The scan reads its filled block again, after the other file's open: a hit, no write, on
+        // the sync path cached reads take first.
+        let filled = scan.filled_bytes_handle().load(Ordering::Acquire);
+        scan.try_get_range_sync(0, 1).expect("cached block read");
+        store.block_writes_settled().await;
+        assert_eq!(
+            scan.filled_bytes_handle().load(Ordering::Acquire),
+            filled,
+            "no write"
+        );
+        drop(scan);
+        for uri in [scanned, opened_between] {
+            drop(store.release_lazy_entry(&uri));
+        }
+
+        assert_evicted_in_order(&store, &[opened_between, scanned]);
+    }
+
+    /// A file filled long ago and then read only from its cached blocks, never written again nor
+    /// released, up to a stop: after the restart it ranks by that read, not its last write, so it
+    /// outlives a file released just before its read.
+    #[tokio::test]
+    async fn a_file_read_only_from_cache_until_a_restart_ranks_by_the_read() {
+        let (_dir, store) = test_store_with(lazy_streaming);
+        let (read_last, released) = (SuperfileUri::new_v4(), SuperfileUri::new_v4());
+        put_superfile(&store, &read_last, tiny_superfile_bytes()).await;
+        put_superfile(&store, &released, tiny_superfile_bytes()).await;
+
+        open_and_fill_a_block(&store, &read_last).await;
+        let source = open_lazily(&store, &read_last).await;
+        // Filled long ago, and its reads since have not moved the mtime for over the step.
+        fs::File::options()
+            .write(true)
+            .open(store.blocks_path(&read_last))
+            .expect("open blocks")
+            .set_modified(SystemTime::now() - LAST_RUN_AGE)
+            .expect("set mtime");
+        source.forget_mtime_mark_for_test();
+
+        open_and_fill_a_block(&store, &released).await;
+        drop(store.release_lazy_entry(&released));
+        sleep(STEP).await;
+        let filled = source.filled_bytes_handle().load(Ordering::Acquire);
+        source.try_get_range_sync(0, 1).expect("cached block read");
+        store.block_writes_settled().await;
+        assert_eq!(
+            source.filled_bytes_handle().load(Ordering::Acquire),
+            filled,
+            "no write"
+        );
+
+        // The stop releases nothing: the restart sees the files as they are on disk.
+        let restarted = reopen_store(&store, lazy_streaming);
+        assert_evicted_in_order(&restarted, &[released, read_last]);
+    }
+
     /// A Stream lazy entry with one block filled, released while its reader is still alive, as
     /// one waiting on the freeing thread is.
     ///  - the block file is counted once, by its record, while the reader lives;
     ///  - freeing the reader later gives back nothing more.
     #[tokio::test]
     async fn a_released_reader_freed_later_leaves_its_block_file_counted_once() {
-        let (_dir, store) = test_store_with(|cfg| {
-            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
-            cfg.promotion_defer_timeout = Duration::MAX;
-        });
+        let (_dir, store) = test_store_with(lazy_streaming);
         let uri = SuperfileUri::new_v4();
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
         open_and_fill_a_block(&store, &uri).await;
@@ -1450,7 +1619,7 @@ mod tests {
             .load(Ordering::Acquire);
         assert!(filled > 0, "a block is filled");
 
-        let queued = store.release_lazy_entry(&uri, store.now_us());
+        let queued = store.release_lazy_entry(&uri);
         assert!(queued.is_some(), "the entry is released");
         store.assert_budget_consistent();
         assert_eq!(store.stats().current_bytes, filled, "counted once");
@@ -1469,10 +1638,7 @@ mod tests {
     async fn a_run_landing_after_release_is_given_back_when_its_source_drops() {
         /// Bytes the late run lands.
         const LATE_BYTES: u64 = 4096;
-        let (_dir, store) = test_store_with(|cfg| {
-            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
-            cfg.promotion_defer_timeout = Duration::MAX;
-        });
+        let (_dir, store) = test_store_with(lazy_streaming);
         let uri = SuperfileUri::new_v4();
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
         open_and_fill_a_block(&store, &uri).await;
@@ -1483,7 +1649,7 @@ mod tests {
             .expect("a lazy entry");
         let filled = source.filled_bytes_handle().load(Ordering::Acquire);
 
-        let queued = store.release_lazy_entry(&uri, store.now_us());
+        let queued = store.release_lazy_entry(&uri);
         assert!(queued.is_some(), "the entry is released");
         store.current_bytes.fetch_add(LATE_BYTES, Ordering::Release);
         source

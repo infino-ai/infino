@@ -109,8 +109,8 @@ fn fixture_with(index: IndexSpec) -> (TempDir, Connection, Supertable) {
     )
     .expect("connect");
     let table = db.create_table("t", schema(), index).expect("create_table");
-    table.append(&batch(0)).expect("append");
-    table.append(&batch(ROWS_PER_APPEND)).expect("append");
+    table.append(&batch(0), None).expect("append");
+    table.append(&batch(ROWS_PER_APPEND), None).expect("append");
     (dir, db, table)
 }
 
@@ -628,7 +628,7 @@ fn one_file_fixture() -> (TempDir, Connection) {
         .create_table("t", schema(), IndexSpec::new())
         .expect("create_table");
     table
-        .append(&batch_of((0..ONE_FILE_ROWS).collect()))
+        .append(&batch_of((0..ONE_FILE_ROWS).collect()), None)
         .expect("append");
     (dir, db)
 }
@@ -750,7 +750,10 @@ fn several_files_fixture() -> (TempDir, Connection) {
         .expect("create_table");
     for f in 0..FILES {
         table
-            .append(&batch_of((f * FILE_ROWS..(f + 1) * FILE_ROWS).collect()))
+            .append(
+                &batch_of((f * FILE_ROWS..(f + 1) * FILE_ROWS).collect()),
+                None,
+            )
             .expect("append");
     }
     (dir, db)

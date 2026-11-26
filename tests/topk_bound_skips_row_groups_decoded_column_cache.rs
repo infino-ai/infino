@@ -240,7 +240,7 @@ fn a_bound_from_above_skips_work_and_changes_no_answer() {
             columns.push(Arc::new(Int64Array::from(seq)));
             Arc::clone(&with_late)
         };
-        t.append(&RecordBatch::try_new(schema, columns).expect("batch"))
+        t.append(&RecordBatch::try_new(schema, columns).expect("batch"), None)
             .expect("append");
     }
 
@@ -364,6 +364,7 @@ fn a_bound_from_above_skips_work_and_changes_no_answer() {
         w.append(
             &RecordBatch::try_new(Arc::clone(&narrow), vec![Arc::new(Int32Array::from(n))])
                 .expect("batch"),
+            None,
         )
         .expect("append");
     }
@@ -380,6 +381,7 @@ fn a_bound_from_above_skips_work_and_changes_no_answer() {
         w.append(
             &RecordBatch::try_new(Arc::clone(&wide), vec![Arc::new(Int64Array::from(n))])
                 .expect("batch"),
+            None,
         )
         .expect("append");
     }
@@ -422,6 +424,7 @@ fn a_top_k_over_kept_columns_answers_as_a_full_sort() {
                 ],
             )
             .expect("batch"),
+            None,
         )
         .expect("append");
     }

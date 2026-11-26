@@ -18,6 +18,7 @@ use super::{
     cursor::{CursorUse, TermCursor},
     metadata::ColumnMeta,
     options::BoolMode,
+    search::FetchedTermMemo,
     work::MatchWork,
 };
 use crate::{
@@ -29,7 +30,7 @@ use crate::{
         error::FtsError,
         fts::{
             posting::BLOCK_LEN,
-            tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER},
+            tokenize::{MAX_TOKEN_CHARS, Phrase, STANDARD_TOKENIZER},
         },
         id_space::{FtsDocId, row_bitmap},
     },
@@ -639,18 +640,10 @@ impl FtsReader {
         column: &str,
         analyzer: &'static str,
         terms: &[&str],
-        prefetched: Option<&crate::superfile::fts::reader::FetchedTermMemo>,
+        prefetched: Option<&FetchedTermMemo>,
         dict: &QueryDict,
     ) -> Result<(Vec<ContainsRows>, MatchWork), FtsError> {
-        let column_id = self.resolve_column_id(column)?;
-        let indexed = self.columns[column_id as usize].tokenizer.name();
-        if indexed != analyzer {
-            return Err(FtsError::ExactNeedsAnalyzer {
-                column: column.to_owned(),
-                analyzer: indexed.to_owned(),
-                expected: analyzer,
-            });
-        }
+        self.ensure_analyzer(column, analyzer)?;
         let mut work = MatchWork::default();
         let mut out = Vec::with_capacity(terms.len());
         for term in terms {
@@ -664,6 +657,45 @@ impl FtsReader {
             });
         }
         Ok((out, work))
+    }
+
+    fn ensure_analyzer(&self, column: &str, analyzer: &'static str) -> Result<(), FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let indexed = self.columns[column_id as usize].tokenizer.name();
+        // Postings match the text only under the analyzer that indexed it.
+        if indexed != analyzer {
+            return Err(FtsError::ExactNeedsAnalyzer {
+                column: column.to_owned(),
+                analyzer: indexed.to_owned(),
+                expected: analyzer,
+            });
+        }
+        Ok(())
+    }
+
+    /// The rows of `column` that hold `words` and `phrases` under `mode`, all
+    /// proven; phrases are read from the positions. A column without positions
+    /// is [`FtsError::PositionsUnavailable`]. Where the term index has not
+    /// located a term, this reads its own copy of the dictionary.
+    pub(crate) async fn text_rows(
+        &self,
+        column: &str,
+        analyzer: &'static str,
+        words: &[&str],
+        phrases: &[Phrase<String>],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+        pool: Option<&ThreadPool>,
+    ) -> Result<(ContainsRows, MatchWork), FtsError> {
+        self.ensure_analyzer(column, analyzer)?;
+        let (rows, work) = self
+            .atoms_match_ids_prefetched(column, words, phrases, mode, prefetched, pool)
+            .await?;
+        let rows = ContainsRows {
+            proven: row_bitmap(&rows),
+            doubtful: RoaringBitmap::new(),
+        };
+        Ok((rows, work))
     }
 
     /// The Parquet rows the postings behind `values` hold, unioned. Inline

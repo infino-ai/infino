@@ -137,6 +137,33 @@ impl core::marker::Unpin for infino::GcError
 impl core::marker::UnsafeUnpin for infino::GcError
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::GcError
 impl !core::panic::unwind_safe::UnwindSafe for infino::GcError
+pub enum infino::IdempotencyToken<'a>
+pub infino::IdempotencyToken::Key(&'a str)
+pub infino::IdempotencyToken::Sequence
+pub infino::IdempotencyToken::Sequence::scope: &'a str
+pub infino::IdempotencyToken::Sequence::seq: u64
+impl<'a> core::clone::Clone for infino::IdempotencyToken<'a>
+pub fn infino::IdempotencyToken<'a>::clone(&self) -> Self
+impl<'a> core::cmp::Eq for infino::IdempotencyToken<'a>
+impl<'a> core::cmp::PartialEq for infino::IdempotencyToken<'a>
+pub fn infino::IdempotencyToken<'a>::eq(&self, &Self) -> bool
+impl<'a> core::convert::From<&'a alloc::string::String> for infino::IdempotencyToken<'a>
+pub fn infino::IdempotencyToken<'a>::from(&'a alloc::string::String) -> Self
+impl<'a> core::convert::From<&'a str> for infino::IdempotencyToken<'a>
+pub fn infino::IdempotencyToken<'a>::from(&'a str) -> Self
+impl<'a> core::fmt::Debug for infino::IdempotencyToken<'a>
+pub fn infino::IdempotencyToken<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::hash::Hash for infino::IdempotencyToken<'a>
+pub fn infino::IdempotencyToken<'a>::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl<'a> core::marker::Copy for infino::IdempotencyToken<'a>
+impl<'a> core::marker::StructuralPartialEq for infino::IdempotencyToken<'a>
+impl<'a> core::marker::Freeze for infino::IdempotencyToken<'a>
+impl<'a> core::marker::Send for infino::IdempotencyToken<'a>
+impl<'a> core::marker::Sync for infino::IdempotencyToken<'a>
+impl<'a> core::marker::Unpin for infino::IdempotencyToken<'a>
+impl<'a> core::marker::UnsafeUnpin for infino::IdempotencyToken<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for infino::IdempotencyToken<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for infino::IdempotencyToken<'a>
 #[non_exhaustive] pub enum infino::InfinoError
 pub infino::InfinoError::AlreadyExists(alloc::string::String)
 pub infino::InfinoError::Backend(alloc::string::String)
@@ -505,6 +532,33 @@ impl core::marker::Unpin for infino::SuperfileIndex
 impl core::marker::UnsafeUnpin for infino::SuperfileIndex
 impl core::panic::unwind_safe::RefUnwindSafe for infino::SuperfileIndex
 impl core::panic::unwind_safe::UnwindSafe for infino::SuperfileIndex
+pub enum infino::TokenStatus
+pub infino::TokenStatus::Absent
+pub infino::TokenStatus::Committed
+pub infino::TokenStatus::Committed::committed_ms: u64
+pub infino::TokenStatus::Committed::manifest_id: u64
+pub infino::TokenStatus::Committed::seq: core::option::Option<u64>
+pub infino::TokenStatus::Expired
+impl core::clone::Clone for infino::TokenStatus
+pub fn infino::TokenStatus::clone(&self) -> Self
+impl core::cmp::Eq for infino::TokenStatus
+impl core::cmp::PartialEq for infino::TokenStatus
+pub fn infino::TokenStatus::eq(&self, &Self) -> bool
+impl core::fmt::Debug for infino::TokenStatus
+pub fn infino::TokenStatus::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::TokenStatus
+impl core::marker::StructuralPartialEq for infino::TokenStatus
+impl serde_core::ser::Serialize for infino::TokenStatus
+pub fn infino::TokenStatus::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for infino::TokenStatus
+pub fn infino::TokenStatus::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for infino::TokenStatus
+impl core::marker::Send for infino::TokenStatus
+impl core::marker::Sync for infino::TokenStatus
+impl core::marker::Unpin for infino::TokenStatus
+impl core::marker::UnsafeUnpin for infino::TokenStatus
+impl core::panic::unwind_safe::RefUnwindSafe for infino::TokenStatus
+impl core::panic::unwind_safe::UnwindSafe for infino::TokenStatus
 #[non_exhaustive] pub struct infino::Bm25FieldsOptions
 pub infino::Bm25FieldsOptions::mode: infino::BoolMode
 pub infino::Bm25FieldsOptions::weights: alloc::collections::btree::map::BTreeMap<alloc::string::String, f32>
@@ -1081,14 +1135,14 @@ impl core::panic::unwind_safe::RefUnwindSafe for infino::StalenessReport
 impl core::panic::unwind_safe::UnwindSafe for infino::StalenessReport
 pub struct infino::Supertable
 impl infino::Supertable
-pub fn infino::Supertable::append(&self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), infino::InfinoError>
-pub fn infino::Supertable::append_named(&self, &arrow_array::record_batch::RecordBatch, &str) -> core::result::Result<(), infino::InfinoError>
-pub fn infino::Supertable::append_rows(&self, &[serde_json::value::Value]) -> core::result::Result<(), infino::InfinoError>
-pub fn infino::Supertable::append_rows_named(&self, &[serde_json::value::Value], &str) -> core::result::Result<(), infino::InfinoError>
+pub fn infino::Supertable::append(&self, &arrow_array::record_batch::RecordBatch, core::option::Option<infino::IdempotencyToken<'_>>) -> core::result::Result<(), infino::InfinoError>
+pub fn infino::Supertable::append_named(&self, &arrow_array::record_batch::RecordBatch, &str, core::option::Option<infino::IdempotencyToken<'_>>) -> core::result::Result<(), infino::InfinoError>
+pub fn infino::Supertable::append_rows(&self, &[serde_json::value::Value], core::option::Option<infino::IdempotencyToken<'_>>) -> core::result::Result<(), infino::InfinoError>
+pub fn infino::Supertable::append_rows_named(&self, &[serde_json::value::Value], &str, core::option::Option<infino::IdempotencyToken<'_>>) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::apply_schema(&self, &infino::SchemaPatch, core::option::Option<u32>) -> core::result::Result<infino::TableSchema, infino::InfinoError>
 pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::Bm25SearchOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::bm25_search_fields(&self, &[infino::FieldClause], usize, &infino::Bm25FieldsOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
-pub fn infino::Supertable::commit_staged(&self, &[infino::StagedAppend]) -> core::result::Result<(), infino::InfinoError>
+pub fn infino::Supertable::commit_staged(&self, &[infino::StagedAppend], core::option::Option<infino::IdempotencyToken<'_>>) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::companion(&self, &str) -> core::result::Result<core::option::Option<infino::Supertable>, infino::InfinoError>
 pub fn infino::Supertable::count(&self, &str, &str, infino::BoolMode) -> core::result::Result<u64, infino::InfinoError>
 pub fn infino::Supertable::count_where(&self, &[datafusion_expr::expr::Expr]) -> core::result::Result<alloc::vec::Vec<u64>, infino::InfinoError>
@@ -1097,6 +1151,7 @@ pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&
 pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Result<infino::GcReport, infino::GcError>
 pub fn infino::Supertable::hybrid_search(&self, &str, &str, infino::BoolMode, &str, &[f32], usize, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::hydrate(&self, impl arrow_array::record_batch::RecordBatchReader, usize) -> core::result::Result<usize, infino::InfinoError>
+pub fn infino::Supertable::idempotency_token_status(&self, infino::IdempotencyToken<'_>, u64) -> core::result::Result<infino::TokenStatus, infino::InfinoError>
 pub fn infino::Supertable::index_staleness(&self, &infino::ReindexOptions) -> core::result::Result<infino::StalenessReport, infino::ReindexError>
 pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
 pub fn infino::Supertable::reindex(&self, &infino::ReindexOptions) -> core::result::Result<infino::ReindexReport, infino::ReindexError>

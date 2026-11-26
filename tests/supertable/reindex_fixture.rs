@@ -160,7 +160,7 @@ fn batch(schema: &Arc<Schema>, docs: Range<u32>) -> RecordBatch {
 /// Append the fixture's documents `docs` to `table`.
 pub(crate) fn append_docs(table: &Supertable, docs: Range<u32>) {
     table
-        .append(&batch(&table.schema(), docs))
+        .append(&batch(&table.schema(), docs), None)
         .expect("append one superfile");
 }
 

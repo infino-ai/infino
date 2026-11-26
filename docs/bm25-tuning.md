@@ -356,8 +356,8 @@ matched whole: host names, paths, status codes, user ids, tags. On a
   and an `OR` of them take their rows straight from the term index, with
   no check of each row. `<>`, `NOT IN`, `LIKE` and other comparisons are
   checked row by row.
-- **`text_match` still means words.** The SQL function always uses
-  `standard` tokens, whatever the column's index. So a `keyword` index
+- **`text_match` still means words and phrases.** The SQL function always
+  uses `standard` tokens, whatever the column's index. So a `keyword` index
   does not answer it, and does not narrow a `LIKE` scan either.
 - **Older engines cannot open the table.** An engine older than the
   release that adds `keyword` refuses a table with a `keyword` column,
@@ -556,7 +556,7 @@ text.
 | Analyzer | `FtsField::analyzer` | No | `standard` splits text into lowercased words; `keyword` keeps each value as one exact term. See [Base tokenizer](#base-tokenizer). |
 | Stopwords | `FtsField::stopwords` | No | Drops very common words from index and query. See [Stopwords](#stopwords). |
 | Stemmer | `FtsField::stemmer` | No | Folds inflections onto one term, so one form finds the others. See [Stemming](#stemming). |
-| Positions | `FtsField::positions` | No | Required for exact phrase queries. Roughly doubles the column's index footprint. A phrase against a positionless column is a typed error, never a silent bag-of-words fallback. |
+| Positions | `FtsField::positions` | No | Required for exact phrase queries. Roughly doubles the column's index footprint. A phrase in `bm25_search` or `token_match` against a positionless column is a typed error, never a silent bag-of-words fallback. `text_match` still matches it by checking row text: on a `standard` column only the rows holding the phrase's words, on a stemmed or stopword column every row, which costs about a scan of that text. |
 | Boolean mode and sigils | Per search | Yes | `BoolMode::And` makes bare terms mandatory, `Or` makes them scoring-only once any `+must` exists. `+term` is a must, `-term` a hard exclusion, and `"quoted words"` is a phrase atom scored as one term whose `tf` is the phrase count and whose IDF is the sum of its members'. |
 | Query shape | Per search | Yes | Prefix search expands a trailing prefix to the indexed terms beginning with it and runs an OR over them. `hybrid_search` fuses text and vector results; do not fuse raw BM25 scores with distances by hand. |
 

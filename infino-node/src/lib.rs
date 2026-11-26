@@ -47,10 +47,7 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    Bm25FieldsOptions, Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError,
-    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
-    RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions,
-    SchemaPatch, Stemmer, Stopwords,
+    Bm25FieldsOptions, Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError, IdempotencyToken, InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions, RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions, SchemaPatch, Stemmer, Stopwords, TokenStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -604,6 +601,103 @@ pub struct FieldClause {
     pub fields: Vec<String>,
 }
 
+/// An idempotency token: `key` alone, or `scope` with `seq` for the
+/// `seq`th commit of the writer `scope`.
+#[napi(object)]
+pub struct IdempotencyTokenInput {
+    /// One write, named by an opaque string the caller chooses.
+    pub key: Option<String>,
+    /// The writer a sequence token belongs to.
+    pub scope: Option<String>,
+    /// The writer's commit number (a non-negative JS integer, up to 2^53).
+    pub seq: Option<i64>,
+}
+
+impl IdempotencyTokenInput {
+    fn as_token(&self) -> Result<IdempotencyToken<'_>> {
+        match (&self.key, &self.scope, self.seq) {
+            (Some(key), None, None) => Ok(IdempotencyToken::Key(key)),
+            (None, Some(scope), Some(seq)) => {
+                let seq = u64::try_from(seq).map_err(|_| {
+                    Error::new(
+                        Status::InvalidArg,
+                        "idempotencyToken: seq must not be negative",
+                    )
+                })?;
+                Ok(IdempotencyToken::Sequence { scope, seq })
+            }
+            _ => Err(Error::new(
+                Status::InvalidArg,
+                "idempotencyToken: pass key alone, or scope with seq",
+            )),
+        }
+    }
+}
+
+fn token_of(input: &Option<IdempotencyTokenInput>) -> Result<Option<IdempotencyToken<'_>>> {
+    input
+        .as_ref()
+        .map(IdempotencyTokenInput::as_token)
+        .transpose()
+}
+
+/// Whether the write that carried a token committed.
+#[napi(object)]
+pub struct IdempotencyTokenStatus {
+    /// `"committed"`, `"absent"` (never held, held before `sinceMs`, or the
+    /// scope is held at an earlier number), or `"expired"` (retention may
+    /// have dropped it after `sinceMs`, so whether it committed is unknown).
+    pub status: String,
+    /// The manifest the token was recorded in, when committed.
+    pub manifest_id: Option<i64>,
+    /// When it committed, in milliseconds since the Unix epoch.
+    pub committed_ms: Option<i64>,
+    /// For a sequence token, the scope's latest committed number, at or
+    /// past the one asked about.
+    pub seq: Option<i64>,
+}
+
+fn status_number(value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| {
+        Error::new(
+            Status::GenericFailure,
+            "idempotency status: value out of range",
+        )
+    })
+}
+
+impl TryFrom<TokenStatus> for IdempotencyTokenStatus {
+    type Error = Error;
+
+    fn try_from(status: TokenStatus) -> Result<Self> {
+        Ok(match status {
+            TokenStatus::Committed {
+                manifest_id,
+                committed_ms,
+                seq,
+            } => IdempotencyTokenStatus {
+                status: "committed".to_owned(),
+                manifest_id: Some(status_number(manifest_id)?),
+                committed_ms: Some(status_number(committed_ms)?),
+                seq: seq.map(status_number).transpose()?,
+            },
+            TokenStatus::Absent => IdempotencyTokenStatus::without_entry("absent"),
+            TokenStatus::Expired => IdempotencyTokenStatus::without_entry("expired"),
+        })
+    }
+}
+
+impl IdempotencyTokenStatus {
+    fn without_entry(status: &str) -> Self {
+        IdempotencyTokenStatus {
+            status: status.to_owned(),
+            manifest_id: None,
+            committed_ms: None,
+            seq: None,
+        }
+    }
+}
+
 /// Row counts from an `update` / `delete`.
 #[napi(object)]
 pub struct MutationStats {
@@ -1138,13 +1232,18 @@ impl Table {
     /// one sealed segment, so batch rows per call. Multi-batch streams are
     /// concatenated into one commit; an empty stream is a no-op.
     #[napi]
-    pub fn append(&self, data: Buffer) -> Result<()> {
+    pub fn append(
+        &self,
+        data: Buffer,
+        idempotency_token: Option<IdempotencyTokenInput>,
+    ) -> Result<()> {
+        let token = token_of(&idempotency_token)?;
         let batches = read_batches_ipc(&data)?;
         if batches.is_empty() {
             return Ok(());
         }
         self.inner
-            .append(&self.merge_batches(batches)?)
+            .append(&self.merge_batches(batches)?, token)
             .map_err(map_err)
     }
 
@@ -1154,24 +1253,35 @@ impl Table {
     /// column typed from its values, and a value whose type disagrees with
     /// the column's is refused.
     #[napi]
-    pub fn append_rows(&self, rows_json: String) -> Result<()> {
+    pub fn append_rows(
+        &self,
+        rows_json: String,
+        idempotency_token: Option<IdempotencyTokenInput>,
+    ) -> Result<()> {
+        let token = token_of(&idempotency_token)?;
         let rows = parse_rows(&rows_json)?;
         if rows.is_empty() {
             return Ok(());
         }
-        self.inner.append_rows(&rows).map_err(map_err)
+        self.inner.append_rows(&rows, token).map_err(map_err)
     }
 
     /// `appendRows`, naming the source the rows came from as `appendNamed`
     /// does.
     #[napi]
-    pub fn append_rows_named(&self, rows_json: String, source_name: String) -> Result<()> {
+    pub fn append_rows_named(
+        &self,
+        rows_json: String,
+        source_name: String,
+        idempotency_token: Option<IdempotencyTokenInput>,
+    ) -> Result<()> {
+        let token = token_of(&idempotency_token)?;
         let rows = parse_rows(&rows_json)?;
         if rows.is_empty() {
             return Ok(());
         }
         self.inner
-            .append_rows_named(&rows, &source_name)
+            .append_rows_named(&rows, &source_name, token)
             .map_err(map_err)
     }
 
@@ -1190,14 +1300,37 @@ impl Table {
     /// listing shows where each came from. The table behaves exactly as
     /// after `append`; the name is a label on the object key.
     #[napi]
-    pub fn append_named(&self, data: Buffer, source_name: String) -> Result<()> {
+    pub fn append_named(
+        &self,
+        data: Buffer,
+        source_name: String,
+        idempotency_token: Option<IdempotencyTokenInput>,
+    ) -> Result<()> {
+        let token = token_of(&idempotency_token)?;
         let batches = read_batches_ipc(&data)?;
         if batches.is_empty() {
             return Ok(());
         }
         self.inner
-            .append_named(&self.merge_batches(batches)?, &source_name)
+            .append_named(&self.merge_batches(batches)?, &source_name, token)
             .map_err(map_err)
+    }
+
+    /// Whether the write that carried `token` committed, as the table holds
+    /// it now. `since_ms` is a time, in milliseconds since the Unix epoch,
+    /// before the write was first tried.
+    #[napi]
+    pub fn idempotency_token_status(
+        &self,
+        token: IdempotencyTokenInput,
+        since_ms: i64,
+    ) -> Result<IdempotencyTokenStatus> {
+        let since_ms = u64::try_from(since_ms)
+            .map_err(|_| Error::new(Status::InvalidArg, "sinceMs must not be negative"))?;
+        self.inner
+            .idempotency_token_status(token.as_token()?, since_ms)
+            .map_err(map_err)?
+            .try_into()
     }
 
     /// BM25 search over one FTS column. Returns matching rows as an Arrow

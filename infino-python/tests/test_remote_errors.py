@@ -14,6 +14,28 @@ import infino
 import pytest
 
 
+def _read_request(conn):
+    """Read one whole request: the head, then the body its Content-Length
+    names. Closing with request bytes unread resets the connection, and macOS
+    then fails the client's next socket call before it reads the answer."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(65536)
+        if not chunk:
+            return
+        data += chunk
+    head, body = data.split(b"\r\n\r\n", 1)
+    length = 0
+    for line in head.decode("latin-1").lower().split("\r\n"):
+        if line.startswith("content-length:"):
+            length = int(line.split(":", 1)[1])
+    while len(body) < length:
+        chunk = conn.recv(65536)
+        if not chunk:
+            return
+        body += chunk
+
+
 def _stub(answer):
     """Serve one connection on a loopback port: read the request, then call
     `answer(conn)`. Returns the connect URL and the server thread."""
@@ -25,7 +47,7 @@ def _stub(answer):
     def serve():
         conn, _ = listener.accept()
         with conn, listener:
-            conn.recv(65536)
+            _read_request(conn)
             answer(conn)
 
     thread = threading.Thread(target=serve, daemon=True)

@@ -29,6 +29,7 @@ pub mod exec;
 pub(crate) mod filter_in_scan;
 pub(crate) mod fine_graph_cache;
 pub(crate) mod fine_graph_follow;
+pub(crate) mod fine_graph_publish;
 pub(crate) mod fine_graph_store;
 pub mod fts;
 #[cfg(feature = "graph-index")]
@@ -62,6 +63,7 @@ pub(crate) mod topk_row_filter;
 pub(crate) mod value_count_carry;
 pub(crate) mod values_subquery;
 pub mod vector;
+pub(crate) mod widening;
 
 pub use vector::VectorSearchOptions;
 
