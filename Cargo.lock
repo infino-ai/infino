@@ -1664,9 +1664,9 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "emeans"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "190042f958e63c0624816a5206eb5decb26e6b2f30f103175ba2c4d177fae016"
+checksum = "057d92676b026610c30452cff8387098c61062c87e4d40553ba5c71125d31ba7"
 dependencies = [
  "matrixmultiply",
  "rayon",

@@ -41,6 +41,12 @@ use crate::superfile::vector::distance::{
 /// seeded from `rot_seed` directly.
 const KMEANS_SEED_OFFSET: u64 = 7;
 
+/// e-means moves a cluster whose row count falls below this fraction of the
+/// mean into a split of a large cluster, so no cluster stays far below the
+/// mean. The crate's default keeps a small cluster when moving it would raise
+/// the error, which leaves sizes less even.
+const EMEANS_REVIVE_BELOW_MEAN_FRACTION: f32 = 0.1;
+
 /// Run 5-iteration Lloyd k-means and return `k * dim` centroids,
 /// row-major. `vectors` is `n_docs * dim`, also row-major. Drops
 /// the final assignments — call [`kmeans_with_assignments`] when
@@ -128,6 +134,7 @@ fn train_emeans(
     Emeans::new(dim, k)
         .nepochs(iters.max(1) as f64)
         .seed(seed)
+        .unused_threshold(EMEANS_REVIVE_BELOW_MEAN_FRACTION)
         .capture_assignments(capture_assignments)
         .train_from(vectors, &init)
         .unwrap_or_else(|e| panic!("emeans: {e}"))
