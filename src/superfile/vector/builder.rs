@@ -2667,7 +2667,8 @@ fn build_subsection_streaming(
         // Drop the reservoir immediately — k-means has converged
         // and the sample bytes aren't needed for pass 2.
         drop(reservoir);
-        (n_cent, centroids)
+        // Training drops centroids no sample row is nearest to.
+        (centroids.len() / dim.max(1), centroids)
     };
 
     // Summary centroid: mean of trained centroids.

@@ -92,8 +92,14 @@ pub fn kmeans_with_assignments(
 
 /// Same random init as [`kmeans_with_assignments`], refined with `iters` e-means passes
 /// instead of Lloyd. Used for a superfile's fine centroids, where e-means gives more even
-/// clusters, so a query reads fewer rows for the same recall. The assignments are the
-/// last pass's labels, as with Lloyd.
+/// clusters, so a query reads fewer rows for the same recall.
+///
+/// The assignments are the last pass's labels, which the crate keeps equal to each row's
+/// nearest final centroid. A centroid no row is labelled with is dropped: it would return
+/// nothing, yet a query could still spend a probe on it. That happens when there are more
+/// centroids than distinct rows, where the empty centroids end up next to occupied ones,
+/// so the answer may hold fewer than `k` centroids. Dropping them reads only the labels,
+/// so it adds no pass over the rows.
 ///
 /// # Panics
 ///
@@ -105,29 +111,49 @@ pub fn emeans_with_assignments(
     iters: usize,
     seed: u64,
 ) -> (Vec<f32>, Vec<u32>) {
-    let model = train_emeans(vectors, dim, k, iters, seed, true);
-    let assignments = model
+    let model = train_emeans(vectors, dim, k, iters, seed);
+    let labels: Vec<u32> = model
         .labels()
         .expect("emeans: labels captured")
         .iter()
         .map(|&l| u32::try_from(l).expect("emeans: the last pass labels every row"))
         .collect();
-    (model.into_centroids(), assignments)
+    occupied_centroids(&model.into_centroids(), dim, labels)
 }
 
-/// Centroids-only e-means (drops assignments), mirroring [`kmeans`].
+/// Centroids-only [`emeans_with_assignments`], mirroring [`kmeans`].
 pub fn emeans(vectors: &[f32], dim: usize, k: usize, iters: usize, seed: u64) -> Vec<f32> {
-    train_emeans(vectors, dim, k, iters, seed, false).into_centroids()
+    emeans_with_assignments(vectors, dim, k, iters, seed).0
 }
 
-fn train_emeans(
-    vectors: &[f32],
+/// Keep only the centroids at least one row is assigned to, in their order, and answer
+/// them with `assignments` renumbered to match.
+fn occupied_centroids(
+    centroids: &[f32],
     dim: usize,
-    k: usize,
-    iters: usize,
-    seed: u64,
-    capture_assignments: bool,
-) -> Model {
+    mut assignments: Vec<u32>,
+) -> (Vec<f32>, Vec<u32>) {
+    let n_cent = centroids.len() / dim;
+    let mut occupied = vec![false; n_cent];
+    for &a in &assignments {
+        occupied[a as usize] = true;
+    }
+    if occupied.iter().all(|&o| o) {
+        return (centroids.to_vec(), assignments);
+    }
+    let mut new_index = vec![u32::MAX; n_cent];
+    let mut kept = Vec::with_capacity(centroids.len());
+    for c in (0..n_cent).filter(|&c| occupied[c]) {
+        new_index[c] = (kept.len() / dim) as u32;
+        kept.extend_from_slice(&centroids[c * dim..(c + 1) * dim]);
+    }
+    for a in &mut assignments {
+        *a = new_index[*a as usize];
+    }
+    (kept, assignments)
+}
+
+fn train_emeans(vectors: &[f32], dim: usize, k: usize, iters: usize, seed: u64) -> Model {
     // The crate checks dim, k, the row count and k <= n, and reports them below.
     let n = vectors.len() / dim.max(1);
     let init = random_init(vectors, dim, k, n, seed);
@@ -135,7 +161,7 @@ fn train_emeans(
         .nepochs(iters.max(1) as f64)
         .seed(seed)
         .unused_threshold(EMEANS_REVIVE_BELOW_MEAN_FRACTION)
-        .capture_assignments(capture_assignments)
+        .capture_assignments(true)
         .train_from(vectors, &init)
         .unwrap_or_else(|e| panic!("emeans: {e}"))
 }
@@ -447,6 +473,27 @@ mod tests {
         let c1 = kmeans(&vectors, 8, 4, 5, 12345);
         let c2 = kmeans(&vectors, 8, 4, 5, 12345);
         assert_eq!(c1, c2);
+    }
+
+    /// More centroids than distinct rows: only centroids that hold a row are
+    /// kept, and every row is assigned to one of them.
+    #[test]
+    fn emeans_keeps_only_centroids_that_hold_a_row() {
+        let (dim, k, distinct) = (4, 12, 3);
+        let vectors: Vec<f32> = (0..24 * dim)
+            .map(|i| ((i / dim) % distinct) as f32)
+            .collect();
+        let (centroids, assignments) = emeans_with_assignments(&vectors, dim, k, 5, 42);
+        let n_cent = centroids.len() / dim;
+        assert!(
+            (1..=distinct).contains(&n_cent),
+            "{n_cent} centroids for {distinct} distinct rows"
+        );
+        let mut counts = vec![0usize; n_cent];
+        for &a in &assignments {
+            counts[a as usize] += 1;
+        }
+        assert!(counts.iter().all(|&c| c > 0), "{counts:?}");
     }
 
     #[test]
