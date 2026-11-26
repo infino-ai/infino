@@ -125,6 +125,13 @@ const BACKOFF_CAP_MS: u64 = 2000;
 /// socket the service dropped under us).
 const MAX_TRANSIENT_RETRIES: u32 = 8;
 
+/// How long the HEAD that settles a transient create failure may run before
+/// the create is re-issued without its answer. A HEAD is a safe request, so
+/// the store client retries its timeouts for up to [`RETRY_TIMEOUT`]; without
+/// this bound a stalled store would make each re-issue wait out that window
+/// first. A healthy HEAD answers in well under a second.
+const SETTLE_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Retry budget applied to a store builder via `.with_retry(...)`.
 pub(crate) fn config() -> RetryConfig {
     RetryConfig {
@@ -223,6 +230,25 @@ impl CreateId {
             .get(&Attribute::Metadata(CREATE_ID_KEY.into()))
             .is_some_and(|id| id.as_ref() == self.0)
     }
+
+    /// Who holds the key, from one HEAD of it.
+    fn settle(&self, head: Result<(Attributes, Option<String>), StorageError>) -> Holder {
+        match head {
+            Ok((attributes, token)) if self.stamped_on(&attributes) => Holder::Ours(token),
+            Ok(_) => Holder::Other,
+            Err(e) => Holder::Unknown(e),
+        }
+    }
+}
+
+/// Who holds a create's key, as a HEAD of it answers.
+enum Holder {
+    /// The object is this call's own write, with its CAS token.
+    Ours(Option<String>),
+    /// Another writer's object holds the key: a lost race.
+    Other,
+    /// The HEAD failed, so the holder is unknown.
+    Unknown(StorageError),
 }
 
 /// Options for a HEAD: the object's metadata and user attributes, no body.
@@ -252,7 +278,8 @@ pub(crate) fn head_options() -> GetOptions {
 /// failure on every issue. So a transient failure is settled by the same
 /// HEAD before it is re-issued: a held key answers now, as created when the
 /// object is this call's and as `PreconditionFailed` otherwise, and only a
-/// free key is re-issued.
+/// free key is re-issued. That HEAD is bounded by [`SETTLE_HEAD_TIMEOUT`]; one
+/// that fails or runs past it re-issues the create, as before it existed.
 ///
 /// `create` performs one create-only PUT built with [`CreateId::put_options`];
 /// `head` one HEAD built with [`head_options`], answering the object's
@@ -260,8 +287,8 @@ pub(crate) fn head_options() -> GetOptions {
 pub(crate) async fn create_with_reissue<C, CFut, H, HFut>(
     uri: &str,
     id: &CreateId,
-    create: C,
-    head: H,
+    mut create: C,
+    mut head: H,
 ) -> Result<Option<String>, StorageError>
 where
     C: FnMut() -> CFut,
@@ -269,18 +296,20 @@ where
     H: FnMut() -> HFut,
     HFut: Future<Output = Result<(Attributes, Option<String>), StorageError>>,
 {
-    let mut create = create;
-    let mut head = head;
     let mut attempt = 0u32;
     let lost = loop {
         match create().await {
             Ok(token) => return Ok(token),
             Err(lost @ StorageError::PreconditionFailed { .. }) => break lost,
             Err(e) if is_retryable(&e) && attempt < MAX_TRANSIENT_RETRIES => {
-                match head().await {
-                    Ok((attributes, token)) if id.stamped_on(&attributes) => return Ok(token),
-                    Ok(_) => return Err(StorageError::PreconditionFailed { uri: uri.into() }),
-                    Err(_) => {}
+                if let Ok(answer) = time::timeout(SETTLE_HEAD_TIMEOUT, head()).await {
+                    match id.settle(answer) {
+                        Holder::Ours(token) => return Ok(token),
+                        Holder::Other => {
+                            return Err(StorageError::PreconditionFailed { uri: uri.into() });
+                        }
+                        Holder::Unknown(_) => {}
+                    }
                 }
                 warn!(attempt, error = %e, "transient object-store error; re-issuing");
                 time::sleep(backoff(attempt)).await;
@@ -289,10 +318,10 @@ where
             Err(e) => return Err(e),
         }
     };
-    match with_reissue(&mut head).await {
-        Ok((attributes, token)) if id.stamped_on(&attributes) => Ok(token),
-        Ok(_) => Err(lost),
-        Err(e) => {
+    match id.settle(with_reissue(&mut head).await) {
+        Holder::Ours(token) => Ok(token),
+        Holder::Other => Err(lost),
+        Holder::Unknown(e) => {
             // Without the object we cannot tell our write from a peer's, so
             // report what the store said rather than claim a create.
             warn!(uri, error = %e, "could not read back a failed create; reporting the precondition");
@@ -473,7 +502,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::{cell::Cell, future::pending};
 
     use object_store::{
         Error as ObjError, ObjectStore, ObjectStoreExt, PutPayload, memory::InMemory,
@@ -623,6 +652,10 @@ mod tests {
         puts: Cell<u32>,
         heads: Cell<u32>,
         head_fails: Cell<bool>,
+        /// Every HEAD fails as a dropped connection does.
+        head_fails_transiently: Cell<bool>,
+        /// Every HEAD hangs and never answers.
+        head_hangs: Cell<bool>,
         /// A create against a held key fails as a dropped connection does,
         /// on every issue, instead of answering the precondition.
         drops_creates_on_held_key: Cell<bool>,
@@ -636,6 +669,8 @@ mod tests {
                 puts: Cell::new(0),
                 heads: Cell::new(0),
                 head_fails: Cell::new(false),
+                head_fails_transiently: Cell::new(false),
+                head_hangs: Cell::new(false),
                 drops_creates_on_held_key: Cell::new(false),
             }
         }
@@ -682,6 +717,12 @@ mod tests {
                 || {
                     self.heads.set(self.heads.get() + 1);
                     async {
+                        if self.head_hangs.get() {
+                            pending::<()>().await;
+                        }
+                        if self.head_fails_transiently.get() {
+                            return Err(transient());
+                        }
                         if self.head_fails.get() {
                             return Err(not_found());
                         }
@@ -799,6 +840,43 @@ mod tests {
         assert_eq!(token, store.token().await);
         assert_eq!((store.puts.get(), store.heads.get()), (2, 1));
         assert!(store.stamped_with(&id).await);
+    }
+
+    /// A HEAD that fails transiently says nothing about the key, so the create
+    /// is re-issued rather than reported as a lost race.
+    #[tokio::test(start_paused = true)]
+    async fn a_create_whose_settling_head_fails_transiently_is_reissued() {
+        let store = Store::new();
+        store.head_fails_transiently.set(true);
+        let id = CreateId::new();
+        let token = store
+            .create(&id, FirstIssue::LostBeforeLanding)
+            .await
+            .expect("created on the second issue");
+        assert_eq!(token, store.token().await);
+        assert_eq!((store.puts.get(), store.heads.get()), (2, 1));
+        assert!(store.stamped_with(&id).await);
+    }
+
+    /// A settling HEAD that hangs is abandoned after [`SETTLE_HEAD_TIMEOUT`]
+    /// and the create re-issued, so a stalled store does not hold each
+    /// re-issue for the HEAD's own retry window.
+    #[tokio::test(start_paused = true)]
+    async fn a_create_whose_settling_head_hangs_is_reissued_after_the_bound() {
+        let store = Store::new();
+        store.head_hangs.set(true);
+        let started = time::Instant::now();
+        let token = store
+            .create(&CreateId::new(), FirstIssue::LostBeforeLanding)
+            .await
+            .expect("created on the second issue");
+        assert_eq!(token, store.token().await);
+        assert_eq!((store.puts.get(), store.heads.get()), (2, 1));
+        assert!(
+            started.elapsed() < SETTLE_HEAD_TIMEOUT + backoff(0) + Duration::from_secs(1),
+            "waited {:?}",
+            started.elapsed()
+        );
     }
 
     /// A first issue the store client retried after it landed meets its own
