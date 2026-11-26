@@ -4180,6 +4180,68 @@ mod tests {
         );
     }
 
+    /// Blobs in the skewed balance sample. Blob `b` holds
+    /// `SKEW_BLOB_ROWS / (b + 1)` rows, so the largest is `SKEW_BLOBS` times
+    /// the smallest.
+    const SKEW_BLOBS: usize = 24;
+    /// Rows in the largest blob of the skewed balance sample.
+    const SKEW_BLOB_ROWS: usize = 2_400;
+    /// Fine runs requested from the skewed balance sample.
+    const SKEW_REQUESTED: usize = 64;
+    /// Largest fine run allowed, as a multiple of the median run.
+    const SKEW_MAX_OVER_P50: usize = 4;
+
+    /// Blobs of very different sizes, centers spread on a grid of side 10,
+    /// jittered deterministically by an LCG.
+    fn skewed_sample() -> Vec<f32> {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((state >> 33) % 1000) as f32 / 1000.0
+        };
+        let mut rows = Vec::new();
+        for b in 0..SKEW_BLOBS {
+            let center: Vec<f32> = (0..SPLIT_DIM)
+                .map(|_| (next() * 10.0).floor() * 10.0)
+                .collect();
+            for _ in 0..SKEW_BLOB_ROWS / (b + 1) {
+                rows.extend(center.iter().map(|c| c + next() - 0.5));
+            }
+        }
+        rows
+    }
+
+    /// On skewed input the build leaves no fine run empty and keeps the
+    /// largest run within a small multiple of the median.
+    #[test]
+    fn materialized_centroids_balances_skewed_input() {
+        let sample = skewed_sample();
+        let cfg = VectorConfig {
+            column: "emb".into(),
+            dim: SPLIT_DIM,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let (n_cent, centroids) = materialized_centroids(
+            &cfg,
+            SKEW_REQUESTED,
+            CONSOLIDATED_CELL_ROWS_THRESHOLD,
+            &sample,
+        );
+        let mut counts = run_counts(&sample, &centroids, n_cent);
+        counts.sort_unstable();
+        let p50 = counts[counts.len() / 2];
+        assert!(counts[0] > 0, "no fine run may be empty: {counts:?}");
+        assert!(
+            counts[counts.len() - 1] <= p50 * SKEW_MAX_OVER_P50,
+            "largest run over {SKEW_MAX_OVER_P50}x the median {p50}: {counts:?}"
+        );
+    }
+
     /// Same inputs and seed produce identical output centroids.
     #[test]
     fn split_oversized_fine_runs_is_deterministic() {

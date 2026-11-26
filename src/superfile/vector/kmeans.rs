@@ -122,30 +122,23 @@ fn train_emeans(
     seed: u64,
     capture_assignments: bool,
 ) -> Model {
-    assert!(dim > 0, "emeans: dim must be > 0");
-    assert!(k > 0, "emeans: k must be > 0");
-    assert_eq!(
-        vectors.len() % dim,
-        0,
-        "emeans: vectors len {} not multiple of dim {dim}",
-        vectors.len()
-    );
-    let n = vectors.len() / dim;
-    assert!(n > 0, "emeans: at least one doc required");
-    assert!(k <= n, "emeans: k ({k}) > n_docs ({n})");
-
+    // The crate checks dim, k, the row count and k <= n, and reports them below.
+    let n = vectors.len() / dim.max(1);
     let init = random_init(vectors, dim, k, n, seed);
     Emeans::new(dim, k)
         .nepochs(iters.max(1) as f64)
         .seed(seed)
         .capture_assignments(capture_assignments)
         .train_from(vectors, &init)
-        .expect("emeans: inputs validated above")
+        .unwrap_or_else(|e| panic!("emeans: {e}"))
 }
 
 /// `k` rows drawn uniformly from `vectors`. Repeats are allowed; for small k vs n
 /// a duplicate is unlikely.
 fn random_init(vectors: &[f32], dim: usize, k: usize, n: usize, seed: u64) -> Vec<f32> {
+    if n == 0 {
+        return Vec::new();
+    }
     let mut rng = StdRng::seed_from_u64(seed.wrapping_add(KMEANS_SEED_OFFSET));
     let mut centroids = vec![0f32; k * dim];
     for i in 0..k {
