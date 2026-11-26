@@ -164,16 +164,11 @@ pub async fn superfile_reader_tiered(
                         storage_key.to_owned(),
                         offsets.total_size,
                     ));
-                let overlay = open_batch_overlay(
-                    Arc::clone(storage),
-                    storage_key.to_owned(),
-                    offsets,
-                    ranges,
-                )
-                .await
-                .map_err(|e| ReaderCacheError::OpenFailed {
-                    source: fetch_failed(format!("storage open batch {storage_key}"), e),
-                })?;
+                let overlay = open_batch_overlay(storage_key.to_owned(), offsets, ranges)
+                    .await
+                    .map_err(|e| ReaderCacheError::OpenFailed {
+                        source: fetch_failed(format!("storage open batch {storage_key}"), e),
+                    })?;
                 Arc::new(overlay)
             }
             // Without one, a suffix GET learns the object's size and its

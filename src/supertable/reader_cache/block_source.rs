@@ -160,6 +160,11 @@ use crate::{
 /// 160K blocks, so bitmaps stay small.
 pub(super) const CACHE_BLOCK_BYTES: u64 = 64 * 1024;
 
+/// Most bytes one open holds in memory until its entry is live (see
+/// [`BlockCachedSource::start_opening`]). The open batch and the page index
+/// are a few hundred KB; past this, the open's reads are not kept.
+const OPENING_HOLD_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 /// What a GET for a short missing run grows to. Blocks are what the cache
 /// tracks; this is what one GET asks for, so the two differ on purpose. A run
 /// shorter than this grows to a window of this length around it (see
@@ -274,6 +279,15 @@ struct BlockFile {
     mmap: OnceLock<Option<Arc<Mmap>>>,
 }
 
+/// Whole blocks read while a file is being opened, held until its entry is live.
+#[derive(Default)]
+struct OpeningReads {
+    /// Bytes held or being fetched to hold, up to [`OPENING_HOLD_MAX_BYTES`].
+    bytes: u64,
+    /// Each read's first byte and its bytes.
+    reads: Vec<(u64, Bytes)>,
+}
+
 /// Block-caching wrapper around a network-backed [`LazyByteSource`].
 /// See the module docs for semantics.
 pub(crate) struct BlockCachedSource {
@@ -331,6 +345,9 @@ pub(crate) struct BlockCachedSource {
     flush_queued: AtomicBool,
     /// Flushes queued and not done yet; see [`Self::has_unfinished_writes`].
     pending_flushes: AtomicUsize,
+    /// The blocks read while the file is being opened, `None` when it is not;
+    /// see [`Self::start_opening`].
+    opening: Mutex<Option<OpeningReads>>,
     /// Fsyncs tried, for tests.
     #[cfg(test)]
     syncs: AtomicUsize,
@@ -824,6 +841,7 @@ impl BlockCachedSource {
             flushing: AtomicBool::new(false),
             flush_queued: AtomicBool::new(false),
             pending_flushes: AtomicUsize::new(0),
+            opening: Mutex::new(None),
             #[cfg(test)]
             syncs: AtomicUsize::new(0),
             #[cfg(test)]
@@ -2155,6 +2173,119 @@ impl BlockCachedSource {
         Some(Bytes::from(out))
     }
 
+    /// Marks the file as being opened. Until [`Self::end_opening`], a read that
+    /// misses fetches the whole blocks it touches and holds them: a source
+    /// whose entry is not live yet fills no blocks itself, so without this
+    /// every open would fetch the open batch and the page index again.
+    pub(crate) fn start_opening(&self) {
+        *self.opening.lock().expect("opening mutex poisoned") = Some(OpeningReads::default());
+    }
+
+    /// The open is over: stops holding reads and returns the ones held, for
+    /// [`Self::keep_held`] once the entry is live. Called before the entry is
+    /// shared, so no other query's read is held. An open that fails never gets
+    /// here, and the held blocks go with the source.
+    pub(crate) fn end_opening(&self) -> Vec<(u64, Bytes)> {
+        self.opening
+            .lock()
+            .expect("opening mutex poisoned")
+            .take()
+            .map(|opening| opening.reads)
+            .unwrap_or_default()
+    }
+
+    /// Keeps the blocks of reads [`Self::end_opening`] returned when this
+    /// source is the live entry; drops them otherwise.
+    pub(crate) fn keep_held(&self, reads: Vec<(u64, Bytes)>) {
+        for (start, bytes) in reads {
+            self.keep(start, &bytes);
+        }
+    }
+
+    /// A read that misses while the file is being opened: fetches the whole
+    /// blocks it touches and holds them for [`Self::end_opening`]. `None` when not
+    /// opening, or when holding the blocks would pass
+    /// [`OPENING_HOLD_MAX_BYTES`] or the store could not write them anyway.
+    async fn read_while_opening(
+        &self,
+        bf: &BlockFile,
+        start: u64,
+        len: u64,
+    ) -> Option<Result<Bytes, LazyByteSourceError>> {
+        let (b0, b1) = Self::block_span(start, len);
+        let (run_start, run_len) = Self::run_bytes(bf.size, b0, b1);
+        {
+            let mut opening = self.opening.lock().expect("opening mutex poisoned");
+            let opening = opening.as_mut()?;
+            let store = self.store.upgrade()?;
+            if opening.bytes + run_len > OPENING_HOLD_MAX_BYTES || store.write_behind_is_full() {
+                return None;
+            }
+            opening.bytes += run_len;
+        }
+        let run = match self.inner.range(run_start, run_len).await {
+            Ok(run) => run,
+            Err(error) => return Some(Err(error)),
+        };
+        let from = (start - run_start) as usize;
+        let bytes = run.slice(from..from + len as usize);
+        if let Some(opening) = self
+            .opening
+            .lock()
+            .expect("opening mutex poisoned")
+            .as_mut()
+        {
+            opening.reads.push((run_start, run));
+        }
+        Some(Ok(bytes))
+    }
+
+    /// Queues `bytes`, the object's bytes from `start`, for writing: each whole
+    /// block they cover that is not on disk or in memory yet. Takes only free
+    /// budget and does not wait for the write. Does nothing when this source is
+    /// not the live entry.
+    fn keep(&self, start: u64, bytes: &Bytes) {
+        let Some(bf) = self.block_file() else {
+            return;
+        };
+        let Some(store) = self.store_if_current() else {
+            return;
+        };
+        let end = start + bytes.len() as u64;
+        // Whole blocks only; the file's last block may be short.
+        let first = start.div_ceil(CACHE_BLOCK_BYTES);
+        let end_block = match end == bf.size {
+            true => end.div_ceil(CACHE_BLOCK_BYTES),
+            false => end / CACHE_BLOCK_BYTES,
+        };
+        if first >= end_block {
+            return;
+        }
+        let (Ok(first), Ok(last)) = (u32::try_from(first), u32::try_from(end_block - 1)) else {
+            return;
+        };
+        for segment in self.segments(first, last) {
+            let Segment::Missing { first, last } = segment else {
+                continue;
+            };
+            let (run_start, run_len) = Self::run_bytes(bf.size, first, last);
+            let reservation = match self.owns_accounting {
+                true => match store.try_reserve(run_len) {
+                    Some(reserved) => Some(reserved),
+                    None => return,
+                },
+                false => None,
+            };
+            let from = (run_start - start) as usize;
+            let run = bytes.slice(from..from + run_len as usize);
+            if let Some(run) =
+                self.admit_run(&store, first, last, &run, reservation, Fill::Read, None)
+            {
+                drop(run.spawn_write());
+            }
+        }
+    }
+
     /// One chunk of [`Self::prefetch`]: fetches every block of `[b0, b1]` that is
     /// neither filled nor in memory, and waits for it to be written. It reserves
     /// only free budget, so a prefetch never evicts what queries use. It first
@@ -2491,12 +2622,15 @@ impl BlockCachedSource {
                 if let Some(bytes) = self.read_local(bf, start, len) {
                     return Ok(bytes);
                 }
-            } else if !in_hole
+            } else if !in_hole {
                 // Missing blocks are fetched and kept, except in the hole,
                 // which reads never fill.
-                && let Some(bytes) = self.read_through(bf, start, len, window).await?
-            {
-                return Ok(bytes);
+                if let Some(read) = self.read_while_opening(bf, start, len).await {
+                    return read;
+                }
+                if let Some(bytes) = self.read_through(bf, start, len, window).await? {
+                    return Ok(bytes);
+                }
             }
         }
 
@@ -3238,6 +3372,81 @@ mod tests {
         );
         store.install_block_entry_for_test(uri, Arc::clone(&src));
         (uri, inner, src)
+    }
+
+    /// A source over an `obj`-byte blob that is not the live entry yet, as
+    /// during an open.
+    fn opening_source(
+        dir: &Path,
+        store: &Arc<DiskCacheStore>,
+        obj: usize,
+    ) -> (SuperfileUri, Arc<CountingSource>, Arc<BlockCachedSource>) {
+        let uri = SuperfileUri::new_v4();
+        let inner = Arc::new(CountingSource::new(obj));
+        let src = BlockCachedSource::new_with_accounting(
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(store),
+            uri,
+            dir.join("opening.blocks"),
+            true,
+            SourceLayout::default(),
+        );
+        src.start_opening();
+        (uri, inner, src)
+    }
+
+    /// An open holds its reads up to [`OPENING_HOLD_MAX_BYTES`] and keeps them
+    /// once its entry is live; a read past the cap is not held.
+    #[tokio::test]
+    async fn an_open_keeps_its_reads_up_to_the_cap() {
+        let b = CACHE_BLOCK_BYTES;
+        let obj = (OPENING_HOLD_MAX_BYTES + 2 * b) as usize;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = opening_source(dir.path(), &store, obj);
+
+        let _ = src
+            .range(0, OPENING_HOLD_MAX_BYTES)
+            .await
+            .expect("read up to the cap");
+        let past = OPENING_HOLD_MAX_BYTES + b;
+        let _ = src.range(past, 100).await.expect("read past the cap");
+        assert_eq!(inner.calls(), 2);
+
+        let held = src.end_opening();
+        store.install_block_entry_for_test(uri, Arc::clone(&src));
+        src.keep_held(held);
+        store.block_writes_settled().await;
+        assert_eq!(
+            src.filled_bytes_handle().load(Ordering::Acquire),
+            OPENING_HOLD_MAX_BYTES,
+            "only the blocks under the cap are kept"
+        );
+
+        let _ = src.range(10, 100).await.expect("read a kept block");
+        assert_eq!(inner.calls(), 2, "a kept block needs no GET");
+
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// An open whose entry never goes live keeps nothing and drops what it held.
+    #[tokio::test]
+    async fn an_open_without_a_live_entry_keeps_nothing() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (_uri, _inner, src) = opening_source(dir.path(), &store, 4 * b as usize);
+
+        let _ = src.range(b + 5, 100).await.expect("read while opening");
+        let held = src.end_opening();
+        src.keep_held(held);
+        store.block_writes_settled().await;
+        assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 0);
+        assert_eq!(store.stats().current_bytes, 0);
+        assert!(
+            src.opening.lock().expect("opening mutex").is_none(),
+            "the held blocks are dropped"
+        );
     }
 
     /// Hole reads stay exact passthrough until a prefetch fills the hole; then
