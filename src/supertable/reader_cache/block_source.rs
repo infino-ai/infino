@@ -288,8 +288,9 @@ pub(crate) struct BlockCachedSource {
     /// Filled bytes a record counts instead of this source ([`Self::retire`]); the source gives
     /// back only what it filled beyond them.
     handed_over: AtomicU64,
-    /// Set once a record keeps this source's file ([`Self::retire`]): the source no longer writes
-    /// the file's index, which a newer source may have adopted and rewritten.
+    /// Set once the source stops writing the file's index: a record keeps the file
+    /// ([`Self::retire`]) and a newer source may have adopted and rewritten the index, or an fsync
+    /// of the file failed (see [`Self::flush_index`]).
     retired: AtomicBool,
     /// Where this file's FTS hole and aligned region lie.
     layout: SourceLayout,
@@ -322,8 +323,7 @@ pub(crate) struct BlockCachedSource {
     runs: Mutex<BTreeMap<u32, MemoryRun>>,
     /// Source of [`MemoryRun::id`].
     next_run_id: AtomicU64,
-    /// Set when blocks are marked filled after the last index write. A failed
-    /// fsync sets it again, so the next flush retries.
+    /// Set when blocks are marked filled after the last index write.
     dirty: AtomicBool,
     /// Set while an index flush runs; see [`Self::flush_index`].
     flushing: AtomicBool,
@@ -344,6 +344,9 @@ pub(crate) struct BlockCachedSource {
     /// Tests hold a flush here, in its fsync.
     #[cfg(test)]
     fsync_stall: Stall,
+    /// Tests set this to fail the next fsync.
+    #[cfg(test)]
+    fail_next_fsync: AtomicBool,
     /// Tests set this to run once [`Self::block_file`] has created a fresh file,
     /// given its inode, before the index at the path is removed again.
     #[cfg(test)]
@@ -832,6 +835,8 @@ impl BlockCachedSource {
             queued_flush_stall: Stall::default(),
             #[cfg(test)]
             fsync_stall: Stall::default(),
+            #[cfg(test)]
+            fail_next_fsync: AtomicBool::new(false),
             #[cfg(test)]
             created_hook: Mutex::new(None),
         })
@@ -1459,7 +1464,6 @@ impl BlockCachedSource {
     /// - The flush waits for a block writer of its own, like a write.
     /// - Runs of the file that land before it starts share it. Runs that land
     ///   while it runs are picked up by its next pass.
-    /// - It holds the source until done, so `Drop` never fsyncs on a query thread.
     fn queue_flush(self: &Arc<Self>, store: &Arc<DiskCacheStore>) {
         // No new blocks, or a queued or running flush will pick them up.
         if !self.dirty.load(Ordering::SeqCst)
@@ -1479,11 +1483,12 @@ impl BlockCachedSource {
 
     /// Fsyncs the block file, then writes the index of the blocks marked filled.
     /// Blocking: runs once a queued flush has its block writer (see
-    /// [`Self::queue_flush`]), or in `Drop`.
+    /// [`Self::queue_flush`]).
     /// - One flush runs per source. A call that finds one running returns at
     ///   once; the running one covers its blocks.
     /// - If blocks were marked during the fsync, the running flush goes again.
-    /// - A failed fsync leaves the blocks for the next flush, or for Drop.
+    /// - A failed fsync stops the file being indexed; a later open fetches the
+    ///   blocks the last index misses.
     fn flush_index(&self) {
         let Some(bf) = self.created_block_file() else {
             return;
@@ -1513,14 +1518,16 @@ impl BlockCachedSource {
             self.fsync_stall.wait_while_held();
             let synced = bf.file.sync_data().is_ok();
             #[cfg(test)]
+            let synced = synced && !self.fail_next_fsync.swap(false, Ordering::SeqCst);
+            #[cfg(test)]
             self.syncs.fetch_add(1, Ordering::AcqRel);
 
             if synced {
                 self.persist_idx(bf, &snapshot);
             } else {
-                // Keep the flag set so the next flush retries, instead of looping
-                // on a failing disk.
-                self.dirty.store(true, Ordering::SeqCst);
+                // A retried fsync can succeed although the failed writes never
+                // reached the disk, and its index would name them.
+                self.retired.store(true, Ordering::Release);
             }
 
             self.flushing.store(false, Ordering::SeqCst);
@@ -2332,9 +2339,6 @@ pub(super) fn indexed_filled_bytes(
 
 impl Drop for BlockCachedSource {
     fn drop(&mut self) {
-        // Every queued write and flush holds the source, so none runs now. This
-        // only retries a failed fsync.
-        self.flush_index();
         // Release accounted bytes only; the file and index persist for adoption.
         if self.owns_accounting
             && let Some(store) = self.store.upgrade()
@@ -3125,40 +3129,6 @@ mod tests {
             d_read, want,
             "D must serve real bytes, not zeros from a successor inode's hole \
              claimed by a dropped generation's stale bitmap"
-        );
-    }
-
-    /// A source whose file a record took over, still owing an index write (an earlier fsync
-    /// failed), dropped after a newer source adopted the file and wrote its own index.
-    /// This test pins that a retired source leaves the newer index in place.
-    #[tokio::test]
-    async fn a_retired_source_leaves_the_index_alone_when_it_drops() {
-        const OBJ: usize = 4 * CACHE_BLOCK_BYTES as usize + 1000;
-        let dir = tempdir().expect("tempdir");
-        let store = test_store(dir.path(), u64::MAX);
-        let uri = SuperfileUri::new_v4();
-        let inner = Arc::new(CountingSource::new(OBJ));
-        let old = BlockCachedSource::new(
-            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
-            Arc::downgrade(&store),
-            uri,
-            dir.path().join("retired.blocks"),
-        );
-        store.install_block_entry_for_test(uri, Arc::clone(&old));
-        let _ = old.range(100, 50).await.expect("fill");
-        store.block_writes_settled().await;
-        let idx_path = old.idx_path();
-        wait_until(|| idx_path.exists(), "the index is written").await;
-        store.remove_block_entry_for_test(&uri);
-
-        let _ = old.retire(old.filled_bytes_handle().load(Ordering::Acquire));
-        fs::write(&idx_path, b"newer").expect("a newer source's index");
-        old.dirty.store(true, Ordering::SeqCst);
-        drop(old);
-        assert_eq!(
-            fs::read(&idx_path).expect("index"),
-            b"newer",
-            "left in place"
         );
     }
 
@@ -5198,6 +5168,32 @@ mod tests {
 
         assert_eq!(src.syncs.load(Ordering::Acquire), 1);
         assert!(!src.idx_path().exists(), "no index for the newer file");
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fsync_stops_the_file_being_indexed() {
+        // Run A's fsync fails, then run B lands.
+        //  - a retried fsync can succeed although A's writes never reached the disk.
+        //  - so B's flush must not write an index naming A's block.
+        // This test pins that a failed fsync stops the file being indexed.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
+
+        src.fail_next_fsync.store(true, Ordering::SeqCst);
+        src.prefetch(0, b, b, 1).await.expect("prefetch A");
+        store.block_writes_settled().await;
+        src.prefetch(b, b, b, 1).await.expect("prefetch B");
+        store.block_writes_settled().await;
+
+        assert!(!src.idx_path().exists(), "no index names A's block");
+        assert_eq!(
+            src.syncs.load(Ordering::Acquire),
+            1,
+            "no fsync after it failed"
+        );
         store.remove_block_entry_for_test(&uri);
     }
 
