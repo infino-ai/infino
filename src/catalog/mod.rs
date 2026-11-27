@@ -1428,6 +1428,8 @@ impl Connection {
                     names,
                     reads_data: reads_table_data(&statement),
                     statistics: uses_statistics(&statement),
+                    declared_types: describes_table(&statement)
+                        || references_information_schema(&refs),
                 };
                 (Some(statement), refs, tables)
             }
@@ -1444,7 +1446,10 @@ impl Connection {
             .filter(|_| tables.reads_data)
             .map(|stats| Arc::new(search_tvf::TableReads::new(Arc::clone(stats))));
 
-        let statistics = tables.statistics;
+        let registration = Registration {
+            statistics: tables.statistics,
+            declared_types: tables.declared_types,
+        };
         let mut seen = HashSet::new();
         let mut handles: Vec<SupertableHandle> = Vec::new();
         let mut registered: Vec<String> = Vec::new();
@@ -1454,7 +1459,7 @@ impl Connection {
                 continue;
             }
             if let Some(table) = self
-                .open_and_register_cancellable(&ctx, &name, cancel, statistics)
+                .open_and_register_cancellable(&ctx, &name, cancel, registration)
                 .map_err(|e| e.with_context("query_sql", None))?
             {
                 // A relation the statement names and the catalog holds:
@@ -1484,7 +1489,7 @@ impl Connection {
                 .filter(|name| seen.insert(name.clone()))
                 .collect();
             handles.extend(
-                self.open_and_register_all(&ctx, &names, cancel, statistics)
+                self.open_and_register_all(&ctx, &names, cancel, registration)
                     .map_err(|e| e.with_context("query_sql", None))?,
             );
         }
@@ -1709,23 +1714,25 @@ impl Connection {
         ctx: &SessionContext,
         name: &str,
         cancel: &QueryCancel,
-        statistics: bool,
+        registration: Registration,
     ) -> Result<Option<SupertableHandle>, InfinoError> {
         cancel.check()?;
         // A memory catalog opens without reading storage, and a hosted one
         // never opens tables here.
         let CatalogStore::Storage { handles, .. } = &self.inner.store else {
-            return self.open_and_register(ctx, name, statistics);
+            return self.open_and_register(ctx, name, registration);
         };
-        if let Some(table) = live_handle(handles, name).filter(|t| ready(t, statistics)) {
-            return register(table, ctx, name);
+        if let Some(table) =
+            live_handle(handles, name).filter(|t| ready(t, registration.statistics))
+        {
+            return register(table, ctx, name, registration.declared_types);
         }
         let Ok(slot) = CANCELLABLE_OPENS.try_acquire() else {
-            return self.open_and_register(ctx, name, statistics);
+            return self.open_and_register(ctx, name, registration);
         };
         // The SQL provider takes the query's work counters from the thread
         // that registers it (`op_stats::current`), so they move with the open.
-        let opened = self.open_on_pool(ctx, name, slot, op_stats::current(), statistics);
+        let opened = self.open_on_pool(ctx, name, slot, op_stats::current(), registration);
         bridge_on_runtime(cancel.unless_cancelled(opened), &shared_io_runtime())
     }
 
@@ -1738,7 +1745,7 @@ impl Connection {
         name: &str,
         slot: SemaphorePermit<'static>,
         collector: Option<Arc<OpStatsCollector>>,
-        statistics: bool,
+        registration: Registration,
     ) -> impl Future<Output = Result<Option<SupertableHandle>, InfinoError>> + use<> {
         let conn = self.clone();
         let session = ctx.clone();
@@ -1746,7 +1753,7 @@ impl Connection {
         let opening = shared_io_runtime().spawn_blocking(carry_span(move || {
             let _slot = slot;
             op_stats::attached(collector, || {
-                conn.open_and_register(&session, &table, statistics)
+                conn.open_and_register(&session, &table, registration)
             })
         }));
         async {
@@ -1771,14 +1778,14 @@ impl Connection {
         ctx: &SessionContext,
         names: &[String],
         cancel: &QueryCancel,
-        statistics: bool,
+        registration: Registration,
     ) -> Result<Vec<SupertableHandle>, InfinoError> {
         cancel.check()?;
         let CatalogStore::Storage { handles, .. } = &self.inner.store else {
             // These opens read no storage, so one by one costs nothing.
             let mut tables = Vec::new();
             for name in names {
-                tables.extend(self.open_and_register(ctx, name, statistics)?);
+                tables.extend(self.open_and_register(ctx, name, registration)?);
             }
             return Ok(tables);
         };
@@ -1787,15 +1794,16 @@ impl Connection {
             .map(|(index, name)| {
                 let collector = collector.clone();
                 async move {
-                    let warm = live_handle(handles, name).filter(|t| ready(t, statistics));
+                    let warm =
+                        live_handle(handles, name).filter(|t| ready(t, registration.statistics));
                     let opened = match warm {
-                        Some(table) => register(table, ctx, name)?,
+                        Some(table) => register(table, ctx, name, registration.declared_types)?,
                         None => {
                             let slot = CANCELLABLE_OPENS
                                 .acquire()
                                 .await
                                 .expect("invariant: the open slots are never closed");
-                            self.open_on_pool(ctx, name, slot, collector, statistics)
+                            self.open_on_pool(ctx, name, slot, collector, registration)
                                 .await?
                         }
                     };
@@ -1818,10 +1826,10 @@ impl Connection {
         &self,
         ctx: &SessionContext,
         name: &str,
-        statistics: bool,
+        registration: Registration,
     ) -> Result<Option<SupertableHandle>, InfinoError> {
-        match self.open_table_handle_for(name, statistics) {
-            Ok(table) => register(table, ctx, name),
+        match self.open_table_handle_for(name, registration.statistics) {
+            Ok(table) => register(table, ctx, name, registration.declared_types),
             Err(InfinoError::NotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
@@ -2010,12 +2018,42 @@ fn register(
     table: SupertableHandle,
     ctx: &SessionContext,
     name: &str,
+    declared_types: bool,
 ) -> Result<Option<SupertableHandle>, InfinoError> {
-    match table.register_into(ctx, name).map_err(InfinoError::from) {
+    match table
+        .register_into(ctx, name, declared_types)
+        .map_err(InfinoError::from)
+    {
         Ok(_) => Ok(Some(table)),
         Err(InfinoError::NotFound(_)) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// What a statement needs of each table it registers: per-column statistics
+/// (`statistics`), and the column types the table declares in place of the
+/// string views the scan reads (`declared_types`, for a statement that shows
+/// the columns).
+#[derive(Clone, Copy, Debug)]
+struct Registration {
+    statistics: bool,
+    declared_types: bool,
+}
+
+/// Whether `statement` is a `DESCRIBE`, which lists a table's columns and
+/// their types.
+///
+/// The scan reads a string column without a full-text index as a string
+/// view, and query results convert it back. A statement that lists columns
+/// would show that internal type instead of the one the table declares, so
+/// its tables are registered with their declared types. It reads no rows, so
+/// the faster comparisons the views buy are not needed.
+fn describes_table(statement: &DFStatement) -> bool {
+    matches!(
+        statement,
+        DFStatement::Statement(statement)
+            if matches!(statement.as_ref(), SqlStatement::ExplainTable { .. })
+    )
 }
 
 /// Schema name DataFusion exposes its introspection views under.
@@ -2674,6 +2712,13 @@ mod tests {
     };
 
     const TOP_K: usize = 10;
+
+    /// How a query that reads its tables registers them: with statistics, and
+    /// planning against the scan's string views.
+    const QUERY_REGISTRATION: Registration = Registration {
+        statistics: true,
+        declared_types: false,
+    };
 
     /// Total rows across the materialized search batches.
     fn n_rows(batches: &[RecordBatch]) -> usize {
@@ -6184,7 +6229,7 @@ mod tests {
         )
         .expect("session");
         for name in tables {
-            conn.open_and_register(&ctx, name, true)
+            conn.open_and_register(&ctx, name, QUERY_REGISTRATION)
                 .expect("register")
                 .expect("a catalog table");
         }
@@ -6303,7 +6348,7 @@ mod tests {
         )
         .expect("session");
         for name in tables {
-            conn.open_and_register(&ctx, name, true)
+            conn.open_and_register(&ctx, name, QUERY_REGISTRATION)
                 .expect("register")
                 .expect("a catalog table");
         }
@@ -6339,6 +6384,7 @@ mod tests {
             names: vec!["tags".to_string()],
             reads_data: true,
             statistics: true,
+            declared_types: false,
         };
         let bytes: Vec<usize> = sqls
             .iter()

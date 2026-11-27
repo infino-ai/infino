@@ -357,13 +357,14 @@ const STATEMENT_PLANS_BUDGET_SHARE_PERCENT: usize = 10;
 
 /// What a kept statement's parse found about its tables, for a later run to
 /// register them as the parse would have: the catalog tables it names,
-/// whether running it reads their data, and whether it can use their column
-/// statistics.
+/// whether running it reads their data, whether it can use their column
+/// statistics, and whether it shows their columns' declared types.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KeptTables {
     pub(crate) names: Vec<String>,
     pub(crate) reads_data: bool,
     pub(crate) statistics: bool,
+    pub(crate) declared_types: bool,
 }
 
 /// A kept statement: what its parse found about its tables, its parsed
@@ -1097,7 +1098,21 @@ impl SupertableReader {
     /// The pushdown-aware provider over this reader's pinned snapshot,
     /// merging value counts through the table's carried sums.
     fn sql_provider(&self) -> SupertableProvider {
-        SupertableProvider::new(self.sql_schemas().scan().clone(), self)
+        self.sql_provider_over(self.sql_schemas().scan().clone())
+    }
+
+    /// [`Self::sql_provider`] planning against the column types the table
+    /// declares, not the string views the scan reads. For a statement that
+    /// shows the table's columns (`DESCRIBE`, `information_schema`), which
+    /// must report the declared types.
+    fn declared_sql_provider(&self) -> SupertableProvider {
+        self.sql_provider_over(self.sql_schemas().scalar().clone())
+    }
+
+    /// The provider over this reader's pinned snapshot, planning against
+    /// `schema`.
+    fn sql_provider_over(&self, schema: SchemaRef) -> SupertableProvider {
+        SupertableProvider::new(schema, self)
             .with_value_count_carry(self.value_count_carry())
             .with_deleted_stats(self.deleted_stats())
     }
@@ -1323,18 +1338,26 @@ impl Supertable {
     /// per referenced table. Returns the pinned reader so the caller can
     /// later wire the same snapshot into search TVFs.
     ///
+    /// With `declared_types` the provider plans against the column types the
+    /// table declares rather than the string views the scan reads, so a
+    /// statement showing the columns reports what the table holds.
+    ///
     /// [`Connection::query_sql`]: crate::Connection::query_sql
     pub(crate) fn register_into(
         &self,
         ctx: &SessionContext,
         name: &str,
+        declared_types: bool,
     ) -> Result<Arc<SupertableReader>, QueryError> {
         // `reader()` applies the read-consistency freshness check itself (and,
         // under Strong, fails rather than serving a stale snapshot), so no
         // separate `ensure_fresh` call is needed here.
         let reader = Arc::new(self.reader().map_err(QueryError::ManifestLoad)?);
-        // Provider scans the cached string-viewed schema.
-        let provider = reader.sql_provider();
+        let provider = match declared_types {
+            true => reader.declared_sql_provider(),
+            // Provider scans the cached string-viewed schema.
+            false => reader.sql_provider(),
+        };
         // Registering the table we just built is ours to get right.
         ctx.register_table(name, Arc::new(provider))
             .map_err(QueryError::internal)?;

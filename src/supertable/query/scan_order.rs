@@ -351,7 +351,7 @@ mod tests {
                 ctx.sql(&set).await.expect("set");
             }
         });
-        st.register_into(&ctx, "t").expect("register");
+        st.register_into(&ctx, "t", false).expect("register");
         ctx
     }
 
