@@ -59,6 +59,7 @@ use crate::{
             id_order::IdOrderUnderTopK,
             join_build_size::RightSizeJoinBuild,
             limit_stage::StageLimitGathers,
+            read_ahead_rule::ReadAheadUnderLimit,
             scan_order::ScanOrderUnderLimit,
             sorted_root::{KeepSortedRoot, OrderUnderScalarSubquery},
             topk_row_filter::RowFilterUnderTopK,
@@ -309,6 +310,9 @@ pub(crate) fn budgeted_session_context(
     //  - `StageLimitGathers` after DataFusion's rules, once `EnforceDistribution`
     //    has split a filtered scan and `LimitPushdown` has set the gather's
     //    fetch, to start its partitions in two stages under a small `LIMIT`.
+    //  - `ReadAheadUnderLimit` last, once DataFusion has placed every limit,
+    //    to mark the scans a `LIMIT` or top-k can stop early, so their
+    //    read-ahead holds to what they read.
     let mut rules = PhysicalOptimizer::new().rules;
     rules.insert(0, Arc::new(RowFilterUnderTopK));
     rules.insert(1, Arc::new(IdOrderUnderTopK));
@@ -318,6 +322,7 @@ pub(crate) fn budgeted_session_context(
     rules.push(Arc::new(KeepSortedRoot));
     rules.push(Arc::new(ScanOrderUnderLimit));
     rules.push(Arc::new(StageLimitGathers));
+    rules.push(Arc::new(ReadAheadUnderLimit));
     let mut builder = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(budgeted_runtime(budget, spill)?)

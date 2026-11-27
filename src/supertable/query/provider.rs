@@ -6565,9 +6565,9 @@ pub(crate) mod tests {
         cached_row_groups: Vec<usize>,
         /// Rows the scan stops after, as a pushed `LIMIT` stops it.
         limit: Option<usize>,
-        /// A top-k on `a`: its filter starts as "every row", and after the
-        /// first batch tightens to `a <` this, as a top-k's does once its heap
-        /// is full. Run as a row filter.
+        /// A top-k on `a`: its filter starts as "every row", and once the scan
+        /// returns its first record batch it tightens to `a <` this, as a
+        /// top-k's does once its heap is full. Run as a row filter.
         top_k: Option<i64>,
     }
 
@@ -6646,9 +6646,9 @@ pub(crate) mod tests {
     /// together overlap like GETs do.
     const GET_LATENCY: Duration = Duration::from_millis(20);
     /// Row groups' worth of rows the LIMIT shapes stop after, in each
-    /// partition: enough to start reading ahead, and few enough that
-    /// fetching on to the end of the file would be more than twice the
-    /// read.
+    /// partition: enough to start reading ahead. With one partition, fetching
+    /// on to the end of the file would be four times the read; with two, each
+    /// partition holds four row groups, so it would be twice.
     const LIMIT_ROW_GROUPS: usize = 2;
     /// Row groups' worth of rows the top-k shape keeps once its filter
     /// tightens.
@@ -6731,6 +6731,11 @@ pub(crate) mod tests {
         ));
         if !read_ahead {
             read_ahead_state.reclaim();
+        }
+        // The plan rule marks a scan a LIMIT or top-k can stop early; this
+        // harness builds the scan without the optimizer, so it marks it here.
+        if shape.limit.is_some() || shape.top_k.is_some() {
+            read_ahead_state.hold_to_what_is_read();
         }
         let factory = ScanReaderFactory {
             read_ahead: Arc::clone(&read_ahead_state),
@@ -6827,9 +6832,12 @@ pub(crate) mod tests {
         // Each shape below is scanned twice, read-ahead off and on, through
         // DataFusion's own opener and the real disk cache:
         //  - the rows must match;
-        //  - the bytes downloaded must match, within the cache's own slack;
+        //  - the bytes downloaded must match, within the cache's own slack,
+        //    except that a LIMIT shape may fetch up to twice the bytes and
+        //    the top-k shape one cache window more;
         //  - the GETs must not grow beyond `GET_SLACK`.
-        // This test pins that read-ahead downloads nothing the scan wouldn't.
+        // This test pins that read-ahead downloads nothing the scan wouldn't,
+        // except what a scan that stops early leaves unread.
         let file = fixture::wide_file(WIDE_ROWS_PER_GROUP, WIDE_PAGE_ROWS);
         let group = WIDE_ROWS_PER_GROUP as i64;
         let mut plan = ParquetAccessPlan::new_all(fixture::GROUPS);
@@ -6916,9 +6924,10 @@ pub(crate) mod tests {
                     on.fetched <= 2 * off.fetched + partition_slack(shape.partitions),
                     "{name}: at most twice the bytes from storage: {on:?} vs {off:?}"
                 ),
-                // Once the filter tightens the scan skips the rest of each row
-                // group, so a batch can move where the scan's next short miss
-                // places its window: one window more at most.
+                // Once the filter tightens, the scan stops reading `c` for rows
+                // past the bound, so its reads get short, and a short read
+                // downloads a whole cache window (`CACHE_MIN_GET`). A batch can
+                // shift where that window lands: one window more at most.
                 (None, Some(_)) => {
                     assert!(
                         on.fetched <= off.fetched + CACHE_MIN_GET,

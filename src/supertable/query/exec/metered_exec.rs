@@ -97,7 +97,8 @@ pub(crate) struct MeteredExec {
     /// reads column sizes from them.
     footers: Option<Arc<ScanFooters>>,
     /// Read-ahead for the table scan below, if it is one. The meter hands it
-    /// the scan's filter when the scan runs.
+    /// the scan's filter when the scan runs, and `ReadAheadUnderLimit` holds
+    /// it to what the scan has read under a `LIMIT` or top-k.
     read_ahead: Option<Arc<ScanReadAhead>>,
     /// Whether the planner may carry a `LIMIT` fetch past this node into
     /// the child. The provider's meter around a scan that carries filters
@@ -169,6 +170,11 @@ impl MeteredExec {
     pub(crate) fn with_note(mut self, note: Option<Arc<str>>) -> Self {
         self.note = note;
         self
+    }
+
+    /// Read-ahead for the table scan this meter wraps, if any.
+    pub(crate) fn read_ahead(&self) -> Option<&Arc<ScanReadAhead>> {
+        self.read_ahead.as_ref()
     }
 
     /// The node this meter wraps.
