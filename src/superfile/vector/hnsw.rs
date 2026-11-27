@@ -465,8 +465,18 @@ impl Fp32Scorer {
         }
     }
 
+    /// A scorer over `data`, `dim` values per node in node order.
+    pub(crate) fn from_rows(data: Vec<f32>, dim: usize, metric: Metric) -> Self {
+        Self {
+            len: data.len() / dim,
+            data,
+            dim,
+            metric,
+        }
+    }
+
     #[inline]
-    fn row(&self, node: u32) -> &[f32] {
+    pub(crate) fn row(&self, node: u32) -> &[f32] {
         let start = node as usize * self.dim;
         &self.data[start..start + self.dim]
     }
