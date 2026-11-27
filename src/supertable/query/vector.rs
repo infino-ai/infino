@@ -86,6 +86,7 @@ use arrow_array::{Array, Decimal128Array};
 use arrow_schema::Schema;
 use datafusion::logical_expr::Expr;
 use futures::{StreamExt, TryStreamExt, stream};
+use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashSet;
 use tokio::{join, sync::OnceCell};
@@ -99,6 +100,7 @@ use crate::test_helpers::{admit_trace, check_hits_probe, served_shortlist_probe}
 use crate::utils::trace::OpOrigin;
 use crate::{
     config,
+    memory::ConnectionMemoryBudget,
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::{StorageProvider, io_counters},
@@ -106,7 +108,7 @@ use crate::{
         SuperfileReader,
         error::ReadError,
         fts::reader::{BoolMode, QueryDict},
-        id_space::row_bitmap,
+        id_space::{Admitted, row_bitmap},
         vector::{
             cell_posting::EncodedCellRow,
             distance::{
@@ -135,7 +137,7 @@ use crate::{
         options::{GappedPlacementCell, GappedPlacementIndex},
         query::{
             SuperfileHit,
-            candidate::{CandidatePlan, CandidateScope},
+            candidate::{CandidatePlan, CandidateScope, RankScope, SetSpace},
             dispatch,
             exec::common::{
                 SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source,
@@ -143,7 +145,7 @@ use crate::{
             fine_graph_cache::{self, FineNodeKey, GraphRole},
             fine_graph_follow, fine_graph_publish,
             fine_graph_store::{GraphHead, KeyedGraph},
-            fts::{memo_from_locations, memos_from_plan_locations},
+            fts::{PlanLocations, memo_from_locations, memos_from_plan_locations},
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
             superfile_reader::OpenTierCounts,
@@ -8371,52 +8373,81 @@ impl SupertableReader {
         superfiles: &[Arc<SuperfileEntry>],
         plan: &CandidatePlan,
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
-        let plan_arc = Arc::new(plan.clone());
-        let unbounded_is_legitimate = plan.may_evaluate_unbounded();
-        let op_stats = self.op_stats.clone();
-        // A `LIKE` leaf's dictionary walk is CPU work: it runs on the reader
-        // pool, not on the tokio worker driving this fan-out.
-        let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
-        // The index's locations for the plan's terms let each superfile
-        // resolve them from its postings alone.
-        let locations = Arc::new(self.plan_locations(plan, superfiles).await?);
-        let budget = Arc::clone(&self.manifest().options.connection_memory_budget);
+        let eval = Arc::new(self.plan_evaluation(plan, superfiles).await?);
         self.fanout_candidate_bitmaps(superfiles, move |r, entry| {
-            let plan = Arc::clone(&plan_arc);
-            let op_stats = op_stats.clone();
-            let reader_pool = Arc::clone(&reader_pool);
-            let locations = Arc::clone(&locations);
-            let budget = Arc::clone(&budget);
+            let eval = Arc::clone(&eval);
+            async move { eval.set(&r, entry.superfile_id, SetSpace::Rows).await }
+        })
+        .await
+    }
+
+    /// [`Self::candidate_scope`] for a ranked text search, where a superfile's set may be in blob
+    /// ids, which the search checks without reading the doc-id map (hundreds of megabytes on a
+    /// large superfile). A set is in blob ids when all of these hold, and in rows otherwise:
+    /// - `plan` has no range leaf, since a range index gives rows.
+    /// - The blob reorders its documents; a blob in row order needs no map anyway.
+    /// - The superfile has no deleted row, since deletes are rows.
+    pub(crate) async fn rank_scope(
+        &self,
+        filters: &[Expr],
+        plan: &CandidatePlan,
+    ) -> Result<RankScope, QueryError> {
+        let superfiles = self.superfiles_a_where_may_match(filters, plan).await?;
+        if superfiles.is_empty() {
+            return Ok(RankScope::empty());
+        }
+        let allow = match plan {
+            CandidatePlan::Unbounded => None,
+            bounded => Some(self.admitted_from_plan(&superfiles, bounded).await?),
+        };
+        Ok(RankScope { superfiles, allow })
+    }
+
+    /// [`Self::candidate_bitmaps_from_plan`], with sets in blob ids as [`Self::rank_scope`] says.
+    async fn admitted_from_plan(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        plan: &CandidatePlan,
+    ) -> Result<HashMap<SuperfileUri, Admitted>, QueryError> {
+        let text_only = !plan.has_range();
+        let eval = Arc::new(self.plan_evaluation(plan, superfiles).await?);
+        self.fanout_candidate_sets(superfiles, move |r, entry, deleted| {
+            let eval = Arc::clone(&eval);
             async move {
-                let memos = memos_from_plan_locations(&r, &locations, entry.superfile_id).await;
-                // A `LIKE` leaf's expansion and the match share one dictionary read while the
-                // budget has room.
-                let (bitmap, work) = plan
-                    .evaluate(
-                        r.as_ref(),
-                        Some(&reader_pool),
-                        &memos,
-                        &QueryDict::with_budget(&budget),
-                    )
-                    .await
-                    .map_err(QueryError::from)?;
-                // The SQL predicate's posting walks, summed across the
-                // plan tree — the pushdown leg of the vector TVF.
-                work.add_to(op_stats.as_deref());
-                match bitmap {
-                    Some(bitmap) => Ok(bitmap),
-                    None if unbounded_is_legitimate => {
-                        let mut all = RoaringBitmap::new();
-                        all.insert_range(0..r.n_docs() as u32);
-                        Ok(all)
-                    }
-                    None => Err(QueryError::Internal(
-                        "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
+                let reorders = r.fts().is_some_and(|fts| fts.has_doc_map());
+                let set = match (text_only && reorders, deleted) {
+                    (true, None) => Admitted::BlobIds(Arc::new(
+                        eval.set(&r, entry.superfile_id, SetSpace::BlobIds).await?,
                     )),
-                }
+                    (_, deleted) => {
+                        let rows = eval.set(&r, entry.superfile_id, SetSpace::Rows).await?;
+                        Admitted::Rows(Arc::new(live_rows(rows, deleted.as_deref())))
+                    }
+                };
+                Ok((!set.is_empty()).then_some(set))
             }
         })
         .await
+    }
+
+    /// The state every superfile's evaluation of `plan` shares.
+    async fn plan_evaluation(
+        &self,
+        plan: &CandidatePlan,
+        superfiles: &[Arc<SuperfileEntry>],
+    ) -> Result<PlanEvaluation, QueryError> {
+        Ok(PlanEvaluation {
+            plan: plan.clone(),
+            unbounded_is_legitimate: plan.may_evaluate_unbounded(),
+            op_stats: self.op_stats.clone(),
+            // A `LIKE` leaf's dictionary walk is CPU work: it runs on the reader
+            // pool, not on the tokio worker driving this fan-out.
+            reader_pool: Arc::clone(&self.manifest().options.reader_pool),
+            // The index's locations for the plan's terms let each superfile
+            // resolve them from its postings alone.
+            locations: self.plan_locations(plan, superfiles).await?,
+            budget: Arc::clone(&self.manifest().options.connection_memory_budget),
+        })
     }
 
     /// Fan out over `superfiles`, resolve matching `local_doc_id`s per
@@ -8430,6 +8461,32 @@ impl SupertableReader {
         F: Fn(Arc<SuperfileReader>, Arc<SuperfileEntry>) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = Result<RoaringBitmap, QueryError>> + Send,
     {
+        self.fanout_candidate_sets(superfiles, move |r, entry, deleted| {
+            let doc_ids = doc_ids.clone();
+            async move {
+                let live = live_rows(doc_ids(r, entry).await?, deleted.as_deref());
+                Ok((!live.is_empty()).then(|| Arc::new(live)))
+            }
+        })
+        .await
+    }
+
+    /// Fan out over `superfiles` and build each one's set with `set_of`, which is given the
+    /// superfile's deleted rows (`None` if none). A `None` set means empty and is dropped.
+    async fn fanout_candidate_sets<T, F, Fut>(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        set_of: F,
+    ) -> Result<HashMap<SuperfileUri, T>, QueryError>
+    where
+        T: Send + 'static,
+        F: Fn(Arc<SuperfileReader>, Arc<SuperfileEntry>, Option<Arc<RoaringBitmap>>) -> Fut
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+        Fut: Future<Output = Result<Option<T>, QueryError>> + Send,
+    {
         let units: Vec<(Arc<SuperfileEntry>, ())> =
             superfiles.iter().map(|e| (Arc::clone(e), ())).collect();
         let body = move |r: Arc<SuperfileReader>,
@@ -8437,19 +8494,21 @@ impl SupertableReader {
                          tombstone_cache: Option<Arc<SidecarCache>>,
                          now: Instant,
                          _: ()| {
-            let doc_ids = doc_ids.clone();
+            let set_of = set_of.clone();
             async move {
-                let mut bm = doc_ids(r, Arc::clone(&entry)).await?;
-                subtract_tombstones(&mut bm, &entry, tombstone_cache.as_deref(), now)?;
-                Ok((entry.uri, bm))
+                let deleted = match &tombstone_cache {
+                    Some(cache) => dispatch::tombstone_deny_set(cache, entry.superfile_id, now)?,
+                    None => None,
+                };
+                let uri = entry.uri;
+                Ok((uri, set_of(r, entry, deleted).await?))
             }
         };
-        let pairs: Vec<(SuperfileUri, RoaringBitmap)> =
+        let sets: Vec<(SuperfileUri, Option<T>)> =
             dispatch::fanout_with(self, units, true, ReadIntent::Stream, body).await?;
-        Ok(pairs
+        Ok(sets
             .into_iter()
-            .filter(|(_, bm)| !bm.is_empty())
-            .map(|(uri, bm)| (uri, Arc::new(bm)))
+            .filter_map(|(uri, set)| Some((uri, set?)))
             .collect())
     }
     /// kNN over every user superfile: the search before the first drain,
@@ -8754,21 +8813,64 @@ impl SupertableReader {
     }
 }
 
-fn subtract_tombstones(
-    bm: &mut RoaringBitmap,
-    entry: &SuperfileEntry,
-    tombstone_cache: Option<&SidecarCache>,
-    now: Instant,
-) -> Result<(), QueryError> {
-    if let Some(cache) = tombstone_cache {
-        let deleted = cache
-            .bitmap_for(entry.superfile_id, now)
-            .map_err(QueryError::tombstone_cache)?;
-        if !deleted.is_empty() {
-            *bm -= &*deleted;
+/// A bounded [`CandidatePlan`], plus what its evaluation shares across superfiles.
+struct PlanEvaluation {
+    plan: CandidatePlan,
+    /// Whether the plan may bound nothing in a superfile (see
+    /// [`SupertableReader::candidate_bitmaps_from_plan`]).
+    unbounded_is_legitimate: bool,
+    op_stats: Option<Arc<OpStatsCollector>>,
+    reader_pool: Arc<ThreadPool>,
+    locations: PlanLocations,
+    budget: Arc<ConnectionMemoryBudget>,
+}
+
+impl PlanEvaluation {
+    /// The plan's set in superfile `r`, in `space`; every document when the plan bounds none
+    /// there.
+    async fn set(
+        &self,
+        r: &SuperfileReader,
+        superfile: Uuid,
+        space: SetSpace,
+    ) -> Result<RoaringBitmap, QueryError> {
+        let memos = memos_from_plan_locations(r, &self.locations, superfile).await;
+        // A `LIKE` leaf's expansion and the match share one dictionary read while the
+        // budget has room.
+        let (bitmap, work) = self
+            .plan
+            .evaluate_in(
+                space,
+                r,
+                Some(&self.reader_pool),
+                &memos,
+                &QueryDict::with_budget(&self.budget),
+            )
+            .await
+            .map_err(QueryError::from)?;
+        // The SQL predicate's posting walks, summed across the
+        // plan tree: the pushdown leg of the vector or text search TVF.
+        work.add_to(self.op_stats.as_deref());
+        match bitmap {
+            Some(bitmap) => Ok(bitmap),
+            None if self.unbounded_is_legitimate => {
+                let mut all = RoaringBitmap::new();
+                all.insert_range(0..r.n_docs() as u32);
+                Ok(all)
+            }
+            None => Err(QueryError::Internal(
+                "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
+            )),
         }
     }
-    Ok(())
+}
+
+/// `rows` without the `deleted` ones.
+fn live_rows(mut rows: RoaringBitmap, deleted: Option<&RoaringBitmap>) -> RoaringBitmap {
+    if let Some(deleted) = deleted {
+        rows -= deleted;
+    }
+    rows
 }
 
 /// Merge per-superfile hits and return the top-k by *ascending*

@@ -76,7 +76,7 @@ use crate::{
         handle::{SupertableReader, WeakReader},
         query::{
             SuperfileHit,
-            candidate::CandidateScope,
+            candidate::RankScope,
             exec::common::{
                 Arity, PushedPredicate, RowCheck, arg_to_string, arg_to_usize,
                 candidate_plan_for_filters, fill_ceiling, fill_top_k_within, live_reader,
@@ -428,15 +428,14 @@ impl ExecutionPlan for Bm25Exec {
         let projected_schema = Arc::clone(&self.projected_schema);
 
         let fut = async move {
-            // What the pushed-down `WHERE` admits: the superfiles the
-            // manifest keeps and, under an index-bounded predicate, the
-            // rows in each. Prefix search has no scoped kernel (its term
-            // set is only known per superfile), so it fills its `k` under
-            // the exact predicate alone.
+            // What the pushed-down `WHERE` admits: the superfiles the manifest
+            // keeps and, under an index-bounded predicate, the documents in each.
+            // Prefix search has no scoped kernel (its term set is only known per
+            // superfile), so it fills its `k` under the exact predicate alone.
             let scope = match &query {
                 Bm25Query::Terms { .. } if !filters.is_empty() => {
                     let plan = candidate_plan_for_filters(reader.manifest(), &filters);
-                    Some(reader.candidate_scope(&filters, &plan).await?)
+                    Some(reader.rank_scope(&filters, &plan).await?)
                 }
                 Bm25Query::Terms { .. } | Bm25Query::Prefix { .. } => None,
             };
@@ -478,7 +477,7 @@ impl ExecutionPlan for Bm25Exec {
             // every hit the widening looked at. Rank once within the rows the
             // query's terms match, checking the predicate on each superfile's
             // best rows as the search reaches them.
-            let matched = reader.match_scope(&column, text, *mode, scope).await?;
+            let matched = RankScope::from(reader.match_scope(&column, text, *mode, scope).await?);
             call.checked_rows(&matched, check, text, *mode).await
         };
 
@@ -526,7 +525,7 @@ impl RankedCall<'_> {
     async fn hits(
         &self,
         want: usize,
-        scope: Option<&CandidateScope>,
+        scope: Option<&RankScope>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         match self.query {
             Bm25Query::Terms { query, mode } => {
@@ -552,7 +551,7 @@ impl RankedCall<'_> {
     /// since every hit the search returns has passed it.
     async fn checked_rows(
         &self,
-        scope: &CandidateScope,
+        scope: &RankScope,
         check: Arc<RowCheck>,
         text: &str,
         mode: BoolMode,
@@ -585,7 +584,7 @@ impl RankedCall<'_> {
     /// caller checks the predicate exactly if the rows come back short.
     async fn rows(
         &self,
-        scope: Option<&CandidateScope>,
+        scope: Option<&RankScope>,
         checked_when_short: bool,
     ) -> DfResult<RecordBatch> {
         let ceiling = fill_ceiling(self.reader, self.k);
@@ -623,16 +622,25 @@ mod tests {
     use arrow_array::{Array, Float32Array, Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::{col, lit, lower};
+    use rayon::ThreadPoolBuilder;
+    use tempfile::TempDir;
+    use tokio::task::spawn_blocking;
 
     use super::*;
     use crate::{
         FieldPatch, SchemaPatch,
+        config::{CompactionSettings, OptimizeOptions},
         storage::{LocalFsStorageProvider, StorageProvider},
-        superfile::builder::FtsConfig,
+        superfile::{SuperfileReader, builder::FtsConfig, id_space::Admitted},
         supertable::{
             Supertable, SupertableOptions,
-            query::{candidate::CandidatePlan, exec::common::OVER_FETCH_MIN_CEILING},
+            query::{
+                candidate::CandidatePlan, dispatch::open_reader,
+                exec::common::OVER_FETCH_MIN_CEILING,
+            },
+            reader_cache::ReadIntent,
         },
+        test_helpers::lazy_foreground_disk_cache,
     };
 
     fn title_schema() -> Arc<Schema> {
@@ -678,17 +686,20 @@ mod tests {
     }
 
     fn titles_of(batches: &[RecordBatch]) -> Vec<String> {
+        strings_of(batches, "title")
+    }
+
+    /// The values of the `LargeUtf8` column `column` in `batches`, in order.
+    fn strings_of(batches: &[RecordBatch], column: &str) -> Vec<String> {
         let mut out = Vec::new();
         for b in batches {
-            let idx = b.schema().index_of("title").expect("title col");
             let col = b
-                .column(idx)
+                .column_by_name(column)
+                .expect("column projected")
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
                 .expect("utf8");
-            for i in 0..col.len() {
-                out.push(col.value(i).to_string());
-            }
+            out.extend((0..col.len()).map(|i| col.value(i).to_string()));
         }
         out
     }
@@ -1342,7 +1353,7 @@ mod tests {
                 .await
                 .expect("scope");
             reader
-                .match_scope("title", "zyzzyva", BoolMode::Or, &scope)
+                .match_scope("title", "zyzzyva", BoolMode::Or, &RankScope::from(scope))
                 .await
                 .expect("match scope")
         });
@@ -1888,6 +1899,519 @@ mod tests {
         assert!(
             prefix.contains("Bm25Exec") && prefix.contains("kind=prefix"),
             "prefix describe missing: {prefix}"
+        );
+    }
+
+    // ---- A WHERE on text columns over a reordered superfile ------------
+
+    /// Commits the mapped fixture writes: enough that their merge reorders the
+    /// documents (a smaller merge keeps arrival order) and so has a doc-id map.
+    const MAPPED_COMMITS: usize = 60;
+    /// Rows in each of [`MAPPED_COMMITS`].
+    const MAPPED_PER_COMMIT: usize = 80;
+    /// Rows in the mapped fixture.
+    const MAPPED_ROWS: usize = MAPPED_COMMITS * MAPPED_PER_COMMIT;
+    /// Values the `tag` column cycles through, row by row.
+    const MAPPED_TAGS: [&str; 3] = ["red", "blue", "green"];
+    /// Compaction target for the mapped fixture, in MiB: larger than all the
+    /// commits together, so they merge into one file.
+    const MAPPED_TARGET_MB: u64 = 64;
+    /// A `k` above the row count, so a search returns every match.
+    const MAPPED_EVERY_HIT: usize = 2 * MAPPED_ROWS;
+    /// A `k` well below the match count, so the kernel's heap prunes.
+    const MAPPED_FEW_HITS: usize = 10;
+    /// Queries the concurrency test runs at once on one reader.
+    const MAPPED_CONCURRENT: usize = 8;
+    /// Rows the deletes test removes: two that `tag = 'red'` keeps, one it does not.
+    const MAPPED_DELETED: [usize; 3] = [3, 2223, 1000];
+    /// Commits of the checked fixture: past the fill's smallest ceiling, so a
+    /// widening that keeps fewer than `k` rows stops short.
+    const CHECKED_COMMITS: usize = OVER_FETCH_MIN_CEILING / MAPPED_PER_COMMIT + 1;
+    /// The one row [`checked_where`] keeps.
+    const CHECKED_ROW: usize = 6;
+    /// Moduli that give each body two words shared with many other rows, so
+    /// most terms match many documents.
+    const MAPPED_SHARED_WORDS: [usize; 2] = [37, 53];
+    /// The `n` range the range test keeps, inclusive.
+    const MAPPED_RANGE: [i64; 2] = [1000, 1999];
+
+    /// A `WHERE` only row [`CHECKED_ROW`] passes: it is `red` and the only body
+    /// holding its `uq` word.
+    fn checked_where() -> String {
+        format!("tag = 'red' AND body LIKE '%uq{CHECKED_ROW} %'")
+    }
+
+    /// [`checked_where`] as an expression.
+    fn checked_filter() -> Expr {
+        col("tag")
+            .eq(lit("red"))
+            .and(col("body").like(lit(format!("%uq{CHECKED_ROW} %"))))
+    }
+
+    /// Row `n`'s `body`: every row holds `shared`, the searched word.
+    fn mapped_body(n: usize) -> String {
+        let [a, b] = MAPPED_SHARED_WORDS;
+        format!("uq{n} shared t{} t{}", n % a, n % b)
+    }
+
+    /// Whether row `n`'s `body` holds the word `t{w}`.
+    fn mapped_holds(n: usize, w: usize) -> bool {
+        MAPPED_SHARED_WORDS.iter().any(|m| n % m == w)
+    }
+
+    /// A query for each way the search walks, with the rows it matches: a phrase and a negated
+    /// phrase (the phrase walk), a negated term, every term required, required terms beside
+    /// optional ones (both must-should walks), and any term.
+    fn mapped_queries() -> Vec<(&'static str, fn(usize) -> bool)> {
+        vec![
+            ("\"shared t1\"", |n| n % MAPPED_SHARED_WORDS[0] == 1),
+            ("shared -\"shared t1\"", |n| n % MAPPED_SHARED_WORDS[0] != 1),
+            ("shared -t1", |n| !mapped_holds(n, 1)),
+            ("+shared +t1", |n| mapped_holds(n, 1)),
+            ("+t1 shared", |n| mapped_holds(n, 1)),
+            ("+shared +t1 t2", |n| mapped_holds(n, 1)),
+            ("t1 t2", |n| mapped_holds(n, 1) || mapped_holds(n, 2)),
+        ]
+    }
+
+    /// Row `n`'s `tag`.
+    fn mapped_tag(n: usize) -> &'static str {
+        MAPPED_TAGS[n % MAPPED_TAGS.len()]
+    }
+
+    fn body_tag_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("body", DataType::LargeUtf8, false),
+            Field::new("tag", DataType::LargeUtf8, false),
+            Field::new("n", DataType::Int64, false),
+        ]))
+    }
+
+    /// `commits` commits with `body` (with token positions, for phrases) and `tag` text-indexed
+    /// and `n`, the row number, range-indexed, merged into one superfile that reorders its
+    /// documents. Reopened cold behind a lazily filled disk cache, so a query reads the doc-id map
+    /// only if it needs it.
+    fn mapped_body_tag_table(commits: usize) -> (Supertable, TempDir, TempDir) {
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        let options = || {
+            let pool = Arc::new(
+                ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("pool"),
+            );
+            SupertableOptions::new(
+                body_tag_schema(),
+                vec![
+                    FtsConfig::new("body").positions(true),
+                    FtsConfig::new("tag"),
+                ],
+                vec![],
+            )
+            .expect("valid options")
+            .with_range_indexes(&["n".to_owned()])
+            .with_writer_pool(pool)
+            .with_storage(Arc::clone(&storage))
+        };
+        {
+            let table = Supertable::create(options()).expect("create");
+            for commit in 0..commits {
+                let rows = commit * MAPPED_PER_COMMIT..(commit + 1) * MAPPED_PER_COMMIT;
+                let bodies: Vec<String> = rows.clone().map(mapped_body).collect();
+                let tags: Vec<&str> = rows.clone().map(mapped_tag).collect();
+                let ns: Vec<i64> = rows.map(|n| n as i64).collect();
+                let batch = RecordBatch::try_new(
+                    body_tag_schema(),
+                    vec![
+                        Arc::new(LargeStringArray::from(bodies)),
+                        Arc::new(LargeStringArray::from(tags)),
+                        Arc::new(Int64Array::from(ns)),
+                    ],
+                )
+                .expect("batch");
+                let mut w = table.writer().expect("writer");
+                w.append(&batch).expect("append");
+                w.commit().expect("commit");
+            }
+            table
+                .optimize(&OptimizeOptions::compact(CompactionSettings {
+                    target_superfile_size_mb: MAPPED_TARGET_MB,
+                    min_fill_percent: 1,
+                    ..CompactionSettings::default()
+                }))
+                .expect("optimize");
+        }
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
+        let table = Supertable::open(options().with_disk_cache(cache)).expect("open");
+        assert_eq!(
+            table.reader().expect("reader").n_superfiles(),
+            1,
+            "one merged file"
+        );
+        (table, storage_dir, cache_dir)
+    }
+
+    /// Deletes the rows [`MAPPED_DELETED`] names.
+    fn delete_mapped(st: &Supertable) {
+        for n in MAPPED_DELETED {
+            st.delete(col("body").eq(lit(mapped_body(n))))
+                .expect("delete");
+        }
+    }
+
+    /// Asserts every superfile's set in `scope` is in blob ids.
+    fn assert_in_blob_ids(scope: &RankScope) {
+        let sets = scope.allow.as_ref().expect("a bounded scope");
+        assert!(!sets.is_empty(), "a superfile in scope");
+        assert!(sets.values().all(|set| matches!(set, Admitted::BlobIds(_))));
+    }
+
+    /// Asserts every superfile's set in `scope` is in rows.
+    fn assert_in_rows(scope: &RankScope) {
+        let sets = scope.allow.as_ref().expect("a bounded scope");
+        assert!(!sets.is_empty(), "a superfile in scope");
+        assert!(sets.values().all(|set| matches!(set, Admitted::Rows(_))));
+    }
+
+    /// The scope `filters` gives in blob ids (asserted so), and the same scope in rows.
+    fn scopes_both_ways(reader: &SupertableReader, filters: &[Expr]) -> [RankScope; 2] {
+        let plan = candidate_plan_for_filters(reader.manifest(), filters);
+        let in_blob_ids = reader
+            .block_on(reader.rank_scope(filters, &plan))
+            .expect("scope");
+        assert_in_blob_ids(&in_blob_ids);
+        let in_rows = reader
+            .block_on(reader.candidate_scope(filters, &plan))
+            .expect("scope");
+        [in_blob_ids, RankScope::from(in_rows)]
+    }
+
+    /// The top-`k` hits of `query` on `body` under each of `scopes`.
+    fn hits_under(
+        reader: &SupertableReader,
+        query: &str,
+        k: usize,
+        scopes: [&RankScope; 2],
+    ) -> [Vec<SuperfileHit>; 2] {
+        scopes.map(|scope| {
+            let opts = Bm25SearchOptions::new();
+            let search = reader.bm25_search_scoped_async("body", query, k, opts, Some(scope));
+            reader.block_on(search).expect("search")
+        })
+    }
+
+    /// The reader of the table's one superfile, the same one its queries use.
+    async fn the_superfile_reader(st: &Supertable) -> Arc<SuperfileReader> {
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = manifest.get_all_superfiles()[0].clone();
+        open_reader(
+            &manifest.options.store,
+            manifest.options.disk_cache.as_ref(),
+            manifest.options.storage.as_ref(),
+            &entry,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("open superfile")
+    }
+
+    /// The `body` of each row `sql` returns, sorted.
+    fn bodies_of(reader: &SupertableReader, sql: &str) -> Vec<String> {
+        let mut out = strings_of(&reader.query_sql(sql).expect("sql"), "body");
+        out.sort();
+        out
+    }
+
+    /// The bodies of the rows `keep` admits, sorted.
+    fn bodies_kept(keep: impl Fn(usize) -> bool) -> Vec<String> {
+        let mut out: Vec<String> = (0..MAPPED_ROWS)
+            .filter(|&n| keep(n))
+            .map(mapped_body)
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// How many rows `keep` admits.
+    fn count_kept(keep: impl Fn(usize) -> bool) -> usize {
+        (0..MAPPED_ROWS).filter(|&n| keep(n)).count()
+    }
+
+    /// SQL for a top-`k` `bm25_search` of `shared` (in every row) under `filter`.
+    fn shared_search(k: usize, filter: &str) -> String {
+        format!("SELECT body FROM bm25_search('body', 'shared', {k}) WHERE {filter}")
+    }
+
+    /// Each `WHERE` the search runs under, with the rows it keeps. The text indexes bound all but
+    /// the `NOT`, which the exact predicate fills.
+    fn mapped_wheres() -> Vec<(&'static str, Box<dyn Fn(usize) -> bool>)> {
+        vec![
+            ("tag = 'red'", Box::new(|n| mapped_tag(n) == "red")),
+            (
+                "tag = 'red' OR tag = 'blue'",
+                Box::new(|n| mapped_tag(n) != "green"),
+            ),
+            ("NOT (tag = 'red')", Box::new(|n| mapped_tag(n) != "red")),
+            (
+                "tag = 'red' AND body LIKE '%t5 %'",
+                Box::new(|n| mapped_tag(n) == "red" && mapped_body(n).contains("t5 ")),
+            ),
+            ("tag = 'purple'", Box::new(|_| false)),
+            ("body LIKE '%shared%'", Box::new(|_| true)),
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_where_on_a_reordered_file_keeps_no_doc_id_map() {
+        // A reordered superfile, top hits for `shared` under `tag = 'red'`.
+        // - The text index bounds the `WHERE`, so the set is in blob ids.
+        // - The kernel checks blob ids directly, with no doc-id map.
+        // - Only the few top hits become rows, reading just their map pages.
+        // This test pins that the whole doc-id map (hundreds of MB on a large
+        // file) is never loaded.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
+        let file = the_superfile_reader(&st).await;
+        let fts = file.fts().expect("fts");
+        assert!(
+            fts.has_doc_map(),
+            "the merge must reorder for this test to mean anything"
+        );
+        let reader = st.reader().expect("reader");
+        let want = bodies_kept(|n| mapped_tag(n) == "red");
+        let few = bodies_of(&reader, &shared_search(MAPPED_FEW_HITS, "tag = 'red'"));
+        assert_eq!(few.len(), MAPPED_FEW_HITS);
+        assert!(few.iter().all(|b| want.binary_search(b).is_ok()), "{few:?}");
+        assert!(
+            !fts.doc_map_is_read(),
+            "the WHERE kept the whole doc-id map"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_where_on_a_reordered_file_ranks_exactly_its_rows() {
+        // A reordered superfile, searched under each `WHERE` of `mapped_wheres`:
+        // `OR`, `NOT`, an `AND` across two columns, none kept and all kept.
+        // - With `k` above the row count, the hits are exactly the kept rows.
+        // - With a small `k`, every hit is a kept row.
+        // This test pins that a bounded `WHERE` checked in blob ids keeps the same rows as rows.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
+        let reader = st.reader().expect("reader");
+        for (filter, keep) in mapped_wheres() {
+            let want = bodies_kept(keep.as_ref());
+            assert_eq!(
+                bodies_of(&reader, &shared_search(MAPPED_EVERY_HIT, filter)),
+                want,
+                "every match of {filter}"
+            );
+            let few = bodies_of(&reader, &shared_search(MAPPED_FEW_HITS, filter));
+            assert_eq!(few.len(), want.len().min(MAPPED_FEW_HITS), "{filter}");
+            assert!(
+                few.iter().all(|b| want.binary_search(b).is_ok()),
+                "the top {MAPPED_FEW_HITS} of {filter} are rows it keeps: {few:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_checked_search_on_a_reordered_file_returns_exactly_its_rows() {
+        // A reordered superfile past the fill's smallest ceiling, under a
+        // `WHERE` that keeps one row, fewer than `k`.
+        // - The widening stops short at the ceiling.
+        // - The search ranks again within the rows its terms match, checking
+        //   the predicate on them in rows, through the doc-id map.
+        // - From a blob-id scope and a row scope, the rows the check works on are the same.
+        // This test pins that the answer is exactly the one row the `WHERE` keeps, from either
+        // scope.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(CHECKED_COMMITS);
+        let file = the_superfile_reader(&st).await;
+        assert!(
+            file.fts().expect("fts").has_doc_map(),
+            "the merge must reorder for this test to mean anything"
+        );
+        let reader = st.reader().expect("reader");
+        assert_eq!(
+            bodies_of(&reader, &shared_search(MAPPED_FEW_HITS, &checked_where())),
+            vec![mapped_body(CHECKED_ROW)]
+        );
+        let [in_blob_ids, in_rows] = scopes_both_ways(&reader, &[checked_filter()]);
+        let matched = [&in_blob_ids, &in_rows].map(|scope| {
+            let scope = reader.match_scope("body", "shared", BoolMode::Or, scope);
+            reader.block_on(scope).expect("match scope").allow
+        });
+        assert_eq!(
+            matched[0], matched[1],
+            "blob-id and row scopes check the same rows"
+        );
+        let rows: u64 = matched[0]
+            .as_ref()
+            .expect("a bounded scope")
+            .values()
+            .map(|set| set.len())
+            .sum();
+        assert!(rows > 0, "the scope holds the row the `WHERE` keeps");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_searches_with_and_without_a_where_each_rank_their_rows() {
+        // Queries at once on one reader, half under `tag = 'red'` and half not.
+        // - All of them translate their hits through the one reader's doc-id map.
+        // This test pins that each query still ranks exactly its own rows.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
+        let reader = Arc::new(st.reader().expect("reader"));
+        let red = bodies_kept(|n| mapped_tag(n) == "red");
+        let every = bodies_kept(|_| true);
+        let runs: Vec<_> = (0..MAPPED_CONCURRENT)
+            .map(|i| {
+                let reader = Arc::clone(&reader);
+                let sql = match i % 2 {
+                    0 => shared_search(MAPPED_EVERY_HIT, "tag = 'red'"),
+                    _ => format!(
+                        "SELECT body FROM bm25_search('body', 'shared', {MAPPED_EVERY_HIT})"
+                    ),
+                };
+                spawn_blocking(move || (i, bodies_of(&reader, &sql)))
+            })
+            .collect();
+        for run in runs {
+            let (i, got) = run.await.expect("query task");
+            let want = match i % 2 {
+                0 => &red,
+                _ => &every,
+            };
+            assert_eq!(&got, want, "query {i}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_where_on_a_reordered_file_with_deletes_ranks_its_live_rows() {
+        // A reordered superfile with three deleted rows, under `tag = 'red'`.
+        // - Deletes are rows, so this superfile's set is in rows, not blob ids.
+        // This test pins that the search ranks exactly the live rows the
+        // `WHERE` keeps.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
+        delete_mapped(&st);
+        let reader = st.reader().expect("reader");
+        assert_eq!(
+            bodies_of(&reader, &shared_search(MAPPED_EVERY_HIT, "tag = 'red'")),
+            bodies_kept(|n| mapped_tag(n) == "red" && !MAPPED_DELETED.contains(&n)),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_where_in_blob_ids_ranks_the_same_hits_as_in_rows() {
+        // A reordered superfile under `tag = 'red'`, ranked with the scope in blob ids and with
+        // the same scope in rows, for a query whose hits score one, two or three terms.
+        // - For each `k`, both give the same hits, scores and order.
+        // This test pins that checking in blob ids changes no hit, tie or cut at `k`.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
+        let reader = st.reader().expect("reader");
+        let red = count_kept(|n| mapped_tag(n) == "red");
+        let [in_blob_ids, in_rows] = scopes_both_ways(&reader, &[col("tag").eq(lit("red"))]);
+        for k in [1, MAPPED_FEW_HITS, red - 1, red, red + 1] {
+            let hits = hits_under(&reader, "shared t1 t2", k, [&in_blob_ids, &in_rows]);
+            assert_eq!(hits[0], hits[1], "k = {k}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_id_scope_meeting_new_deletes_ranks_only_live_rows() {
+        // A reordered superfile's scope under `tag = 'red'` built in blob ids, then three rows
+        // deleted, then searches on the new snapshot under that scope, with `k` small, at the
+        // live red count and past it.
+        // - The search turns the blob ids into rows and takes the deleted rows out before it
+        //   ranks, so it still fills `k`.
+        // - It ranks the same hits as a scope built after the deletes, which is in rows.
+        // This test pins that a delete seen after the scope was built is never ranked.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
+        let before = st.reader().expect("reader");
+        let filters = vec![col("tag").eq(lit("red"))];
+        let plan = candidate_plan_for_filters(before.manifest(), &filters);
+        let scope = before
+            .block_on(before.rank_scope(&filters, &plan))
+            .expect("scope");
+        assert_in_blob_ids(&scope);
+        delete_mapped(&st);
+        let after = st.reader().expect("reader");
+        let fresh = after
+            .block_on(after.rank_scope(&filters, &plan))
+            .expect("scope");
+        assert_in_rows(&fresh);
+        let live = count_kept(|n| mapped_tag(n) == "red" && !MAPPED_DELETED.contains(&n));
+        for k in [MAPPED_FEW_HITS, live, MAPPED_EVERY_HIT] {
+            let hits = hits_under(&after, "shared", k, [&scope, &fresh]);
+            assert_eq!(hits[0].len(), k.min(live), "k = {k}: live red rows only");
+            assert_eq!(hits[0], hits[1], "k = {k}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_query_shape_under_a_blob_id_scope_ranks_the_same_hits_as_in_rows() {
+        // A reordered superfile under `tag = 'red'`, each of `mapped_queries` in both scopes.
+        // - At a small `k` and past the row count, blob ids and rows give the same hits.
+        // - The hit count is the red rows the query matches, up to `k`.
+        // - Through SQL, the rows are exactly the red rows the query matches.
+        // This test pins that every walk checks a blob-id set as it checks rows.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
+        let reader = st.reader().expect("reader");
+        let [in_blob_ids, in_rows] = scopes_both_ways(&reader, &[col("tag").eq(lit("red"))]);
+        for (query, matches) in mapped_queries() {
+            let want = count_kept(|n| mapped_tag(n) == "red" && matches(n));
+            assert!(want > 0, "{query} matches no red row");
+            let sql = format!(
+                "SELECT body FROM bm25_search('body', '{query}', {MAPPED_EVERY_HIT}) \
+                 WHERE tag = 'red'"
+            );
+            assert_eq!(
+                bodies_of(&reader, &sql),
+                bodies_kept(|n| mapped_tag(n) == "red" && matches(n)),
+                "{query}: exactly the red rows it matches"
+            );
+            for k in [MAPPED_FEW_HITS, MAPPED_EVERY_HIT] {
+                let hits = hits_under(&reader, query, k, [&in_blob_ids, &in_rows]);
+                assert_eq!(
+                    hits[0].len(),
+                    k.min(want),
+                    "{query}, k = {k}: red rows it matches"
+                );
+                assert_eq!(hits[0], hits[1], "{query}, k = {k}");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_and_range_where_on_a_reordered_file_ranks_exactly_its_rows() {
+        // A reordered superfile under `tag = 'red'` and a range on `n`.
+        // - The scope stays in rows: a range leaf is checked in rows only.
+        // - With `k` above the row count, the hits are exactly the rows both keep.
+        // This test pins that a range leaf never goes through blob ids.
+        let (st, _storage_dir, _cache_dir) = mapped_body_tag_table(MAPPED_COMMITS);
+        let file = the_superfile_reader(&st).await;
+        assert!(
+            file.fts().expect("fts").has_doc_map(),
+            "the merge must reorder for this test to mean anything"
+        );
+        let reader = st.reader().expect("reader");
+        let [lo, hi] = MAPPED_RANGE;
+        let filters = vec![
+            col("tag")
+                .eq(lit("red"))
+                .and(col("n").gt_eq(lit(lo)))
+                .and(col("n").lt_eq(lit(hi))),
+        ];
+        let plan = candidate_plan_for_filters(reader.manifest(), &filters);
+        assert!(plan.has_range(), "the plan holds a range leaf");
+        let scope = reader
+            .block_on(reader.rank_scope(&filters, &plan))
+            .expect("scope");
+        assert_in_rows(&scope);
+        let filter = format!("tag = 'red' AND n >= {lo} AND n <= {hi}");
+        assert_eq!(
+            bodies_of(&reader, &shared_search(MAPPED_EVERY_HIT, &filter)),
+            bodies_kept(|n| mapped_tag(n) == "red" && (lo..=hi).contains(&(n as i64))),
         );
     }
 }

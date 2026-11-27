@@ -68,7 +68,7 @@ use crate::{
         manifest::SuperfileUri,
         query::{
             SuperfileHit,
-            candidate::CandidateScope,
+            candidate::{CandidateScope, RankScope},
             exec::{
                 common::{
                     Arity, PushedPredicate, arg_to_string, arg_to_usize,
@@ -363,12 +363,12 @@ impl ExecutionPlan for Bm25FieldsExec {
             // Short at the ceiling: check the predicate on every row some
             // clause matches on some column, and rank once within exactly
             // the ones it keeps.
-            let matched = try_join_all(
-                query
-                    .searches()
-                    .map(|(column, text)| reader.match_scope(column, text, query.mode(), scope)),
-            )
-            .await?;
+            let rank_scope = RankScope::from(scope.clone());
+            let matched =
+                try_join_all(query.searches().map(|(column, text)| {
+                    reader.match_scope(column, text, query.mode(), &rank_scope)
+                }))
+                .await?;
             let matched = union_scopes(matched);
             match exact_scope(&reader, &matched, predicate, &output_schema).await? {
                 Some(exact) => call.rows(Some(&exact), Some(k)).await,
@@ -756,6 +756,7 @@ mod tests {
                 &crate::supertable::query::candidate::CandidatePlan::Unbounded,
             ))
             .expect("scope");
+        let scope = RankScope::from(scope);
         let a = reader
             .block_on(reader.match_scope("title", "rust", BoolMode::Or, &scope))
             .expect("a");

@@ -5,8 +5,8 @@
 //! phrase-aware sibling [`AtomExcludeFilter`]. Both skip-probe their
 //! negated cursors against a monotonically increasing candidate doc, so
 //! a common negated list is never fully decoded — and both can carry an
-//! **allow-set**, the rows a SQL `WHERE` pushed into the search admits at
-//! all, checked before any negated list is consulted. `pub(super)` within
+//! **allow-set**, the documents a pushed-down SQL `WHERE` admits, checked
+//! before any negated list is read. `pub(super)` within
 //! `reader/` (ExcludeFilter stays pub(crate) — PreparedClauses carries it).
 
 use super::{
@@ -16,19 +16,27 @@ use super::{
 };
 use crate::superfile::{
     error::FtsError,
-    id_space::{DocMap, FtsDocId, RowSet},
+    id_space::{BlobIdSet, DocMap, FtsDocId, RowSet},
 };
 
-/// Whether the pushed-down row set admits the blob id `doc`.
-///
-/// The set is the one thing that reaches a kernel in row space while the
-/// kernel walks blob ids, so the translation happens here, in the single
-/// place both gates ask the question. `None` admits everything.
+/// A pushed-down `WHERE`'s set, in rows or in blob ids, as both gates check it.
+pub(super) enum AllowGate {
+    /// Rows. The kernel walks blob ids, so each one is turned into its row through `doc_map`, this
+    /// blob's doc-id map, before the check; on a reordered blob a blob id is not its row.
+    Rows { rows: RowSet, doc_map: DocMap },
+    /// Blob ids, checked directly.
+    BlobIds(BlobIdSet),
+}
+
+/// Whether the pushed-down set admits blob id `doc`; both gates ask here. `None` admits everything.
 #[inline]
-fn allows(allow: &Option<RowSet>, doc_map: &DocMap, doc: u32) -> bool {
+fn allows(allow: &Option<AllowGate>, doc: u32) -> bool {
     match allow {
         None => true,
-        Some(allow) => allow.contains(doc_map.row_of(FtsDocId::new(doc))),
+        Some(AllowGate::Rows { rows, doc_map }) => {
+            rows.contains(doc_map.row_of(FtsDocId::new(doc)))
+        }
+        Some(AllowGate::BlobIds(ids)) => ids.contains(FtsDocId::new(doc)),
     }
 }
 
@@ -38,28 +46,21 @@ fn allows(allow: &Option<RowSet>, doc_map: &DocMap, doc: u32) -> bool {
 pub(super) struct AtomExcludeFilter {
     pub(super) atoms: Vec<AnyCursor>,
     /// See [`ExcludeFilter::allow`].
-    pub(super) allow: Option<RowSet>,
-    /// See [`ExcludeFilter::doc_map`].
-    pub(super) doc_map: DocMap,
+    pub(super) allow: Option<AllowGate>,
     pub(super) last_doc: u32,
 }
 
 impl AtomExcludeFilter {
     pub(super) fn new(atoms: Vec<AnyCursor>) -> Self {
-        Self::with_allow(atoms, None, DocMap::Identity)
+        Self::with_allow(atoms, None)
     }
 
     /// A gate over `atoms` that additionally admits only the docs in
     /// `allow` (`None` admits every doc the atoms do not exclude).
-    pub(super) fn with_allow(
-        atoms: Vec<AnyCursor>,
-        allow: Option<RowSet>,
-        doc_map: DocMap,
-    ) -> Self {
+    pub(super) fn with_allow(atoms: Vec<AnyCursor>, allow: Option<AllowGate>) -> Self {
         Self {
             atoms,
             allow,
-            doc_map,
             last_doc: 0,
         }
     }
@@ -73,7 +74,7 @@ impl AtomExcludeFilter {
             self.last_doc
         );
         self.last_doc = doc;
-        if !allows(&self.allow, &self.doc_map, doc) {
+        if !allows(&self.allow, doc) {
             return Ok(false);
         }
         for a in &mut self.atoms {
@@ -102,20 +103,10 @@ impl AtomExcludeFilter {
 /// parameter threaded through each walk.
 pub(crate) struct ExcludeFilter {
     pub(super) cursors: Vec<TermCursor>,
-    /// The rows the caller admits at all — a SQL `WHERE`'s candidate set,
-    /// resolved for this superfile as `local_doc_id`s. `None` admits every
-    /// doc the negated lists do not exclude. Checked first: a doc outside
-    /// the set never costs a negated-list probe.
-    pub(super) allow: Option<RowSet>,
-    /// This blob's doc-id map, when it stores its documents in an order
-    /// of its own.
-    ///
-    /// The allow-set is the one thing that travels *into* a kernel in
-    /// row space: it is built outside, from a predicate over rows. The
-    /// kernel walks blob ids, so the id is translated before the set is
-    /// consulted. Without this a scoped search on a reordered blob tests
-    /// a row set with a blob id and matches almost nothing.
-    pub(super) doc_map: DocMap,
+    /// The documents a pushed-down SQL `WHERE` admits in this superfile.
+    /// `None` admits every doc the negated lists do not exclude. Checked
+    /// first, so a doc outside the set never costs a negated-list probe.
+    pub(super) allow: Option<AllowGate>,
     /// Last doc-id passed to `admits`; guards the monotonic call order.
     pub(super) last_doc: u32,
 }
@@ -126,20 +117,15 @@ impl ExcludeFilter {
     /// shorthand is for the tests that exercise negation alone.
     #[cfg(test)]
     pub(super) fn new(cursors: Vec<TermCursor>) -> Self {
-        Self::with_allow(cursors, None, DocMap::Identity)
+        Self::with_allow(cursors, None)
     }
 
     /// A gate over `cursors` that additionally admits only the docs in
     /// `allow` (`None` admits every doc the cursors do not exclude).
-    pub(super) fn with_allow(
-        cursors: Vec<TermCursor>,
-        allow: Option<RowSet>,
-        doc_map: DocMap,
-    ) -> Self {
+    pub(super) fn with_allow(cursors: Vec<TermCursor>, allow: Option<AllowGate>) -> Self {
         Self {
             cursors,
             allow,
-            doc_map,
             last_doc: 0,
         }
     }
@@ -171,7 +157,7 @@ impl ExcludeFilter {
             self.last_doc
         );
         self.last_doc = doc;
-        if !allows(&self.allow, &self.doc_map, doc) {
+        if !allows(&self.allow, doc) {
             return false;
         }
         // Membership only: the negated cursors are never iterated, so a
@@ -195,6 +181,14 @@ mod tests {
         reader::{FtsReader, QueryIdf, cursor::CursorUse},
         tokenize::Phrase,
     };
+
+    /// `rows` as a gate over a blob stored in row order.
+    fn rows_gate(rows: RoaringBitmap) -> AllowGate {
+        AllowGate::Rows {
+            rows: RowSet::new(Arc::new(rows)),
+            doc_map: DocMap::Identity,
+        }
+    }
 
     // ── ExcludeFilter (negation gate) ─────────────────────────────────
     // `build_blob` plants: "rust" in docs 0 and 1, "java" in doc 2.
@@ -261,21 +255,13 @@ mod tests {
             .await
             .expect("build cursors");
         let allow: RoaringBitmap = [1u32, 2].into_iter().collect();
-        let mut f = ExcludeFilter::with_allow(
-            cursors,
-            Some(RowSet::new(Arc::new(allow.clone()))),
-            DocMap::Identity,
-        );
+        let mut f = ExcludeFilter::with_allow(cursors, Some(rows_gate(allow.clone())));
         assert!(!f.admits(0), "outside the allow-set (and negated)");
         assert!(!f.admits(1), "inside the allow-set but negated");
         assert!(f.admits(2), "inside the allow-set, not negated");
 
         // A bare row bound: no negated cursors at all.
-        let mut bound = ExcludeFilter::with_allow(
-            Vec::new(),
-            Some(RowSet::new(Arc::new(allow))),
-            DocMap::Identity,
-        );
+        let mut bound = ExcludeFilter::with_allow(Vec::new(), Some(rows_gate(allow)));
         assert!(!bound.admits(0));
         assert!(bound.admits(1));
         assert!(bound.admits(2));
@@ -303,8 +289,7 @@ mod tests {
         let allow: RoaringBitmap = (0u32..4).collect();
         let mut f = AtomExcludeFilter::with_allow(
             atoms.into_iter().flatten().collect(),
-            Some(RowSet::new(Arc::new(allow))),
-            DocMap::Identity,
+            Some(rows_gate(allow)),
         );
         assert!(!f.admits(0).expect("admits"), "allowed but negated");
         assert!(f.admits(1).expect("admits"), "allowed, clean");

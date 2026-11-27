@@ -22,7 +22,7 @@ use super::{
     bounds::BoundDecoder,
     core::*,
     cursor::{CursorUse, TermCursor, TermMeta},
-    filter::{AtomExcludeFilter, ExcludeFilter},
+    filter::{AllowGate, AtomExcludeFilter, ExcludeFilter},
     metadata::NormTable,
     options::BoolMode,
     phrase::{AnyCursor, approx_align, batch_phrase_with_terms},
@@ -47,7 +47,7 @@ use crate::{
             posting::{BLOCK_LEN, BlockHeader, decode_block},
             short::{decode_short, short_df},
         },
-        id_space::{DocMap, FtsDocId, RowId, RowSet},
+        id_space::{Admitted, BlobIdSet, DocMap, FtsDocId, RowId, RowSet},
     },
     utils::terms::{DictEntry, make_key},
 };
@@ -662,14 +662,17 @@ impl FtsReader {
         (distinct, qtf)
     }
 
-    /// The doc-id map for a filter: read now when it checks rows against an
-    /// allow set, and the identity otherwise, which such a filter never
-    /// consults.
-    async fn filter_doc_map(&self, checks_rows: bool) -> Result<DocMap, FtsError> {
-        match checks_rows {
-            true => Ok(self.ensure_doc_map().await?.clone()),
-            false => Ok(DocMap::Identity),
-        }
+    /// `allow` as a filter's gate. A row set reads the doc-id map here, so a row gate always holds
+    /// the real map; a blob-id set needs none.
+    async fn allow_gate(&self, allow: Option<Admitted>) -> Result<Option<AllowGate>, FtsError> {
+        Ok(match allow {
+            None => None,
+            Some(Admitted::Rows(rows)) => Some(AllowGate::Rows {
+                rows: RowSet::new(rows),
+                doc_map: self.ensure_doc_map().await?.clone(),
+            }),
+            Some(Admitted::BlobIds(ids)) => Some(AllowGate::BlobIds(BlobIdSet::new(ids))),
+        })
     }
 
     /// I/O half of an un-ranged clause search: resolve the column,
@@ -804,17 +807,13 @@ impl FtsReader {
                 });
             }
             // The gate exists when there is anything to gate on: a negated
-            // atom, or a pushed-down row set.
+            // atom, or a pushed-down set.
             let filter = match (negative_atoms.is_empty(), lists.allow.clone()) {
                 (true, None) => None,
-                (_, allow) => {
-                    let doc_map = self.filter_doc_map(allow.is_some()).await?;
-                    Some(AtomExcludeFilter::with_allow(
-                        negative_atoms,
-                        allow.map(RowSet::new),
-                        doc_map,
-                    ))
-                }
+                (_, allow) => Some(AtomExcludeFilter::with_allow(
+                    negative_atoms,
+                    self.allow_gate(allow).await?,
+                )),
             };
             // The atom walk is the whole kernel for phrase shapes —
             // `run_prepared` sees only the finished `Done` — so bracket
@@ -868,20 +867,13 @@ impl FtsReader {
             .is_some_and(|m| lists.negatives.iter().all(|t| m.contains(t)));
         let mut dict_ranges = u64::from(!lists.negatives.is_empty() && !negatives_from_memo);
         // The gate exists when there is anything to gate on: a negated
-        // term present in this superfile, or a pushed-down row set.
+        // term present in this superfile, or a pushed-down set.
         let neg_filter = match (neg_cursors.is_empty(), lists.allow.clone()) {
             (true, None) => None,
-            (_, allow) => {
-                // The positive terms are resolved below, after the filter;
-                // with an allow set the map is read here so a filter that
-                // checks rows always holds the real one.
-                let doc_map = self.filter_doc_map(allow.is_some()).await?;
-                Some(ExcludeFilter::with_allow(
-                    neg_cursors,
-                    allow.map(RowSet::new),
-                    doc_map,
-                ))
-            }
+            (_, allow) => Some(ExcludeFilter::with_allow(
+                neg_cursors,
+                self.allow_gate(allow).await?,
+            )),
         };
 
         // Fold repeated MUST/SHOULD terms into one weighted cursor each: the
@@ -2678,8 +2670,12 @@ mod tests {
     /// so the rescale of the stored bounds rounds every way across the
     /// sweep.
     const TIE_FLOOR_IDF_STEP: f32 = 1.0 / 65_536.0;
-    /// Rows apart of the documents holding [`GAP_TERM`]: four pages of the test map.
-    const GAP_EVERY: u32 = 64;
+    /// Doc ids in one doc-id map page.
+    const IDS_PER_PAGE: u32 = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
+    /// Pages between hits that no read joins: one past the merge gap.
+    const PAGES_APART: u32 = DOC_MAP_MERGE_GAP_PAGES as u32 + 2;
+    /// Rows apart of the documents holding [`GAP_TERM`]: [`PAGES_APART`] pages of the test map.
+    const GAP_EVERY: u32 = PAGES_APART * IDS_PER_PAGE;
     /// A term on every [`GAP_EVERY`]th row only.
     const GAP_TERM: &str = "gap";
     /// Slices a sliced match cuts one file into in the tests below: more than a file's reads in
@@ -2692,8 +2688,6 @@ mod tests {
     const ORDER_FIXTURE_ROWS: [u32; 2] = [4096, 4101];
     /// Every this many rows carry `beta`: a match dense enough for the bitset.
     const BETA_EVERY: u32 = 3;
-    /// Doc ids in one doc-id map page.
-    const IDS_PER_PAGE: u32 = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
     /// Every this many rows carry `rare`: a match sparse enough to be sorted.
     const RARE_EVERY: u32 = 128;
     /// Seed of the term lists the dedup test draws.
@@ -3220,7 +3214,7 @@ mod tests {
         let allow: Arc<RoaringBitmap> = Arc::new([0u32, 2].into_iter().collect());
         let lists = || ClauseLists {
             shoulds: &["rust", "java"],
-            allow: Some(Arc::clone(&allow)),
+            allow: Some(Admitted::Rows(Arc::clone(&allow))),
             ..ClauseLists::default()
         };
         let pruned = r
@@ -3260,7 +3254,7 @@ mod tests {
         let lists = || ClauseLists {
             shoulds: &["w"],
             negatives: &["x"],
-            allow: Some(Arc::clone(&allow)),
+            allow: Some(Admitted::Rows(Arc::clone(&allow))),
             ..ClauseLists::default()
         };
         let want = (0..N_DOCS)
@@ -3704,7 +3698,7 @@ mod tests {
                 "body",
                 ClauseLists {
                     shoulds: &["rust"],
-                    allow: only_one.clone(),
+                    allow: only_one.clone().map(Admitted::Rows),
                     ..ClauseLists::default()
                 },
                 10,
@@ -3721,7 +3715,7 @@ mod tests {
                 "body",
                 ClauseLists {
                     shoulds: &["rust", "spring"],
-                    allow: zero_two.clone(),
+                    allow: zero_two.clone().map(Admitted::Rows),
                     ..ClauseLists::default()
                 },
                 10,
@@ -3737,7 +3731,7 @@ mod tests {
                 "body",
                 ClauseLists {
                     musts: &["rust", "runtime"],
-                    allow: zero_two.clone(),
+                    allow: zero_two.clone().map(Admitted::Rows),
                     ..ClauseLists::default()
                 },
                 10,
@@ -3755,7 +3749,7 @@ mod tests {
                 ClauseLists {
                     shoulds: &["rust"],
                     negatives: &["async"],
-                    allow: zero_two,
+                    allow: zero_two.map(Admitted::Rows),
                     ..ClauseLists::default()
                 },
                 10,
@@ -3778,7 +3772,7 @@ mod tests {
                 "title",
                 ClauseLists {
                     should_phrases: &phrases,
-                    allow: Some(Arc::new([2u32, 3].into_iter().collect())),
+                    allow: Some(Admitted::Rows(Arc::new([2u32, 3].into_iter().collect()))),
                     ..ClauseLists::default()
                 },
                 10,
@@ -3794,7 +3788,7 @@ mod tests {
                 "title",
                 ClauseLists {
                     shoulds: &["new"],
-                    allow: Some(Arc::new(RoaringBitmap::new())),
+                    allow: Some(Admitted::Rows(Arc::new(RoaringBitmap::new()))),
                     ..ClauseLists::default()
                 },
                 10,
@@ -4472,7 +4466,7 @@ mod tests {
     async fn a_translation_covering_the_whole_map_refuses_a_damaged_one() {
         // Setup: a blob whose doc-id map has one flipped byte, and readers that check CRCs.
         //  - Every id, read in pages (no room in the heap budget) or whole to keep the map.
-        //  - Ids every fourth page, dense but with gaps, read in pages.
+        //  - Ids [`PAGES_APART`] pages apart, dense but with gaps, read in pages.
         // This test pins that each way refuses the damaged map rather than naming wrong rows.
         const N_DOCS: u32 = 1000;
         let (damaged, json) = damaged_dense_blob().await;
@@ -4500,10 +4494,10 @@ mod tests {
             );
             assert_eq!(r.doc_map_reads() > 0, in_pages, "budget {budget:?}");
         }
-        // Hits in every fourth page are dense but leave gaps; without room for the map the pass
-        // still reads every page, so the damage is caught.
+        // Hits [`PAGES_APART`] pages apart are dense but leave gaps; without room for the map the
+        // pass still reads every page, so the damage is caught.
         let gapped: Vec<FtsDocId> = (0..N_DOCS)
-            .step_by(4 * IDS_PER_PAGE as usize)
+            .step_by((PAGES_APART * IDS_PER_PAGE) as usize)
             .map(FtsDocId::new)
             .collect();
         let r = open(damaged).await.with_heap_budget(roomy(Some(0)));
@@ -4877,8 +4871,8 @@ mod tests {
         // room in the heap budget, so nothing is kept.
         //  - A sliced match over every document reads every page once and refuses the map.
         //  - So does a contains over every document.
-        //  - So does a contains over documents in every fourth page, damaged in a page it doesn't
-        //    touch: dense with gaps, it reads every page to check the CRC.
+        //  - So does a contains over documents [`PAGES_APART`] pages apart, damaged in a page it
+        //    doesn't touch: dense with gaps, it reads every page to check the CRC.
         // This test pins that reading pages instead of keeping the map still checks its CRC.
         let (damaged, json) = damaged_dense_blob().await;
         let refused = |result: Result<(), FtsError>| {
@@ -4903,8 +4897,8 @@ mod tests {
     }
 
     /// A reordered blob of 1000 documents where every [`GAP_EVERY`]th row also holds [`GAP_TERM`],
-    /// so that term's documents fall in every fourth page of the map, with one byte of a page they
-    /// don't touch flipped.
+    /// so that term's documents fall [`PAGES_APART`] pages apart in the map, with one byte of a
+    /// page they don't touch flipped.
     async fn damaged_gapped_blob() -> (Bytes, String) {
         const N_DOCS: u32 = 1000;
         let docs: Vec<String> = (0..N_DOCS)
@@ -4950,9 +4944,6 @@ mod tests {
 
     /// Translations the concurrency test runs at once.
     const CONCURRENT: usize = 8;
-
-    /// Pages between the cap test's hits: far enough apart that no two share a read.
-    const CAP_TEST_PAGE_STRIDE: u32 = 4;
 
     /// Bytes of [`sparse_hits`]' pages on `r`'s map: two full pages and the short last one.
     fn sparse_page_bytes(r: &FtsReader) -> u64 {
@@ -5263,7 +5254,7 @@ mod tests {
         let budget = roomy(None);
         let r = open_charged(blob, &json, budget).await;
         let hits: Vec<(FtsDocId, f32)> = (0..=DOC_MAP_KEPT_PAGES_MAX as u32)
-            .map(|i| (FtsDocId::new(i * CAP_TEST_PAGE_STRIDE * IDS_PER_PAGE), 1.0))
+            .map(|i| (FtsDocId::new(i * PAGES_APART * IDS_PER_PAGE), 1.0))
             .collect();
         assert_eq!(
             r.hits_to_rows_async(hits.clone()).await.expect("translate"),
@@ -5512,21 +5503,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_sparse_translation_sends_its_page_reads_at_once() {
-        // Setup: a map of 10,000 documents and one hit every fourth page, too far apart to join:
-        // 40 reads, more than one read cap, under the sparse share.
+        // Setup: a map of 10,000 documents and one hit every [`PAGES_APART`] pages, too far apart
+        // to join: 40 reads, more than one read cap, under the sparse share.
         //  - Held at the source, the translation has started every read before any comes back.
         // This test pins that a sparse translation takes one round trip, not one per read cap.
         const N_DOCS: u32 = 10_000;
         /// Reads the hits fall in, each its own page.
         const READS: u32 = 40;
-        /// Pages from one hit to the next: past the merge gap, so no two reads join.
-        const STRIDE_PAGES: u32 = 4;
         let docs: Vec<String> = (0..N_DOCS).map(|row| format!("alpha r{row}")).collect();
         let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
         let order: Vec<u32> = (0..N_DOCS).rev().collect();
         let (blob, json) = build_standard_blob_with(&refs, Some(&order));
         let ids: Vec<FtsDocId> = (0..READS)
-            .map(|i| FtsDocId::new(i * STRIDE_PAGES * IDS_PER_PAGE))
+            .map(|i| FtsDocId::new(i * PAGES_APART * IDS_PER_PAGE))
             .collect();
         let read_bytes = READS as usize * DOC_MAP_PAGE_BYTES;
         let src = Arc::new(GatedSource::new(blob));

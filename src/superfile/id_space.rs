@@ -66,7 +66,16 @@ impl RowId {
 /// strictly ascending (only a corrupt doc-id map, naming a row twice, gives them) are inserted one
 /// by one.
 pub(crate) fn row_bitmap(rows: &[RowId]) -> RoaringBitmap {
-    let positions = || rows.iter().map(|row| row.get());
+    bitmap_of(|| rows.iter().map(|row| row.get()))
+}
+
+/// [`row_bitmap`] for blob ids. A match walks postings in blob order, so `ids` come ascending.
+pub(crate) fn blob_id_bitmap(ids: &[FtsDocId]) -> RoaringBitmap {
+    bitmap_of(|| ids.iter().map(|id| id.get()))
+}
+
+/// A bitmap of what `positions` yields: built in one pass when ascending, else one by one.
+fn bitmap_of<I: Iterator<Item = u32>>(positions: impl Fn() -> I) -> RoaringBitmap {
     RoaringBitmap::from_sorted_iter(positions()).unwrap_or_else(|_| positions().collect())
 }
 
@@ -275,6 +284,52 @@ impl RowSet {
     #[inline]
     pub fn contains(&self, row: RowId) -> bool {
         self.0.contains(row.get())
+    }
+}
+
+/// The blob ids a pushed-down SQL `WHERE` admits in one superfile. A kernel checks the blob id it
+/// walks directly, with no [`DocMap`].
+/// [`RowSet`] is the same gate in rows.
+#[derive(Clone, Debug)]
+pub(crate) struct BlobIdSet(Arc<RoaringBitmap>);
+
+impl BlobIdSet {
+    /// Wraps `bitmap`, which must already hold blob ids, not rows.
+    #[inline]
+    pub fn new(bitmap: Arc<RoaringBitmap>) -> Self {
+        Self(bitmap)
+    }
+
+    /// Whether `doc` is admitted.
+    #[inline]
+    pub fn contains(&self, doc: FtsDocId) -> bool {
+        self.0.contains(doc.get())
+    }
+}
+
+/// What a pushed-down SQL `WHERE` admits in one superfile, as rows or as blob ids.
+#[derive(Clone, Debug)]
+pub(crate) enum Admitted {
+    /// Rows. A kernel turns each blob id into its row through the blob's [`DocMap`] to check it.
+    Rows(Arc<RoaringBitmap>),
+    /// Blob ids, when a ranked search's scope chooses them (`SupertableReader::rank_scope` says
+    /// when). A kernel checks them directly and reads no map.
+    BlobIds(Arc<RoaringBitmap>),
+}
+
+impl Admitted {
+    /// How many documents it admits, the same count in either space.
+    #[inline]
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Rows(set) | Self::BlobIds(set) => set.len(),
+        }
+    }
+
+    /// Whether it admits no document.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

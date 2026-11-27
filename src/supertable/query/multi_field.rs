@@ -63,14 +63,17 @@ use tracing::{Instrument, debug};
 use crate::supertable::query::{exec::common::SCORE_COLUMN, sorted::quote};
 use crate::{
     InfinoError,
-    superfile::fts::reader::{Bm25SearchOptions, BoolMode},
+    superfile::{
+        fts::reader::{Bm25SearchOptions, BoolMode},
+        id_space::Admitted,
+    },
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
         manifest::{SuperfileEntry, SuperfileUri},
         query::{
             SuperfileHit,
-            candidate::{CandidatePlan, CandidateScope},
+            candidate::{CandidatePlan, CandidateScope, RankScope},
             exec::common::resolve_hits_named,
             fts::select_top_k_stable,
             widening::OVER_FETCH_GROWTH,
@@ -496,6 +499,8 @@ impl SupertableReader {
         // confined to the candidates is scoped to, and each superfile's
         // smallest `_id` for the final tie order.
         let entries = self.scope_entries(scope).await?;
+        let rank_scope = scope.cloned().map(RankScope::from);
+        let rank_scope = rank_scope.as_ref();
         let at_once = self.searches_at_once(entries.len());
         // Every row any pair has returned, kept across rounds: a later round
         // scores only what earlier rounds left unknown.
@@ -519,7 +524,7 @@ impl SupertableReader {
                                 &query.texts[pair.clause],
                                 want,
                                 opts,
-                                scope,
+                                rank_scope,
                             )
                             .await?;
                         Ok::<_, QueryError>((p, hits))
@@ -667,12 +672,12 @@ impl SupertableReader {
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            let scope = CandidateScope {
+            let scope = RankScope {
                 superfiles,
                 allow: Some(
                     allow
                         .into_iter()
-                        .map(|(uri, rows)| (uri, Arc::new(rows)))
+                        .map(|(uri, rows)| (uri, Admitted::Rows(Arc::new(rows))))
                         .collect(),
                 ),
             };

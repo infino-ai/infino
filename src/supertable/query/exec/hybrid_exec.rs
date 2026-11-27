@@ -97,7 +97,7 @@ use crate::{
         handle::{Supertable, SupertableReader, WeakReader},
         query::{
             SuperfileHit,
-            candidate::CandidateScope,
+            candidate::{CandidateScope, RankScope},
             dispatch::attach_stable_ids_to_hits,
             exec::{
                 common::{
@@ -285,13 +285,14 @@ impl SupertableReader {
         // inherits its own manifest skip and returns hits best-first. Each
         // leg has its span, so a trace shows which one the query waited on.
         let phases = self.phase_spans();
+        let rank_scope = scope.candidates().cloned().map(RankScope::from);
         let bm25_leg = self
             .bm25_search_scoped_async(
                 text_col,
                 q_text,
                 k,
                 Bm25SearchOptions::new().with_mode(mode),
-                scope.candidates(),
+                rank_scope.as_ref(),
             )
             .instrument(trace::phase(phases, || detail_span!("hybrid.bm25")));
         let vector_leg =

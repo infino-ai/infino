@@ -134,7 +134,7 @@ use crate::{
             },
             tokenize::{KEYWORD_TOKENIZER, Phrase},
         },
-        id_space::{FtsDocId, RowId, row_bitmap},
+        id_space::{Admitted, FtsDocId, RowId, row_bitmap},
     },
     supertable::{
         error::QueryError,
@@ -145,7 +145,7 @@ use crate::{
         },
         query::{
             SuperfileHit,
-            candidate::{CandidatePlan, CandidateScope, TermMemos},
+            candidate::{CandidatePlan, CandidateScope, RankScope, TermMemos},
             dispatch,
             exec::common::{
                 RowCheck, candidate_plan_for_filters, hit_output_schema, resolve_hits_named,
@@ -1320,7 +1320,7 @@ impl SupertableReader {
             .await
     }
 
-    /// [`Self::bm25_search_async`] confined to a [`CandidateScope`] — what a
+    /// [`Self::bm25_search_async`] confined to a [`RankScope`]: what a
     /// SQL `WHERE` pushed into the `bm25_search` / `hybrid_search` table
     /// functions admits. Only the scope's superfiles are searched, and
     /// under a bounded scope each superfile's kernel admits only its
@@ -1333,7 +1333,7 @@ impl SupertableReader {
         query: &str,
         k: usize,
         opts: Bm25SearchOptions,
-        scope: Option<&CandidateScope>,
+        scope: Option<&RankScope>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let (hits, _) = self
             .bm25_scored_async(column, query, k, opts, scope, None, false)
@@ -1352,7 +1352,7 @@ impl SupertableReader {
         query: &str,
         k: usize,
         opts: Bm25SearchOptions,
-        scope: &CandidateScope,
+        scope: &RankScope,
         check: Arc<RowCheck>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let (hits, _) = self
@@ -1370,7 +1370,7 @@ impl SupertableReader {
         query: &str,
         k: usize,
         opts: Bm25SearchOptions,
-        scope: Option<&CandidateScope>,
+        scope: Option<&RankScope>,
         check: Option<Arc<RowCheck>>,
         exact_count: bool,
     ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
@@ -1483,7 +1483,7 @@ impl SupertableReader {
         &self,
         column: &str,
         leaf: &PruneLeaf,
-        scope: Option<&CandidateScope>,
+        scope: Option<&RankScope>,
     ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
         let manifest = self.manifest();
         let select_span = trace::phase(self.phase_spans(), || {
@@ -1521,7 +1521,7 @@ impl SupertableReader {
         k: usize,
         bm25_params: Option<Bm25Params>,
         score_tolerance: f32,
-        scope: Option<&CandidateScope>,
+        scope: Option<&RankScope>,
         check: Option<Arc<RowCheck>>,
         exact_count: bool,
     ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
@@ -1913,7 +1913,7 @@ impl SupertableReader {
         // admission gate, only the clause kernels do. A scope whose
         // candidate sets admit every row of every kept superfile gates
         // nothing, so it is dropped here and the fast path stays open.
-        let per_row_scope: Option<Arc<HashMap<SuperfileUri, Arc<RoaringBitmap>>>> = scope
+        let per_row_scope: Option<Arc<HashMap<SuperfileUri, Admitted>>> = scope
             .filter(|s| check.is_some() || s.bounds_rows(&kept))
             .and_then(|s| s.allow.clone())
             .map(Arc::new);
@@ -2070,14 +2070,15 @@ impl SupertableReader {
             let row_counts = Arc::clone(&row_counts);
             let total = Arc::clone(&total);
             let check = check.clone();
-            // This superfile's admitted rows under a bounded scope. `kept`
+            // This superfile's admitted documents under a bounded scope. `kept`
             // holds only superfiles the scope admits, so the lookup
             // succeeds; an absent entry would mean no row and is treated
-            // as exactly that rather than as "every row".
-            let allow: Option<Arc<RoaringBitmap>> = per_row_scope.as_ref().map(|rows| {
-                rows.get(&uri)
+            // as exactly that rather than as "every row". An empty blob-id
+            // set admits nothing and reads no doc-id map.
+            let allow: Option<Admitted> = per_row_scope.as_ref().map(|sets| {
+                sets.get(&uri)
                     .cloned()
-                    .unwrap_or_else(|| Arc::new(RoaringBitmap::new()))
+                    .unwrap_or_else(|| Admitted::BlobIds(Arc::new(RoaringBitmap::new())))
             });
             async move {
                 // A file written before a rename labels the column as it was
@@ -2310,8 +2311,11 @@ impl SupertableReader {
                                     "superfile {suid} row count exceeds a local id"
                                 ))
                             })?;
+                            // Deletes are rows. A file with deletes already has a row set; a
+                            // blob-id set here (a delete seen since the scope was built) is
+                            // turned into rows through the doc-id map.
                             let mut live = match &allow {
-                                Some(set) => set.as_ref().clone(),
+                                Some(set) => Arc::unwrap_or_clone(r.admitted_rows(set).await?),
                                 None => {
                                     let mut all = RoaringBitmap::new();
                                     all.insert_range(0..rows);
@@ -2319,7 +2323,7 @@ impl SupertableReader {
                                 }
                             };
                             live -= deleted.as_ref();
-                            Some(Arc::new(live))
+                            Some(Admitted::Rows(Arc::new(live)))
                         }
                         _ => allow,
                     };
@@ -2332,7 +2336,7 @@ impl SupertableReader {
                 // `allow`, prepared, its read volume counted.
                 let prepare = async |want: usize,
                                      live_floor: Option<&LiveFloor>,
-                                     allow: Option<Arc<RoaringBitmap>>,
+                                     allow: Option<Admitted>,
                                      exact_count: bool| {
                     let prep = r
                         .prepare_clauses(
@@ -2369,9 +2373,7 @@ impl SupertableReader {
                 };
                 // The un-ranged walk run to its top `want` hits, in rows.
                 let prepare_and_run =
-                    async |want: usize,
-                           live_floor: Option<&LiveFloor>,
-                           allow: Option<Arc<RoaringBitmap>>| {
+                    async |want: usize, live_floor: Option<&LiveFloor>, allow: Option<Admitted>| {
                         let prep = prepare(want, live_floor, allow, false).await?;
                         // The kernels score in blob ids; the top hits are
                         // translated to rows here, on this runtime, reading
@@ -2503,19 +2505,27 @@ impl SupertableReader {
                         r.hits_to_rows_async(hits).await?
                     }
                     (None, Some(check)) => {
-                        let Some(mut admitted) = allow else {
+                        let Some(set) = allow else {
                             return Err(QueryError::Internal(
                                 "a checked search needs a scope that bounds rows".to_owned(),
                             ));
                         };
+                        // The check works in rows. A checked search's scope is the rows its
+                        // search terms match (from `match_scope`), so nothing is turned into rows
+                        // here; each round's row gate still reads the whole doc-id map.
+                        let mut admitted = r.admitted_rows(&set).await?;
                         // The unit's best `want` admitted rows, checked where
                         // not checked before. Rows that fail leave the
                         // admitted set, so the next round reaches deeper.
                         let mut passing = RoaringBitmap::new();
                         let mut want = k;
                         loop {
-                            let hits =
-                                prepare_and_run(want, None, Some(Arc::clone(&admitted))).await?;
+                            let hits = prepare_and_run(
+                                want,
+                                None,
+                                Some(Admitted::Rows(Arc::clone(&admitted))),
+                            )
+                            .await?;
                             let fresh: RoaringBitmap = hits
                                 .iter()
                                 .map(|(row, _)| row.get())
@@ -2541,7 +2551,12 @@ impl SupertableReader {
                             if want >= CHECKED_UNIT_MAX_ROWS.max(k) {
                                 let mut passed = check.keep(&r, &(&rest - &passing)).await?;
                                 passed |= &passing;
-                                break prepare_and_run(k, None, Some(Arc::new(passed))).await?;
+                                break prepare_and_run(
+                                    k,
+                                    None,
+                                    Some(Admitted::Rows(Arc::new(passed))),
+                                )
+                                .await?;
                             }
                             admitted = Arc::new(rest);
                             want = next_checked_want(want, k);
@@ -3802,19 +3817,20 @@ impl SupertableReader {
     /// bounds one (already free of tombstones) and has the superfile's
     /// tombstones taken out when it does not. The result is bounded, its
     /// sets free of tombstones, and holds only superfiles with a row left.
+    /// A blob-id set is turned into rows through its superfile's doc-id map.
     pub(crate) async fn match_scope(
         &self,
         column: &str,
         query: &str,
         mode: BoolMode,
-        scope: &CandidateScope,
+        scope: &RankScope,
     ) -> Result<CandidateScope, QueryError> {
         let Some((units, kernel)) = self.match_kernel(column, query, mode, &[]).await? else {
             return Ok(CandidateScope::empty());
         };
         let admitted: HashSet<SuperfileUri> =
             scope.admitted_superfiles().map(|entry| entry.uri).collect();
-        let units: Vec<(Arc<SuperfileEntry>, (Uuid, Option<Arc<RoaringBitmap>>))> = units
+        let units: Vec<(Arc<SuperfileEntry>, (Uuid, Option<Admitted>))> = units
             .into_iter()
             .filter(|(entry, _)| admitted.contains(&entry.uri))
             .map(|(entry, suid)| {
@@ -3829,12 +3845,12 @@ impl SupertableReader {
                          entry: Arc<SuperfileEntry>,
                          cache: Option<Arc<SidecarCache>>,
                          now: Instant,
-                         (suid, within): (Uuid, Option<Arc<RoaringBitmap>>)| {
+                         (suid, within): (Uuid, Option<Admitted>)| {
             let kernel = Arc::clone(&kernel);
             async move {
                 let mut rows = row_bitmap(&kernel.docs(&r, suid).await?);
                 match within {
-                    Some(within) => rows &= within.as_ref(),
+                    Some(within) => rows &= r.admitted_rows(&within).await?.as_ref(),
                     None => {
                         if let Some(cache) = cache.as_ref()
                             && let Some(deny) =
