@@ -3824,6 +3824,10 @@ impl SupertableReader {
                         batch
                     }
                 };
+                // Let go of the rows and the reader before waiting on a
+                // consumer that may be behind: only the batch is sent.
+                drop(locals);
+                drop(r);
                 let rows = batch.num_rows();
                 out.send(Ok(batch))
                     .await

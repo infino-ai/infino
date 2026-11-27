@@ -53,6 +53,7 @@ use datafusion::{
 use futures::{StreamExt, TryFutureExt, stream};
 
 use crate::{
+    runtime_metrics::op_stats::{attached_to_future, current as current_op_stats},
     superfile::fts::reader::BoolMode,
     supertable::{
         error::QueryError,
@@ -575,9 +576,11 @@ impl ExecutionPlan for MatchExec {
         // superfile's matching rows come out as their own batch as soon as
         // that superfile is done, straight from the walk to a column take,
         // and the consumer (an aggregate, a filter) takes them in any order.
-        // No more of them are alive at once than the fan-out runs plus
-        // `MATCH_BATCHES_AHEAD`, however many superfiles match. Dropping the
-        // stream (a cancelled or failed statement) aborts the fan-out. The
+        // No more of them are alive at once than the fan-out runs, plus
+        // `MATCH_BATCHES_AHEAD` in the channel, plus the one the consumer
+        // holds, however many superfiles match. Dropping the stream (a
+        // cancelled or failed statement, a `LIMIT` with its rows) aborts the
+        // fan-out. The
         // projection may name a column twice; the batches carry each
         // distinct column once and are laid out to the projection here.
         if !counts_only
@@ -596,8 +599,11 @@ impl ExecutionPlan for MatchExec {
             }
             let columns_schema = Arc::clone(&projected_schema);
             // Built on the first poll, inside the runtime that drives the
-            // statement: `execute` itself may run outside one.
+            // statement (`execute` itself may run outside one), and under the
+            // statement's stats collector, which the producer's own task then
+            // carries, so the prune still counts the superfiles it weighed.
             let batches = stream::once(async move {
+                let op_stats = current_op_stats();
                 let mut batches = RecordBatchReceiverStream::builder(
                     Arc::clone(&columns_schema),
                     MATCH_BATCHES_AHEAD,
@@ -610,7 +616,11 @@ impl ExecutionPlan for MatchExec {
                         .await?;
                     Ok::<usize, DataFusionError>(rows)
                 };
-                batches.spawn(traced_tvf_rows(span, produce, |rows: &usize| *rows).map_ok(|_| ()));
+                // `rows_out` is recorded when the match runs to the end. A
+                // stream dropped early aborts the producer before that, so
+                // the span then records no count rather than a partial one.
+                let produce = traced_tvf_rows(span, produce, |rows: &usize| *rows);
+                batches.spawn(attached_to_future(op_stats, produce).map_ok(|_| ()));
                 batches.build()
             })
             .flatten();
@@ -884,42 +894,130 @@ mod tests {
         });
     }
 
+    /// The `MatchExec` line of `sql`'s physical plan with its output schema.
+    fn match_exec_with_schema(st: &Supertable, sql: &str) -> String {
+        let batches = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!("EXPLAIN VERBOSE {sql}"))
+            .expect("explain");
+        let mut line = None;
+        for batch in &batches {
+            let kinds = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("plan type");
+            let plans = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("plan");
+            for row in 0..batch.num_rows() {
+                if kinds.value(row) == "physical_plan_with_schema" {
+                    line = plans
+                        .value(row)
+                        .lines()
+                        .find(|l| l.contains("MatchExec"))
+                        .map(str::to_string);
+                }
+            }
+        }
+        line.unwrap_or_else(|| panic!("no MatchExec with a schema in the plan of {sql}"))
+    }
+
     #[test]
     fn a_streamed_match_answers_as_the_hit_path_does() {
-        // The same grouped, ordered and limited queries over the column path
-        // (`title` only) and the hit path (`_id` too) return the same rows.
+        // The same grouped, ordered and limited queries, once over the column
+        // path (`title` only, no order the match walks) and once over the hit
+        // path (`_id` kept in the output), return the same titles.
         // This test pins that streaming changes no answer.
         let (st, _reader, _exec) = streamed_match();
         let reader = st.reader().expect("reader");
-        let rows = |sql: &str| -> Vec<String> {
+        let column = |sql: &str, c: usize| -> Vec<String> {
             let batches = reader.query_sql(sql).expect("query_sql");
             batches
                 .iter()
                 .flat_map(|batch| {
-                    (0..batch.num_rows()).map(move |row| {
-                        (0..batch.num_columns())
-                            .map(|c| array_value_to_string(batch.column(c), row).expect("value"))
-                            .collect::<Vec<_>>()
-                            .join("|")
-                    })
+                    (0..batch.num_rows())
+                        .map(move |row| array_value_to_string(batch.column(c), row).expect("value"))
                 })
                 .collect()
         };
+        let column_path = |sql: &str| {
+            let plan = match_exec_with_schema(&st, sql);
+            assert!(
+                !plan.contains("_id") && !plan.contains("score") && !plan.contains("order="),
+                "{sql} takes the column path: {plan}"
+            );
+        };
+        let hit_path = |sql: &str| {
+            let plan = match_exec_with_schema(&st, sql);
+            assert!(plan.contains("_id"), "{sql} takes the hit path: {plan}");
+        };
         let tvf = "token_match('title', 'rust')";
-        let grouped = rows(&format!(
-            "SELECT title, COUNT(*) AS c FROM {tvf} GROUP BY title ORDER BY title"
-        ));
-        let grouped_hits = rows(&format!(
-            "SELECT title, COUNT(_id) AS c FROM {tvf} GROUP BY title ORDER BY title"
-        ));
-        assert_eq!(grouped.len(), STREAMED_SUPERFILES);
-        assert_eq!(grouped, grouped_hits);
-        let limited = rows(&format!("SELECT title FROM {tvf} ORDER BY title LIMIT 5"));
-        let limited_hits = rows(&format!(
-            "SELECT title FROM (SELECT _id, title FROM {tvf}) ORDER BY title LIMIT 5"
-        ));
-        assert_eq!(limited, limited_hits);
-        assert_eq!(rows(&format!("SELECT title FROM {tvf} LIMIT 5")).len(), 5);
+
+        let grouped =
+            format!("SELECT title, COUNT(*) AS c FROM {tvf} GROUP BY title ORDER BY title");
+        let grouped_hits =
+            format!("SELECT title, COUNT(_id) AS c FROM {tvf} GROUP BY title ORDER BY title");
+        column_path(&grouped);
+        hit_path(&grouped_hits);
+        assert_eq!(column(&grouped, 0).len(), STREAMED_SUPERFILES);
+        assert_eq!(column(&grouped, 0), column(&grouped_hits, 0));
+        assert_eq!(column(&grouped, 1), column(&grouped_hits, 1));
+
+        // An order on an expression, which the match cannot walk, so the
+        // sort and limit run above it on either path.
+        let order = "ORDER BY length(title) DESC, title LIMIT 5";
+        let limited = format!("SELECT title FROM {tvf} {order}");
+        let limited_hits = format!("SELECT title, _id FROM {tvf} {order}");
+        column_path(&limited);
+        hit_path(&limited_hits);
+        assert_eq!(column(&limited, 0), column(&limited_hits, 0));
+
+        let first = format!("SELECT title FROM {tvf} LIMIT 5");
+        column_path(&first);
+        assert_eq!(column(&first, 0).len(), 5);
+    }
+
+    #[test]
+    fn a_streamed_match_counts_the_superfiles_its_prune_weighed() {
+        // The column path's match runs on a task of its own.
+        //  - its prune must still count into the statement's stats.
+        //  - so it counts the superfiles weighed and kept as the hit path does.
+        // This test pins the stats collector on that task.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("bucket", DataType::Int64, false),
+        ]));
+        let commits: Vec<_> = [
+            (0_i64, ["rust", "rust zero"]),
+            (1, ["rust", "rust one"]),
+            (2, ["go", "go two"]),
+        ]
+        .into_iter()
+        .map(|(bucket, titles)| {
+            titled_batch(
+                &schema,
+                &titles,
+                Arc::new(Int64Array::from(vec![bucket; 2])),
+            )
+        })
+        .collect();
+        let conn = metered_table(&schema, IndexSpec::new().fts("title"), &commits);
+        let stats = |sql: &str| {
+            let (_, stats) = with_op_stats(|| conn.query_sql(sql).expect("query_sql"));
+            (
+                stats.superfiles_considered,
+                stats.presence_pruning_survived,
+                stats.score_pruning_survived,
+            )
+        };
+        let tvf = format!("token_match('{METERED_TABLE}', 'title', 'rust')");
+        let hits = stats(&format!("SELECT _id FROM {tvf}"));
+        assert!(hits.0 > 0, "premise: the hit path counts its prune");
+        assert_eq!(stats(&format!("SELECT title FROM {tvf}")), hits);
     }
 
     /// Queries whose aggregates are held to the materialized rows: a bare
