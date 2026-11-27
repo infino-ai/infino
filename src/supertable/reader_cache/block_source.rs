@@ -128,6 +128,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -353,6 +354,9 @@ pub(crate) struct BlockCachedSource {
     /// Tests hold a flush pass here, before it takes `flushing`.
     #[cfg(test)]
     pass_stall: Stall,
+    /// Tests set this to panic in the next fsync.
+    #[cfg(test)]
+    panic_next_fsync: AtomicBool,
     /// Tests set this to run once [`Self::block_file`] has created a fresh file,
     /// given its inode, before the index at the path is removed again.
     #[cfg(test)]
@@ -424,6 +428,19 @@ impl FetchedRun {
         self.unlanded = self.unlanded.saturating_sub(newly);
         self.landed = true;
         true
+    }
+}
+
+/// An index flush pass in progress: holds its source's `flushing` until it drops, however the pass
+/// ends. A pass that panicked sets `dirty` again first, so the next flush covers its blocks.
+struct FlushPass<'a>(&'a BlockCachedSource);
+
+impl Drop for FlushPass<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.0.dirty.store(true, Ordering::SeqCst);
+        }
+        self.0.flushing.store(false, Ordering::SeqCst);
     }
 }
 
@@ -845,6 +862,7 @@ impl BlockCachedSource {
             fail_next_fsync: AtomicBool::new(false),
             #[cfg(test)]
             pass_stall: Stall::default(),
+            panic_next_fsync: AtomicBool::new(false),
             #[cfg(test)]
             created_hook: Mutex::new(None),
         })
@@ -1497,6 +1515,7 @@ impl BlockCachedSource {
     /// - If blocks were marked during the fsync, the running flush goes again.
     /// - A failed fsync stops this source indexing the file; a later open
     ///   fetches the blocks the last index misses.
+    /// - A pass that panics leaves its blocks for the next flush.
     fn flush_index(&self) {
         let Some(bf) = self.created_block_file() else {
             return;
@@ -1508,6 +1527,7 @@ impl BlockCachedSource {
             if self.flushing.swap(true, Ordering::SeqCst) {
                 return;
             }
+            let _pass = FlushPass(self);
 
             // Nothing is left to flush if the source stopped indexing the file,
             // or the file was evicted, erased or replaced at its path. `retired`
@@ -1515,7 +1535,6 @@ impl BlockCachedSource {
             // while another's fsync failed must see it.
             if self.retired.load(Ordering::Acquire) || !self.path_names(bf) {
                 self.dirty.store(false, Ordering::SeqCst);
-                self.flushing.store(false, Ordering::SeqCst);
                 return;
             }
 
@@ -1525,26 +1544,25 @@ impl BlockCachedSource {
             let snapshot = self.snapshot_index(bf);
             #[cfg(test)]
             self.fsync_stall.wait_while_held();
+            #[cfg(test)]
+            assert!(
+                !self.panic_next_fsync.swap(false, Ordering::SeqCst),
+                "a test made this fsync panic"
+            );
             let synced = bf.file.sync_data().is_ok();
             #[cfg(test)]
             let synced = synced && !self.fail_next_fsync.swap(false, Ordering::SeqCst);
             #[cfg(test)]
             self.syncs.fetch_add(1, Ordering::AcqRel);
 
-            if synced {
-                self.persist_idx(bf, &snapshot);
-            } else {
+            if !synced {
                 // Stop indexing the file: a retried fsync can succeed although
                 // the failed writes never reached the disk, and its index would
                 // name them.
                 self.retired.store(true, Ordering::Release);
-            }
-
-            self.flushing.store(false, Ordering::SeqCst);
-
-            if !synced {
                 return;
             }
+            self.persist_idx(bf, &snapshot);
         }
     }
 
@@ -5243,6 +5261,30 @@ mod tests {
             1,
             "pass 2 does not fsync"
         );
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    #[tokio::test]
+    async fn a_flush_runs_again_after_one_panics() {
+        // Block 0's flush panics in its fsync.
+        //  - the panic must not leave the file marked as flushing.
+        //  - the next flush still indexes block 0.
+        // This test pins the flush pass guard.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
+
+        src.panic_next_fsync.store(true, Ordering::SeqCst);
+        src.prefetch(0, b, b, 1).await.expect("prefetch");
+        store.block_writes_settled().await;
+        assert!(
+            !src.idx_path().exists(),
+            "the panicked flush wrote no index"
+        );
+
+        src.flush_index();
+        assert_indexed(&src.path, &src.idx_path(), 2 * b, 0..1);
         store.remove_block_entry_for_test(&uri);
     }
 
