@@ -862,6 +862,7 @@ impl BlockCachedSource {
             fail_next_fsync: AtomicBool::new(false),
             #[cfg(test)]
             pass_stall: Stall::default(),
+            #[cfg(test)]
             panic_next_fsync: AtomicBool::new(false),
             #[cfg(test)]
             created_hook: Mutex::new(None),
