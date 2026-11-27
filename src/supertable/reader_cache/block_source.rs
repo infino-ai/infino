@@ -347,6 +347,9 @@ pub(crate) struct BlockCachedSource {
     /// Tests set this to fail the next fsync.
     #[cfg(test)]
     fail_next_fsync: AtomicBool,
+    /// Tests hold a flush pass here, before it takes `flushing`.
+    #[cfg(test)]
+    pass_stall: Stall,
     /// Tests set this to run once [`Self::block_file`] has created a fresh file,
     /// given its inode, before the index at the path is removed again.
     #[cfg(test)]
@@ -837,6 +840,8 @@ impl BlockCachedSource {
             fsync_stall: Stall::default(),
             #[cfg(test)]
             fail_next_fsync: AtomicBool::new(false),
+            #[cfg(test)]
+            pass_stall: Stall::default(),
             #[cfg(test)]
             created_hook: Mutex::new(None),
         })
@@ -1487,24 +1492,25 @@ impl BlockCachedSource {
     /// - One flush runs per source. A call that finds one running returns at
     ///   once; the running one covers its blocks.
     /// - If blocks were marked during the fsync, the running flush goes again.
-    /// - A failed fsync stops the file being indexed; a later open fetches the
-    ///   blocks the last index misses.
+    /// - A failed fsync stops this source indexing the file; a later open
+    ///   fetches the blocks the last index misses.
     fn flush_index(&self) {
         let Some(bf) = self.created_block_file() else {
             return;
         };
-        if self.retired.load(Ordering::Acquire) {
-            return;
-        }
 
         while self.dirty.load(Ordering::SeqCst) {
+            #[cfg(test)]
+            self.pass_stall.wait_while_held();
             if self.flushing.swap(true, Ordering::SeqCst) {
                 return;
             }
 
-            // The file was evicted, erased or replaced at its path: its blocks can
-            // never be indexed, so nothing is left to flush.
-            if !self.path_names(bf) {
+            // Nothing is left to flush if the source stopped indexing the file
+            // (checked here, once this pass runs alone: another pass's failed
+            // fsync stops it), or the file was evicted, erased or replaced at
+            // its path.
+            if self.retired.load(Ordering::Acquire) || !self.path_names(bf) {
                 self.dirty.store(false, Ordering::SeqCst);
                 self.flushing.store(false, Ordering::SeqCst);
                 return;
@@ -5193,6 +5199,44 @@ mod tests {
             src.syncs.load(Ordering::Acquire),
             1,
             "no fsync after it failed"
+        );
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    #[tokio::test]
+    async fn a_pass_waiting_while_another_fsync_fails_writes_no_index() {
+        // Pass 1 is in its fsync, which will fail. Block 1 lands meanwhile, and
+        // pass 2 stops just before it takes `flushing`.
+        //  - pass 1's failed fsync stops the source indexing the file.
+        //  - pass 2 then runs alone, and must not write an index naming block 0.
+        // This test pins that a pass checks `retired` once it runs alone.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
+
+        src.fail_next_fsync.store(true, Ordering::SeqCst);
+        let in_fsync = src.fsync_stall.hold();
+        src.prefetch(0, b, b, 1).await.expect("prefetch block 0");
+        wait_until(|| in_fsync.waiting() == 1, "pass 1's fsync").await;
+        src.prefetch(b, b, b, 1).await.expect("prefetch block 1");
+
+        let before_swap = src.pass_stall.hold();
+        let pass_two = thread::spawn({
+            let src = Arc::clone(&src);
+            move || src.flush_index()
+        });
+        wait_until(|| before_swap.waiting() == 1, "pass 2").await;
+        drop(in_fsync);
+        store.block_writes_settled().await;
+        drop(before_swap);
+        pass_two.join().expect("pass 2");
+
+        assert!(!src.idx_path().exists(), "no index names block 0");
+        assert_eq!(
+            src.syncs.load(Ordering::Acquire),
+            1,
+            "pass 2 does not fsync"
         );
         store.remove_block_entry_for_test(&uri);
     }
