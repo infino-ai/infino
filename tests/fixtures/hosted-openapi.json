@@ -306,6 +306,16 @@
               }
             }
           },
+          "402": {
+            "description": "The account's free period has ended and no payment method is on file. Adding one restores access.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "403": {
             "description": "The API key may not address this database; the account already owns as many databases as its plan allows (a free-plan limit — adding a payment method lifts it); or the account is not entitled to storage bindings (BYOB is an enterprise feature).",
             "content": {
