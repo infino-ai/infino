@@ -86,11 +86,13 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
-use datafusion::logical_expr::Expr;
+use datafusion::{error::Result as DfResult, logical_expr::Expr};
 use futures::future::join;
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
-use tokio::sync::{OnceCell, Semaphore};
+#[cfg(test)]
+use tokio::sync::mpsc::channel;
+use tokio::sync::{OnceCell, Semaphore, mpsc::Sender};
 use tracing::{Instrument, debug, warn};
 use uuid::Uuid;
 
@@ -111,6 +113,9 @@ const RANGED_KERNEL_POOL_MIN_TERMS: usize = OR_WINDOW_MIN_TERMS;
 /// masses split bimodal — cheap matches stay under 4,000, real scans
 /// start past 60,000 — so this sits in the gap.
 const UNRANGED_KERNEL_POOL_MIN_MASS: u64 = 20_000;
+
+/// The error a match's column take fails with once its consumer has gone.
+const MATCH_COLUMNS_CLOSED: &str = "token_match columns: the consumer stopped reading";
 
 pub use crate::superfile::fts::reader::BoolMode;
 #[cfg(feature = "detailed-tracing")]
@@ -3683,13 +3688,20 @@ impl SupertableReader {
     }
 
     /// The matching rows' `names` columns, one batch per superfile in no
-    /// particular order, for a consumer that reads neither `_id` nor the
-    /// score: an aggregate over the match. Each superfile's rows go from
-    /// the kernel's walk to a column take and out as their own batch, with
-    /// no hit per row, no stable-id stamping and no global interleave in
-    /// between, which on a match of a few hundred thousand rows is most of
-    /// what producing a hit set costs. Tombstoned rows are left out, as
-    /// the hit path leaves them out.
+    /// particular order, sent to `out` as each superfile finishes, for a
+    /// consumer that reads neither `_id` nor the score: an aggregate over
+    /// the match. Each superfile's rows go from the kernel's walk to a
+    /// column take and out as their own batch, with no hit per row, no
+    /// stable-id stamping and no global interleave in between, which on a
+    /// match of a few hundred thousand rows is most of what producing a hit
+    /// set costs. Tombstoned rows are left out, as the hit path leaves them
+    /// out. Returns the rows sent.
+    ///
+    /// A superfile waits to send while `out` is full, holding its slot of
+    /// the fan-out, so the batches alive at once are bounded by the fan-out
+    /// and `out`, not by the superfiles matched. Once `out` closes (the
+    /// statement was cancelled or failed), the next send fails the fan-out,
+    /// which drops the superfiles still running.
     ///
     /// A plain union of terms over a superfile holding a large share of the
     /// table is cut into doc-id slices, as many as its share of the reader
@@ -3705,9 +3717,10 @@ impl SupertableReader {
         mode: BoolMode,
         names: &[&str],
         filters: &[Expr],
-    ) -> Result<Vec<RecordBatch>, QueryError> {
+        out: Sender<DfResult<RecordBatch>>,
+    ) -> Result<usize, QueryError> {
         let Some((units, kernel)) = self.match_kernel(column, query, mode, filters).await? else {
-            return Ok(Vec::new());
+            return Ok(0);
         };
         let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
         let fanout = match kernel.slices() {
@@ -3746,6 +3759,7 @@ impl SupertableReader {
             let shared = Arc::clone(&shared);
             let cursor_sets = Arc::clone(&cursor_sets);
             let reader_pool = Arc::clone(&reader_pool);
+            let out = out.clone();
             async move {
                 let docs = match range {
                     None => kernel.docs(&r, suid).await?,
@@ -3793,20 +3807,62 @@ impl SupertableReader {
                 // superfile lives; the hit path memoises them under that
                 // key, and so does this.
                 let decoded = &shared.decoded_scalar_cache;
-                if let Some(batch) = decoded.get(entry.uri, schema_id, &locals, &refs) {
-                    return Ok(batch);
-                }
-                let batch =
-                    take_file_columns(&manifest, &r, locals.clone(), &refs, &out_schema, &op_stats)
+                let batch = match decoded.get(entry.uri, schema_id, &locals, &refs) {
+                    Some(batch) => batch,
+                    None => {
+                        let batch = take_file_columns(
+                            &manifest,
+                            &r,
+                            locals.clone(),
+                            &refs,
+                            &out_schema,
+                            &op_stats,
+                        )
                         .await
                         .map_err(QueryError::DataFusion)?;
-                decoded.insert(entry.uri, schema_id, &locals, &refs, batch.clone());
-                Ok(batch)
+                        decoded.insert(entry.uri, schema_id, &locals, &refs, batch.clone());
+                        batch
+                    }
+                };
+                let rows = batch.num_rows();
+                out.send(Ok(batch))
+                    .await
+                    .map_err(|_| QueryError::Internal(MATCH_COLUMNS_CLOSED.to_string()))?;
+                Ok(rows)
             }
         };
-        dispatch::fanout_with(self, units, true, self.open_intent(), body)
+        let sent = dispatch::fanout_with(self, units, true, self.open_intent(), body)
             .instrument(fanout_span)
-            .await
+            .await?;
+        Ok(sent.into_iter().sum())
+    }
+
+    /// [`Self::token_match_columns_async`]'s batches, collected, for tests
+    /// that check them all at once.
+    #[cfg(test)]
+    pub(crate) async fn token_match_columns_collected(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+        names: &[&str],
+        filters: &[Expr],
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        let (out, mut batches) = channel::<DfResult<RecordBatch>>(1);
+        let collect = async move {
+            let mut collected = Vec::new();
+            while let Some(batch) = batches.recv().await {
+                collected.push(batch.map_err(QueryError::DataFusion)?);
+            }
+            Ok(collected)
+        };
+        let (sent, collected) = join(
+            self.token_match_columns_async(column, query, mode, names, filters, out),
+            collect,
+        )
+        .await;
+        sent?;
+        collected
     }
 
     /// `scope` narrowed to the rows `query`'s terms match under `mode`: the

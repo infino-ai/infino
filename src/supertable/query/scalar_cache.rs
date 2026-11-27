@@ -263,6 +263,12 @@ impl DecodedScalarCache {
             .get(&Self::key(uri, schema_id, local_doc_ids, columns))
     }
 
+    /// How many batches are kept.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lru.len()
+    }
+
     pub(crate) fn insert(
         &self,
         uri: SuperfileUri,
