@@ -187,7 +187,8 @@ class Table:
     ) -> dict[str, Any]: ...
     # `k1` / `b` override the columns' declared parameters for this search
     # only; pass both or neither. Results stay exact — only pruning power is
-    # traded — and nothing is rebuilt.
+    # traded — and nothing is rebuilt. Not yet applied over a hosted
+    # (https://) connection, which scores with the column's declared values.
     def bm25_search(
         self,
         column: str,

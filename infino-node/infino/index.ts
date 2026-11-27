@@ -299,7 +299,8 @@ export interface Bm25SearchOptions {
   /** BM25 `k1` for this search only, overriding the column's declared value.
    * Pass `k1` and `b` together or neither. Results stay exact; only pruning
    * power is traded. A pair you mean to keep belongs on the column
-   * (`IndexSpec.fts`). */
+   * (`IndexSpec.fts`). Not yet applied over a hosted (https://)
+   * connection, which scores with the column's declared values. */
   k1?: number;
   /** BM25 `b` for this search only; see {@link Bm25SearchOptions.k1}. */
   b?: number;
