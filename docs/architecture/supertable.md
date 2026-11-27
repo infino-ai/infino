@@ -343,15 +343,18 @@ by range or whole by the same rule. Lookups racing for a slice share
 one read of its block index. A piece that fails its check is never
 read as absent: the lookup reads the slice whole instead.
 
-After a slice is read by range, it is read whole in the background and
-kept in memory, in room the resident budget has free. With a disk
-cache this happens to every such slice: it is read from local disk
+After a slice is read by range, it is read whole in the background
+when the resident budget has free room for it, and kept in memory in
+that room; a whole copy never pushes anything else out. With a disk
+cache any slice read by range qualifies: it is read from local disk
 when it is there, otherwise downloaded and also written to local disk.
-Without a disk cache it happens to a slice read by range a second time
-while its block index is still in memory. Root and slices are
-content-addressed and immutable. Slices are cached on local disk like
-manifest parts, and both are kept live by garbage collection for as
-long as a manifest names them.
+Without a disk cache only a slice read by range a second time, while
+its block index is still in memory, qualifies. Once memory holds only
+block indexes, no slice is read whole in the background any more, so
+a hot slice stays ranged, and off local disk if it was not there.
+Root and slices are content-addressed and immutable. Slices are cached
+on local disk like manifest parts, and both are kept live by garbage
+collection for as long as a manifest names them.
 
 Every commit publishes its superfiles' postings in the same atomic
 step as their entries: the writer already holds each new superfile's

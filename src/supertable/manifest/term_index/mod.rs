@@ -704,10 +704,10 @@ impl FetchBudget {
 /// the query path, and kept as a whole read keeps them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Promote {
-    /// A disk cache is attached: every slice. One not on disk yet is
+    /// A disk cache is attached: every slice, when the resident set has room
+    /// for it ([`TermIndex::promote_slice`]). One not on disk yet is
     /// downloaded and also written there; one on disk is read from there, its
-    /// hash checked once. Later lookups then read it from memory, as when
-    /// every slice was read whole.
+    /// hash checked once. Later lookups then read it from memory.
     Disk,
     /// No disk cache: a slice read by range a second time, while its block
     /// index is still resident. So a hot slice ends up whole in memory, as
@@ -3984,11 +3984,15 @@ impl TermIndex {
     /// lookup never waits for it. `reused` says its block index was resident.
     /// - Only into free room: it is queued only if the resident set's free
     ///   room, plus what its own block index frees, minus what promotions
-    ///   already queued hold, fits it, and it holds that room until it lands
-    ///   or gives up. A copy never pushes block indexes out
-    ///   ([`TierChunks::keep_whole_in_room`]), so a working set too big for
-    ///   whole copies stays on its block indexes, and nothing is read only to
-    ///   be dropped.
+    ///   already queued hold, fits it. That room is held against other
+    ///   promotions until it lands or gives up, so they never queue more than
+    ///   fits; a lookup can still take it meanwhile, and then the copy is not
+    ///   kept ([`TierChunks::keep_whole_in_room`]). A copy never pushes block
+    ///   indexes out, so a working set too big for whole copies stays on its
+    ///   block indexes.
+    /// - Known limit: nothing else frees room in the resident set, so once it
+    ///   holds only block indexes no promotion queues again, and a hot slice
+    ///   stays ranged; freeing room for hot slices is left to a later change.
     /// - Skipped too when a read of it is already queued, or an earlier whole
     ///   read failed its hash or could never fit on disk.
     async fn promote_slice(&self, hash: &ContentHash, len: Option<u64>, reused: bool) {
@@ -4007,6 +4011,8 @@ impl TermIndex {
             if chunks.unpromotable.get(hash).is_some() {
                 return;
             }
+            // Once the set holds only block indexes this stays below a slice's
+            // size for good, so no promotion queues (the known limit above).
             let room = (chunks.slices.room() + chunks.slices.weight_of(hash)) as u64;
             let promotions = Arc::clone(&chunks.promotions);
             // Taken while the cache is locked, so the room it reserves against
@@ -4047,8 +4053,8 @@ impl TermIndex {
             )
             .await;
             // A storage error leaves the slice to a later read. A disk cache too
-            // full to take it leaves it off disk, kept in memory in the room it
-            // reserved, until a later promotion writes it. A slice failing its
+            // full to take it leaves it off disk, kept in memory if its room is
+            // still free, until a later promotion writes it. A slice failing its
             // hash, or larger than the whole disk cache, would fail again, so it
             // is marked unpromotable.
             let mut chunks = tier_chunks.lock().expect("tier chunk cache lock");
@@ -10637,10 +10643,6 @@ mod tests {
         assert_eq!(kept(&cache).await, (0, layers), "block indexes only");
     }
 
-    /// Bytes of a disk cache a test fills with one pinned object, so it refuses
-    /// every slice.
-    const PINNED_DISK_CACHE_BYTES: u64 = 64 * 1024;
-
     /// The resident weight of the block indexes one lookup of `term` reads in
     /// `root`, and the largest slice it touches.
     async fn index_weight_and_largest_slice(
@@ -10665,24 +10667,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_full_resident_set_downloads_no_whole_slice_even_for_the_disk_cache() {
-        // A disk cache that refuses every slice (a pinned object fills it), and
-        // a resident set that holds the block indexes one term reads and no byte
-        // more; the term looked up three times by indexes sharing that set.
-        //  - no lookup starts a whole download: memory has no room to keep it,
-        //    and the disk cache would refuse it;
-        //  - each lookup after the first reads a block and a run per slice.
-        // This test pins that full memory never turns each ranged read into a
-        // whole download that is then dropped.
+        // A disk cache with room, and a resident set that holds the block
+        // indexes one term reads and no byte more; the term looked up three
+        // times by indexes sharing that set.
+        //  - no lookup starts a whole download, even though the disk cache
+        //    would take it: memory has no room to keep it;
+        //  - each lookup after the first reads a block and a run per slice, and
+        //    no slice reaches local disk.
+        // This test pins that no whole read starts without room in memory.
         let (local, root, terms, _store) = two_layer_checked_index().await;
         let layers = root.layers.len();
         let (indexes, _) = index_weight_and_largest_slice(&root, &local, &terms[0]).await;
         let dir = TempDir::new().expect("cache dir");
-        let disk = MetadataDiskCache::new(dir.path().to_path_buf(), PINNED_DISK_CACHE_BYTES, None)
+        let disk = MetadataDiskCache::new(dir.path().to_path_buf(), DISK_CACHE_BYTES, None)
             .expect("cache");
-        let filler = Bytes::from(vec![0u8; PINNED_DISK_CACHE_BYTES as usize]);
-        let filler_hash = ContentHash::of(&filler);
-        assert!(disk.put(filler_hash, filler).await, "the filler fits");
-        let _pinned = disk.pin(filler_hash).expect("pinned");
         let slow = SlowStorage::wrap(Arc::clone(&local), Duration::ZERO);
         let cache = tier_chunk_cache(indexes);
         for _ in 0..3 {
@@ -10698,6 +10696,39 @@ mod tests {
             "no whole download"
         );
         assert_eq!(kept(&cache).await, (0, layers), "block indexes only");
+        assert!(
+            root.slices_for_key(&fid("body").term_key(&terms[0]))
+                .all(|s| !disk.contains(&s.content_hash)),
+            "nothing written to disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_promotion_counts_the_room_its_own_block_index_frees() {
+        // No disk cache, one slice, and a resident set exactly the slice's size,
+        // so once its block index is resident the free room is the slice minus
+        // that index; the slice's term looked up twice.
+        //  - the second lookup reuses the block index and its whole read fits,
+        //    because keeping the slice whole frees its block index;
+        //  - the slice ends up whole.
+        // This test pins the credit a promotion takes for its own block index,
+        // without which a slice that exactly fits would never be kept whole.
+        let (local, root, terms, _store) = one_slice_index(OVER_SMALL_SLICE_TERMS).await;
+        let len = root.layers[0].slices[0].len as usize;
+        let cache = tier_chunk_cache(len);
+        let index = || {
+            TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None)
+                .with_small_slice_bytes(NO_SMALL_SLICES)
+                .with_tier_chunk_cache(Arc::clone(&cache))
+        };
+        for _ in 0..2 {
+            index()
+                .runs_many(fid("body"), &[terms[0].as_str()])
+                .await
+                .expect("lookup");
+            promotions_settle(&cache).await;
+        }
+        assert_eq!(kept(&cache).await, (1, 0), "the slice kept whole");
     }
 
     #[tokio::test]
@@ -10865,7 +10896,13 @@ mod tests {
     async fn promotions_settle(cache: &TierChunkCache) {
         for _ in 0..PROMOTION_WAIT_POLLS {
             let promotions = Arc::clone(&cache.lock().expect("tier chunk cache lock").promotions);
-            if promotions.queued.lock().expect("lock").slices.is_empty() {
+            let (empty, held) = {
+                let queued = promotions.queued.lock().expect("lock");
+                (queued.slices.is_empty(), queued.bytes)
+            };
+            if empty {
+                // Every finished or cancelled promotion gives its room back.
+                assert_eq!(held, 0, "no room left held by a finished promotion");
                 return;
             }
             sleep(PROMOTION_WAIT_POLL).await;
@@ -11853,7 +11890,7 @@ mod tests {
     #[tokio::test]
     async fn a_slice_read_by_range_waits_for_no_promotion_past_the_queue() {
         // A lookup with a disk cache attached while the table's background
-        // queue already holds more bytes than the resident set has room for.
+        // queue already holds the whole resident budget.
         //  - the lookup reads each slice by range and queues no whole read, so
         //    none reaches disk;
         //  - once the queue is emptied, the next lookup writes them to disk.
@@ -11869,10 +11906,11 @@ mod tests {
         let promotions = Arc::clone(&cache.lock().expect("tier chunk cache lock").promotions);
         {
             let mut queued = promotions.queued.lock().expect("lock");
-            queued
-                .slices
-                .insert(ContentHash::of(b"queued"), DISK_CACHE_BYTES);
-            queued.bytes = DISK_CACHE_BYTES;
+            queued.slices.insert(
+                ContentHash::of(b"queued"),
+                RESIDENT_SLICE_BUDGET_BYTES as u64,
+            );
+            queued.bytes = RESIDENT_SLICE_BUDGET_BYTES as u64;
         }
         let lookup = || async {
             found(
@@ -11887,8 +11925,8 @@ mod tests {
             let queued = promotions.queued.lock().expect("lock");
             assert_eq!(
                 (queued.slices.len(), queued.bytes),
-                (1, DISK_CACHE_BYTES),
-                "no whole read queued past the bound"
+                (1, RESIDENT_SLICE_BUDGET_BYTES as u64),
+                "no whole read queued past the free room"
             );
         }
         *promotions.queued.lock().expect("lock") = Queued::default();
