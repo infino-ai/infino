@@ -124,8 +124,9 @@ use crate::{
     supertable::query::df_object_store::{SuperfileObjectStore, merged_ranges},
 };
 
-/// Row groups a batch takes before the byte cap can stop it: a batch of one
-/// would be only the read the scan is about to make.
+/// Row groups a batch looks at before half the reader's cap can end it, so a
+/// batch is more than the row group the scan reads next. Fitting the batch to
+/// the cap can still cut it to one.
 const READ_AHEAD_MIN_ROW_GROUPS: usize = 2;
 
 /// Planned row groups a reader has read when it enters the order: the one
@@ -1820,8 +1821,10 @@ mod tests {
     const SHORT_SPAN_BLOCKS: u64 = 2;
     const SHORT_SPAN_GAP_BLOCKS: u64 = 7;
     const SHORT_SPANS_FILE_BYTES: usize = 32 * BLOCK as usize;
-    /// How long a download takes in the test that drops a reader mid-download,
-    /// so the batch is still running when the last read returns.
+    /// How long a download takes in the tests that need one still running:
+    /// the reader and batch given back mid-download (through [`setup_slow`]),
+    /// and the short-spans test, where a span must plan its download while the
+    /// one before is still downloading.
     const SLOW_DOWNLOAD: Duration = Duration::from_millis(200);
     /// How long a test waits for downloads ahead from an in-memory source.
     const SETTLE_DEADLINE: Duration = Duration::from_secs(10);
@@ -2842,6 +2845,11 @@ mod tests {
             .await
             .expect("batch");
         assert_eq!(got.len(), spans.len());
+        assert!(
+            in_order < spans.len(),
+            "one after another, the windows reach the next span: {in_order} GETs for {} spans",
+            spans.len()
+        );
         assert_eq!(
             superfile.reads().len(),
             in_order,

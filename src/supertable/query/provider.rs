@@ -6679,8 +6679,9 @@ pub(crate) mod tests {
     const RANDOM_GET_LATENCY: Duration = Duration::from_millis(2);
     /// Size of the file the no-footer test opens; it's never read.
     const FOOTERLESS_FILE_BYTES: u64 = 1024;
-    /// Extra GETs one shape may take: read-ahead downloads the same blocks,
-    /// but groups them into GETs its own way.
+    /// Extra GETs one shape may take, on top of read-ahead off's (or twice
+    /// those, for a LIMIT shape): read-ahead downloads the same blocks, but
+    /// groups them into GETs its own way.
     const GET_SLACK: usize = 2;
     /// The smallest download the fixture's cache makes. A short miss
     /// downloads this much, and where the extra bytes land depends on which
