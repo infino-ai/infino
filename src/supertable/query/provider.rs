@@ -6735,7 +6735,7 @@ pub(crate) mod tests {
         // The plan rule marks a scan a LIMIT or top-k can stop early; this
         // harness builds the scan without the optimizer, so it marks it here.
         if shape.limit.is_some() || shape.top_k.is_some() {
-            read_ahead_state.hold_to_what_is_read();
+            read_ahead_state.set_may_stop_early();
         }
         let factory = ScanReaderFactory {
             read_ahead: Arc::clone(&read_ahead_state),
@@ -6835,7 +6835,8 @@ pub(crate) mod tests {
         //  - the bytes downloaded must match, within the cache's own slack,
         //    except that a LIMIT shape may fetch up to twice the bytes and
         //    the top-k shape one cache window more;
-        //  - the GETs must not grow beyond `GET_SLACK`.
+        //  - the GETs must not grow beyond `GET_SLACK`, or for a LIMIT shape
+        //    beyond twice the GETs plus `GET_SLACK`.
         // This test pins that read-ahead downloads nothing the scan wouldn't,
         // except what a scan that stops early leaves unread.
         let file = fixture::wide_file(WIDE_ROWS_PER_GROUP, WIDE_PAGE_ROWS);
@@ -6920,10 +6921,16 @@ pub(crate) mod tests {
             match (shape.limit, shape.top_k) {
                 // A scan that stops early may have fetched ahead what it never
                 // reads, but no more than it read.
-                (Some(_), _) => assert!(
-                    on.fetched <= 2 * off.fetched + partition_slack(shape.partitions),
-                    "{name}: at most twice the bytes from storage: {on:?} vs {off:?}"
-                ),
+                (Some(_), _) => {
+                    assert!(
+                        on.fetched <= 2 * off.fetched + partition_slack(shape.partitions),
+                        "{name}: at most twice the bytes from storage: {on:?} vs {off:?}"
+                    );
+                    assert!(
+                        on.gets <= 2 * off.gets + GET_SLACK,
+                        "{name}: at most twice the GETs: {on:?} vs {off:?}"
+                    );
+                }
                 // Once the filter tightens, the scan stops reading `c` for rows
                 // past the bound, so its reads get short, and a short read
                 // downloads a whole cache window (`CACHE_MIN_GET`). A batch can

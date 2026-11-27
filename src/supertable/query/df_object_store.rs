@@ -37,10 +37,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use futures::{
-    future::try_join_all,
-    stream::{self, BoxStream, StreamExt, TryStreamExt},
-};
+use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use object_store::{
     Attributes, CopyOptions, Error as OsError, GetOptions, GetRange, GetResult, GetResultPayload,
     ListResult, MultipartUpload, OBJECT_STORE_COALESCE_DEFAULT, ObjectMeta, ObjectStore,
@@ -197,9 +194,8 @@ impl SuperfileObjectStore {
     /// [`LazyByteSource::range_ahead`], and return every span's bytes in
     /// order. Not counted as page reads.
     /// - Clusters download [`FETCH_PARALLELISM`] at a time.
-    /// - A cluster's spans start together. A cache block two of them share is
-    ///   still downloaded once: the cache's download of it is in flight when
-    ///   the other span gets there, so that span waits for it.
+    /// - A cluster's spans download one after another, so a cache block they
+    ///   share is downloaded once.
     pub(crate) async fn get_spans_ahead(
         &self,
         location: &ObjPath,
@@ -210,12 +206,11 @@ impl SuperfileObjectStore {
             .map(|cluster| {
                 let source = Arc::clone(&source);
                 async move {
-                    try_join_all(
-                        cluster
-                            .into_iter()
-                            .map(|span| read_range_ahead(&source, span)),
-                    )
-                    .await
+                    let mut bytes = Vec::with_capacity(cluster.len());
+                    for span in cluster {
+                        bytes.push(read_range_ahead(&source, span).await?);
+                    }
+                    Ok::<_, OsError>(bytes)
                 }
             })
             .buffered(FETCH_PARALLELISM)
