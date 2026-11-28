@@ -53,7 +53,7 @@ use datafusion::{
 use futures::{StreamExt, TryFutureExt, stream};
 
 use crate::{
-    runtime_metrics::op_stats::{attached_to_future, current as current_op_stats},
+    runtime_metrics::op_stats::{attached_to_future, current as current_op_stats, timed_future},
     superfile::fts::reader::BoolMode,
     supertable::{
         error::QueryError,
@@ -604,7 +604,8 @@ impl ExecutionPlan for MatchExec {
             // Built on the first poll, inside the runtime that drives the
             // statement (`execute` itself may run outside one), and under the
             // statement's stats collector, which the producer's own task then
-            // carries, so the prune still counts the superfiles it weighed.
+            // carries, so the prune still counts the superfiles it weighed and
+            // the match's CPU still bills the statement.
             let batches = stream::once(async move {
                 let op_stats = current_op_stats();
                 let mut batches =
@@ -620,6 +621,9 @@ impl ExecutionPlan for MatchExec {
                 // stream dropped early aborts the producer before that, so
                 // the span then records no count rather than a partial one.
                 let produce = traced_tvf_rows(span, produce, |rows: &usize| *rows);
+                // The task runs outside the `MeteredExec` polls that bill a
+                // statement's CPU, so each of its polls is billed here.
+                let produce = timed_future(op_stats.clone(), produce);
                 batches.spawn(attached_to_future(op_stats, produce).map_ok(|_| ()));
                 batches.build()
             })
@@ -704,7 +708,12 @@ impl ExecutionPlan for MatchExec {
 
 #[cfg(test)]
 mod tests {
-    use std::{fmt, iter::repeat_n, sync::Arc, time::Duration};
+    use std::{
+        fmt,
+        iter::repeat_n,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use arrow::util::display::array_value_to_string;
     use arrow_array::{
@@ -722,7 +731,10 @@ mod tests {
     use futures::StreamExt;
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
-    use tokio::{runtime::Runtime, time::sleep};
+    use tokio::{
+        runtime::Runtime,
+        time::{sleep, timeout},
+    };
 
     use super::{
         EXACT_MATCH_UDTF, ExactMatchFunc, MATCH_BATCHES_AHEAD, MatchExec, MatchQuery, OrderHint,
@@ -738,13 +750,14 @@ mod tests {
             Supertable, SupertableOptions,
             error::QueryError,
             handle::SupertableReader,
-            manifest::SuperfileEntry,
+            manifest::{SUPERFILE_KEY_SUFFIX, SuperfileEntry},
             query::{
                 exec::common::{output_schema_with_score, test_support::sql_row_count},
                 fts::ROW_FILTER_MIN_HITS,
                 match_order::{MAX_OVERLAPPING_FETCH, MatchOrder, ORDERED_WINDOW},
             },
         },
+        test_helpers::slow_storage::SlowStorage,
     };
 
     fn title_schema() -> Arc<Schema> {
@@ -800,6 +813,19 @@ mod tests {
     /// the one the consumer holds, the ones waiting in the channel, and one
     /// waiting to send per superfile in flight.
     const STREAMED_MOST_TAKEN: usize = 1 + MATCH_BATCHES_AHEAD + STREAMED_IN_FLIGHT;
+    /// Superfiles of the drop test: more than it runs at once.
+    const DROPPED_SUPERFILES: usize = 4;
+    /// Rows per superfile of the drop test: enough that a superfile's data
+    /// lies past what the manifest carries, so the match reads it.
+    const DROPPED_ROWS_PER_SUPERFILE: usize = 5_000;
+    /// An odd multiplier that scatters consecutive row numbers across the
+    /// 128-bit range, so the drop test's titles compress poorly.
+    const SCATTER: u128 = 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835;
+    /// Longest the drop test waits for a read to start or to be dropped:
+    /// far beyond any scheduling delay.
+    const READ_BOUND: Duration = Duration::from_secs(30);
+    /// How often the drop test checks the reads in flight.
+    const READ_POLL: Duration = Duration::from_millis(5);
 
     /// A table of [`STREAMED_SUPERFILES`] superfiles of one `rust` row each,
     /// read [`STREAMED_IN_FLIGHT`] superfiles at a time, and a `MatchExec`
@@ -814,11 +840,18 @@ mod tests {
             w.commit().expect("commit");
         }
         let reader = Arc::new(st.reader().expect("reader"));
+        let exec = streamed_exec(&reader);
+        (st, reader, exec)
+    }
+
+    /// A `MatchExec` of `rust` over `reader` projecting only `title`: the
+    /// per-superfile column path.
+    fn streamed_exec(reader: &Arc<SupertableReader>) -> MatchExec {
         let scalar_schema = reader.manifest().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
         let title = scalar_schema.index_of("title").expect("title column");
-        let exec = MatchExec::try_new(
-            Arc::clone(&reader),
+        MatchExec::try_new(
+            Arc::clone(reader),
             "title".into(),
             MatchQuery::Token {
                 query: "rust".into(),
@@ -828,8 +861,7 @@ mod tests {
             output_schema,
             Some(vec![title]),
         )
-        .expect("exec");
-        (st, reader, exec)
+        .expect("exec")
     }
 
     #[test]
@@ -868,28 +900,73 @@ mod tests {
 
     #[test]
     fn dropping_a_match_stops_its_fan_out() {
-        // A consumer reads one batch of a match over 32 superfiles, then drops
-        // the stream, as a cancelled statement or a filled LIMIT does.
-        //  - the fan-out is aborted: at most the few already under way are
-        //    taken, not all 32.
+        // A match over stored superfiles whose data lies past what the
+        // manifest carries, with every superfile read held, so the match
+        // parks on one. The consumer then drops the stream, as a cancelled
+        // statement or a filled LIMIT does.
+        //  - the held read's future is dropped with the stream.
+        //  - once let go, no superfile read starts.
         // This test pins that a dropped match stops reading.
-        let (_st, reader, exec) = streamed_match();
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_title_fts().with_storage(Arc::clone(&storage)))
+            .expect("create");
+        for file in 0..DROPPED_SUPERFILES {
+            let titles: Vec<String> = (0..DROPPED_ROWS_PER_SUPERFILE)
+                .map(|row| {
+                    let n = (file * DROPPED_ROWS_PER_SUPERFILE + row) as u128;
+                    format!("rust {:032x}", n.wrapping_mul(SCATTER))
+                })
+                .collect();
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            let mut w = st.writer().expect("writer");
+            w.append(&titles_batch(&refs)).expect("append");
+            w.commit().expect("commit");
+        }
+        let slow = SlowStorage::wrap(storage, Duration::ZERO);
+        let options = options_title_fts()
+            .with_storage(slow.clone())
+            .with_superfiles_in_flight(STREAMED_IN_FLIGHT);
+        let reader = Arc::new(
+            Supertable::open(options)
+                .expect("open")
+                .reader()
+                .expect("reader"),
+        );
+        let exec = streamed_exec(&reader);
         let rt = Runtime::new().expect("runtime");
         rt.block_on(async {
+            slow.hold_reads_of(SUPERFILE_KEY_SUFFIX);
             let mut batches = exec
                 .execute(0, Arc::new(TaskContext::default()))
                 .expect("execute");
-            batches.next().await.expect("a batch").expect("batch");
-            assert!(
-                reader.decoded_scalar_cache().len() >= 1,
-                "premise: the column path took the batch read"
-            );
+            let started = Instant::now();
+            while slow.in_flight() == 0 {
+                assert!(
+                    started.elapsed() < READ_BOUND,
+                    "premise: the match starts a superfile read within {READ_BOUND:?}"
+                );
+                // The first poll starts the match; later ones take what it
+                // sends before it parks.
+                let _ = timeout(READ_POLL, batches.next()).await;
+            }
             drop(batches);
+            let started = Instant::now();
+            while slow.in_flight() > 0 {
+                assert!(
+                    started.elapsed() < READ_BOUND,
+                    "the dropped match still has a read in flight after {READ_BOUND:?}"
+                );
+                sleep(READ_POLL).await;
+            }
+            let reads = slow.reads_of(SUPERFILE_KEY_SUFFIX);
+            slow.release_reads();
             sleep(RUN_AHEAD).await;
-            let taken = reader.decoded_scalar_cache().len();
-            assert!(
-                taken <= STREAMED_MOST_TAKEN,
-                "{taken} superfiles taken after the stream was dropped"
+            assert_eq!(
+                slow.reads_of(SUPERFILE_KEY_SUFFIX),
+                reads,
+                "a superfile read started after the stream was dropped"
             );
         });
     }
@@ -1035,6 +1112,51 @@ mod tests {
         let hits = stats(&format!("SELECT _id FROM {tvf}"));
         assert!(hits.0 > 0, "premise: the hit path counts its prune");
         assert_eq!(stats(&format!("SELECT title FROM {tvf}")), hits);
+    }
+
+    /// Times the absent token repeats in the CPU-billing test's query: enough
+    /// that parsing and looking it up outweighs the rest of the statement.
+    const ABSENT_TOKEN_REPEATS: usize = 200_000;
+    /// Least share of the hit path's CPU the column path must bill for the
+    /// same match. The match's own work dominates both, so an unbilled
+    /// producer bills a small fraction of it.
+    const COLUMN_PATH_LEAST_CPU_SHARE: u64 = 2;
+
+    #[test]
+    fn a_streamed_match_bills_its_cpu_as_the_hit_path_does() {
+        // A token no row holds, repeated until the match's own work dominates.
+        //  - on the hit path the match runs inside the plan's metered polls.
+        //  - on the column path it runs on a task of its own.
+        // Both match no row; the column path must still bill the match's CPU.
+        // This test pins the CPU clock around that task's polls.
+        let schema = title_schema();
+        let conn = metered_table(
+            &schema,
+            IndexSpec::new().fts("title"),
+            &[titles_batch(&["rust"])],
+        );
+        let query = vec!["absent"; ABSENT_TOKEN_REPEATS].join(" ");
+        let cpu = |projection: &str| {
+            let sql = format!(
+                "SELECT {projection} FROM token_match('{METERED_TABLE}', 'title', '{query}')"
+            );
+            let (rows, stats) = with_op_stats(|| {
+                conn.query_sql(&sql)
+                    .expect("query_sql")
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>()
+            });
+            assert_eq!(rows, 0, "premise: no row holds the token");
+            stats.kernel_cpu_ns
+        };
+        let hits = cpu("_id");
+        let columns = cpu("title");
+        assert!(hits > 0, "premise: the hit path bills its CPU");
+        assert!(
+            columns * COLUMN_PATH_LEAST_CPU_SHARE >= hits,
+            "the column path billed {columns} ns against the hit path's {hits} ns"
+        );
     }
 
     /// Queries whose aggregates are held to the materialized rows: a bare
