@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! [`ReadAheadOff`]: a plan rule that turns read-ahead off for scans that
-//! may stop early, since what read-ahead downloaded past the stop is wasted.
+//! [`ReadAheadUnderLimit`]: a plan rule that marks the scans a `LIMIT` or
+//! top-k can stop early, so their read-ahead never holds more row groups
+//! unread than the scan has read (see
+//! `ScanReadAhead::set_may_stop_early`). What it downloaded past the stop
+//! is wasted, and this keeps the waste to at most as many row groups as the
+//! scan read. A full scan reads every row group, so it keeps full batches.
 //!
-//! It turns read-ahead off under:
+//! It marks scans under:
 //! - a `LIMIT` that can stop the scan in any row group. With a filter, the
 //!   `LIMIT` never reaches the scan; it stays in a node above, so this rule
 //!   looks for it there:
@@ -13,14 +17,14 @@
 //!     GlobalLimitExec fetch=10        ◀── the limit
 //!       FilterExec price > 5          ◀── rows pass straight through
 //!         MeteredExec
-//!           DataSourceExec            ◀── never told; this rule turns read-ahead off
+//!           DataSourceExec            ◀── never told; this rule marks its read-ahead
 //!   ```
 //!
 //! - a `DISTINCT ... LIMIT`, which stops once it has enough groups;
 //! - a top-k (`ORDER BY ... LIMIT`), whose filter tightens while it runs and
 //!   makes the scan skip row groups.
 //!
-//! A full sort (`ORDER BY` with no `LIMIT`) keeps read-ahead, since it reads
+//! A full sort (`ORDER BY` with no `LIMIT`) is not marked, since it reads
 //! every row group. If DataFusion reorders the scan's row groups for it, the
 //! reader sees the reads go out of order and turns itself off, wasting at
 //! most one batch.
@@ -28,8 +32,8 @@
 //! The rule looks down from a limit only through nodes that pass rows on as
 //! they come (filters, repartitions, our meter, and the nodes DataFusion
 //! pushes a limit through). A join's probe side or a streaming window can
-//! still stop early; those keep read-ahead and may waste up to two batches.
-//! The rule runs after DataFusion places its limits and sorts.
+//! still stop early; those keep full batches and may waste up to two. The
+//! rule runs after DataFusion places its limits and sorts.
 
 use std::sync::Arc;
 
@@ -46,20 +50,20 @@ use datafusion::{
 use crate::supertable::query::exec::metered_exec::MeteredExec;
 
 /// Rule name, as DataFusion lists it in `EXPLAIN VERBOSE`.
-const RULE_NAME: &str = "ReadAheadOff";
+const RULE_NAME: &str = "ReadAheadUnderLimit";
 
-/// Turns read-ahead off for scans under a `LIMIT` or top-k that can stop
-/// them early; see the module docs.
+/// Marks the scans under a `LIMIT` or top-k that can stop them early; see the
+/// module docs.
 #[derive(Debug, Default)]
-pub(crate) struct ReadAheadOff;
+pub(crate) struct ReadAheadUnderLimit;
 
-impl PhysicalOptimizerRule for ReadAheadOff {
+impl PhysicalOptimizerRule for ReadAheadUnderLimit {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        turn_off_under_limit(&plan, false);
+        mark_under_limit(&plan, false);
         Ok(plan)
     }
 
@@ -72,14 +76,14 @@ impl PhysicalOptimizerRule for ReadAheadOff {
     }
 }
 
-/// Turn off read-ahead for the scans under `plan` that may stop early.
+/// Mark the read-ahead of the scans under `plan` that may stop early.
 /// `limited` says a limit or top-k above `plan` reaches them.
-fn turn_off_under_limit(plan: &Arc<dyn ExecutionPlan>, limited: bool) {
+fn mark_under_limit(plan: &Arc<dyn ExecutionPlan>, limited: bool) {
     if let Some(meter) = plan.downcast_ref::<MeteredExec>()
         && let Some(read_ahead) = meter.read_ahead()
         && (limited || meter.input().fetch().is_some() || is_top_k(meter.input()))
     {
-        read_ahead.disable();
+        read_ahead.set_may_stop_early();
     }
     let passes_rows_on = plan.supports_limit_pushdown()
         || plan.is::<FilterExec>()
@@ -88,7 +92,7 @@ fn turn_off_under_limit(plan: &Arc<dyn ExecutionPlan>, limited: bool) {
     // A limit node's fetch is its `LIMIT`; an `OFFSET` alone has none.
     let below = stops_early(plan) || (passes_rows_on && (limited || plan.fetch().is_some()));
     for child in plan.children() {
-        turn_off_under_limit(child, below);
+        mark_under_limit(child, below);
     }
 }
 
@@ -136,7 +140,7 @@ mod tests {
             df_object_store::SuperfileObjectStore,
             exec::metered_exec::MeteredExec,
             read_ahead::ScanReadAhead,
-            read_ahead_rule::{RULE_NAME, ReadAheadOff},
+            read_ahead_rule::{RULE_NAME, ReadAheadUnderLimit},
         },
     };
 
@@ -149,14 +153,14 @@ mod tests {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]))
     }
 
-    /// Whether read-ahead is still on for the scan under the plan `wrap`
-    /// builds, after the rule runs.
-    fn on_after_rule(wrap: impl FnOnce(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>) -> bool {
-        on_after_rule_over(Arc::new(EmptyExec::new(schema())), wrap)
+    /// Whether the rule marks the scan under the plan `wrap` builds as one
+    /// that may stop early.
+    fn marked(wrap: impl FnOnce(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>) -> bool {
+        marked_over(Arc::new(EmptyExec::new(schema())), wrap)
     }
 
-    /// [`on_after_rule`] with `input` as the node the scan's meter wraps.
-    fn on_after_rule_over(
+    /// [`marked`] with `input` as the node the scan's meter wraps.
+    fn marked_over(
         input: Arc<dyn ExecutionPlan>,
         wrap: impl FnOnce(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>,
     ) -> bool {
@@ -167,10 +171,10 @@ mod tests {
         ));
         let meter: Arc<dyn ExecutionPlan> =
             Arc::new(MeteredExec::new(input, None).with_read_ahead(Arc::clone(&scan)));
-        ReadAheadOff
+        ReadAheadUnderLimit
             .optimize(wrap(meter), &ConfigOptions::default())
             .expect("rule");
-        scan.is_enabled()
+        scan.may_stop_early()
     }
 
     /// `ORDER BY a`.
@@ -201,29 +205,29 @@ mod tests {
     }
 
     #[test]
-    fn a_limit_above_a_filter_turns_read_ahead_off() {
-        assert!(on_after_rule(|scan| Arc::new(a_gt_5(scan))));
-        assert!(!on_after_rule(|scan| Arc::new(GlobalLimitExec::new(
+    fn a_limit_above_a_filter_holds_read_ahead_to_what_is_read() {
+        assert!(!marked(|scan| Arc::new(a_gt_5(scan))));
+        assert!(marked(|scan| Arc::new(GlobalLimitExec::new(
             Arc::new(a_gt_5(scan)),
             0,
             Some(LIMIT)
         ))));
-        assert!(!on_after_rule(|scan| a_gt_5(scan)
+        assert!(marked(|scan| a_gt_5(scan)
             .with_fetch(Some(LIMIT))
             .expect("fetch")));
     }
 
     #[test]
-    fn a_limit_pushed_into_the_scan_turns_read_ahead_off() {
+    fn a_limit_pushed_into_the_scan_holds_read_ahead_to_what_is_read() {
         let scan_with_fetch = a_gt_5(Arc::new(EmptyExec::new(schema())))
             .with_fetch(Some(LIMIT))
             .expect("fetch");
-        assert!(!on_after_rule_over(scan_with_fetch, |meter| meter));
+        assert!(marked_over(scan_with_fetch, |meter| meter));
     }
 
     #[test]
-    fn an_offset_without_a_limit_keeps_read_ahead_on() {
-        assert!(on_after_rule(|scan| Arc::new(GlobalLimitExec::new(
+    fn an_offset_without_a_limit_keeps_full_batches() {
+        assert!(!marked(|scan| Arc::new(GlobalLimitExec::new(
             Arc::new(a_gt_5(scan)),
             LIMIT,
             None
@@ -231,16 +235,16 @@ mod tests {
     }
 
     #[test]
-    fn an_order_by_limit_turns_read_ahead_off() {
-        assert!(!on_after_rule(|scan| Arc::new(
+    fn an_order_by_limit_holds_read_ahead_to_what_is_read() {
+        assert!(marked(|scan| Arc::new(
             SortExec::new(a_order(), Arc::new(a_gt_5(scan))).with_fetch(Some(LIMIT))
         )));
     }
 
     #[test]
-    fn a_top_k_on_the_scan_turns_read_ahead_off() {
+    fn a_top_k_on_the_scan_holds_read_ahead_to_what_is_read() {
         // Above it, through rows passed on as they come.
-        assert!(!on_after_rule(|scan| Arc::new(GlobalLimitExec::new(
+        assert!(marked(|scan| Arc::new(GlobalLimitExec::new(
             Arc::new(SortExec::new(a_order(), scan).with_fetch(Some(LIMIT))),
             0,
             Some(LIMIT),
@@ -249,33 +253,33 @@ mod tests {
         let top_k = Arc::new(
             SortExec::new(a_order(), Arc::new(EmptyExec::new(schema()))).with_fetch(Some(LIMIT)),
         );
-        assert!(!on_after_rule_over(top_k, |meter| meter));
+        assert!(marked_over(top_k, |meter| meter));
     }
 
     #[test]
-    fn a_full_sort_keeps_read_ahead_on() {
+    fn a_full_sort_keeps_full_batches() {
         // The sort reads every row group. If the scan's order changes, the
         // reader turns read-ahead off itself.
-        assert!(on_after_rule(|scan| Arc::new(SortExec::new(
+        assert!(!marked(|scan| Arc::new(SortExec::new(
             a_order(),
             Arc::new(a_gt_5(scan))
         ))));
         let sorted = Arc::new(SortExec::new(a_order(), Arc::new(EmptyExec::new(schema()))));
-        assert!(on_after_rule_over(sorted, |meter| meter));
+        assert!(!marked_over(sorted, |meter| meter));
     }
 
     #[test]
-    fn a_sort_above_an_aggregate_keeps_read_ahead_on() {
+    fn a_sort_above_an_aggregate_keeps_full_batches() {
         // The aggregate reads the whole scan before the sort sees a row.
-        assert!(on_after_rule(|scan| Arc::new(SortExec::new(
+        assert!(!marked(|scan| Arc::new(SortExec::new(
             a_order(),
             Arc::new(group_by_a(scan, None))
         ))));
     }
 
     #[test]
-    fn a_distinct_limit_turns_read_ahead_off() {
-        assert!(!on_after_rule(|scan| Arc::new(group_by_a(
+    fn a_distinct_limit_holds_read_ahead_to_what_is_read() {
+        assert!(marked(|scan| Arc::new(group_by_a(
             scan,
             Some(LimitOptions::new(LIMIT))
         ))));
@@ -283,7 +287,7 @@ mod tests {
 
     #[test]
     fn a_limit_reaches_the_scan_through_a_repartition() {
-        assert!(!on_after_rule(|scan| {
+        assert!(marked(|scan| {
             let spread = RepartitionExec::try_new(scan, Partitioning::RoundRobinBatch(PARTITIONS))
                 .expect("repartition");
             Arc::new(GlobalLimitExec::new(Arc::new(spread), 0, Some(LIMIT)))

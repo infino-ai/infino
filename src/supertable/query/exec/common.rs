@@ -2469,8 +2469,8 @@ fn take_prefetch_fallbacks() -> u64 {
 /// pool, or with no prefetch stream through `source`, as does a decode that
 /// reads outside it. The prefetch is reserved from `budget` (at most
 /// [`BUDGET_SHARE_PERCENT`] of it, as the scan's read-ahead), and streams
-/// without room there; without room in the cache's write queue it is fetched
-/// but not cached.
+/// without room there; without room under the cache's write-behind cap it is
+/// fetched but not cached.
 async fn take_prefetched(
     reader: &SuperfileReader,
     source: Source,
@@ -4501,8 +4501,8 @@ mod tests {
 
     /// A take reserves its prefetch from the connection's budget and gives it
     /// back when done; with no room there it streams instead. With no room
-    /// in the cache's write queue it still prefetches. The same rows either
-    /// way.
+    /// under the cache's write-behind cap it still prefetches. The same rows
+    /// either way.
     #[tokio::test]
     async fn a_take_without_room_streams_the_same_rows() {
         let source = Superfile::new(titled_superfile_bytes(), false);
@@ -4543,7 +4543,7 @@ mod tests {
         assert_eq!(take(Arc::clone(&full)).await, batch);
         assert_eq!(full.peak(), 0, "no room in the budget: nothing reserved");
 
-        source.keeps.store(false, Ordering::Relaxed);
+        source.has_room.store(false, Ordering::Relaxed);
         let roomy = ConnectionMemoryBudget::measured();
         assert_eq!(take(Arc::clone(&roomy)).await, batch);
         assert!(roomy.peak() > 0, "no room in the cache: still prefetched");

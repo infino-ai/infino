@@ -96,8 +96,9 @@ pub(crate) struct MeteredExec {
     /// Footers of the scan below, when it is a table scan. `RowFilterUnderTopK`
     /// reads column sizes from them.
     footers: Option<Arc<ScanFooters>>,
-    /// Read-ahead for the table scan below, if it is one. `ReadAheadOff`
-    /// turns it off under a `LIMIT`.
+    /// Read-ahead for the table scan below, if it is one. The meter hands it
+    /// the scan's filter when the scan runs, and `ReadAheadUnderLimit` holds
+    /// it to what the scan has read under a `LIMIT` or top-k.
     read_ahead: Option<Arc<ScanReadAhead>>,
     /// Whether the planner may carry a `LIMIT` fetch past this node into
     /// the child. The provider's meter around a scan that carries filters
