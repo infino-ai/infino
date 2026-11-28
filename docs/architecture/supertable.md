@@ -332,10 +332,28 @@ superfiles it covers, each with its smallest document id, and per
 *layer* the key range and content hash of every *slice*. A slice is a
 few megabytes covering one contiguous range of `column`-and-term keys —
 a front-coded block dictionary over a postings region — so a lookup
-binary-searches the root for the one slice that can hold the key,
-fetches it, and reads one block; a prefix scan touches one slice or a
-few adjacent ones. Root and slices are content-addressed and immutable,
-cached on local disk like manifest parts, and kept live by garbage
+binary-searches the root for the one slice that can hold the key and
+reads only what it needs of it: the slice's header and block index in
+one request, kept in memory, then the key's block, then its run, each
+checked by a crc32c of its own. A slice of an older layout, or a
+checked one of 256 KiB or less, is read whole in one request and
+checked by its content hash; a prefix scan reads one slice or a few
+adjacent ones whole. A slice already on local disk is read from there,
+by range or whole by the same rule. Lookups racing for a slice share
+one read of its block index. A piece that fails its check is never
+read as absent: the lookup reads the slice whole instead.
+
+After a slice is read by range, it is read whole in the background
+when the resident budget has free room for it, and kept in memory in
+that room; a whole copy never pushes anything else out. With a disk
+cache any slice read by range qualifies: it is read from local disk
+when it is there, otherwise downloaded and also written to local disk.
+Without a disk cache only a slice read by range a second time, while
+its block index is still in memory, qualifies. Once memory holds only
+block indexes, no slice is read whole in the background any more, so
+a hot slice stays ranged, and off local disk if it was not there.
+Root and slices are content-addressed and immutable. Slices are cached
+on local disk like manifest parts, and both are kept live by garbage
 collection for as long as a manifest names them.
 
 Every commit publishes its superfiles' postings in the same atomic

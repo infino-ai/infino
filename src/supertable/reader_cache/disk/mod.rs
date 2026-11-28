@@ -900,7 +900,10 @@ pub(crate) mod test_support {
     #[derive(Debug)]
     pub(crate) struct RecordingStorage {
         inner: Arc<dyn StorageProvider>,
-        ranges: Mutex<Vec<Range<u64>>>,
+        /// Each ranged GET's object key and range, in order.
+        ranges: Mutex<Vec<(String, Range<u64>)>>,
+        /// Each whole GET's object key, in order.
+        gets: Mutex<Vec<String>>,
         /// Ranged GETs to let through before parking one; `None` parks none.
         pause_after: Mutex<Option<usize>>,
         paused: AtomicBool,
@@ -912,6 +915,7 @@ pub(crate) mod test_support {
             Arc::new(Self {
                 inner,
                 ranges: Mutex::new(Vec::new()),
+                gets: Mutex::new(Vec::new()),
                 pause_after: Mutex::new(None),
                 paused: AtomicBool::new(false),
                 resume: Notify::new(),
@@ -923,7 +927,35 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn ranges_since(&self, from: usize) -> Vec<Range<u64>> {
-            self.ranges.lock().expect("ranges")[from..].to_vec()
+            self.ranges.lock().expect("ranges")[from..]
+                .iter()
+                .map(|(_, range)| range.clone())
+                .collect()
+        }
+
+        /// The ranges read from the `from`th ranged GET on, for keys ending in `key`.
+        pub(crate) fn ranges_of_since(&self, key: &str, from: usize) -> Vec<Range<u64>> {
+            self.ranges.lock().expect("ranges")[from..]
+                .iter()
+                .filter(|(uri, _)| uri.ends_with(key))
+                .map(|(_, range)| range.clone())
+                .collect()
+        }
+
+        /// The keys of whole GETs so far.
+        pub(crate) fn gets(&self) -> Vec<String> {
+            self.gets.lock().expect("gets").clone()
+        }
+
+        /// Each ranged GET of a key holding `fragment`, with its key, in order.
+        pub(crate) fn ranges_containing(&self, fragment: &str) -> Vec<(String, Range<u64>)> {
+            self.ranges
+                .lock()
+                .expect("ranges")
+                .iter()
+                .filter(|(uri, _)| uri.contains(fragment))
+                .cloned()
+                .collect()
         }
 
         pub(crate) fn pause_next_read(&self) {
@@ -966,10 +998,14 @@ pub(crate) mod test_support {
             self.inner.head(uri).await
         }
         async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            self.gets.lock().expect("gets").push(uri.to_string());
             self.inner.get(uri).await
         }
         async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
-            self.ranges.lock().expect("ranges").push(range.clone());
+            self.ranges
+                .lock()
+                .expect("ranges")
+                .push((uri.to_string(), range.clone()));
             if self.take_pause() {
                 self.paused.store(true, Ordering::SeqCst);
                 self.resume.notified().await;

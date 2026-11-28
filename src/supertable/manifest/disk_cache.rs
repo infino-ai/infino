@@ -740,7 +740,6 @@ impl MetadataDiskCache {
     }
 
     /// Whether `hash` is in the cache.
-    #[cfg(test)]
     pub(crate) fn contains(&self, hash: &ContentHash) -> bool {
         self.entries.contains_key(hash)
     }

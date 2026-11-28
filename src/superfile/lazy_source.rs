@@ -354,6 +354,16 @@ impl RangeCoalescePlan {
         &self.fetch_ranges
     }
 
+    /// For each fetch range, the original ranges it serves: each one's index
+    /// and where it sits in the fetched bytes.
+    pub(crate) fn members(&self) -> Vec<Vec<(usize, Range<usize>)>> {
+        let mut members = vec![Vec::new(); self.fetch_ranges.len()];
+        for (index, &(fetch_index, offset, len)) in self.scatter.iter().enumerate() {
+            members[fetch_index].push((index, offset..offset + len));
+        }
+        members
+    }
+
     pub(crate) fn restore(&self, fetched: &[Bytes]) -> Vec<Bytes> {
         self.scatter
             .iter()
@@ -949,6 +959,30 @@ pub(crate) fn held_table_bytes(tables: &mut Vec<(usize, usize)>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ranges in any order, overlapping, repeated and far apart.
+    ///  - each range's piece from `members` is the bytes `restore` gives it.
+    /// This test pins `members` to `restore` for every shape of plan.
+    #[test]
+    fn members_cut_each_range_where_restore_does() {
+        let file = Bytes::from((0..=255u8).cycle().take(4096).collect::<Vec<u8>>());
+        let ranges = [100..200, 0..50, 150..300, 100..200, 3000..3100, 40..60];
+        let plan = RangeCoalescePlan::new(&ranges, 64, 64);
+        let fetched: Vec<Bytes> = plan
+            .fetch_ranges()
+            .iter()
+            .map(|r| file.slice(r.clone()))
+            .collect();
+        let restored = plan.restore(&fetched);
+        let mut seen = vec![false; ranges.len()];
+        for (members, bytes) in plan.members().into_iter().zip(&fetched) {
+            for (i, piece) in members {
+                assert_eq!(bytes.slice(piece), restored[i], "range {i}");
+                seen[i] = true;
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "every range is a member once");
+    }
 
     /// Slices of one buffer count the bytes they cover between them once;
     /// a separate buffer counts on its own.

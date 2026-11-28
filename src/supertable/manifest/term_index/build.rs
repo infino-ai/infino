@@ -49,8 +49,9 @@ use super::{
     FOLD_CURSOR_BYTES, REMOTE_TIER_WINDOW_BYTES, REMOTE_TIER_WINDOW_MAX_BYTES, RemoteSlice,
     TermIndexError,
     format::{
-        Layer, Location, Posting, Root, Run, SLICE_HEADER_LEN, Slice, SliceDictionary, SliceRef,
-        TierRef, encode_run, encode_slice, legacy_bound_as_key, push_posting, read_posting,
+        Layer, Location, Posting, Root, Run, Slice, SliceDictionary, SliceHeader, SliceRef,
+        TierRef, encode_run, encode_slice, legacy_bound_as_key, push_checked_run, push_posting,
+        read_posting,
     },
     level_head::{
         BucketMaxTf, HeadRef, KeyedEntry, LEVEL_GROWTH, LEVEL0_ENTRIES, LevelBlock, LevelRef,
@@ -77,10 +78,9 @@ use crate::{
     },
 };
 
-/// Target slice size. A cold lookup fetches one slice, so this is the
-/// cold cost of a term; a smaller slice means a larger root. **Pending
-/// measurement** — the plan's first milestone replaces this with a
-/// measured value.
+/// Target slice size. A smaller slice means a larger root; a larger one
+/// means a larger block index for a lookup's first read, and a larger whole
+/// read for prefix scans and background promotions.
 pub(crate) const SLICE_TARGET_BYTES: usize = 8 * 1024 * 1024;
 
 /// A tier of at most this many entries rides in its run instead of a
@@ -1783,17 +1783,18 @@ impl SliceBuilder {
     }
 
     fn add(&mut self, key: &[u8], run: &[u8]) {
+        let at = self.postings.len() as u64;
+        let len = push_checked_run(&mut self.postings, run);
         self.dict
             .insert_sorted(
                 key,
                 DictEntry::Pfor {
-                    metadata_offset: self.postings.len() as u64,
-                    postings_length: run.len() as u32,
+                    metadata_offset: at,
+                    postings_length: len as u32,
                     short: false,
                 },
             )
             .expect("Vec sink cannot fail");
-        self.postings.extend_from_slice(run);
         if self.first_key.is_none() {
             self.first_key = Some(key.to_vec());
         }
@@ -1814,7 +1815,7 @@ impl SliceBuilder {
     fn finish(self, tier: Option<ContentHash>) -> Option<(SliceRef, Vec<u8>)> {
         let first_key = self.first_key?;
         let dict = self.dict.finish().expect("Vec sink cannot fail");
-        let bytes = encode_slice(&dict, &self.postings);
+        let (bytes, index_end) = encode_slice(&dict, &self.postings);
         let content_hash = ContentHash::of(&bytes);
         Some((
             SliceRef {
@@ -1823,6 +1824,7 @@ impl SliceBuilder {
                 content_hash,
                 tier,
                 len: bytes.len() as u64,
+                index_end,
             },
             bytes,
         ))
@@ -2384,10 +2386,11 @@ pub(crate) fn build(
 /// ordinals continue from `base`'s superfile count. Onto an empty root this
 /// is a full build: one layer, ordinals from zero.
 ///
-/// Optimize skips the rebuild when the current index already has a full
-/// build's shape, so a change to what this writes reaches existing tables
-/// only if it also bumps `ROOT_FORMAT_VERSION`: an old root then fails to
-/// load and is rebuilt.
+/// A change to what this writes reaches an existing table's next commit at
+/// once, in the layer the commit adds; its older layers change only as
+/// folds rewrite them, since optimize skips the rebuild when the index
+/// already has a full build's shape. Roots from version 3 on, and their
+/// slices, still load, and are read as their layout allows.
 #[cfg_attr(
     feature = "detailed-tracing",
     tracing::instrument(skip_all, fields(inputs = contributions.len()))
@@ -3439,10 +3442,9 @@ pub(crate) fn key_ranges(
             handle.read_exact_at(&mut bytes, offset)?;
             Ok(bytes)
         };
-        let header = read_at(0, SLICE_HEADER_LEN)?;
-        let dict_len = SliceDictionary::dict_len(&header)?;
-        let bytes = read_at(0, SLICE_HEADER_LEN + dict_len as usize)?;
-        let dictionary = SliceDictionary::open(&bytes)?;
+        let header = SliceHeader::decode(&read_at(0, SliceHeader::MAX_LEN)?)?;
+        let bytes = read_at(0, header.postings_start() as usize)?;
+        let dictionary = SliceDictionary::open(header, &bytes)?;
         let starts = dictionary.block_starts()?;
         let (_, tier_len) = file.lens()?;
         let group = starts.len().div_ceil(per_slice).max(1);
