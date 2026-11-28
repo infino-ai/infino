@@ -722,9 +722,9 @@ enum Promote {
     /// hash checked once. Later lookups then read it from memory.
     Disk,
     /// No disk cache: a slice read by range a second time, while its block
-    /// index is still resident, when the resident set has room for it. So a hot slice ends up whole in memory, as
-    /// when every slice was read whole, and the resident budget bounds what
-    /// stays, whatever the index's size.
+    /// index is still resident, when the resident set has room for it. So a
+    /// hot slice ends up whole in memory, as when every slice was read whole,
+    /// and the resident budget bounds what stays, whatever the index's size.
     Resident,
     /// None, so a test counts a lookup's reads without background ones.
     #[cfg(test)]
@@ -3962,8 +3962,8 @@ impl TermIndex {
     ) -> Result<(Bytes, SemaphorePermit<'b>), TermIndexError> {
         let held = budget.hold(len_or_target(len)).await;
         // A small slice is one short request, so it goes as many at once as
-        // ranged reads do; [`WHOLE_SLICES_AT_ONCE`] at a time would cost a table
-        // of many small layers a wave of requests per that many slices.
+        // ranged reads do; WHOLE_SLICES_AT_ONCE at a time would cost a table of
+        // many small layers a wave of requests per that many slices.
         let _turn = match self.is_small(len) {
             true => budget.request().await,
             false => budget.whole().await,
