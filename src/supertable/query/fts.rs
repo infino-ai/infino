@@ -1877,13 +1877,13 @@ impl SupertableReader {
                 .instrument(term_span.clone())
                 .await?;
             ceilings_at_table_avgdl(&mut c, &kept, column_id, table_avgdl);
-            let ceiling_of =
-                |e: &Arc<SuperfileEntry>| c.get(&e.superfile_id).copied().unwrap_or(f32::INFINITY);
-            kept.sort_by(|a, b| {
-                ceiling_of(b)
-                    .total_cmp(&ceiling_of(a))
-                    .then(a.id_min.cmp(&b.id_min))
-            });
+            // Sorts on ceilings looked up once per superfile.
+            let mut by_ceiling: Vec<(f32, Arc<SuperfileEntry>)> = kept
+                .drain(..)
+                .map(|e| (c.get(&e.superfile_id).copied().unwrap_or(f32::INFINITY), e))
+                .collect();
+            by_ceiling.sort_by(|(ca, a), (cb, b)| cb.total_cmp(ca).then(a.id_min.cmp(&b.id_min)));
+            kept.extend(by_ceiling.into_iter().map(|(_, e)| e));
             ceilings = Some(c);
         }
         // The index also knows where each term's postings sit in every

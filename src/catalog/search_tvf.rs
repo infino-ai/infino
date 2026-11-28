@@ -60,6 +60,17 @@ use crate::{
     },
 };
 
+/// The search TVFs [`register_search_tvfs`] registers, by name.
+pub(crate) const SEARCH_FUNCTIONS: [&str; 7] = [
+    BM25_SEARCH_UDTF,
+    BM25_FIELDS_UDTF,
+    BM25_PREFIX_UDTF,
+    VECTOR_SEARCH_UDTF,
+    TOKEN_MATCH_UDTF,
+    EXACT_MATCH_UDTF,
+    HYBRID_SEARCH_UDTF,
+];
+
 /// Why the table a search names could not be opened, as a DataFusion error that
 /// keeps its cause: a name that resolves to nothing is the caller's mistake (a
 /// plan error); a storage or credential failure while opening it is not, and
@@ -134,6 +145,9 @@ struct TableResolver {
     /// Where the statement counts the tables it reads; `None` when it
     /// counts none (no scope, or a statement that only describes tables).
     reads: Option<Arc<TableReads>>,
+    /// Whether the statement may read the per-column statistics; a table
+    /// opened without them reads them in place before a filter needs them.
+    statistics: bool,
 }
 
 impl fmt::Debug for TableResolver {
@@ -143,12 +157,13 @@ impl fmt::Debug for TableResolver {
 }
 
 impl TableResolver {
-    fn new(conn: Connection, reads: Option<Arc<TableReads>>) -> Self {
+    fn new(conn: Connection, reads: Option<Arc<TableReads>>, statistics: bool) -> Self {
         Self {
             conn,
             cache: Mutex::new(HashMap::new()),
             op_stats: op_stats::current(),
             reads,
+            statistics,
         }
     }
 
@@ -165,7 +180,7 @@ impl TableResolver {
         }
         let table = self
             .conn
-            .open_table_handle(name)
+            .open_table_handle_for(name, self.statistics)
             .map_err(|e| open_table_error(name, e))?;
         // `reader()` applies the read-consistency freshness check itself (and,
         // under Strong, fails rather than serving a stale snapshot), so there
@@ -300,16 +315,18 @@ enum IndexedColumns {
 }
 
 /// Register the catalog search TVFs (table-name-first form) on `ctx`,
-/// resolving tables through `conn` and counting each into `reads`.
+/// resolving tables through `conn` and counting each into `reads`. Tables
+/// open without their per-column statistics unless `statistics`.
 pub(crate) fn register_search_tvfs(
     ctx: &SessionContext,
     conn: Connection,
     reads: Option<Arc<TableReads>>,
+    statistics: bool,
 ) {
     // `text_match`, the token match as a WHERE predicate, beside the
     // table functions it stands in for.
     crate::supertable::query::text_match::register_text_match(ctx);
-    let resolver = Arc::new(TableResolver::new(conn, reads));
+    let resolver = Arc::new(TableResolver::new(conn, reads, statistics));
     ctx.register_udtf(
         BM25_SEARCH_UDTF,
         Arc::new(Bm25SearchCatalogFunc {
@@ -370,8 +387,8 @@ pub(crate) fn register_graph_tvfs(
     edge_table: Option<String>,
     reads: Option<Arc<TableReads>>,
 ) {
-    let graph = Arc::new(TableResolver::new(graph, reads.clone()));
-    let tables = Arc::new(TableResolver::new(tables, reads));
+    let graph = Arc::new(TableResolver::new(graph, reads.clone(), true));
+    let tables = Arc::new(TableResolver::new(tables, reads, true));
     for traversal in [Traversal::Walk, Traversal::Rank] {
         ctx.register_udtf(
             traversal.name(),
