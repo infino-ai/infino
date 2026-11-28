@@ -510,13 +510,19 @@ impl TierChunks {
         }
     }
 
+    /// Room the resident set has for slice `hash` whole: its free room, plus
+    /// what the slice's block index frees once the whole copy replaces it.
+    fn room_for(&self, hash: &ContentHash) -> usize {
+        self.slices.room() + self.slices.weight_of(hash)
+    }
+
     /// [`Self::keep_whole`] for a background read: only into free room, never
     /// pushing anything out, so a working set too big for whole copies keeps
     /// its block indexes instead of trading them for whole copies in turn.
     /// Returns what to free after releasing the lock: what it replaced, or the
     /// copy itself when it is not kept.
     fn keep_whole_in_room(&mut self, hash: ContentHash, bytes: Bytes) -> Vec<ResidentSlice> {
-        let fits = self.slices.room() + self.slices.weight_of(&hash) >= bytes.len();
+        let fits = self.room_for(&hash) >= bytes.len();
         match self.whole(&hash).is_none() && fits {
             true => self.slices.replace(hash, ResidentSlice::Whole(bytes)),
             false => vec![ResidentSlice::Whole(bytes)],
@@ -626,6 +632,12 @@ struct SliceSpan {
     index_end: Option<u64>,
 }
 
+/// A slice's length when the root records it, else the target size: what a
+/// whole read of it is budgeted at.
+fn len_or_target(len: Option<u64>) -> u64 {
+    len.unwrap_or(SLICE_TARGET_BYTES as u64)
+}
+
 impl SliceSpan {
     fn of(slice: &SliceRef) -> Self {
         Self {
@@ -710,7 +722,7 @@ enum Promote {
     /// hash checked once. Later lookups then read it from memory.
     Disk,
     /// No disk cache: a slice read by range a second time, while its block
-    /// index is still resident. So a hot slice ends up whole in memory, as
+    /// index is still resident, when the resident set has room for it. So a hot slice ends up whole in memory, as
     /// when every slice was read whole, and the resident budget bounds what
     /// stays, whatever the index's size.
     Resident,
@@ -753,7 +765,11 @@ struct Promoting {
 
 impl Drop for Promoting {
     fn drop(&mut self) {
-        let mut queued = self.promotions.queued.lock().expect("promotions lock");
+        let mut queued = self
+            .promotions
+            .queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(len) = queued.slices.remove(&self.hash) {
             queued.bytes -= len;
         }
@@ -3230,6 +3246,12 @@ impl TermIndex {
         }
     }
 
+    /// Whether a slice of length `len` is small enough to read whole in one
+    /// request; see [`SMALL_SLICE_BYTES`].
+    fn is_small(&self, len: Option<u64>) -> bool {
+        len.is_some_and(|len| len <= self.small_slice_bytes)
+    }
+
     /// This index reading checked slices up to `bytes` whole, so a test's
     /// small slices can be read by range.
     #[cfg(test)]
@@ -3645,7 +3667,7 @@ impl TermIndex {
         if let Some(ResidentSlice::Whole(bytes)) = &resident {
             return runs_in(bytes, keys, wanted);
         }
-        let small = span.len.is_some_and(|len| len <= self.small_slice_bytes);
+        let small = self.is_small(span.len);
         if let Some(index_end) = span.index_end
             && !read_whole
             && !small
@@ -3663,7 +3685,7 @@ impl TermIndex {
             };
             match ranged {
                 Ok(runs) => {
-                    self.promote_slice(hash, span.len, reused).await;
+                    self.promote_slice(hash, span.len, reused);
                     return Ok(runs);
                 }
                 Err(error @ (TermIndexError::Malformed(_) | TermIndexError::HashMismatch)) => {
@@ -3938,11 +3960,11 @@ impl TermIndex {
         len: Option<u64>,
         budget: &'b FetchBudget,
     ) -> Result<(Bytes, SemaphorePermit<'b>), TermIndexError> {
-        let held = budget.hold(len.unwrap_or(SLICE_TARGET_BYTES as u64)).await;
+        let held = budget.hold(len_or_target(len)).await;
         // A small slice is one short request, so it goes as many at once as
-        // ranged reads do; eight at a time would cost a table of many small
-        // layers a wave of requests per eight slices.
-        let _turn = match len.is_some_and(|len| len <= self.small_slice_bytes) {
+        // ranged reads do; [`WHOLE_SLICES_AT_ONCE`] at a time would cost a table
+        // of many small layers a wave of requests per that many slices.
+        let _turn = match self.is_small(len) {
             true => budget.request().await,
             false => budget.whole().await,
         };
@@ -3995,7 +4017,7 @@ impl TermIndex {
     ///   stays ranged; freeing room for hot slices is left to a later change.
     /// - Skipped too when a read of it is already queued, or an earlier whole
     ///   read failed its hash or could never fit on disk.
-    async fn promote_slice(&self, hash: &ContentHash, len: Option<u64>, reused: bool) {
+    fn promote_slice(&self, hash: &ContentHash, len: Option<u64>, reused: bool) {
         let wanted = match self.promote {
             Promote::Disk => true,
             Promote::Resident => reused,
@@ -4005,15 +4027,13 @@ impl TermIndex {
         if !wanted {
             return;
         }
-        let len = len.unwrap_or(SLICE_TARGET_BYTES as u64);
+        let len = len_or_target(len);
         let promotions = {
             let mut chunks = self.tier_chunks.lock().expect("tier chunk cache lock");
             if chunks.unpromotable.get(hash).is_some() {
                 return;
             }
-            // Once the set holds only block indexes this stays below a slice's
-            // size for good, so no promotion queues (the known limit above).
-            let room = (chunks.slices.room() + chunks.slices.weight_of(hash)) as u64;
+            let room = chunks.room_for(hash) as u64;
             let promotions = Arc::clone(&chunks.promotions);
             // Taken while the cache is locked, so the room it reserves against
             // is the room it saw.
@@ -10732,6 +10752,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_whole_read_whose_room_was_taken_meanwhile_is_not_kept() {
+        // No disk cache, one slice, and a resident set exactly the slice's size;
+        // the term looked up twice, the second lookup's background read held
+        // from starting, and meanwhile another object takes part of the room.
+        //  - the whole read still runs once released, but its copy no longer
+        //    fits, so it is dropped: the slice stays a block index and nothing
+        //    already resident is pushed out.
+        // This test pins the stated gap in the reservation: it holds room only
+        // against other background reads, and a copy that lands without room
+        // is not kept.
+        let (local, root, terms, _store) = one_slice_index(OVER_SMALL_SLICE_TERMS).await;
+        let hash = root.layers[0].slices[0].content_hash;
+        let len = root.layers[0].slices[0].len as usize;
+        let slow = SlowStorage::wrap(Arc::clone(&local), Duration::ZERO);
+        let cache = tier_chunk_cache(len);
+        let index = || {
+            TermIndex::new(
+                root.clone(),
+                String::new(),
+                Arc::clone(&slow) as Arc<dyn StorageProvider>,
+                None,
+            )
+            .with_small_slice_bytes(NO_SMALL_SLICES)
+            .with_tier_chunk_cache(Arc::clone(&cache))
+        };
+        index()
+            .runs_many(fid("body"), &[terms[0].as_str()])
+            .await
+            .expect("first");
+        let promotions = Arc::clone(&cache.lock().expect("tier chunk cache lock").promotions);
+        let held = promotions
+            .permits
+            .acquire_many(SLICE_PROMOTION_CONCURRENCY as u32)
+            .await
+            .expect("permits");
+        index()
+            .runs_many(fid("body"), &[terms[0].as_str()])
+            .await
+            .expect("second");
+        assert_eq!(
+            promotions
+                .queued
+                .lock()
+                .expect("promotions lock")
+                .slices
+                .len(),
+            1,
+            "the whole read is queued"
+        );
+        let taker = ContentHash::of(b"another object");
+        {
+            let mut chunks = cache.lock().expect("tier chunk cache lock");
+            let taken = chunks.slices.room().saturating_sub(1).max(1);
+            let evicted = chunks
+                .slices
+                .insert(taker, ResidentSlice::Whole(Bytes::from(vec![0u8; taken])));
+            assert!(evicted.is_empty(), "the taker fits in the free room");
+        }
+        let reads = slow.reads_of(SLICE_URI_FRAGMENT);
+        drop(held);
+        promotions_settle(&cache).await;
+        assert_eq!(
+            slow.reads_of(SLICE_URI_FRAGMENT),
+            reads + 1,
+            "the whole read ran"
+        );
+        let mut chunks = cache.lock().expect("tier chunk cache lock");
+        assert!(
+            matches!(chunks.slices.get(&hash), Some(ResidentSlice::Index(_))),
+            "the slice stays a block index"
+        );
+        assert!(chunks.slices.get(&taker).is_some(), "nothing pushed out");
+    }
+
+    #[tokio::test]
     async fn queued_whole_reads_never_hold_more_than_the_free_room() {
         // No disk cache, and a resident set with room, past the block indexes,
         // for one whole slice of the two a term's lookup reads; the term looked
@@ -12078,7 +12173,7 @@ mod tests {
         let index = disk_index(&root, slow.clone(), &disk, &cache);
         assert_eq!(index.promote, Promote::Disk);
         for (hash, len) in &slices {
-            index.promote_slice(hash, *len, false).await;
+            index.promote_slice(hash, *len, false);
         }
         for _ in 0..PROMOTION_WAIT_POLLS {
             if slow.in_flight() >= SLICE_PROMOTION_CONCURRENCY {
