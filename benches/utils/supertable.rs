@@ -1530,10 +1530,12 @@ struct ColdReadAssert<'a> {
     expected: ExpectedTiers,
     ceilings_first: &'a [(&'a str, u64, u64)],
     ceilings_second: &'a [(&'a str, u64, u64)],
-    /// The stamped width law at the battery's `k` (1 when absent). The
-    /// ceiling tables encode a width-1 probe; a wider law legitimately
-    /// reads one more coalesced cell-GET per extra probed cell, so both
-    /// cold windows scale by `width - 1`. The gate then measures
+    /// The stamped width law at the battery's `k` (1 when absent), or the
+    /// stamped router's fine-cluster count when the centroid graph serves
+    /// the table (see `routed_width_at_top_k`). The ceiling tables encode a
+    /// width-1 probe; a wider law legitimately reads one more coalesced
+    /// GET per extra probed unit, so both cold windows scale by
+    /// `width - 1`. The gate then measures
     /// per-cell fetch efficiency, not the law's width choice (the
     /// accepted trade: 0.994 recall at width 2 vs 0.957 at width 1 on
     /// the 10M gate).
@@ -2557,8 +2559,10 @@ pub mod vector {
     };
 
     use infino::{
-        VectorFilter, roaring::RoaringBitmap, storage::io_counters,
-        supertable::manifest::list::PartitionStrategy,
+        VectorFilter, config,
+        roaring::RoaringBitmap,
+        storage::io_counters,
+        supertable::{manifest::list::PartitionStrategy, query::vector::graph_fanout_for_query},
     };
 
     use super::*;
@@ -3348,18 +3352,31 @@ pub mod vector {
     /// query runs at.
     const WIDTH_LAW_K10_IDX: usize = 1;
 
-    /// The stamped width law at the battery's `TOP_K`, read from the
-    /// hidden manifest exactly as the default query path resolves it
-    /// (1 when the table has no hidden index or no calibrated law).
-    fn stamped_width_law_at_top_k(consumer: &Supertable) -> u64 {
+    /// The read allowance of a default `TOP_K` query on the hidden index, in
+    /// probed units: the stamped width law in cells, or, when the centroid
+    /// graph serves the table, the fine clusters the stamped router reads
+    /// (`width × fine_for_k`). The graph is held to the stamped router's
+    /// reads, never to its own fanout, so a fanout regression still trips the
+    /// gate. 1 when the table has no hidden index or no calibrated law.
+    fn routed_width_at_top_k(consumer: &Supertable) -> u64 {
         let Some(hidden) = consumer.vector_index_table() else {
             return 1;
         };
-        match hidden.pinned_reader().manifest().get_partition_strategy() {
-            PartitionStrategy::VectorCell { routing, .. } => {
-                u64::from(routing.width_for_k[WIDTH_LAW_K10_IDX].max(1))
-            }
-            _ => 1,
+        let reader = hidden.pinned_reader();
+        let manifest = reader.manifest();
+        let PartitionStrategy::VectorCell { routing, .. } = manifest.get_partition_strategy()
+        else {
+            return 1;
+        };
+        let width = u64::from(routing.width_for_k[WIDTH_LAW_K10_IDX].max(1));
+        let column = &hidden.options().vector_columns[0].column;
+        let graph_serves =
+            graph_fanout_for_query(manifest, column, TOP_K, None, &config::global().vector)
+                .is_some();
+        if graph_serves {
+            width * u64::from(routing.fine_for_k[WIDTH_LAW_K10_IDX].max(1))
+        } else {
+            width
         }
     }
 
@@ -3813,7 +3830,7 @@ pub mod vector {
                 expected,
                 ceilings_first: super::VECTOR_COLD_GET_CEILINGS_FIRST,
                 ceilings_second: super::VECTOR_COLD_GET_CEILINGS_SECOND,
-                steady_law_width: stamped_width_law_at_top_k(consumer),
+                steady_law_width: routed_width_at_top_k(consumer),
             }),
         )
     }
