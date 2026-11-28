@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! K-means clustering — 5-iteration Lloyd's algorithm.
+//! K-means clustering: 5-iteration Lloyd's algorithm, plus e-means for
+//! a superfile's fine centroids ([`emeans_with_assignments`]).
 //!
 //! Used to derive the `n_cent` IVF centroids per vector index at
 //! build time. Five iterations is the standard turn-key default —
@@ -26,6 +27,7 @@
 //! The seed is derived from this column's `rot_seed` (offset by 7) so
 //! the rotation and clustering use distinct PRNG streams.
 
+use emeans::{Emeans, Model};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 
@@ -38,6 +40,12 @@ use crate::superfile::vector::distance::{
 /// clustering PRNG stream distinct from the rotation stream, which is
 /// seeded from `rot_seed` directly.
 const KMEANS_SEED_OFFSET: u64 = 7;
+
+/// e-means moves a cluster whose row count falls below this fraction of the
+/// mean into a split of a large cluster, so no cluster stays far below the
+/// mean. The crate's default keeps a small cluster when moving it would raise
+/// the error, which leaves sizes less even.
+const EMEANS_REVIVE_BELOW_MEAN_FRACTION: f32 = 0.1;
 
 /// Run 5-iteration Lloyd k-means and return `k * dim` centroids,
 /// row-major. `vectors` is `n_docs * dim`, also row-major. Drops
@@ -78,17 +86,99 @@ pub fn kmeans_with_assignments(
     assert!(n > 0, "kmeans: at least one doc required");
     assert!(k <= n, "kmeans: k ({k}) > n_docs ({n})");
 
+    let centroids = random_init(vectors, dim, k, n, seed);
+    lloyd_refine(vectors, dim, k, iters, centroids)
+}
+
+/// Same random init as [`kmeans_with_assignments`], refined with `iters` e-means passes
+/// instead of Lloyd. Used for a superfile's fine centroids, where e-means gives more even
+/// clusters, so a query reads fewer rows for the same recall.
+///
+/// The assignments are the last pass's labels, which the crate keeps equal to each row's
+/// nearest final centroid. A centroid no row is labelled with is dropped: it would return
+/// nothing, yet a query could still spend a probe on it. That happens when there are more
+/// centroids than distinct rows, where the empty centroids end up next to occupied ones,
+/// so the answer may hold fewer than `k` centroids. Dropping them reads only the labels,
+/// so it adds no pass over the rows.
+///
+/// # Panics
+///
+/// Same as [`kmeans_with_assignments`].
+pub fn emeans_with_assignments(
+    vectors: &[f32],
+    dim: usize,
+    k: usize,
+    iters: usize,
+    seed: u64,
+) -> (Vec<f32>, Vec<u32>) {
+    let model = train_emeans(vectors, dim, k, iters, seed);
+    let labels: Vec<u32> = model
+        .labels()
+        .expect("emeans: labels captured")
+        .iter()
+        .map(|&l| u32::try_from(l).expect("emeans: the last pass labels every row"))
+        .collect();
+    occupied_centroids(&model.into_centroids(), dim, labels)
+}
+
+/// Centroids-only [`emeans_with_assignments`], mirroring [`kmeans`].
+pub fn emeans(vectors: &[f32], dim: usize, k: usize, iters: usize, seed: u64) -> Vec<f32> {
+    emeans_with_assignments(vectors, dim, k, iters, seed).0
+}
+
+/// Keep only the centroids at least one row is assigned to, in their order, and answer
+/// them with `assignments` renumbered to match.
+fn occupied_centroids(
+    centroids: &[f32],
+    dim: usize,
+    mut assignments: Vec<u32>,
+) -> (Vec<f32>, Vec<u32>) {
+    let n_cent = centroids.len() / dim;
+    let mut occupied = vec![false; n_cent];
+    for &a in &assignments {
+        occupied[a as usize] = true;
+    }
+    if occupied.iter().all(|&o| o) {
+        return (centroids.to_vec(), assignments);
+    }
+    let mut new_index = vec![u32::MAX; n_cent];
+    let mut kept = Vec::with_capacity(centroids.len());
+    for c in (0..n_cent).filter(|&c| occupied[c]) {
+        new_index[c] = (kept.len() / dim) as u32;
+        kept.extend_from_slice(&centroids[c * dim..(c + 1) * dim]);
+    }
+    for a in &mut assignments {
+        *a = new_index[*a as usize];
+    }
+    (kept, assignments)
+}
+
+fn train_emeans(vectors: &[f32], dim: usize, k: usize, iters: usize, seed: u64) -> Model {
+    // The crate checks dim, k, the row count and k <= n, and reports them below.
+    let n = vectors.len() / dim.max(1);
+    let init = random_init(vectors, dim, k, n, seed);
+    Emeans::new(dim, k)
+        .nepochs(iters.max(1) as f64)
+        .seed(seed)
+        .unused_threshold(EMEANS_REVIVE_BELOW_MEAN_FRACTION)
+        .capture_assignments(true)
+        .train_from(vectors, &init)
+        .unwrap_or_else(|e| panic!("emeans: {e}"))
+}
+
+/// `k` rows drawn uniformly from `vectors`. Repeats are allowed; for small k vs n
+/// a duplicate is unlikely.
+fn random_init(vectors: &[f32], dim: usize, k: usize, n: usize, seed: u64) -> Vec<f32> {
+    if n == 0 {
+        return Vec::new();
+    }
     let mut rng = StdRng::seed_from_u64(seed.wrapping_add(KMEANS_SEED_OFFSET));
     let mut centroids = vec![0f32; k * dim];
-
-    // Init: random sample of input vectors. (Repetition is allowed; for
-    // small k vs n the chance of a duplicate is negligible.)
     for i in 0..k {
         let idx = rng.random_range(0..n);
         centroids[i * dim..(i + 1) * dim].copy_from_slice(&vectors[idx * dim..(idx + 1) * dim]);
     }
-
-    lloyd_refine(vectors, dim, k, iters, centroids)
+    centroids
 }
 
 /// k-means++ (D²-weighted) init followed by the same Lloyd refinement. Returns
@@ -383,6 +473,46 @@ mod tests {
         let c1 = kmeans(&vectors, 8, 4, 5, 12345);
         let c2 = kmeans(&vectors, 8, 4, 5, 12345);
         assert_eq!(c1, c2);
+    }
+
+    /// More centroids than distinct rows: only centroids that hold a row are
+    /// kept, and every row is assigned to one of them.
+    #[test]
+    fn emeans_keeps_only_centroids_that_hold_a_row() {
+        let (dim, k, distinct) = (4, 12, 3);
+        let vectors: Vec<f32> = (0..24 * dim)
+            .map(|i| ((i / dim) % distinct) as f32)
+            .collect();
+        let (centroids, assignments) = emeans_with_assignments(&vectors, dim, k, 5, 42);
+        let n_cent = centroids.len() / dim;
+        assert!(
+            (1..=distinct).contains(&n_cent),
+            "{n_cent} centroids for {distinct} distinct rows"
+        );
+        let mut counts = vec![0usize; n_cent];
+        for &a in &assignments {
+            counts[a as usize] += 1;
+        }
+        assert!(counts.iter().all(|&c| c > 0), "{counts:?}");
+    }
+
+    #[test]
+    fn emeans_same_result_at_any_thread_count() {
+        let (n, dim, k) = (20_000, 96, 64);
+        let vectors: Vec<f32> = (0..n * dim)
+            .map(|i| ((i * 7919) % 1000) as f32 / 1000.0)
+            .collect();
+        let run = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool")
+                .install(|| emeans_with_assignments(&vectors, dim, k, 5, 12345))
+        };
+        let one = run(1);
+        for threads in [3, 32] {
+            assert_eq!(one, run(threads), "threads {threads}");
+        }
     }
 
     #[test]

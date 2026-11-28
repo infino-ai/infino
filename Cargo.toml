@@ -184,6 +184,9 @@ unicode-properties = { version = "0.1", default-features = false, features = [
 ] }
 
 # Numerics
+# Mini-batch k-means with cluster revival (port of faiss e-means), used for a
+# superfile's fine centroids. Pure Rust, MIT.
+emeans = "=0.2.3"
 rand = "0.10"
 rand_distr = "0.6"
 rayon = "1"

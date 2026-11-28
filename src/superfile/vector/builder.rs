@@ -45,8 +45,8 @@ use crate::{
             },
             ivf_merge::MergedIvfSubsection,
             kmeans::{
-                assign_to_centroids, assign_to_transposed_centroids, kmeans,
-                kmeans_with_assignments,
+                assign_to_centroids, assign_to_transposed_centroids, emeans,
+                emeans_with_assignments,
             },
             quant::BitQuantizer,
             rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
@@ -85,7 +85,7 @@ const VECTOR_DIM_MAX: usize = 4096;
 /// k-means streams.
 const RESERVOIR_SEED_XOR_MASK: u64 = 0x5a5a_5a5a_5a5a_5a5a;
 
-/// Lloyd k-means iteration count for pass-1 centroid training. Five
+/// e-means pass count for pass-1 centroid training. Five
 /// is the standard turn-key default; returns diminish past it on
 /// typical embedding distributions.
 const KMEANS_ITERS: usize = 5;
@@ -1268,16 +1268,16 @@ fn materialized_centroids(
     // row-derived byte-target uncapped; everything below keeps the
     // legacy row-count cap so the 1M/10M cold-GET layout stays on the
     // measured shape. Oversized fine-run splitting always runs — the
-    // cap alone does not stop Lloyd from parking 2×-skewed runs that
+    // cap alone does not stop k-means from parking 2×-skewed runs that
     // flatten fine-first p=1 recall below 0.99.
     let requested = effective_cell_n_cent(requested_n_cent, n_docs);
-    // Keep the final Lloyd assignments — `split_oversized_fine_runs`
+    // Keep the final assignments: `split_oversized_fine_runs`
     // consumes them for the first bound check so a balanced pack (the
     // common commit-cell case) does not pay a redundant full sample
-    // assign on top of the train. `kmeans` alone would drop them and
-    // force that duplicate pass (see `kmeans_with_assignments`).
+    // assign on top of the train. `emeans` alone would drop them and
+    // force that duplicate pass (see `emeans_with_assignments`).
     let (mut centroids, assignments) =
-        kmeans_with_assignments(sample, dim, requested, KMEANS_ITERS, cfg.rot_seed);
+        emeans_with_assignments(sample, dim, requested, KMEANS_ITERS, cfg.rot_seed);
     let n_cent = split_oversized_fine_runs(
         &mut centroids,
         sample,
@@ -1299,7 +1299,7 @@ fn materialized_centroids(
 /// `requested == 1`) can never exceed the bound and pass through untouched.
 ///
 /// When `initial_assignments` matches the current `centroids` (the final
-/// Lloyd labeling from [`kmeans_with_assignments`]), the first round
+/// labeling from [`emeans_with_assignments`]), the first round
 /// skips `assign_to_centroids` and only scans counts — balanced packs
 /// return without another distance pass. Pass `None` when the caller
 /// has no labeling (tests / synthetic centroid fixtures); the first
@@ -1322,7 +1322,7 @@ fn split_oversized_fine_runs(
     }
     let target = sample_n.div_ceil(requested.max(1)).max(1);
     let bound = target.saturating_mul(FINE_RUN_SPLIT_BOUND_FACTOR);
-    // Reuse the caller's Lloyd labeling on round 0 when it covers every
+    // Reuse the caller's labeling on round 0 when it covers every
     // sample row; any later round (or a missing/mismatched labeling)
     // re-assigns against the current centroids.
     let (mut assignments, mut need_assign) = match initial_assignments {
@@ -1358,7 +1358,7 @@ fn split_oversized_fine_runs(
             let sub_seed = seed
                 .wrapping_add(FINE_RUN_SPLIT_SEED_OFFSET)
                 .wrapping_add(((round as u64) << u32::BITS) | c as u64);
-            let sub = kmeans(&rows, dim, k, KMEANS_ITERS, sub_seed);
+            let sub = emeans(&rows, dim, k, KMEANS_ITERS, sub_seed);
             centroids[c * dim..(c + 1) * dim].copy_from_slice(&sub[..dim]);
             centroids.extend_from_slice(&sub[dim..]);
         }
@@ -2662,12 +2662,13 @@ fn build_subsection_streaming(
         let centroids = if sample_rows == 0 || n_docs == 0 {
             vec![0.0f32; n_cent * dim]
         } else {
-            kmeans(reservoir.sample(), dim, n_cent, KMEANS_ITERS, cfg.rot_seed)
+            emeans(reservoir.sample(), dim, n_cent, KMEANS_ITERS, cfg.rot_seed)
         };
         // Drop the reservoir immediately — k-means has converged
         // and the sample bytes aren't needed for pass 2.
         drop(reservoir);
-        (n_cent, centroids)
+        // Training drops centroids no sample row is nearest to.
+        (centroids.len() / dim.max(1), centroids)
     };
 
     // Summary centroid: mean of trained centroids.
@@ -4177,6 +4178,68 @@ mod tests {
         assert!(
             after.iter().all(|&n| n <= bound),
             "sub-threshold cell must still bound every fine run at {bound}: {after:?}"
+        );
+    }
+
+    /// Blobs in the skewed balance sample. Blob `b` holds
+    /// `SKEW_BLOB_ROWS / (b + 1)` rows, so the largest is `SKEW_BLOBS` times
+    /// the smallest.
+    const SKEW_BLOBS: usize = 24;
+    /// Rows in the largest blob of the skewed balance sample.
+    const SKEW_BLOB_ROWS: usize = 2_400;
+    /// Fine runs requested from the skewed balance sample.
+    const SKEW_REQUESTED: usize = 64;
+    /// Largest fine run allowed, as a multiple of the median run.
+    const SKEW_MAX_OVER_P50: usize = 4;
+
+    /// Blobs of very different sizes, centers spread on a grid of side 10,
+    /// jittered deterministically by an LCG.
+    fn skewed_sample() -> Vec<f32> {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((state >> 33) % 1000) as f32 / 1000.0
+        };
+        let mut rows = Vec::new();
+        for b in 0..SKEW_BLOBS {
+            let center: Vec<f32> = (0..SPLIT_DIM)
+                .map(|_| (next() * 10.0).floor() * 10.0)
+                .collect();
+            for _ in 0..SKEW_BLOB_ROWS / (b + 1) {
+                rows.extend(center.iter().map(|c| c + next() - 0.5));
+            }
+        }
+        rows
+    }
+
+    /// On skewed input the build leaves no fine run empty and keeps the
+    /// largest run within a small multiple of the median.
+    #[test]
+    fn materialized_centroids_balances_skewed_input() {
+        let sample = skewed_sample();
+        let cfg = VectorConfig {
+            column: "emb".into(),
+            dim: SPLIT_DIM,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let (n_cent, centroids) = materialized_centroids(
+            &cfg,
+            SKEW_REQUESTED,
+            CONSOLIDATED_CELL_ROWS_THRESHOLD,
+            &sample,
+        );
+        let mut counts = run_counts(&sample, &centroids, n_cent);
+        counts.sort_unstable();
+        let p50 = counts[counts.len() / 2];
+        assert!(counts[0] > 0, "no fine run may be empty: {counts:?}");
+        assert!(
+            counts[counts.len() - 1] <= p50 * SKEW_MAX_OVER_P50,
+            "largest run over {SKEW_MAX_OVER_P50}x the median {p50}: {counts:?}"
         );
     }
 

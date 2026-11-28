@@ -8453,7 +8453,6 @@ mod tests {
     #[test]
     fn open_sq8_cosine_carries_per_doc_norms() {
         let dim = 16usize;
-        let n_cent = 32usize;
         let n_docs = 32u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
@@ -8496,6 +8495,8 @@ mod tests {
             "Cosine Sq8 must carry per-doc norms to normalize the decoded vector at rerank",
         );
         assert_eq!(norms.len(), n_docs as usize);
+        let n_cent = col.n_cent as usize;
+        assert!((1..=n_docs as usize).contains(&n_cent));
         assert_eq!(scale.len(), n_cent * dim);
         assert_eq!(offset.len(), n_cent * dim);
     }
@@ -10892,14 +10893,23 @@ mod tests {
 
         let (got_n_cent, got_dim, centroids, counts) =
             r.cluster_centroids("embedding").expect("cluster_centroids");
-        assert_eq!(got_n_cent, n_cent as u32);
+        // The build drops a centroid no row is nearest to, so up to n_cent remain.
+        let got = got_n_cent as usize;
+        assert!(
+            (1..=n_cent).contains(&got),
+            "{got} clusters for {n_cent} requested"
+        );
         assert_eq!(got_dim, dim as u32);
         assert_eq!(
             centroids.len(),
-            n_cent * dim,
+            got * dim,
             "centroids are cluster-major n_cent × dim fp32"
         );
-        assert_eq!(counts.len(), n_cent, "one count per cluster");
+        assert_eq!(counts.len(), got, "one count per cluster");
+        assert!(
+            counts.iter().all(|&c| c > 0),
+            "no empty cluster: {counts:?}"
+        );
         // Every doc lands in exactly one cluster, so the counts sum to
         // n_docs — the contract the manifest staging path relies on.
         let total: u32 = counts.iter().sum();
@@ -10919,7 +10929,12 @@ mod tests {
         assert_eq!(cols.len(), 1);
         assert_eq!(cols[0].name, "embedding");
         assert_eq!(cols[0].dim, 16);
-        assert_eq!(cols[0].n_cent, 32);
+        // One centroid per row at most; the build drops any no row is nearest to.
+        assert!(
+            (1..=32).contains(&cols[0].n_cent),
+            "n_cent {}",
+            cols[0].n_cent
+        );
         assert_eq!(cols[0].metric, Metric::L2Sq);
     }
 
@@ -11332,8 +11347,10 @@ mod tests {
             "fixture sanity: candidates from both packed cells, got {cells:?}"
         );
 
-        // Scope to one cell's flat at a time; only that cell may score.
-        for (flat, cell_idx) in [(0u32, 0usize), (2u32, 1usize)] {
+        // Scope to one cell's flat at a time; only that cell may score. Each
+        // cell holds identical rows, which train one cluster, so cell 0 is
+        // flat 0 and cell 1 is flat 1.
+        for (flat, cell_idx) in [(0u32, 0usize), (1u32, 1usize)] {
             let scoped = r
                 .search_clusters_scan_async(
                     "embedding",
@@ -11353,7 +11370,7 @@ mod tests {
                 .expect("scoped scan");
             assert!(
                 !scoped.candidates.is_empty(),
-                "flat {flat} resolves to a non-empty cluster; scoping it must score rows"
+                "flat {flat} holds cell {cell_idx}'s rows; scoping it must score rows"
             );
             for c in &scoped.candidates {
                 assert_eq!(
@@ -11377,8 +11394,13 @@ mod tests {
         use std::collections::HashSet;
         let (blob, json, all) = build_large_corpus(16, 4, 2600, RerankCodec::Fp32, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
-        // k * rerank_mult = 64 * 41 = 2624 >= 2600: nothing truncated.
-        let hits = r.search("v", &all[42], 64, 4, 41).await.expect("search");
+        // k * rerank_mult = 64 * 41 = 2624 >= 2600: nothing truncated. Probe
+        // every cluster: the build may split runs past the 4 planted phases.
+        let probe_all = all.len();
+        let hits = r
+            .search("v", &all[42], 64, probe_all, 41)
+            .await
+            .expect("search");
         assert_eq!(hits[0].0, 42, "recovers planted self");
         let l2sq =
             |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum() };
@@ -12013,10 +12035,10 @@ mod tests {
         let r = VectorReader::open(blob, &json).expect("open");
         let (got_n_cent, got_dim, centroids, counts) =
             r.cluster_centroids("embedding").expect("present column");
-        assert_eq!(got_n_cent, n_cent);
+        assert!((1..=n_cent).contains(&got_n_cent), "{got_n_cent} clusters");
         assert_eq!(got_dim, dim as u32);
-        assert_eq!(centroids.len(), (n_cent as usize) * dim);
-        assert_eq!(counts.len(), n_cent as usize);
+        assert_eq!(centroids.len(), (got_n_cent as usize) * dim);
+        assert_eq!(counts.len(), got_n_cent as usize);
         assert!(centroids.iter().all(|c| c.is_finite()));
         let total: u32 = counts.iter().sum();
         assert_eq!(
@@ -12105,10 +12127,10 @@ mod tests {
     #[test]
     fn score_centroids_truncates_and_sorts() {
         let dim = 16usize;
-        let n_cent = 64u32;
-        let (blob, json) = build_blob(64, dim, n_cent as usize, Metric::L2Sq);
+        let (blob, json) = build_blob(64, dim, 64, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let col = &r.columns[0];
+        let n_cent = col.n_cent;
         let (_, _, centroids, _) = r.cluster_centroids("embedding").expect("centroids");
 
         // Query equal to centroid 0 → cluster 0 is the nearest.
