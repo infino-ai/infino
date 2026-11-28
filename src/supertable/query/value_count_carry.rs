@@ -50,8 +50,14 @@ struct CarriedColumn {
     /// The type the values were counted in. A column the table now reads as
     /// another type starts over.
     data_type: DataType,
-    /// The superfiles the sum covers.
-    files: HashMap<Uuid, Arc<SuperfileEntry>>,
+    /// The superfiles the sum covers, each with what it added to the sum,
+    /// so it can be taken off again when the superfile leaves. The counts
+    /// are kept rather than the superfile's entry: an entry reads its
+    /// statistics from its part's summaries section, which covers every
+    /// superfile of the part as that commit wrote it, so holding the entry
+    /// first seen for each superfile would keep one superseded section alive
+    /// per commit the table took between reads.
+    files: HashMap<Uuid, FileCounts>,
     sum: Sum,
 }
 
@@ -67,12 +73,12 @@ enum Sum {
 }
 
 impl Sum {
-    /// Adds `entry`'s counts of column `column`; an unknown sum stays so.
-    fn add(&mut self, entry: &SuperfileEntry, column: FieldId) {
+    /// Adds a superfile's `counts`; an unknown sum stays so.
+    fn add(&mut self, counts: &FileCounts) {
         let Sum::Counts(sum) = self else {
             return;
         };
-        let known = match file_counts(entry, column) {
+        let known = match counts {
             FileCounts::NoValues => true,
             FileCounts::Unrecorded => false,
             FileCounts::Values(counts) => {
@@ -95,6 +101,7 @@ impl Sum {
 }
 
 /// What one superfile adds to a column's sum.
+#[derive(Debug, Clone)]
 enum FileCounts {
     Values(ScalarValueCounts),
     /// The column holds only nulls there: nothing to count.
@@ -167,7 +174,7 @@ pub(crate) fn counts_of(
 ) -> Option<HashMap<ScalarValue, u64>> {
     let mut sum = Sum::Counts(HashMap::new());
     for entry in files {
-        sum.add(entry, column);
+        sum.add(&file_counts(entry, column));
     }
     match sum {
         Sum::Counts(counts) => Some(counts),
@@ -209,7 +216,7 @@ impl ValueCountCarry {
             .filter(|suid| !current.contains_key(suid))
             .copied()
             .collect();
-        if !gone.is_empty() && !carried.take_off(&gone, column) {
+        if !gone.is_empty() && !carried.take_off(&gone) {
             *carried = CarriedColumn::empty(data_type);
         }
         for (suid, entry) in current {
@@ -231,24 +238,30 @@ impl CarriedColumn {
         }
     }
 
-    /// Adds `entry`'s counts.
-    fn add(&mut self, entry: &Arc<SuperfileEntry>, column: FieldId) {
-        self.files.insert(entry.superfile_id, Arc::clone(entry));
-        self.sum.add(entry, column);
+    /// Adds `entry`'s counts of column `column`.
+    fn add(&mut self, entry: &SuperfileEntry, column: FieldId) {
+        // An unknown sum is never taken from, only started over: keep the
+        // superfile's id, not its decoded counts.
+        let counts = match self.sum {
+            Sum::Unknown => FileCounts::Unrecorded,
+            Sum::Counts(_) => file_counts(entry, column),
+        };
+        self.sum.add(&counts);
+        self.files.insert(entry.superfile_id, counts);
     }
 
     /// Takes the counts of the superfiles `gone` off the sum. `false` when
     /// they can't be: the sum is unknown, or holds less than a superfile
     /// recorded, which a carried sum never does. The sum then starts over.
-    fn take_off(&mut self, gone: &[Uuid], column: FieldId) -> bool {
+    fn take_off(&mut self, gone: &[Uuid]) -> bool {
         let Sum::Counts(sum) = &mut self.sum else {
             return false;
         };
         for suid in gone {
-            let Some(entry) = self.files.remove(suid) else {
+            let Some(counts) = self.files.remove(suid) else {
                 continue;
             };
-            let counts = match file_counts(&entry, column) {
+            let counts = match counts {
                 FileCounts::NoValues => continue,
                 FileCounts::Unrecorded => return false,
                 FileCounts::Values(counts) => counts,
@@ -275,5 +288,168 @@ impl CarriedColumn {
                 .map(|(value, count)| (value.clone(), *count))
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Weak;
+
+    use arrow_array::{ArrayRef, Int64Array};
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::{
+        superfile::vector::layout::VectorLayout,
+        supertable::manifest::{
+            ScalarStats, ScalarStatsAgg, SuperfileUri,
+            list::FtsSummaryAgg,
+            part::PartId,
+            summaries::{SummariesSection, rows_from_entries},
+        },
+        test_helpers::fid,
+    };
+
+    /// A superfile whose column `n` holds `values`, its statistics decoded.
+    fn superfile(values: Vec<i64>) -> Arc<SuperfileEntry> {
+        let column: ArrayRef = Arc::new(Int64Array::from(values));
+        let mut stats = HashMap::new();
+        stats.insert(
+            fid("n"),
+            ScalarStatsAgg::from_column(&column).expect("i64 is orderable"),
+        );
+        Arc::new(SuperfileEntry {
+            physical_schema: None,
+            stem: None,
+            birth_version: 0,
+            superfile_id: Uuid::new_v4(),
+            uri: SuperfileUri::new_v4(),
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: stats.into(),
+            fts_summary: HashMap::<FieldId, FtsSummaryAgg>::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        })
+    }
+
+    /// `entries` as one commit hands them to readers: each reading its row
+    /// of one summaries section written over all of them, as a part's
+    /// entries do. Returns the section too, so a test can watch it.
+    fn sectioned(
+        entries: &[Arc<SuperfileEntry>],
+    ) -> (Vec<Arc<SuperfileEntry>>, Arc<SummariesSection>) {
+        let ids: Vec<Uuid> = entries.iter().map(|entry| entry.superfile_id).collect();
+        let bytes = SummariesSection::encode(PartId::new_v4(), &ids, rows_from_entries(entries))
+            .expect("encode");
+        let section = Arc::new(SummariesSection::parse(Bytes::from(bytes)).expect("parse"));
+        let read = entries
+            .iter()
+            .enumerate()
+            .map(|(row, entry)| {
+                Arc::new(SuperfileEntry {
+                    scalar_stats: ScalarStats::Section {
+                        section: Arc::clone(&section),
+                        row: row as u32,
+                    },
+                    ..(**entry).clone()
+                })
+            })
+            .collect();
+        (read, section)
+    }
+
+    fn counts(carry: &ValueCountCarry, files: &[Arc<SuperfileEntry>]) -> Vec<(i64, u64)> {
+        let counts = carry
+            .sum(fid("n"), &DataType::Int64, files)
+            .expect("exact counts");
+        let mut out: Vec<(i64, u64)> = counts
+            .entries()
+            .iter()
+            .map(|(value, count)| match value {
+                ScalarValue::Int64(Some(v)) => (*v, *count),
+                other => panic!("unexpected value {other:?}"),
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Each commit rewrites the latest part's summaries section over all of
+    /// its superfiles, and hands out fresh entries reading the new one. The
+    /// carry must not hold the entries it first saw: each would keep the
+    /// section of its own commit alive, so a table read between commits
+    /// would hold one superseded section per commit, each as large as the
+    /// part was then.
+    #[test]
+    fn a_carried_sum_keeps_no_superseded_section_alive() {
+        let first = superfile(vec![1, 2, 2]);
+        let second = superfile(vec![2, 3]);
+        let carry = ValueCountCarry::default();
+
+        let (at_first_commit, first_section) = sectioned(&[Arc::clone(&first)]);
+        assert_eq!(counts(&carry, &at_first_commit), vec![(1, 1), (2, 2)]);
+        let superseded: Weak<SummariesSection> = Arc::downgrade(&first_section);
+        drop((at_first_commit, first_section));
+
+        let (at_second_commit, _second_section) =
+            sectioned(&[Arc::clone(&first), Arc::clone(&second)]);
+        assert_eq!(
+            counts(&carry, &at_second_commit),
+            vec![(1, 1), (2, 3), (3, 1)]
+        );
+        assert!(
+            superseded.upgrade().is_none(),
+            "the carry keeps the first commit's summaries section alive"
+        );
+    }
+
+    /// Once the sum is unknown, a superfile that comes is recorded by its id
+    /// alone: its counts are never read again, so they are not decoded and
+    /// kept.
+    #[test]
+    fn a_superfile_added_to_an_unknown_sum_keeps_no_counts() {
+        let past_the_limit = superfile((0..=MAX_TABLE_VALUE_COUNTS as i64).collect());
+        let later = superfile(vec![1, 2]);
+        let carry = ValueCountCarry::default();
+
+        assert!(
+            carry
+                .sum(fid("n"), &DataType::Int64, &[Arc::clone(&past_the_limit)])
+                .is_none()
+        );
+        assert!(
+            carry
+                .sum(
+                    fid("n"),
+                    &DataType::Int64,
+                    &[Arc::clone(&past_the_limit), Arc::clone(&later)]
+                )
+                .is_none()
+        );
+        let columns = carry.columns.lock().expect("lock");
+        let kept = &columns[&fid("n")].files[&later.superfile_id];
+        assert!(
+            matches!(kept, FileCounts::Unrecorded),
+            "kept {kept:?} for a superfile added to an unknown sum"
+        );
+    }
+
+    /// A superfile that leaves is taken off with the counts it added, kept
+    /// without its entry.
+    #[test]
+    fn a_superfile_that_leaves_is_taken_off_the_carried_sum() {
+        let first = superfile(vec![1, 2, 2]);
+        let second = superfile(vec![2, 3]);
+        let carry = ValueCountCarry::default();
+
+        let (both, _section) = sectioned(&[Arc::clone(&first), Arc::clone(&second)]);
+        assert_eq!(counts(&carry, &both), vec![(1, 1), (2, 3), (3, 1)]);
+        let (after_compaction, _section) = sectioned(&[Arc::clone(&second)]);
+        assert_eq!(counts(&carry, &after_compaction), vec![(2, 1), (3, 1)]);
     }
 }
