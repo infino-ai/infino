@@ -9,7 +9,7 @@
 //! (`PutMode::Create` / `PutMode::Update`) are native, so no
 //! builder flag is needed to enable them.
 
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{fmt, ops::Range, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -18,6 +18,7 @@ use object_store::{
     ClientOptions, Error as ObjError, GetOptions, MultipartUpload, ObjectStore, ObjectStoreExt,
     PutMode, PutOptions, PutPayload, UpdateVersion,
     azure::{AzureConfigKey, MicrosoftAzure, MicrosoftAzureBuilder},
+    client::{HttpClient, HttpConnector, HttpRequest, HttpRequestBody, ReqwestConnector},
     path::Path as ObjPath,
 };
 
@@ -34,6 +35,8 @@ pub struct AzureStorageProvider {
     container: String,
     prefix: String,
     store: Arc<MicrosoftAzure>,
+    /// How a delete is issued when the credentials are a SAS; `None` deletes through `store`.
+    sas_delete: Option<SasDelete>,
     meter: Arc<UsageMeter>,
 }
 
@@ -64,6 +67,7 @@ impl AzureStorageProvider {
         let builder = apply::<AzureConfigKey, _>(builder, opts, &uri, |b, key, value| {
             b.with_config(key, value)
         })?;
+        let sas_delete = SasDelete::for_builder(&builder, &container, &uri)?;
         let store = builder.build().map_err(|e| StorageError::Permanent {
             uri,
             source: Box::new(e),
@@ -72,6 +76,7 @@ impl AzureStorageProvider {
             container,
             prefix: normalize_prefix(prefix),
             store: Arc::new(store),
+            sas_delete,
             meter: UsageMeter::process_default(),
         })
     }
@@ -96,6 +101,7 @@ impl AzureStorageProvider {
             container,
             prefix: String::new(),
             store: Arc::new(store),
+            sas_delete: None,
             meter: UsageMeter::process_default(),
         })
     }
@@ -107,7 +113,17 @@ impl AzureStorageProvider {
             container: container.into(),
             prefix: String::new(),
             store: Arc::new(store),
+            sas_delete: None,
             meter: UsageMeter::process_default(),
+        }
+    }
+
+    /// One DELETE of `path`: by its own request under a SAS ([`SasDelete`]), else through the
+    /// store.
+    async fn delete_blob(&self, path: &ObjPath) -> Result<(), ObjError> {
+        match &self.sas_delete {
+            Some(sas) => sas.delete(path).await,
+            None => self.store.delete(path).await,
         }
     }
 
@@ -185,6 +201,168 @@ fn tuned_client_options() -> ClientOptions {
         .with_pool_idle_timeout(AZURE_POOL_IDLE_TIMEOUT)
         .with_connect_timeout(AZURE_CONNECT_TIMEOUT)
         .with_timeout(AZURE_REQUEST_TIMEOUT)
+}
+
+/// The store name errors from [`SasDelete`] carry, as `object_store`'s own Azure errors do.
+const AZURE_STORE: &str = "MicrosoftAzure";
+
+/// The scheme of an endpoint served without TLS (an emulator), which the client must be told to
+/// allow.
+const PLAIN_HTTP: &str = "http://";
+
+/// The method of a Delete Blob request.
+const DELETE_METHOD: &str = "DELETE";
+
+/// The status of a refused request: its credentials are missing or not valid.
+const STATUS_UNAUTHENTICATED: u16 = 401;
+
+/// The status of a refused request: its credentials do not allow the operation.
+const STATUS_FORBIDDEN: u16 = 403;
+
+/// The status of a request for a blob that does not exist.
+const STATUS_NOT_FOUND: u16 = 404;
+
+/// The status of a request the service gave up waiting for.
+const STATUS_REQUEST_TIMEOUT: u16 = 408;
+
+/// The status of a request refused for coming too fast.
+const STATUS_TOO_MANY_REQUESTS: u16 = 429;
+
+/// The first status that reports a fault of the service's own.
+const STATUS_SERVER_ERROR_MIN: u16 = 500;
+
+/// Most bytes of a refusal's body kept in the error: enough for the service's error code and
+/// detail.
+const ERROR_BODY_MAX: usize = 512;
+
+/// Deletes blobs one request each, signed by a SAS.
+///
+/// `object_store` issues every Azure delete, a single one included, as a Blob Batch request: a
+/// POST to the container. A SAS signs one resource. An account or container SAS signs the
+/// container, so the batch is accepted. A SAS for a directory (`sr=d`) or a blob does not, and the
+/// service refuses the batch with `403 AuthenticationFailed` ("Signed Directory Depth Invalid" for
+/// a directory), whatever the batch holds: under such a SAS no delete ever succeeds. A Delete Blob
+/// request names the blob itself, which every SAS that grants delete on it signs, so under any SAS
+/// a delete is sent that way. It is one request per blob either way.
+struct SasDelete {
+    http: HttpClient,
+    /// The container's URL, with no trailing slash and no query.
+    container_url: String,
+    /// The SAS as a query string, with no leading `?`. A secret: never logged or put in an error.
+    sas: String,
+}
+
+impl fmt::Debug for SasDelete {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SasDelete")
+            .field("container_url", &self.container_url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SasDelete {
+    /// The per-blob delete for a store `builder` makes of `container`, or `None` when its
+    /// credentials are not a SAS (or it names no account to address), and deletes go through the
+    /// store.
+    fn for_builder(
+        builder: &MicrosoftAzureBuilder,
+        container: &str,
+        uri: &str,
+    ) -> Result<Option<Self>, StorageError> {
+        let Some(sas) = builder.get_config_value(&AzureConfigKey::SasKey) else {
+            return Ok(None);
+        };
+        let endpoint = match builder.get_config_value(&AzureConfigKey::Endpoint) {
+            Some(endpoint) => endpoint,
+            None => match builder.get_config_value(&AzureConfigKey::AccountName) {
+                Some(account) => format!("https://{account}.blob.core.windows.net"),
+                None => return Ok(None),
+            },
+        };
+        let options = tuned_client_options().with_allow_http(endpoint.starts_with(PLAIN_HTTP));
+        let http =
+            ReqwestConnector::default()
+                .connect(&options)
+                .map_err(|e| StorageError::Permanent {
+                    uri: uri.to_string(),
+                    source: Box::new(e),
+                })?;
+        Ok(Some(Self {
+            http,
+            container_url: format!("{}/{container}", endpoint.trim_end_matches('/')),
+            sas: sas.trim_start_matches('?').to_string(),
+        }))
+    }
+
+    /// The URL of a Delete Blob request for `path`. It carries the SAS: never log it.
+    fn blob_url(&self, path: &ObjPath) -> String {
+        let blob = path
+            .parts()
+            .map(|part| encode_segment(part.as_ref()))
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("{}/{blob}?{}", self.container_url, self.sas)
+    }
+
+    /// One Delete Blob request for `path`, its answer in `object_store`'s terms so the provider
+    /// settles and translates it as it does the store's own: a missing blob is `NotFound`, refused
+    /// credentials are `Unauthenticated` or `PermissionDenied`, and a timeout, a dropped connection
+    /// or a fault of the service is `Generic`, which the provider re-issues.
+    async fn delete(&self, path: &ObjPath) -> Result<(), ObjError> {
+        let unsendable = || ObjError::NotSupported {
+            source: format!("no Delete Blob request can be made for {path}").into(),
+        };
+        let mut request = HttpRequest::new(HttpRequestBody::empty());
+        *request.method_mut() = DELETE_METHOD.parse().map_err(|_| unsendable())?;
+        // The parse error is dropped, not kept as the source: the URL holds the SAS.
+        *request.uri_mut() = self.blob_url(path).parse().map_err(|_| unsendable())?;
+        let response = self
+            .http
+            .execute(request)
+            .await
+            .map_err(|e| ObjError::Generic {
+                store: AZURE_STORE,
+                source: Box::new(e),
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let code = status.as_u16();
+        // The body is the service's error document: its code and detail, and nothing of the SAS.
+        let body = response.into_body().bytes().await.unwrap_or_default();
+        let detail = String::from_utf8_lossy(&body[..body.len().min(ERROR_BODY_MAX)]).into_owned();
+        let source = format!("Delete Blob answered {code}: {detail}").into();
+        let path = path.to_string();
+        Err(match code {
+            STATUS_NOT_FOUND => ObjError::NotFound { path, source },
+            STATUS_UNAUTHENTICATED => ObjError::Unauthenticated { path, source },
+            STATUS_FORBIDDEN => ObjError::PermissionDenied { path, source },
+            STATUS_REQUEST_TIMEOUT | STATUS_TOO_MANY_REQUESTS => ObjError::Generic {
+                store: AZURE_STORE,
+                source,
+            },
+            code if code >= STATUS_SERVER_ERROR_MIN => ObjError::Generic {
+                store: AZURE_STORE,
+                source,
+            },
+            _ => ObjError::NotSupported { source },
+        })
+    }
+}
+
+/// `segment` of a blob's path as it goes in a URL: every byte but an unreserved one
+/// (`A-Z a-z 0-9 - . _ ~`) percent-encoded.
+fn encode_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Translate an `object_store::Error` to our `StorageError`. Kept
@@ -458,7 +636,7 @@ impl StorageProvider for AzureStorageProvider {
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = self.path(uri)?;
         retry::delete_with_reissue(
-            || async { self.store.delete(&path).await },
+            || async { self.delete_blob(&path).await },
             |e| translate(uri, e),
         )
         .await?;
@@ -468,7 +646,7 @@ impl StorageProvider for AzureStorageProvider {
 
     async fn delete_once(&self, uri: &str) -> Result<(), StorageError> {
         let path = self.path(uri)?;
-        retry::delete_once(async { self.store.delete(&path).await }, |e| {
+        retry::delete_once(async { self.delete_blob(&path).await }, |e| {
             translate(uri, e)
         })
         .await?;
@@ -524,6 +702,13 @@ mod tests {
     //! and `from_object_store`. The trait impls are
     //! exercised end-to-end against Azurite in the gated
     //! `supertable_smoke_via_azure_wire_protocol` integration test.
+    use std::{
+        io::{BufRead, BufReader, Read as _, Write},
+        net::TcpListener,
+        sync::Mutex,
+        thread,
+    };
+
     use super::*;
     use crate::storage::stalling_endpoint::{
         Endpoint, Read, Stall, assert_stalled_read_recovers, stalling_endpoint,
@@ -533,6 +718,21 @@ mod tests {
     /// any path).
     const STALL_ACCOUNT: &str = "acct";
     const STALL_CONTAINER: &str = "container";
+
+    /// The container and prefix the SAS delete tests delete under.
+    const SAS_CONTAINER: &str = "data";
+    const SAS_PREFIX: &str = "tenant/db";
+
+    /// A SAS for a directory, as a query string. `sig` holds an encoded `+` and `/`, which must
+    /// reach the service as they are.
+    const DIRECTORY_SAS: &str = "sv=2022-11-02&sr=d&sdd=2&sp=racwdl&sig=qfK%2BlW%2FsecretSig%3D";
+
+    /// The signature inside [`DIRECTORY_SAS`], which no error may show.
+    const SAS_SIGNATURE: &str = "secretSig";
+
+    /// The service's answer to a batch signed by a directory SAS, and to any refused request here.
+    const REFUSAL_BODY: &str = "<Error><Code>AuthenticationFailed</Code>\
+        <AuthenticationErrorDetail>Signed Directory Depth Invalid</AuthenticationErrorDetail></Error>";
 
     // ---- translate -----------------------------------------------------
 
@@ -771,6 +971,197 @@ mod tests {
             .object_store_handle("data/seg-1")
             .expect("handle for valid uri");
         assert_eq!(path.to_string(), "tbl/data/seg-1");
+    }
+
+    // ---- deletes under a SAS ---------------------------------------------
+
+    /// A plain-HTTP endpoint that answers every request with one status, and keeps each request's
+    /// first line (`METHOD target HTTP/1.1`) in the order they came.
+    struct RecordingEndpoint {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingEndpoint {
+        /// Start one on a free port that answers `status_line` (as `202 Accepted`) with `body`.
+        fn answering(status_line: &'static str, body: &'static str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&requests);
+            thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut conn) = conn else { return };
+                    let seen = Arc::clone(&seen);
+                    thread::spawn(move || {
+                        let mut reader = BufReader::new(conn.try_clone().expect("clone"));
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let mut content_length = 0usize;
+                            loop {
+                                let mut header = String::new();
+                                if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                                    return;
+                                }
+                                if header == "\r\n" {
+                                    break;
+                                }
+                                let header = header.to_ascii_lowercase();
+                                if let Some(len) = header.strip_prefix("content-length:") {
+                                    content_length = len.trim().parse().expect("length");
+                                }
+                            }
+                            // A batch request carries a body, which must be read off before the
+                            // next request's line.
+                            let mut sent = vec![0u8; content_length];
+                            if reader.read_exact(&mut sent).is_err() {
+                                return;
+                            }
+                            seen.lock().expect("requests").push(line.trim().to_string());
+                            let answer = format!(
+                                "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            );
+                            if conn.write_all(answer.as_bytes()).is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                url: format!("http://{addr}"),
+                requests,
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().expect("requests").clone()
+        }
+    }
+
+    /// A provider under [`SAS_PREFIX`] of [`SAS_CONTAINER`] whose credentials are
+    /// [`DIRECTORY_SAS`] and whose service is `endpoint`.
+    fn sas_provider(endpoint: &RecordingEndpoint) -> AzureStorageProvider {
+        let opts = StorageOptions::from([
+            ("azure_storage_account_name".to_string(), "acct".to_string()),
+            ("azure_storage_endpoint".to_string(), endpoint.url.clone()),
+            (
+                "azure_storage_sas_token".to_string(),
+                DIRECTORY_SAS.to_string(),
+            ),
+        ]);
+        AzureStorageProvider::new_with_prefix(SAS_CONTAINER, SAS_PREFIX, &opts).expect("build")
+    }
+
+    /// Under a SAS a delete is one Delete Blob request for the blob itself, with the SAS as its
+    /// query, untouched. Before, it was a Blob Batch POST to the container, which a SAS for a
+    /// directory cannot sign: the service refused every delete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delete_under_a_sas_names_the_blob_itself() {
+        let endpoint = RecordingEndpoint::answering("202 Accepted", "");
+        let provider = sas_provider(&endpoint);
+        provider
+            .delete("wal/mutations/0001.arrow")
+            .await
+            .expect("the blob's own URL is one the SAS signs");
+        provider
+            .delete_once("wal/mutations/0001.json")
+            .await
+            .expect("delete_once goes the same way");
+        assert_eq!(
+            endpoint.requests(),
+            [
+                format!(
+                    "DELETE /{SAS_CONTAINER}/{SAS_PREFIX}/wal/mutations/0001.arrow?{DIRECTORY_SAS} HTTP/1.1"
+                ),
+                format!(
+                    "DELETE /{SAS_CONTAINER}/{SAS_PREFIX}/wal/mutations/0001.json?{DIRECTORY_SAS} HTTP/1.1"
+                ),
+            ]
+        );
+    }
+
+    /// A blob that is already gone is deleted: a re-issued delete, or a sweep run twice, converges.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delete_under_a_sas_of_a_missing_blob_succeeds() {
+        let endpoint = RecordingEndpoint::answering("404 Not Found", "<Error/>");
+        sas_provider(&endpoint)
+            .delete("data/gone.parquet")
+            .await
+            .expect("a missing blob counts as deleted");
+        assert_eq!(endpoint.requests().len(), 1);
+    }
+
+    /// A refused delete is `PermissionDenied`, at once and not re-issued, and says what the
+    /// service said without showing the SAS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_delete_under_a_sas_is_permission_denied_and_hides_the_sas() {
+        let endpoint = RecordingEndpoint::answering("403 Forbidden", REFUSAL_BODY);
+        let provider = sas_provider(&endpoint);
+        let err = provider
+            .delete("data/seg.parquet")
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(&err, StorageError::PermissionDenied { uri } if uri == "data/seg.parquet")
+        );
+        assert_eq!(endpoint.requests().len(), 1);
+
+        let path = provider.path("data/seg.parquet").expect("path");
+        let per_blob = provider
+            .sas_delete
+            .as_ref()
+            .expect("a SAS provider deletes per blob");
+        let raw = per_blob.delete(&path).await.expect_err("refused");
+        let shown = format!("{raw} {raw:?} {per_blob:?}");
+        assert!(shown.contains("Signed Directory Depth Invalid"), "{shown}");
+        assert!(!shown.contains(SAS_SIGNATURE), "{shown}");
+    }
+
+    /// A fault of the service's own is transient, as the store's is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_fault_on_a_delete_under_a_sas_is_transient() {
+        let endpoint = RecordingEndpoint::answering("503 Service Unavailable", "<Error/>");
+        let provider = sas_provider(&endpoint);
+        let err = provider
+            .delete_once("data/seg.parquet")
+            .await
+            .expect_err("unavailable");
+        assert!(matches!(err, StorageError::TransientExhausted { .. }));
+    }
+
+    /// Credentials that are not a SAS sign a batch, so those deletes stay with the store.
+    #[test]
+    fn only_a_sas_deletes_per_blob() {
+        let key = StorageOptions::from([
+            ("azure_storage_account_name".to_string(), "acct".to_string()),
+            ("azure_storage_account_key".to_string(), "a2V5".to_string()),
+        ]);
+        let provider = AzureStorageProvider::new_with_prefix("c", "p", &key).expect("build");
+        assert!(provider.sas_delete.is_none());
+        assert!(test_provider().sas_delete.is_none());
+
+        let sas = StorageOptions::from([
+            ("azure_storage_account_name".to_string(), "acct".to_string()),
+            (
+                "azure_storage_sas_key".to_string(),
+                format!("?{DIRECTORY_SAS}"),
+            ),
+        ]);
+        let provider = AzureStorageProvider::new_with_prefix("c", "p", &sas).expect("build");
+        let per_blob = provider
+            .sas_delete
+            .as_ref()
+            .expect("a SAS deletes per blob");
+        let path = provider.path("a b/ü.parquet").expect("path");
+        assert_eq!(
+            per_blob.blob_url(&path),
+            format!("https://acct.blob.core.windows.net/c/p/a%20b/%C3%BC.parquet?{DIRECTORY_SAS}")
+        );
     }
 
     // ---- stalled reads, through the real client ---------------------------
