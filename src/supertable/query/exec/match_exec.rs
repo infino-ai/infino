@@ -1123,6 +1123,10 @@ mod tests {
     const COLUMN_PATH_LEAST_CPU_SHARE: u64 = 2;
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "per-thread CPU clock is Linux procfs (schedstat); off Linux kernel_cpu_ns is always 0"
+    )]
     fn a_streamed_match_bills_its_cpu_as_the_hit_path_does() {
         // A token no row holds, repeated until the match's own work dominates.
         //  - on the hit path the match runs inside the plan's metered polls.
