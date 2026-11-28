@@ -435,9 +435,11 @@ impl FetchedRun {
 struct FlushPass<'a>(&'a BlockCachedSource);
 
 impl<'a> FlushPass<'a> {
-    /// Takes `source`'s `flushing`, or `None` if another pass holds it.
+    /// Takes `source`'s `flushing`, or `None` if another pass holds it. The
+    /// guard is built only once the flag is taken: dropping one would clear a
+    /// flag the running pass holds.
     fn start(source: &'a BlockCachedSource) -> Option<Self> {
-        (!source.flushing.swap(true, Ordering::SeqCst)).then_some(Self(source))
+        (!source.flushing.swap(true, Ordering::SeqCst)).then(|| Self(source))
     }
 }
 
@@ -450,13 +452,12 @@ impl Drop for FlushPass<'_> {
     }
 }
 
-/// What a test makes the next fsync do instead of syncing.
+/// What a test makes the next fsync do.
 #[cfg(test)]
-#[derive(Clone, Copy)]
 enum FsyncFault {
-    /// Report a failure.
+    /// Sync, then report a failure.
     Fail,
-    /// Panic.
+    /// Panic before syncing.
     Panic,
 }
 
@@ -2151,7 +2152,7 @@ impl BlockCachedSource {
         self.write_stall.hold()
     }
 
-    /// Makes the next fsync of this source's block file `fault` instead of syncing.
+    /// Makes the next fsync of this source's block file `fault`.
     #[cfg(test)]
     fn fault_next_fsync(&self, fault: FsyncFault) {
         *self.next_fsync_fault.lock().expect("fsync fault poisoned") = Some(fault);
@@ -5290,6 +5291,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_flush_that_finds_one_running_leaves_its_flag_set() {
+        // Pass 1 waits in its fsync, holding `flushing`. Block 1 lands, and a
+        // second caller flushes.
+        //  - the second caller finds pass 1 running and returns.
+        //  - it must leave `flushing` set: clearing it would let a third pass
+        //    run beside pass 1.
+        // This test pins that a pass that is not started changes no flag.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
+
+        let in_fsync = src.fsync_stall.hold();
+        src.prefetch(0, b, b, 1).await.expect("prefetch block 0");
+        wait_until(|| in_fsync.waiting() == 1, "pass 1's fsync").await;
+        src.prefetch(b, b, b, 1).await.expect("prefetch block 1");
+
+        src.flush_index();
+        assert!(
+            src.flushing.load(Ordering::SeqCst),
+            "pass 1 still holds `flushing`"
+        );
+        drop(in_fsync);
+        store.block_writes_settled().await;
+        assert_indexed(&src.path, &src.idx_path(), 2 * b, 0..2);
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    #[tokio::test]
     async fn a_flush_runs_again_after_one_panics() {
         // Block 0's flush panics in its fsync.
         //  - the panic must not leave the file marked as flushing.
@@ -5419,7 +5449,9 @@ mod tests {
 
         src.mark_filled(2 * b, 1, 1);
         store.remove_block_entry_for_test(&uri);
+        let source = Arc::downgrade(&src);
         drop(src);
+        assert!(source.upgrade().is_none(), "premise: the source dropped");
         assert_indexed(&path, &idx, 2 * b, 0..1);
     }
 
