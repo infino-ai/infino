@@ -87,7 +87,9 @@
 //! - The index on disk lists only blocks that were fsynced, so a crash loses at
 //!   most the blocks not synced yet, and later reads fetch them again. A write
 //!   doesn't wait for its fsync: the file's flush waits for a block writer of
-//!   its own, and every run that lands before it starts shares it.
+//!   its own, and every run that lands before it starts shares it. After a
+//!   failed fsync the source stops writing the file's index; the next open
+//!   fetches what the index misses.
 //! - Each store runs at most [`BLOCK_WRITERS`] writes at once, so a slow disk
 //!   can't take the blocking threads a query needs.
 //! - Each store holds up to [`WRITE_BEHIND_CAP_BYTES`] of fetched runs not
@@ -126,6 +128,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -288,8 +291,10 @@ pub(crate) struct BlockCachedSource {
     /// Filled bytes a record counts instead of this source ([`Self::retire`]); the source gives
     /// back only what it filled beyond them.
     handed_over: AtomicU64,
-    /// Set once a record keeps this source's file ([`Self::retire`]): the source no longer writes
-    /// the file's index, which a newer source may have adopted and rewritten.
+    /// Set once the source stops writing the file's index, when:
+    /// - a record keeps the file ([`Self::retire`]), and a newer source may have adopted and
+    ///   rewritten the index;
+    /// - an fsync of the file failed (see [`Self::flush_index`]).
     retired: AtomicBool,
     /// Where this file's FTS hole and aligned region lie.
     layout: SourceLayout,
@@ -322,8 +327,8 @@ pub(crate) struct BlockCachedSource {
     runs: Mutex<BTreeMap<u32, MemoryRun>>,
     /// Source of [`MemoryRun::id`].
     next_run_id: AtomicU64,
-    /// Set when blocks are marked filled after the last index write. A failed
-    /// fsync sets it again, so the next flush retries.
+    /// Set when blocks are marked filled after the last index write, or when a
+    /// flush pass panics before indexing them.
     dirty: AtomicBool,
     /// Set while an index flush runs; see [`Self::flush_index`].
     flushing: AtomicBool,
@@ -344,6 +349,12 @@ pub(crate) struct BlockCachedSource {
     /// Tests hold a flush here, in its fsync.
     #[cfg(test)]
     fsync_stall: Stall,
+    /// Tests set this to fault the next fsync; see [`Self::fault_next_fsync`].
+    #[cfg(test)]
+    next_fsync_fault: Mutex<Option<FsyncFault>>,
+    /// Tests hold a flush pass here, before it takes `flushing`.
+    #[cfg(test)]
+    pass_stall: Stall,
     /// Tests set this to run once [`Self::block_file`] has created a fresh file,
     /// given its inode, before the index at the path is removed again.
     #[cfg(test)]
@@ -416,6 +427,38 @@ impl FetchedRun {
         self.landed = true;
         true
     }
+}
+
+/// An index flush pass in progress: takes its source's `flushing` ([`Self::start`]) and clears it
+/// when dropped, however the pass ends. A pass that panicked sets `dirty` again first, so the next
+/// flush covers its blocks.
+struct FlushPass<'a>(&'a BlockCachedSource);
+
+impl<'a> FlushPass<'a> {
+    /// Takes `source`'s `flushing`, or `None` if another pass holds it. The
+    /// guard is built only once the flag is taken: dropping one would clear a
+    /// flag the running pass holds.
+    fn start(source: &'a BlockCachedSource) -> Option<Self> {
+        (!source.flushing.swap(true, Ordering::SeqCst)).then(|| Self(source))
+    }
+}
+
+impl Drop for FlushPass<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.0.dirty.store(true, Ordering::SeqCst);
+        }
+        self.0.flushing.store(false, Ordering::SeqCst);
+    }
+}
+
+/// What a test makes the next fsync do.
+#[cfg(test)]
+enum FsyncFault {
+    /// Sync, then report a failure.
+    Fail,
+    /// Panic before syncing.
+    Panic,
 }
 
 /// A queued index flush. Counted in its source's `pending_flushes` until it
@@ -832,6 +875,10 @@ impl BlockCachedSource {
             queued_flush_stall: Stall::default(),
             #[cfg(test)]
             fsync_stall: Stall::default(),
+            #[cfg(test)]
+            next_fsync_fault: Mutex::new(None),
+            #[cfg(test)]
+            pass_stall: Stall::default(),
             #[cfg(test)]
             created_hook: Mutex::new(None),
         })
@@ -1459,7 +1506,6 @@ impl BlockCachedSource {
     /// - The flush waits for a block writer of its own, like a write.
     /// - Runs of the file that land before it starts share it. Runs that land
     ///   while it runs are picked up by its next pass.
-    /// - It holds the source until done, so `Drop` never fsyncs on a query thread.
     fn queue_flush(self: &Arc<Self>, store: &Arc<DiskCacheStore>) {
         // No new blocks, or a queued or running flush will pick them up.
         if !self.dirty.load(Ordering::SeqCst)
@@ -1479,29 +1525,31 @@ impl BlockCachedSource {
 
     /// Fsyncs the block file, then writes the index of the blocks marked filled.
     /// Blocking: runs once a queued flush has its block writer (see
-    /// [`Self::queue_flush`]), or in `Drop`.
+    /// [`Self::queue_flush`]).
     /// - One flush runs per source. A call that finds one running returns at
     ///   once; the running one covers its blocks.
     /// - If blocks were marked during the fsync, the running flush goes again.
-    /// - A failed fsync leaves the blocks for the next flush, or for Drop.
+    /// - A failed fsync stops this source indexing the file; a later open
+    ///   fetches the blocks the last index misses.
+    /// - A pass that panics leaves its blocks for the next flush.
     fn flush_index(&self) {
         let Some(bf) = self.created_block_file() else {
             return;
         };
-        if self.retired.load(Ordering::Acquire) {
-            return;
-        }
 
         while self.dirty.load(Ordering::SeqCst) {
-            if self.flushing.swap(true, Ordering::SeqCst) {
+            #[cfg(test)]
+            self.pass_stall.wait_while_held();
+            let Some(_pass) = FlushPass::start(self) else {
                 return;
-            }
+            };
 
-            // The file was evicted, erased or replaced at its path: its blocks can
-            // never be indexed, so nothing is left to flush.
-            if !self.path_names(bf) {
+            // Nothing is left to flush if the source stopped indexing the file,
+            // or the file was evicted, erased or replaced at its path. `retired`
+            // is read only now, holding `flushing`: a pass that waited here
+            // while another's fsync failed must see it.
+            if self.retired.load(Ordering::Acquire) || !self.path_names(bf) {
                 self.dirty.store(false, Ordering::SeqCst);
-                self.flushing.store(false, Ordering::SeqCst);
                 return;
             }
 
@@ -1511,23 +1559,30 @@ impl BlockCachedSource {
             let snapshot = self.snapshot_index(bf);
             #[cfg(test)]
             self.fsync_stall.wait_while_held();
+            #[cfg(test)]
+            let fault = self
+                .next_fsync_fault
+                .lock()
+                .expect("fsync fault poisoned")
+                .take();
+            #[cfg(test)]
+            if matches!(fault, Some(FsyncFault::Panic)) {
+                panic!("a test made this fsync panic");
+            }
             let synced = bf.file.sync_data().is_ok();
+            #[cfg(test)]
+            let synced = synced && !matches!(fault, Some(FsyncFault::Fail));
             #[cfg(test)]
             self.syncs.fetch_add(1, Ordering::AcqRel);
 
-            if synced {
-                self.persist_idx(bf, &snapshot);
-            } else {
-                // Keep the flag set so the next flush retries, instead of looping
-                // on a failing disk.
-                self.dirty.store(true, Ordering::SeqCst);
-            }
-
-            self.flushing.store(false, Ordering::SeqCst);
-
             if !synced {
+                // Stop indexing the file: a retried fsync can succeed although
+                // the failed writes never reached the disk, and its index would
+                // name them.
+                self.retired.store(true, Ordering::Release);
                 return;
             }
+            self.persist_idx(bf, &snapshot);
         }
     }
 
@@ -2097,6 +2152,12 @@ impl BlockCachedSource {
         self.write_stall.hold()
     }
 
+    /// Makes the next fsync of this source's block file `fault`.
+    #[cfg(test)]
+    fn fault_next_fsync(&self, fault: FsyncFault) {
+        *self.next_fsync_fault.lock().expect("fsync fault poisoned") = Some(fault);
+    }
+
     /// Holds this source's queued flushes, once they have their block writer,
     /// until the guard drops.
     #[cfg(test)]
@@ -2332,9 +2393,6 @@ pub(super) fn indexed_filled_bytes(
 
 impl Drop for BlockCachedSource {
     fn drop(&mut self) {
-        // Every queued write and flush holds the source, so none runs now. This
-        // only retries a failed fsync.
-        self.flush_index();
         // Release accounted bytes only; the file and index persist for adoption.
         if self.owns_accounting
             && let Some(store) = self.store.upgrade()
@@ -3125,40 +3183,6 @@ mod tests {
             d_read, want,
             "D must serve real bytes, not zeros from a successor inode's hole \
              claimed by a dropped generation's stale bitmap"
-        );
-    }
-
-    /// A source whose file a record took over, still owing an index write (an earlier fsync
-    /// failed), dropped after a newer source adopted the file and wrote its own index.
-    /// This test pins that a retired source leaves the newer index in place.
-    #[tokio::test]
-    async fn a_retired_source_leaves_the_index_alone_when_it_drops() {
-        const OBJ: usize = 4 * CACHE_BLOCK_BYTES as usize + 1000;
-        let dir = tempdir().expect("tempdir");
-        let store = test_store(dir.path(), u64::MAX);
-        let uri = SuperfileUri::new_v4();
-        let inner = Arc::new(CountingSource::new(OBJ));
-        let old = BlockCachedSource::new(
-            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
-            Arc::downgrade(&store),
-            uri,
-            dir.path().join("retired.blocks"),
-        );
-        store.install_block_entry_for_test(uri, Arc::clone(&old));
-        let _ = old.range(100, 50).await.expect("fill");
-        store.block_writes_settled().await;
-        let idx_path = old.idx_path();
-        wait_until(|| idx_path.exists(), "the index is written").await;
-        store.remove_block_entry_for_test(&uri);
-
-        let _ = old.retire(old.filled_bytes_handle().load(Ordering::Acquire));
-        fs::write(&idx_path, b"newer").expect("a newer source's index");
-        old.dirty.store(true, Ordering::SeqCst);
-        drop(old);
-        assert_eq!(
-            fs::read(&idx_path).expect("index"),
-            b"newer",
-            "left in place"
         );
     }
 
@@ -5201,6 +5225,124 @@ mod tests {
         store.remove_block_entry_for_test(&uri);
     }
 
+    #[tokio::test]
+    async fn a_failed_fsync_stops_the_file_being_indexed() {
+        // Block 0's fsync fails, then block 1 lands.
+        //  - a retried fsync can succeed although block 0's writes never
+        //    reached the disk.
+        //  - so block 1's flush must not write an index, which would name block 0.
+        // This test pins that a failed fsync stops the file being indexed.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
+
+        src.fault_next_fsync(FsyncFault::Fail);
+        src.prefetch(0, b, b, 1).await.expect("prefetch block 0");
+        store.block_writes_settled().await;
+        src.prefetch(b, b, b, 1).await.expect("prefetch block 1");
+        store.block_writes_settled().await;
+
+        assert!(!src.idx_path().exists(), "no index written");
+        assert_eq!(
+            src.syncs.load(Ordering::Acquire),
+            1,
+            "no fsync after it failed"
+        );
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    #[tokio::test]
+    async fn a_pass_waiting_while_another_fsync_fails_writes_no_index() {
+        // Pass 1 is in its fsync, which will fail. Block 1 lands meanwhile, and
+        // pass 2 stops just before it takes `flushing`.
+        //  - pass 1's failed fsync stops the source indexing the file.
+        //  - pass 2 then runs alone, and must not write an index naming block 0.
+        // This test pins that a pass checks `retired` once it runs alone.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
+
+        src.fault_next_fsync(FsyncFault::Fail);
+        let in_fsync = src.fsync_stall.hold();
+        src.prefetch(0, b, b, 1).await.expect("prefetch block 0");
+        wait_until(|| in_fsync.waiting() == 1, "pass 1's fsync").await;
+        src.prefetch(b, b, b, 1).await.expect("prefetch block 1");
+
+        let before_swap = src.pass_stall.hold();
+        let pass_two = thread::spawn({
+            let src = Arc::clone(&src);
+            move || src.flush_index()
+        });
+        wait_until(|| before_swap.waiting() == 1, "pass 2").await;
+        drop(in_fsync);
+        store.block_writes_settled().await;
+        drop(before_swap);
+        pass_two.join().expect("pass 2");
+
+        assert!(!src.idx_path().exists(), "no index names block 0");
+        assert_eq!(
+            src.syncs.load(Ordering::Acquire),
+            1,
+            "pass 2 does not fsync"
+        );
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    #[tokio::test]
+    async fn a_flush_that_finds_one_running_leaves_its_flag_set() {
+        // Pass 1 waits in its fsync, holding `flushing`. Block 1 lands, and a
+        // second caller flushes.
+        //  - the second caller finds pass 1 running and returns.
+        //  - it must leave `flushing` set: clearing it would let a third pass
+        //    run beside pass 1.
+        // This test pins that a pass that is not started changes no flag.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
+
+        let in_fsync = src.fsync_stall.hold();
+        src.prefetch(0, b, b, 1).await.expect("prefetch block 0");
+        wait_until(|| in_fsync.waiting() == 1, "pass 1's fsync").await;
+        src.prefetch(b, b, b, 1).await.expect("prefetch block 1");
+
+        src.flush_index();
+        assert!(
+            src.flushing.load(Ordering::SeqCst),
+            "pass 1 still holds `flushing`"
+        );
+        drop(in_fsync);
+        store.block_writes_settled().await;
+        assert_indexed(&src.path, &src.idx_path(), 2 * b, 0..2);
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    #[tokio::test]
+    async fn a_flush_runs_again_after_one_panics() {
+        // Block 0's flush panics in its fsync.
+        //  - the panic must not leave the file marked as flushing.
+        //  - the next flush still indexes block 0.
+        // This test pins the flush pass guard.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
+
+        src.fault_next_fsync(FsyncFault::Panic);
+        src.prefetch(0, b, b, 1).await.expect("prefetch");
+        store.block_writes_settled().await;
+        assert!(
+            !src.idx_path().exists(),
+            "the panicked flush wrote no index"
+        );
+
+        src.flush_index();
+        assert_indexed(&src.path, &src.idx_path(), 2 * b, 0..1);
+        store.remove_block_entry_for_test(&uri);
+    }
+
     /// Asserts the index at `idx` names exactly `blocks` of the block file at `path`.
     fn assert_indexed(path: &Path, idx: &Path, size: u64, blocks: Range<u32>) {
         let idx = fs::read(idx).expect("index written by the flush");
@@ -5264,9 +5406,9 @@ mod tests {
     #[tokio::test]
     async fn a_source_let_go_while_its_flush_waits_flushes_on_a_writer() {
         // The cache lets the source go while its flush waits for a writer.
-        //  - the queued flush keeps it alive, so nothing fsyncs on this thread.
+        //  - the queued flush keeps it alive, so block 0 is still indexed.
         //  - the flush then runs on a writer, indexes block 0, and lets it go.
-        // This test pins where the fsync runs.
+        // This test pins that a queued flush outlives the cache's hold.
         let b = CACHE_BLOCK_BYTES;
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
@@ -5282,12 +5424,35 @@ mod tests {
             source.upgrade().is_some(),
             "the queued flush keeps the source"
         );
-        assert!(!idx.exists(), "no fsync and index on the caller's thread");
+        assert!(!idx.exists(), "not indexed before the flush runs");
 
         drop(writers);
         store.block_writes_settled().await;
         assert_indexed(&path, &idx, 2 * b, 0..1);
         assert!(source.upgrade().is_none(), "the flush lets the source go");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_source_writes_no_index() {
+        // Block 0 is indexed; block 1 is then marked filled with no flush
+        // queued, and the source is dropped.
+        //  - dropping a source runs no flush: the index still names block 0 only.
+        // This test pins that `Drop` does no index I/O on the dropping thread.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
+        src.prefetch(0, b, b, 1).await.expect("prefetch block 0");
+        store.block_writes_settled().await;
+        let (idx, path) = (src.idx_path(), src.path.clone());
+        assert_indexed(&path, &idx, 2 * b, 0..1);
+
+        src.mark_filled(2 * b, 1, 1);
+        store.remove_block_entry_for_test(&uri);
+        let source = Arc::downgrade(&src);
+        drop(src);
+        assert!(source.upgrade().is_none(), "premise: the source dropped");
+        assert_indexed(&path, &idx, 2 * b, 0..1);
     }
 
     /// A run that is never written, like one a shutting-down runtime drops,

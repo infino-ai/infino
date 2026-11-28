@@ -679,8 +679,8 @@ impl DiskCacheStore {
                 }
 
                 let replaced = mem::replace(occupied.get_mut(), Arc::clone(&entry));
-                // Leave the shard lock before `replaced` drops: its last reference may fsync a
-                // block index or munmap, and every URI in the shard would wait on that.
+                // Leave the shard lock before `replaced` drops: its last reference may munmap,
+                // and every URI in the shard would wait on that.
                 drop(occupied);
                 self.release_entry_accounting(&replaced);
                 entry

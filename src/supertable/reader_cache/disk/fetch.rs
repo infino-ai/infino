@@ -256,8 +256,8 @@ impl DiskCacheStore {
                 let held = own_reservation + occupied.get().whole_file_charge();
                 if held >= charge || self.try_reserve_without_evicting(charge - held) {
                     let replaced = mem::replace(occupied.get_mut(), Arc::clone(&entry));
-                    // Leave the lock before the old entry drops: its last reference may fsync a
-                    // block index.
+                    // Leave the lock before the old entry drops: its last reference may munmap
+                    // its block file.
                     drop(occupied);
                     drop(replaced);
                     (true, held.saturating_sub(charge))
