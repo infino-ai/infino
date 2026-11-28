@@ -8,12 +8,12 @@
 //! `sources` (mmap).
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fmt, fs,
     path::{Path, PathBuf},
     process,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -25,6 +25,8 @@ use memmap2::Mmap;
 use thiserror::Error;
 use tokio::sync::{Notify, OnceCell, Semaphore};
 
+#[cfg(test)]
+use crate::supertable::reader_cache::disk::test_support::Stall;
 use crate::{
     storage::{StorageError, StorageProvider},
     superfile::reader::SuperfileReader,
@@ -64,10 +66,32 @@ pub(super) const WRITE_BEHIND_CAP_BYTES: u64 = 256 * 1024 * 1024;
 /// rest is left for reads' own downloads.
 pub(super) const AHEAD_WRITE_BEHIND_PERCENT: u64 = 50;
 
-/// Block-file writes a store runs at once. Each one holds a thread of the blocking pool, which a
-/// query also needs to hand off its worker in `block_in_place`; more writers would not write faster
-/// anyway, since they wait on the same disk.
+/// Writers a store runs at once, for block-file writes and index flushes. Each one holds a thread
+/// of the blocking pool, which a query also needs to hand off its worker in `block_in_place`; more
+/// writers would not write faster anyway, since they wait on the same disk.
 pub(super) const BLOCK_WRITERS: usize = 4;
+
+/// A queued block-file write or index flush.
+pub(crate) type BlockWrite = Box<dyn FnOnce() + Send>;
+
+/// What a queued [`BlockWrite`] does: land a run, or fsync a file and save its index.
+#[derive(Clone, Copy)]
+pub(crate) enum BlockJob {
+    Write,
+    Flush,
+}
+
+/// A store's queued block-file writes and index flushes, and how many writers run them. Writers
+/// run on the query runtime's blocking pool, not on its workers, which a scan keeps busy for
+/// seconds while the disk idles.
+#[derive(Default)]
+struct BlockWriteQueue {
+    writes: VecDeque<BlockWrite>,
+    flushes: VecDeque<BlockWrite>,
+    writers: usize,
+    /// Writers running a flush.
+    running_flushes: usize,
+}
 
 /// Filename suffix for per-superfile sparse block-cache files.
 const BLOCKS_FILE_SUFFIX: &str = ".blocks";
@@ -454,8 +478,12 @@ pub struct DiskCacheStore {
     /// Room reserved by downloads ahead of reads that are still downloading; see
     /// [`Self::try_reserve_ahead`].
     ahead_bytes: AtomicU64,
-    /// [`BLOCK_WRITERS`] slots; a fetched run waits for one before its write takes a thread.
-    block_writers: Arc<Semaphore>,
+    /// Block-file writes and index flushes not started yet, run by at most [`BLOCK_WRITERS`]
+    /// writers.
+    block_write_queue: Mutex<BlockWriteQueue>,
+    /// Where a test holds writers on their way out; see [`Self::stall_writer_exits`].
+    #[cfg(test)]
+    writer_exit_stall: Stall,
     /// Queued block-file writes not finished yet (index write included), and a wake-up when it
     /// reaches zero; see [`Self::block_writes_settled`].
     #[cfg(test)]
@@ -616,7 +644,9 @@ impl DiskCacheStore {
             current_bytes: AtomicU64::new(0),
             write_behind_bytes: AtomicU64::new(0),
             ahead_bytes: AtomicU64::new(0),
-            block_writers: Arc::new(Semaphore::new(BLOCK_WRITERS)),
+            block_write_queue: Mutex::default(),
+            #[cfg(test)]
+            writer_exit_stall: Stall::default(),
             #[cfg(test)]
             block_writes: AtomicUsize::new(0),
             #[cfg(test)]
@@ -857,7 +887,7 @@ pub(crate) mod test_support {
         ops::Range,
         os::unix::fs::MetadataExt,
         sync::{
-            Arc, Mutex, OnceLock,
+            Arc, Condvar, Mutex, OnceLock, PoisonError,
             atomic::{AtomicBool, AtomicU64, Ordering},
         },
         time::{Duration, Instant},
@@ -1100,8 +1130,84 @@ pub(crate) mod test_support {
         permit
     }
 
+    /// A point where a test holds threads until the guard drops.
+    #[derive(Default)]
+    pub(crate) struct Stall {
+        state: Mutex<StallState>,
+        resume: Condvar,
+    }
+
+    /// Whether a [`Stall`] holds, and how many wait there.
+    #[derive(Default)]
+    struct StallState {
+        on: bool,
+        waiting: usize,
+    }
+
+    impl Stall {
+        /// Holds whatever reaches the stall until the guard drops.
+        pub(crate) fn hold(&self) -> StallGuard<'_> {
+            self.state.lock().expect("stall poisoned").on = true;
+            StallGuard(self)
+        }
+
+        /// Blocks while the stall is held.
+        pub(crate) fn wait_while_held(&self) {
+            let mut state = self.state.lock().expect("stall poisoned");
+            state.waiting += 1;
+            while state.on {
+                state = self.resume.wait(state).expect("stall poisoned");
+            }
+            state.waiting -= 1;
+        }
+    }
+
+    /// Lets a [`Stall`] go on drop, even when an assert fails, so a failing test can't hang.
+    pub(crate) struct StallGuard<'a>(&'a Stall);
+
+    impl StallGuard<'_> {
+        /// How many wait at the stall now.
+        pub(crate) fn waiting(&self) -> usize {
+            self.0.state.lock().expect("stall poisoned").waiting
+        }
+    }
+
+    impl Drop for StallGuard<'_> {
+        fn drop(&mut self) {
+            self.0.state.lock().expect("stall poisoned").on = false;
+            self.0.resume.notify_all();
+        }
+    }
+
     /// How long [`wait_until`] waits before it fails.
     pub(crate) const WAIT_UNTIL_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Blocks every thread that runs one of its waiters until the gate drops.
+    pub(crate) struct Gate(Arc<(Mutex<bool>, Condvar)>);
+
+    impl Gate {
+        pub(crate) fn new() -> Self {
+            Self(Arc::new((Mutex::new(false), Condvar::new())))
+        }
+
+        /// Returns a closure that blocks its caller until the gate drops.
+        pub(crate) fn waiter(&self) -> impl FnOnce() + Send + 'static {
+            let gate = Arc::clone(&self.0);
+            move || {
+                let (open, wake) = &*gate;
+                let open = open.lock().unwrap_or_else(PoisonError::into_inner);
+                drop(wake.wait_while(open, |open| !*open));
+            }
+        }
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            let (open, wake) = &*self.0;
+            *open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            wake.notify_all();
+        }
+    }
 
     /// How often [`wait_until`] checks its condition.
     pub(crate) const WAIT_UNTIL_POLL: Duration = Duration::from_millis(1);
