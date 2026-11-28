@@ -327,7 +327,8 @@ pub(crate) struct BlockCachedSource {
     runs: Mutex<BTreeMap<u32, MemoryRun>>,
     /// Source of [`MemoryRun::id`].
     next_run_id: AtomicU64,
-    /// Set when blocks are marked filled after the last index write.
+    /// Set when blocks are marked filled after the last index write, or when a
+    /// flush pass panics before indexing them.
     dirty: AtomicBool,
     /// Set while an index flush runs; see [`Self::flush_index`].
     flushing: AtomicBool,
@@ -348,15 +349,12 @@ pub(crate) struct BlockCachedSource {
     /// Tests hold a flush here, in its fsync.
     #[cfg(test)]
     fsync_stall: Stall,
-    /// Tests set this to fail the next fsync.
+    /// Tests set this to fault the next fsync; see [`Self::fault_next_fsync`].
     #[cfg(test)]
-    fail_next_fsync: AtomicBool,
+    next_fsync_fault: Mutex<Option<FsyncFault>>,
     /// Tests hold a flush pass here, before it takes `flushing`.
     #[cfg(test)]
     pass_stall: Stall,
-    /// Tests set this to panic in the next fsync.
-    #[cfg(test)]
-    panic_next_fsync: AtomicBool,
     /// Tests set this to run once [`Self::block_file`] has created a fresh file,
     /// given its inode, before the index at the path is removed again.
     #[cfg(test)]
@@ -431,9 +429,17 @@ impl FetchedRun {
     }
 }
 
-/// An index flush pass in progress: holds its source's `flushing` until it drops, however the pass
-/// ends. A pass that panicked sets `dirty` again first, so the next flush covers its blocks.
+/// An index flush pass in progress: takes its source's `flushing` ([`Self::start`]) and clears it
+/// when dropped, however the pass ends. A pass that panicked sets `dirty` again first, so the next
+/// flush covers its blocks.
 struct FlushPass<'a>(&'a BlockCachedSource);
+
+impl<'a> FlushPass<'a> {
+    /// Takes `source`'s `flushing`, or `None` if another pass holds it.
+    fn start(source: &'a BlockCachedSource) -> Option<Self> {
+        (!source.flushing.swap(true, Ordering::SeqCst)).then_some(Self(source))
+    }
+}
 
 impl Drop for FlushPass<'_> {
     fn drop(&mut self) {
@@ -442,6 +448,16 @@ impl Drop for FlushPass<'_> {
         }
         self.0.flushing.store(false, Ordering::SeqCst);
     }
+}
+
+/// What a test makes the next fsync do instead of syncing.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum FsyncFault {
+    /// Report a failure.
+    Fail,
+    /// Panic.
+    Panic,
 }
 
 /// A queued index flush. Counted in its source's `pending_flushes` until it
@@ -859,11 +875,9 @@ impl BlockCachedSource {
             #[cfg(test)]
             fsync_stall: Stall::default(),
             #[cfg(test)]
-            fail_next_fsync: AtomicBool::new(false),
+            next_fsync_fault: Mutex::new(None),
             #[cfg(test)]
             pass_stall: Stall::default(),
-            #[cfg(test)]
-            panic_next_fsync: AtomicBool::new(false),
             #[cfg(test)]
             created_hook: Mutex::new(None),
         })
@@ -1525,10 +1539,9 @@ impl BlockCachedSource {
         while self.dirty.load(Ordering::SeqCst) {
             #[cfg(test)]
             self.pass_stall.wait_while_held();
-            if self.flushing.swap(true, Ordering::SeqCst) {
+            let Some(_pass) = FlushPass::start(self) else {
                 return;
-            }
-            let _pass = FlushPass(self);
+            };
 
             // Nothing is left to flush if the source stopped indexing the file,
             // or the file was evicted, erased or replaced at its path. `retired`
@@ -1546,13 +1559,18 @@ impl BlockCachedSource {
             #[cfg(test)]
             self.fsync_stall.wait_while_held();
             #[cfg(test)]
-            assert!(
-                !self.panic_next_fsync.swap(false, Ordering::SeqCst),
-                "a test made this fsync panic"
-            );
+            let fault = self
+                .next_fsync_fault
+                .lock()
+                .expect("fsync fault poisoned")
+                .take();
+            #[cfg(test)]
+            if matches!(fault, Some(FsyncFault::Panic)) {
+                panic!("a test made this fsync panic");
+            }
             let synced = bf.file.sync_data().is_ok();
             #[cfg(test)]
-            let synced = synced && !self.fail_next_fsync.swap(false, Ordering::SeqCst);
+            let synced = synced && !matches!(fault, Some(FsyncFault::Fail));
             #[cfg(test)]
             self.syncs.fetch_add(1, Ordering::AcqRel);
 
@@ -2131,6 +2149,12 @@ impl BlockCachedSource {
     #[cfg(test)]
     pub(crate) fn stall_writes(&self) -> StallGuard<'_> {
         self.write_stall.hold()
+    }
+
+    /// Makes the next fsync of this source's block file `fault` instead of syncing.
+    #[cfg(test)]
+    fn fault_next_fsync(&self, fault: FsyncFault) {
+        *self.next_fsync_fault.lock().expect("fsync fault poisoned") = Some(fault);
     }
 
     /// Holds this source's queued flushes, once they have their block writer,
@@ -5212,7 +5236,7 @@ mod tests {
         let store = test_store(dir.path(), u64::MAX);
         let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
 
-        src.fail_next_fsync.store(true, Ordering::SeqCst);
+        src.fault_next_fsync(FsyncFault::Fail);
         src.prefetch(0, b, b, 1).await.expect("prefetch block 0");
         store.block_writes_settled().await;
         src.prefetch(b, b, b, 1).await.expect("prefetch block 1");
@@ -5239,7 +5263,7 @@ mod tests {
         let store = test_store(dir.path(), u64::MAX);
         let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
 
-        src.fail_next_fsync.store(true, Ordering::SeqCst);
+        src.fault_next_fsync(FsyncFault::Fail);
         let in_fsync = src.fsync_stall.hold();
         src.prefetch(0, b, b, 1).await.expect("prefetch block 0");
         wait_until(|| in_fsync.waiting() == 1, "pass 1's fsync").await;
@@ -5276,7 +5300,7 @@ mod tests {
         let store = test_store(dir.path(), u64::MAX);
         let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
 
-        src.panic_next_fsync.store(true, Ordering::SeqCst);
+        src.fault_next_fsync(FsyncFault::Panic);
         src.prefetch(0, b, b, 1).await.expect("prefetch");
         store.block_writes_settled().await;
         assert!(
