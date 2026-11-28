@@ -678,6 +678,40 @@ impl Drop for OuterBracketGuard {
     }
 }
 
+/// Bracket one poll with the thread-CPU clock and fold its on-CPU time into
+/// `collector`. The outer-bracket depth is raised while `poll` runs, so the
+/// kernels it drives inline stand down instead of counting the same
+/// nanoseconds again. A plain call with no collector, with no live scope, or
+/// inside another bracket on this thread, which already measures it.
+pub(crate) fn timed_poll<R>(collector: Option<&OpStatsCollector>, poll: impl FnOnce() -> R) -> R {
+    let Some(stats) = collector else {
+        return poll();
+    };
+    if !metering_active() || outer_bracket_active() {
+        return poll();
+    }
+    // Dropped before the fold below, which is this bracket's own and must
+    // not be gated by it.
+    let restore = OuterBracketGuard::enter();
+    let start = cpu::thread_cpu_ns();
+    let out = poll();
+    let delta = cpu::thread_cpu_delta_ns(start);
+    drop(restore);
+    stats.add_kernel_cpu_ns(delta);
+    out
+}
+
+/// [`timed_poll`] for each poll of `work`. For work a query moves onto a task
+/// of its own, outside every `MeteredExec` poll, whose CPU would otherwise
+/// bill nothing.
+pub(crate) async fn timed_future<F: Future>(
+    collector: Option<Arc<OpStatsCollector>>,
+    work: F,
+) -> F::Output {
+    let mut work = pin!(work);
+    poll_fn(|cx| timed_poll(collector.as_deref(), || work.as_mut().poll(cx))).await
+}
+
 /// Bracket one synchronous section with the thread-CPU clock, gated on
 /// [`metering_active`] so an unmetered process pays one relaxed load and
 /// no procfs reads. For the superfile layers, which have no collector —
@@ -754,7 +788,11 @@ impl Drop for InstalledForPoll<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::{
+        hint::black_box,
+        panic::{AssertUnwindSafe, catch_unwind},
+        time::Duration,
+    };
 
     use futures::FutureExt;
     use tokio::{runtime::Builder, task::yield_now};
@@ -896,6 +934,44 @@ mod tests {
             .block_on(runtime.spawn(async { current() }))
             .expect("a later task");
         assert!(after.is_none(), "the worker's own collector is back");
+    }
+
+    /// On-CPU time the timed-future test's poll spins for.
+    const TIMED_POLL_CPU: Duration = Duration::from_millis(1);
+
+    /// Spin until this thread has accrued [`TIMED_POLL_CPU`] of on-CPU time.
+    /// Needs the thread clock, which the caller checks.
+    fn spin_cpu() {
+        let start = cpu::thread_cpu_ns().expect("thread clock");
+        let mut acc = 0u64;
+        while cpu::thread_cpu_ns().expect("thread clock") - start < TIMED_POLL_CPU.as_nanos() {
+            acc = black_box(acc.wrapping_add(1));
+        }
+    }
+
+    #[test]
+    fn a_timed_future_bills_its_polls_once() {
+        // A future that spins on its own polls, as a match's producer task
+        // does outside every plan poll.
+        //  - timed, its polls bill the collector.
+        //  - inside another bracket on the thread, that bracket bills them.
+        if cpu::thread_cpu_ns().is_none() {
+            return;
+        }
+        let (_, stats) = with_op_stats(|| {
+            let collector = current();
+            timed_future(collector, async { spin_cpu() }).now_or_never();
+        });
+        assert!(stats.kernel_cpu_ns > 0, "the future's polls are billed");
+        let (_, stats) = with_op_stats(|| {
+            let collector = current();
+            let _outer = OuterBracketGuard::enter();
+            timed_future(collector, async { spin_cpu() }).now_or_never();
+        });
+        assert_eq!(
+            stats.kernel_cpu_ns, 0,
+            "the enclosing bracket is the one that reports this thread's CPU"
+        );
     }
 
     #[test]

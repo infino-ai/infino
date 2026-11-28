@@ -47,12 +47,13 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
         execution_plan::{Boundedness, EmissionType},
-        stream::RecordBatchStreamAdapter,
+        stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter},
     },
 };
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, TryFutureExt, stream};
 
 use crate::{
+    runtime_metrics::op_stats::{attached_to_future, current as current_op_stats, timed_future},
     superfile::fts::reader::BoolMode,
     supertable::{
         error::QueryError,
@@ -71,6 +72,12 @@ use crate::{
     },
     utils::trace::detail_span,
 };
+
+/// Batches that finished superfiles can leave in a match's channel before the
+/// next one has to wait for the consumer. Kept small: the superfiles in flight
+/// already keep the consumer busy, so this only smooths their uneven finish
+/// times.
+const MATCH_BATCHES_AHEAD: usize = 2;
 
 /// SQL name for the unranked token-match TVF.
 pub(crate) const TOKEN_MATCH_UDTF: &str = "token_match";
@@ -567,11 +574,16 @@ impl ExecutionPlan for MatchExec {
         };
 
         // Scalar columns only, neither `_id` nor the score: each
-        // superfile's matching rows come out as their own batch, straight
-        // from the walk to a column take, and the consumer (an aggregate,
-        // a filter) takes them in any order. The projection may name a
-        // column twice; the batches carry each distinct column once and
-        // are laid out to the projection here.
+        // superfile's matching rows come out as their own batch as soon as
+        // that superfile is done, straight from the walk to a column take,
+        // and the consumer (an aggregate, a filter) takes them in any order.
+        // No more of them are alive at once than the fan-out runs, plus
+        // `MATCH_BATCHES_AHEAD` in the channel, plus the one the consumer
+        // holds, however many superfiles match; the decoded-column cache also
+        // keeps copies, within its own budget. Dropping the stream (a
+        // cancelled or failed statement, a `LIMIT` with its rows) aborts the
+        // fan-out. The projection may name a column twice; the batches carry
+        // each distinct column once and are laid out to the projection here.
         if !counts_only
             && !needs_ids
             && !needs_score
@@ -579,48 +591,64 @@ impl ExecutionPlan for MatchExec {
             && let (Some(indices), MatchQuery::Token { query, mode }) =
                 (projection.clone(), query.clone())
         {
-            let columns_schema = Arc::clone(&projected_schema);
-            let fut = async move {
-                let mut names: Vec<&str> = Vec::new();
-                for &p in &indices {
-                    let name = scalar_schema.field(p).name().as_str();
-                    if !names.contains(&name) {
-                        names.push(name);
-                    }
+            let mut names: Vec<String> = Vec::new();
+            for &p in &indices {
+                let name = scalar_schema.field(p).name();
+                if !names.contains(name) {
+                    names.push(name.clone());
                 }
-                let per_file = reader
-                    .token_match_columns_async(&column, &query, mode, &names, &filters)
-                    .await?;
-                let mut out = Vec::with_capacity(per_file.len());
-                for batch in per_file {
-                    let columns: Vec<_> = indices
-                        .iter()
-                        .map(|&p| {
-                            let name = scalar_schema.field(p).name();
-                            let idx = batch
-                                .schema()
-                                .index_of(name)
-                                .map_err(QueryError::internal)?;
-                            Ok::<_, QueryError>(Arc::clone(batch.column(idx)))
-                        })
-                        .collect::<Result<_, _>>()?;
-                    out.push(
-                        RecordBatch::try_new_with_options(
-                            Arc::clone(&columns_schema),
-                            columns,
-                            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-                        )
-                        .map_err(QueryError::internal)?,
-                    );
-                }
-                Ok::<Vec<RecordBatch>, DataFusionError>(out)
-            };
-            let fut = traced_tvf_rows(span, fut, |batches: &Vec<RecordBatch>| {
-                batches.iter().map(RecordBatch::num_rows).sum()
+            }
+            // Never read: `flatten` keeps only the channel's batches, which
+            // carry each distinct column once.
+            let channel_schema = Arc::clone(&projected_schema);
+            // Built on the first poll, inside the runtime that drives the
+            // statement (`execute` itself may run outside one), and under the
+            // statement's stats collector, which the producer's own task then
+            // carries, so the prune still counts the superfiles it weighed and
+            // the match's CPU still bills the statement.
+            let batches = stream::once(async move {
+                let op_stats = current_op_stats();
+                let mut batches =
+                    RecordBatchReceiverStream::builder(channel_schema, MATCH_BATCHES_AHEAD);
+                let out = batches.tx();
+                let produce = async move {
+                    let rows = reader
+                        .token_match_columns_async(&column, &query, mode, names, &filters, out)
+                        .await?;
+                    Ok::<usize, DataFusionError>(rows)
+                };
+                // `rows_out` is recorded when the match runs to the end. A
+                // stream dropped early aborts the producer before that, so
+                // the span then records no count rather than a partial one.
+                let produce = traced_tvf_rows(span, produce, |rows: &usize| *rows);
+                // The task runs outside the `MeteredExec` polls that bill a
+                // statement's CPU, so each of its polls is billed here.
+                let produce = timed_future(op_stats.clone(), produce);
+                batches.spawn(attached_to_future(op_stats, produce).map_ok(|_| ()));
+                batches.build()
+            })
+            .flatten();
+            let laid_out_schema = Arc::clone(&projected_schema);
+            let stream = batches.map(move |batch| {
+                let batch = batch?;
+                let columns: Vec<_> = indices
+                    .iter()
+                    .map(|&p| {
+                        let name = scalar_schema.field(p).name();
+                        let idx = batch
+                            .schema()
+                            .index_of(name)
+                            .map_err(QueryError::internal)?;
+                        Ok::<_, QueryError>(Arc::clone(batch.column(idx)))
+                    })
+                    .collect::<Result<_, _>>()?;
+                RecordBatch::try_new_with_options(
+                    Arc::clone(&laid_out_schema),
+                    columns,
+                    &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+                )
+                .map_err(|e| QueryError::internal(e).into())
             });
-            let stream = stream::once(fut)
-                .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
-                .try_flatten();
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 projected_schema,
                 stream,
@@ -680,7 +708,12 @@ impl ExecutionPlan for MatchExec {
 
 #[cfg(test)]
 mod tests {
-    use std::{fmt, iter::repeat_n, sync::Arc};
+    use std::{
+        fmt,
+        iter::repeat_n,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use arrow::util::display::array_value_to_string;
     use arrow_array::{
@@ -695,12 +728,17 @@ mod tests {
         physical_plan::{DisplayFormatType, ExecutionPlan, collect},
         prelude::{col, lit},
     };
+    use futures::StreamExt;
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
-    use tokio::runtime::Runtime;
+    use tokio::{
+        runtime::Runtime,
+        time::{sleep, timeout},
+    };
 
     use super::{
-        EXACT_MATCH_UDTF, ExactMatchFunc, MatchExec, MatchQuery, OrderHint, TokenMatchFunc,
+        EXACT_MATCH_UDTF, ExactMatchFunc, MATCH_BATCHES_AHEAD, MatchExec, MatchQuery, OrderHint,
+        TokenMatchFunc,
     };
     use crate::{
         Bm25Params, ColumnIndex, Connection, FieldPatch, FtsField, IndexSpec, SchemaPatch, Stemmer,
@@ -712,13 +750,14 @@ mod tests {
             Supertable, SupertableOptions,
             error::QueryError,
             handle::SupertableReader,
-            manifest::SuperfileEntry,
+            manifest::{SUPERFILE_KEY_SUFFIX, SuperfileEntry},
             query::{
                 exec::common::{output_schema_with_score, test_support::sql_row_count},
                 fts::ROW_FILTER_MIN_HITS,
                 match_order::{MAX_OVERLAPPING_FETCH, MatchOrder, ORDERED_WINDOW},
             },
         },
+        test_helpers::slow_storage::SlowStorage,
     };
 
     fn title_schema() -> Arc<Schema> {
@@ -761,6 +800,367 @@ mod tests {
             "rust systems programming", // 2
             "go routines",              // 3
         ])
+    }
+
+    /// Superfiles of the streamed-match fixture: many more than it runs at once.
+    const STREAMED_SUPERFILES: usize = 32;
+    /// Superfiles the streamed-match fixture runs at once.
+    const STREAMED_IN_FLIGHT: usize = 2;
+    /// How long the streamed-match tests leave the fan-out alone: ample for
+    /// one that ignored its consumer to take every superfile's rows.
+    const RUN_AHEAD: Duration = Duration::from_millis(200);
+    /// Most superfiles the match can have taken while its consumer pauses:
+    /// the one the consumer holds, the ones waiting in the channel, and one
+    /// waiting to send per superfile in flight.
+    const STREAMED_MOST_TAKEN: usize = 1 + MATCH_BATCHES_AHEAD + STREAMED_IN_FLIGHT;
+    /// Superfiles of the drop test: more than it runs at once.
+    const DROPPED_SUPERFILES: usize = 4;
+    /// Rows per superfile of the drop test: enough that a superfile's data
+    /// lies past what the manifest carries, so the match reads it.
+    const DROPPED_ROWS_PER_SUPERFILE: usize = 5_000;
+    /// An odd multiplier that scatters consecutive row numbers across the
+    /// 128-bit range, so the drop test's titles compress poorly.
+    const SCATTER: u128 = 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835;
+    /// Longest the drop test waits for a read to start or to be dropped:
+    /// far beyond any scheduling delay.
+    const READ_BOUND: Duration = Duration::from_secs(30);
+    /// How often the drop test checks the reads in flight.
+    const READ_POLL: Duration = Duration::from_millis(5);
+
+    /// A table of [`STREAMED_SUPERFILES`] superfiles of one `rust` row each,
+    /// read [`STREAMED_IN_FLIGHT`] superfiles at a time, and a `MatchExec`
+    /// of `rust` projecting only `title`: the per-superfile column path.
+    fn streamed_match() -> (Supertable, Arc<SupertableReader>, MatchExec) {
+        let options = options_title_fts().with_superfiles_in_flight(STREAMED_IN_FLIGHT);
+        let st = Supertable::create(options).expect("create");
+        for i in 0..STREAMED_SUPERFILES {
+            let mut w = st.writer().expect("writer");
+            w.append(&titles_batch(&[&format!("rust {i}")]))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        let reader = Arc::new(st.reader().expect("reader"));
+        let exec = streamed_exec(&reader);
+        (st, reader, exec)
+    }
+
+    /// A `MatchExec` of `rust` over `reader` projecting only `title`: the
+    /// per-superfile column path.
+    fn streamed_exec(reader: &Arc<SupertableReader>) -> MatchExec {
+        let scalar_schema = reader.manifest().scalar_schema();
+        let output_schema = output_schema_with_score(&scalar_schema);
+        let title = scalar_schema.index_of("title").expect("title column");
+        MatchExec::try_new(
+            Arc::clone(reader),
+            "title".into(),
+            MatchQuery::Token {
+                query: "rust".into(),
+                mode: BoolMode::Or,
+            },
+            scalar_schema,
+            output_schema,
+            Some(vec![title]),
+        )
+        .expect("exec")
+    }
+
+    #[test]
+    fn a_match_takes_only_as_far_ahead_as_its_consumer_reads() {
+        // A consumer reads one batch of a match over 32 superfiles, then waits.
+        //  - each superfile's batch goes out as that superfile finishes.
+        //  - a finished superfile waits to send while the consumer is behind.
+        //  - so only a few superfiles' rows are taken meanwhile, not all 32.
+        // Read to the end, the stream still yields every match.
+        // This test pins that a match's memory follows its fan-out, not its rows.
+        let (_st, reader, exec) = streamed_match();
+        let rt = Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let mut batches = exec
+                .execute(0, Arc::new(TaskContext::default()))
+                .expect("execute");
+            let first = batches.next().await.expect("a batch").expect("batch");
+            sleep(RUN_AHEAD).await;
+            let taken = reader.decoded_scalar_cache().len();
+            assert!(
+                taken <= STREAMED_MOST_TAKEN,
+                "{taken} superfiles taken while the consumer waited"
+            );
+            let mut rows = first.num_rows();
+            while let Some(batch) = batches.next().await {
+                rows += batch.expect("batch").num_rows();
+            }
+            assert_eq!(rows, STREAMED_SUPERFILES, "every match comes out");
+            assert_eq!(
+                reader.decoded_scalar_cache().len(),
+                STREAMED_SUPERFILES,
+                "premise: each superfile's rows were taken on the column path"
+            );
+        });
+    }
+
+    #[test]
+    fn dropping_a_match_stops_its_fan_out() {
+        // A match over stored superfiles whose data lies past what the
+        // manifest carries, with every superfile read held, so the match
+        // parks on one. The consumer then drops the stream, as a cancelled
+        // statement or a filled LIMIT does.
+        //  - the held read's future is dropped with the stream.
+        //  - once let go, no superfile read starts.
+        // This test pins that a dropped match stops reading.
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_title_fts().with_storage(Arc::clone(&storage)))
+            .expect("create");
+        for file in 0..DROPPED_SUPERFILES {
+            let titles: Vec<String> = (0..DROPPED_ROWS_PER_SUPERFILE)
+                .map(|row| {
+                    let n = (file * DROPPED_ROWS_PER_SUPERFILE + row) as u128;
+                    format!("rust {:032x}", n.wrapping_mul(SCATTER))
+                })
+                .collect();
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            let mut w = st.writer().expect("writer");
+            w.append(&titles_batch(&refs)).expect("append");
+            w.commit().expect("commit");
+        }
+        let slow = SlowStorage::wrap(storage, Duration::ZERO);
+        let options = options_title_fts()
+            .with_storage(slow.clone())
+            .with_superfiles_in_flight(STREAMED_IN_FLIGHT);
+        let reader = Arc::new(
+            Supertable::open(options)
+                .expect("open")
+                .reader()
+                .expect("reader"),
+        );
+        let exec = streamed_exec(&reader);
+        let rt = Runtime::new().expect("runtime");
+        rt.block_on(async {
+            slow.hold_reads_of(SUPERFILE_KEY_SUFFIX);
+            let mut batches = exec
+                .execute(0, Arc::new(TaskContext::default()))
+                .expect("execute");
+            let started = Instant::now();
+            while slow.in_flight() == 0 {
+                assert!(
+                    started.elapsed() < READ_BOUND,
+                    "premise: the match starts a superfile read within {READ_BOUND:?}"
+                );
+                // The first poll starts the match; later ones take what it
+                // sends before it parks.
+                let _ = timeout(READ_POLL, batches.next()).await;
+            }
+            drop(batches);
+            let started = Instant::now();
+            while slow.in_flight() > 0 {
+                assert!(
+                    started.elapsed() < READ_BOUND,
+                    "the dropped match still has a read in flight after {READ_BOUND:?}"
+                );
+                sleep(READ_POLL).await;
+            }
+            let reads = slow.reads_of(SUPERFILE_KEY_SUFFIX);
+            slow.release_reads();
+            sleep(RUN_AHEAD).await;
+            assert_eq!(
+                slow.reads_of(SUPERFILE_KEY_SUFFIX),
+                reads,
+                "a superfile read started after the stream was dropped"
+            );
+        });
+    }
+
+    /// The `MatchExec` line of `sql`'s physical plan with its output schema.
+    fn match_exec_with_schema(reader: &SupertableReader, sql: &str) -> String {
+        let batches = reader
+            .query_sql(&format!("EXPLAIN VERBOSE {sql}"))
+            .expect("explain");
+        let mut line = None;
+        for batch in &batches {
+            let kinds = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("plan type");
+            let plans = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("plan");
+            for row in 0..batch.num_rows() {
+                if kinds.value(row) == "physical_plan_with_schema" {
+                    line = plans
+                        .value(row)
+                        .lines()
+                        .find(|l| l.contains("MatchExec"))
+                        .map(str::to_string);
+                }
+            }
+        }
+        line.unwrap_or_else(|| panic!("no MatchExec with a schema in the plan of {sql}"))
+    }
+
+    #[test]
+    fn a_streamed_match_answers_as_the_hit_path_does() {
+        // The same grouped, ordered and limited queries, run twice.
+        //  - once over the column path: `title` only, no order the match walks.
+        //  - once over the hit path: `_id` kept in the output.
+        //  - each side's path is checked in its plan.
+        // Both return the same titles. This test pins that streaming changes
+        // no answer.
+        let (_st, reader, _exec) = streamed_match();
+        let column = |sql: &str, c: usize| -> Vec<String> {
+            let batches = reader.query_sql(sql).expect("query_sql");
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    (0..batch.num_rows())
+                        .map(move |row| array_value_to_string(batch.column(c), row).expect("value"))
+                })
+                .collect()
+        };
+        let column_path = |sql: &str| {
+            let plan = match_exec_with_schema(&reader, sql);
+            assert!(
+                !plan.contains("_id") && !plan.contains("score") && !plan.contains("order="),
+                "{sql} takes the column path: {plan}"
+            );
+        };
+        let hit_path = |sql: &str| {
+            let plan = match_exec_with_schema(&reader, sql);
+            assert!(plan.contains("_id"), "{sql} takes the hit path: {plan}");
+        };
+        let tvf = "token_match('title', 'rust')";
+
+        let grouped =
+            format!("SELECT title, COUNT(*) AS c FROM {tvf} GROUP BY title ORDER BY title");
+        let grouped_hits =
+            format!("SELECT title, COUNT(_id) AS c FROM {tvf} GROUP BY title ORDER BY title");
+        column_path(&grouped);
+        hit_path(&grouped_hits);
+        assert_eq!(column(&grouped, 0).len(), STREAMED_SUPERFILES);
+        assert_eq!(column(&grouped, 0), column(&grouped_hits, 0));
+        assert_eq!(column(&grouped, 1), column(&grouped_hits, 1));
+
+        // An order on an expression, which the match cannot walk, so the
+        // sort and limit run above it on either path.
+        let order = "ORDER BY length(title) DESC, title LIMIT 5";
+        let limited = format!("SELECT title FROM {tvf} {order}");
+        let limited_hits = format!("SELECT title, _id FROM {tvf} {order}");
+        column_path(&limited);
+        hit_path(&limited_hits);
+        assert_eq!(column(&limited, 0), column(&limited_hits, 0));
+
+        let first = format!("SELECT title FROM {tvf} LIMIT 5");
+        column_path(&first);
+        assert_eq!(column(&first, 0).len(), 5);
+    }
+
+    #[test]
+    fn an_error_on_the_column_path_fails_the_query() {
+        // A match on a column with no text index fails in the match itself,
+        // which runs on the producer's task.
+        //  - the error must reach the query, not end the stream as empty.
+        // This test pins that the column path hands its error on.
+        let st = two_bucket_superfiles();
+        let err = st
+            .reader()
+            .expect("reader")
+            .query_sql("SELECT title FROM token_match('bucket', 'rust')")
+            .expect_err("a match on a column with no text index fails");
+        assert!(
+            err.to_string().contains("bucket"),
+            "names the column: {err}"
+        );
+    }
+
+    #[test]
+    fn a_streamed_match_counts_the_superfiles_its_prune_weighed() {
+        // The column path's match runs on a task of its own.
+        //  - its prune must still count into the statement's stats.
+        //  - so it counts the superfiles weighed and kept as the hit path does.
+        // This test pins the stats collector on that task.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("bucket", DataType::Int64, false),
+        ]));
+        let commits: Vec<_> = [
+            (0_i64, ["rust", "rust zero"]),
+            (1, ["rust", "rust one"]),
+            (2, ["go", "go two"]),
+        ]
+        .into_iter()
+        .map(|(bucket, titles)| {
+            titled_batch(
+                &schema,
+                &titles,
+                Arc::new(Int64Array::from(vec![bucket; 2])),
+            )
+        })
+        .collect();
+        let conn = metered_table(&schema, IndexSpec::new().fts("title"), &commits);
+        let stats = |sql: &str| {
+            let (_, stats) = with_op_stats(|| conn.query_sql(sql).expect("query_sql"));
+            (
+                stats.superfiles_considered,
+                stats.presence_pruning_survived,
+                stats.score_pruning_survived,
+            )
+        };
+        let tvf = format!("token_match('{METERED_TABLE}', 'title', 'rust')");
+        let hits = stats(&format!("SELECT _id FROM {tvf}"));
+        assert!(hits.0 > 0, "premise: the hit path counts its prune");
+        assert_eq!(stats(&format!("SELECT title FROM {tvf}")), hits);
+    }
+
+    /// Times the absent token repeats in the CPU-billing test's query: enough
+    /// that parsing and looking it up outweighs the rest of the statement.
+    const ABSENT_TOKEN_REPEATS: usize = 200_000;
+    /// Least share of the hit path's CPU the column path must bill for the
+    /// same match. The match's own work dominates both, so an unbilled
+    /// producer bills a small fraction of it.
+    const COLUMN_PATH_LEAST_CPU_SHARE: u64 = 2;
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "per-thread CPU clock is Linux procfs (schedstat); off Linux kernel_cpu_ns is always 0"
+    )]
+    fn a_streamed_match_bills_its_cpu_as_the_hit_path_does() {
+        // A token no row holds, repeated until the match's own work dominates.
+        //  - on the hit path the match runs inside the plan's metered polls.
+        //  - on the column path it runs on a task of its own.
+        // Both match no row; the column path must still bill the match's CPU.
+        // This test pins the CPU clock around that task's polls.
+        let schema = title_schema();
+        let conn = metered_table(
+            &schema,
+            IndexSpec::new().fts("title"),
+            &[titles_batch(&["rust"])],
+        );
+        let query = vec!["absent"; ABSENT_TOKEN_REPEATS].join(" ");
+        let cpu = |projection: &str| {
+            let sql = format!(
+                "SELECT {projection} FROM token_match('{METERED_TABLE}', 'title', '{query}')"
+            );
+            let (rows, stats) = with_op_stats(|| {
+                conn.query_sql(&sql)
+                    .expect("query_sql")
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>()
+            });
+            assert_eq!(rows, 0, "premise: no row holds the token");
+            stats.kernel_cpu_ns
+        };
+        let hits = cpu("_id");
+        let columns = cpu("title");
+        assert!(hits > 0, "premise: the hit path bills its CPU");
+        assert!(
+            columns * COLUMN_PATH_LEAST_CPU_SHARE >= hits,
+            "the column path billed {columns} ns against the hit path's {hits} ns"
+        );
     }
 
     /// Queries whose aggregates are held to the materialized rows: a bare
@@ -904,7 +1304,7 @@ mod tests {
     fn column_batch_rows(st: &Supertable, query: &str, mode: BoolMode) -> Vec<usize> {
         let reader = st.reader().expect("reader");
         reader
-            .block_on(reader.token_match_columns_async("title", query, mode, &["title"], &[]))
+            .block_on(reader.token_match_columns_collected("title", query, mode, &["title"], &[]))
             .expect("columns over the match")
             .iter()
             .map(RecordBatch::num_rows)
@@ -1052,7 +1452,7 @@ mod tests {
                         .await
                         .expect("hits");
                     let batches = reader
-                        .token_match_columns_async(
+                        .token_match_columns_collected(
                             "title",
                             "rust",
                             BoolMode::Or,
@@ -1305,7 +1705,7 @@ mod tests {
                 .await
                 .expect("hits");
             let batches = reader
-                .token_match_columns_async("title", term, BoolMode::Or, &["title"], filters)
+                .token_match_columns_collected("title", term, BoolMode::Or, &["title"], filters)
                 .await
                 .expect("columns");
             let exact = reader
@@ -1408,7 +1808,7 @@ mod tests {
         let y = [col("tag").eq(lit("y"))];
         let reader = st.reader().expect("reader");
         let slices: Vec<usize> = reader
-            .block_on(reader.token_match_columns_async(
+            .block_on(reader.token_match_columns_collected(
                 "title",
                 "rust",
                 BoolMode::Or,

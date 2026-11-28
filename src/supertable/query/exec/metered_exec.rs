@@ -67,10 +67,7 @@ use datafusion::{
 use futures::Stream;
 
 use crate::{
-    runtime_metrics::{
-        cpu,
-        op_stats::{OpStatsCollector, OuterBracketGuard, metering_active, outer_bracket_active},
-    },
+    runtime_metrics::op_stats::{OpStatsCollector, timed_poll},
     supertable::query::{
         provider::ScanFooters, read_ahead::ScanReadAhead, scan_order::can_read_in_file_order,
     },
@@ -461,27 +458,10 @@ impl Stream for MeteredStream {
     type Item = DfResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let Some(stats) = self.op_stats.clone() else {
-            return Pin::new(&mut self.inner).poll_next(cx);
-        };
-        if !metering_active() {
-            return Pin::new(&mut self.inner).poll_next(cx);
-        }
-        // Nested inside another bracket on this thread: that one is already
-        // measuring this poll, so counting here would double-charge it.
-        if outer_bracket_active() {
-            return Pin::new(&mut self.inner).poll_next(cx);
-        }
-        // Raised for the duration of the poll so the kernels this poll
-        // drives stand down; dropped before the fold below, which is this
-        // bracket's own and must not be gated by it.
-        let restore = OuterBracketGuard::enter();
-        let start = cpu::thread_cpu_ns();
-        let out = Pin::new(&mut self.inner).poll_next(cx);
-        let delta = cpu::thread_cpu_delta_ns(start);
-        drop(restore);
-        stats.add_kernel_cpu_ns(delta);
-        out
+        let this = &mut *self;
+        timed_poll(this.op_stats.as_deref(), || {
+            Pin::new(&mut this.inner).poll_next(cx)
+        })
     }
 }
 
