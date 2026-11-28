@@ -126,9 +126,8 @@ where
     traced_tvf_rows(span, search, RecordBatch::num_rows)
 }
 
-/// [`traced_tvf`] for a search whose output counts its rows through `rows`:
-/// one that comes out as several batches, one per superfile, records their
-/// sum.
+/// [`traced_tvf`] for a search that reports its row count through `rows`,
+/// such as a streamed match that returns the rows it sent.
 pub(crate) fn traced_tvf_rows<T, F>(
     span: Span,
     search: F,

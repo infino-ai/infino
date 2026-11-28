@@ -462,6 +462,25 @@ fn search_spans_split_into_phases_only_where_there_is_something_to_split() {
         assert_eq!(tvf_span.field("rows_out"), Some(out), "`{name}` rows_out");
     }
 
+    // A match that reads only scalar columns streams them from a task of its
+    // own; its span still sits under the statement and counts the rows sent.
+    let (_, token_tvf) = tvfs
+        .iter()
+        .find(|(name, _)| *name == "tvf.token_match")
+        .expect("token_match case");
+    let (spans, out) = trace_of(
+        &capture,
+        "query_sql",
+        sql(format!("SELECT title FROM {token_tvf}")),
+    );
+    let tvf_span = span(&spans, "tvf.token_match");
+    assert_eq!(tvf_span.parent(), Some("sql.execute"), "column path");
+    assert_eq!(
+        tvf_span.field("rows_out"),
+        Some(out),
+        "column path rows_out"
+    );
+
     // A plan DataFusion wraps around the function (a sort, a join) still
     // runs it inside the query's trace; `trace_of` checks every span's root.
     let bm25_tvf = &tvfs[0].1;

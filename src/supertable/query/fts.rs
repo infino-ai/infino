@@ -3699,9 +3699,10 @@ impl SupertableReader {
     ///
     /// A superfile waits to send while `out` is full, holding its slot of
     /// the fan-out, so the batches alive at once are bounded by the fan-out
-    /// and `out`, not by the superfiles matched. Once `out` closes (the
-    /// statement was cancelled or failed), the next send fails the fan-out,
-    /// which drops the superfiles still running.
+    /// and `out`, not by the superfiles matched; the decoded-column cache
+    /// also keeps copies, within its own budget. Once `out` closes (the
+    /// statement was cancelled or failed, or a `LIMIT` has its rows), the
+    /// next send fails the fan-out, which drops the superfiles still running.
     ///
     /// A plain union of terms over a superfile holding a large share of the
     /// table is cut into doc-id slices, as many as its share of the reader
@@ -3715,7 +3716,7 @@ impl SupertableReader {
         column: &str,
         query: &str,
         mode: BoolMode,
-        names: &[&str],
+        names: Vec<String>,
         filters: &[Expr],
         out: Sender<DfResult<RecordBatch>>,
     ) -> Result<usize, QueryError> {
@@ -3738,9 +3739,10 @@ impl SupertableReader {
                 .collect();
         let cursor_sets = SharedCursorSets::default();
         let manifest = Arc::clone(self.manifest());
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let out_schema =
-            hit_output_schema(&manifest.stored_schema(), names).map_err(QueryError::DataFusion)?;
-        let names: Arc<Vec<String>> = Arc::new(names.iter().map(|s| (*s).to_string()).collect());
+            hit_output_schema(&manifest.stored_schema(), &refs).map_err(QueryError::DataFusion)?;
+        let names = Arc::new(names);
         let op_stats = self.op_stats.clone();
         let shared = self.shared_inner();
         let schema_id = manifest.table_schema().schema_id();
@@ -3824,7 +3826,7 @@ impl SupertableReader {
                         batch
                     }
                 };
-                // Let go of the rows and the reader before waiting on a
+                // Let go of the row ids and the reader before waiting on a
                 // consumer that may be behind: only the batch is sent.
                 drop(locals);
                 drop(r);
@@ -3860,6 +3862,7 @@ impl SupertableReader {
             }
             Ok(collected)
         };
+        let names = names.iter().map(|name| (*name).to_string()).collect();
         let (sent, collected) = join(
             self.token_match_columns_async(column, query, mode, names, filters, out),
             collect,
