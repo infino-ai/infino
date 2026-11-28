@@ -4,6 +4,7 @@
 pub mod brute_force_oracle;
 mod count_from_term_index;
 mod covered_agg;
+mod describe_types;
 pub mod fanout_concurrency;
 pub mod fanout_floor;
 pub mod hierarchical;
