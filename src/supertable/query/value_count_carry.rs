@@ -240,7 +240,12 @@ impl CarriedColumn {
 
     /// Adds `entry`'s counts of column `column`.
     fn add(&mut self, entry: &SuperfileEntry, column: FieldId) {
-        let counts = file_counts(entry, column);
+        // An unknown sum is never taken from, only started over: keep the
+        // superfile's id, not its decoded counts.
+        let counts = match self.sum {
+            Sum::Unknown => FileCounts::Unrecorded,
+            Sum::Counts(_) => file_counts(entry, column),
+        };
         self.sum.add(&counts);
         self.files.insert(entry.superfile_id, counts);
     }
@@ -400,6 +405,37 @@ mod tests {
         assert!(
             superseded.upgrade().is_none(),
             "the carry keeps the first commit's summaries section alive"
+        );
+    }
+
+    /// Once the sum is unknown, a superfile that comes is recorded by its id
+    /// alone: its counts are never read again, so they are not decoded and
+    /// kept.
+    #[test]
+    fn a_superfile_added_to_an_unknown_sum_keeps_no_counts() {
+        let past_the_limit = superfile((0..=MAX_TABLE_VALUE_COUNTS as i64).collect());
+        let later = superfile(vec![1, 2]);
+        let carry = ValueCountCarry::default();
+
+        assert!(
+            carry
+                .sum(fid("n"), &DataType::Int64, &[Arc::clone(&past_the_limit)])
+                .is_none()
+        );
+        assert!(
+            carry
+                .sum(
+                    fid("n"),
+                    &DataType::Int64,
+                    &[Arc::clone(&past_the_limit), Arc::clone(&later)]
+                )
+                .is_none()
+        );
+        let columns = carry.columns.lock().expect("lock");
+        let kept = &columns[&fid("n")].files[&later.superfile_id];
+        assert!(
+            matches!(kept, FileCounts::Unrecorded),
+            "kept {kept:?} for a superfile added to an unknown sum"
         );
     }
 
